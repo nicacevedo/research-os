@@ -14,12 +14,14 @@ from research_os.capsule import (
     init_project,
     validate_project,
 )
+from research_os.digests import subject_digest
 from research_os.errors import (
     E_ACCEPTED_WITHOUT_HUMAN_REVIEW,
     E_DUPLICATE_YAML_KEY,
     E_FILENAME_ID_MISMATCH,
     E_MISSING_CAPSULE_FILE,
     E_SCHEMA,
+    E_STALE_REVIEW_DIGEST,
     E_UNEXPECTED_FILE,
     E_UNSAFE_PATH,
     E_WRONG_OBJECT_DIRECTORY,
@@ -41,6 +43,12 @@ from tests.fs_helpers import (
     write_minimal_capsule,
     write_text,
     write_yaml,
+)
+from tests.helpers import (
+    OTHER_PROJECT_ID,
+    make_claim,
+    make_evidence,
+    make_review,
 )
 
 
@@ -346,11 +354,11 @@ def test_malformed_files_do_not_enter_validate_objects(
     write_text(repo / ".research" / "questions" / "Q-0002.yaml", "status: open\nstatus: paused\n")
     seen: list[str] = []
 
-    def capture(objects):
+    def capture(objects, *, project_id):
         seen.extend(obj.id for obj in objects)
         from research_os.validate import validate_objects as original
 
-        return original(objects)
+        return original(objects, project_id=project_id)
 
     monkeypatch.setattr("research_os.capsule.validate_objects", capture)
     report = validate_project(repo)
@@ -367,11 +375,100 @@ def test_accepted_claim_without_human_review_surfaces_m2_error(
     write_yaml(repo / ".research" / "evidence" / "EVI-0001.yaml", evidence_data())
     write_yaml(
         repo / ".research" / "claims" / "CLAIM-0001.yaml",
-        claim_data(status="accepted", evidence=["EVI-0001"]),
+        claim_data(status="accepted", supporting_evidence=["EVI-0001"]),
     )
     report = validate_project(repo)
     assert E_ACCEPTED_WITHOUT_HUMAN_REVIEW in _codes(report)
     assert not report.ok
+
+
+def test_old_flat_claim_evidence_field_fails_loudly(
+    tmp_path: Path, data_home: Path
+) -> None:
+    """A pre-WP-A ``evidence:`` key is a hard schema error, never ignored."""
+
+    repo = make_git_repo(tmp_path / "sample-project")
+    init_project(repo)
+    write_yaml(repo / ".research" / "evidence" / "EVI-0001.yaml", evidence_data())
+    write_yaml(
+        repo / ".research" / "claims" / "CLAIM-0001.yaml",
+        claim_data(status="accepted", evidence=["EVI-0001"]),
+    )
+    report = validate_project(repo)
+    assert E_SCHEMA in _codes(report)
+    assert not report.ok
+
+
+def test_project_identity_scopes_the_review_digest(
+    tmp_path: Path, data_home: Path
+) -> None:
+    """A review digested under another project id does not validate here."""
+
+    repo = make_git_repo(tmp_path / "sample-project")
+    _, project = init_project(repo)
+    evidence = make_evidence()
+    claim = make_claim(
+        status="accepted",
+        supporting_evidence=["EVI-0001"],
+        statement="X is supported.",
+    )
+    review_for = {
+        scope: make_review(
+            status="concluded",
+            subject=claim.id,
+            reviewer_kind="human",
+            verdict="approve",
+            findings="Reviewed.",
+            subject_digest=subject_digest(claim, project_id=scope),
+            evidence_digests={
+                "EVI-0001": subject_digest(evidence, project_id=scope)
+            },
+        )
+        for scope in (project.id, OTHER_PROJECT_ID)
+    }
+    write_yaml(
+        repo / ".research" / "evidence" / "EVI-0001.yaml",
+        evidence.model_dump(mode="json", exclude_none=True),
+    )
+    write_yaml(
+        repo / ".research" / "claims" / "CLAIM-0001.yaml",
+        claim.model_dump(mode="json", exclude_none=True),
+    )
+
+    reviews = repo / ".research" / "reviews" / "REV-0001.yaml"
+    write_yaml(
+        reviews,
+        review_for[project.id].model_dump(mode="json", exclude_none=True),
+    )
+    assert validate_project(repo).ok
+
+    write_yaml(
+        reviews,
+        review_for[OTHER_PROJECT_ID].model_dump(mode="json", exclude_none=True),
+    )
+    foreign = validate_project(repo)
+    assert not foreign.ok
+    assert E_STALE_REVIEW_DIGEST in _codes(foreign)
+
+
+def test_invalid_project_yaml_does_not_run_weakened_object_validation(
+    tmp_path: Path, data_home: Path
+) -> None:
+    """Object validation is project-scoped, so it is skipped, never weakened."""
+
+    repo = make_git_repo(tmp_path / "sample-project")
+    init_project(repo)
+    write_yaml(repo / ".research" / "evidence" / "EVI-0001.yaml", evidence_data())
+    write_yaml(
+        repo / ".research" / "claims" / "CLAIM-0001.yaml",
+        claim_data(status="accepted", supporting_evidence=["EVI-0001"]),
+    )
+    write_text(repo / ".research" / "project.yaml", "id: Not A Slug\n")
+    report = validate_project(repo)
+    assert report.project is None
+    assert not report.ok
+    assert E_SCHEMA in _codes(report)
+    assert E_ACCEPTED_WITHOUT_HUMAN_REVIEW not in _codes(report)
 
 
 def test_warning_does_not_fail_validation(tmp_path: Path, data_home: Path) -> None:

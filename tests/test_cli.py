@@ -307,7 +307,7 @@ def test_validate_m2_error_surfaces(
     write_yaml(repo / ".research" / "evidence" / "EVI-0001.yaml", evidence_data())
     write_yaml(
         repo / ".research" / "claims" / "CLAIM-0001.yaml",
-        claim_data(status="accepted", evidence=["EVI-0001"]),
+        claim_data(status="accepted", supporting_evidence=["EVI-0001"]),
     )
     code = _run(monkeypatch, "validate-project", str(repo))
     captured = capsys.readouterr()

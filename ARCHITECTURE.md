@@ -90,7 +90,10 @@ Inside each scientific project, canonical state lives under `.research/`:
 
 Canonical files are inspectable, diffable, reviewable, and reconstructible from
 Git history. The kernel never rewrites existing canonical YAML except
-`init-project` creating a missing capsule (M3). Validate never rewrites files.
+`init-project` creating a missing capsule (M3) and an explicit, human-run,
+versioned schema migration, whose effect must appear as an ordinary reviewable
+Git diff in the science project (see the migration policy in
+`docs/CAPSULE.md`). Validate never rewrites files.
 
 Scientific objects are **project-isolated**. Hypotheses, claims, experiments, and
 interpretations belong to the project that owns them. Cross-project reuse is
@@ -190,7 +193,11 @@ A Claim may be `accepted` only when all of the following hold:
 1. at least one **qualifying** Evidence object is referenced;
 2. at least one **qualifying human Review** exists:
    - `subject` equals the Claim ID
-   - `subject_digest` equals the current semantic digest of that Claim
+   - `subject_digest` equals the current project-scoped semantic digest of
+     that Claim
+   - `evidence_digests` covers every Evidence object the Claim currently
+     links, and each stored digest equals that Evidence object's current
+     digest
    - `status == concluded`
    - `verdict == approve`
    - `reviewer_kind == human`
@@ -199,7 +206,10 @@ A Claim may be `accepted` only when all of the following hold:
 Claim `accepted` in R0.
 
 Lifecycle-only Claim changes (`evidence_linked` → `accepted`) must not change
-the semantic digest. Changing title, statement, evidence, or hypotheses must.
+the semantic digest. Changing title, statement, supporting or contrary
+evidence, the response to contrary evidence, or hypotheses must. Changing the
+scientific content of an Evidence object the review examined must invalidate
+the approval too, through the review's explicit `evidence_digests` map.
 
 No agent approves its own scientific work. R0 enforces this structurally; it
 does not prove reviewer identity.
