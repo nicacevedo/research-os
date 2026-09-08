@@ -24,9 +24,14 @@ from research_os.models import (
 )
 
 
-def _id_list(values: list[str] | None) -> list[str] | None:
-    if values is None:
-        return None
+def _id_list(values: list[str] | None) -> list[str]:
+    """Canonicalize optional reference collections as sorted unique ID sets.
+
+    ``None`` and ``[]`` both mean "no references" and project to ``[]``.
+    """
+
+    if not values:
+        return []
     return sorted(set(values))
 
 
@@ -44,18 +49,31 @@ def _provenance(value: Provenance | None) -> dict[str, str] | None:
 def semantic_projection(obj: Reviewable) -> dict[str, Any]:
     """Return the fixed-key scientific projection for ``obj``.
 
-    Absent optionals are JSON ``null``. ID lists are de-duplicated and sorted
-    lexicographically. Administrative fields (``id``, ``status``,
-    ``schema_version``, ``notes``, ``created_from``, ``supersedes``) are
-    excluded. Artifact pointer lists keep parsed order.
+    Absent scalar optionals are JSON ``null``. Optional reference collections
+    whose semantics are "no references" project ``None`` and ``[]`` to the
+    same empty list; remaining ID lists are de-duplicated and sorted
+    lexicographically. Administrative fields (``status``, ``schema_version``,
+    ``notes``, ``created_from``, ``supersedes``) are excluded. Immutable
+    object ``id`` is included. Artifact pointer lists keep parsed order.
     """
 
     if isinstance(obj, Question):
-        return {"type": obj.type, "title": obj.title, "statement": obj.statement}
+        return {
+            "id": obj.id,
+            "type": obj.type,
+            "title": obj.title,
+            "statement": obj.statement,
+        }
     if isinstance(obj, Idea):
-        return {"type": obj.type, "title": obj.title, "statement": obj.statement}
+        return {
+            "id": obj.id,
+            "type": obj.type,
+            "title": obj.title,
+            "statement": obj.statement,
+        }
     if isinstance(obj, Hypothesis):
         return {
+            "id": obj.id,
             "type": obj.type,
             "title": obj.title,
             "statement": obj.statement,
@@ -70,6 +88,7 @@ def semantic_projection(obj: Reviewable) -> dict[str, Any]:
         }
     if isinstance(obj, Assumption):
         return {
+            "id": obj.id,
             "type": obj.type,
             "title": obj.title,
             "statement": obj.statement,
@@ -77,6 +96,7 @@ def semantic_projection(obj: Reviewable) -> dict[str, Any]:
         }
     if isinstance(obj, Claim):
         return {
+            "id": obj.id,
             "type": obj.type,
             "title": obj.title,
             "statement": obj.statement,
@@ -85,6 +105,7 @@ def semantic_projection(obj: Reviewable) -> dict[str, Any]:
         }
     if isinstance(obj, Decision):
         return {
+            "id": obj.id,
             "type": obj.type,
             "title": obj.title,
             "statement": obj.statement,
@@ -95,6 +116,7 @@ def semantic_projection(obj: Reviewable) -> dict[str, Any]:
     if isinstance(obj, Experiment):
         artifacts = None if obj.artifacts is None else list(obj.artifacts)
         return {
+            "id": obj.id,
             "type": obj.type,
             "title": obj.title,
             "purpose": obj.purpose,
@@ -105,6 +127,7 @@ def semantic_projection(obj: Reviewable) -> dict[str, Any]:
         }
     if isinstance(obj, Evidence):
         return {
+            "id": obj.id,
             "type": obj.type,
             "title": obj.title,
             "kind": obj.kind,

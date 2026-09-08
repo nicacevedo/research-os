@@ -10,7 +10,14 @@ import hashlib
 import json
 
 from research_os.digests import semantic_projection, subject_digest
-from tests.helpers import make_claim, make_evidence, make_question
+from tests.helpers import (
+    make_claim,
+    make_decision,
+    make_evidence,
+    make_experiment,
+    make_hypothesis,
+    make_question,
+)
 
 
 def _manual_digest(projection: dict[str, object]) -> str:
@@ -76,9 +83,25 @@ def test_administrative_notes_and_lifecycle_fields_excluded() -> None:
         created_from=["Q-0001"],
         supersedes=["CLAIM-0000"],
     )
-    other_id = make_claim(id="CLAIM-0099")
     assert subject_digest(base) == subject_digest(noisy)
-    assert subject_digest(base) == subject_digest(other_id)
+    projection = semantic_projection(base)
+    assert projection["id"] == "CLAIM-0001"
+    assert "status" not in projection
+    assert "schema_version" not in projection
+    assert "notes" not in projection
+    assert "created_from" not in projection
+    assert "supersedes" not in projection
+
+
+def test_distinct_claim_ids_change_subject_digest() -> None:
+    first = make_claim(id="CLAIM-0001", statement="Same scientific content.")
+    second = make_claim(id="CLAIM-0002", statement="Same scientific content.")
+    assert first.title == second.title
+    assert first.statement == second.statement
+    assert first.evidence == second.evidence
+    assert first.hypotheses == second.hypotheses
+    assert semantic_projection(first)["id"] != semantic_projection(second)["id"]
+    assert subject_digest(first) != subject_digest(second)
 
 
 def test_question_digest_excludes_status() -> None:
@@ -103,14 +126,57 @@ def test_utf8_encoding_is_explicit() -> None:
     assert b"\\u" not in payload
 
 
-def test_absent_optional_lists_are_null_not_empty() -> None:
-    claim = make_claim()
-    projection = semantic_projection(claim)
-    assert projection["evidence"] is None
-    assert projection["hypotheses"] is None
+def test_absent_and_empty_optional_reference_lists_share_digest() -> None:
+    absent = make_claim(evidence=None, hypotheses=None)
     empty = make_claim(evidence=[], hypotheses=[])
+    assert semantic_projection(absent)["evidence"] == []
+    assert semantic_projection(absent)["hypotheses"] == []
     assert semantic_projection(empty)["evidence"] == []
-    assert subject_digest(claim) != subject_digest(empty)
+    assert semantic_projection(empty)["hypotheses"] == []
+    assert subject_digest(absent) == subject_digest(empty)
+
+    hyp_absent = make_hypothesis(
+        addresses=None,
+        assumptions=None,
+        supporting_evidence=None,
+        contrary_evidence=None,
+    )
+    hyp_empty = make_hypothesis(
+        addresses=[],
+        assumptions=[],
+        supporting_evidence=[],
+        contrary_evidence=[],
+    )
+    projection = semantic_projection(hyp_absent)
+    assert projection["addresses"] == []
+    assert projection["assumptions"] == []
+    assert projection["supporting_evidence"] == []
+    assert projection["contrary_evidence"] == []
+    assert subject_digest(hyp_absent) == subject_digest(hyp_empty)
+
+    related_absent = make_decision(related=None)
+    related_empty = make_decision(related=[])
+    assert semantic_projection(related_absent)["related"] == []
+    assert subject_digest(related_absent) == subject_digest(related_empty)
+
+    exp_absent = make_experiment(hypotheses=None)
+    exp_empty = make_experiment(hypotheses=[])
+    assert semantic_projection(exp_absent)["hypotheses"] == []
+    assert subject_digest(exp_absent) == subject_digest(exp_empty)
+
+
+def test_ordered_optional_lists_are_not_empty_normalized() -> None:
+    absent = make_experiment(artifacts=None)
+    empty = make_experiment(artifacts=[])
+    assert semantic_projection(absent)["artifacts"] is None
+    assert semantic_projection(empty)["artifacts"] == []
+    assert subject_digest(absent) != subject_digest(empty)
+
+    alt_absent = make_decision(alternatives_considered=None)
+    alt_empty = make_decision(alternatives_considered=[])
+    assert semantic_projection(alt_absent)["alternatives_considered"] is None
+    assert semantic_projection(alt_empty)["alternatives_considered"] == []
+    assert subject_digest(alt_absent) != subject_digest(alt_empty)
 
 
 def test_evidence_projection_includes_kind_fields() -> None:

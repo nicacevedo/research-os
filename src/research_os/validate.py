@@ -21,6 +21,7 @@ from research_os.errors import (
     E_REVIEW_OF_REVIEW,
     E_STALE_REVIEW_DIGEST,
     E_SUPERSEDED_WITHOUT_SUCCESSOR,
+    E_SUPERSEDES_NON_SUPERSEDED,
     E_SUPERSESSION_CYCLE,
     E_WITHDRAWN_SUPERSEDED,
     E_WRONG_REF_TYPE,
@@ -92,20 +93,24 @@ def validate_objects(objects: Iterable[ScientificObject]) -> ValidationReport:
 
     items = list(objects)
     findings: list[Finding] = []
-    by_id: dict[str, ScientificObject] = {}
-
+    grouped: dict[str, list[ScientificObject]] = defaultdict(list)
     for obj in items:
-        if obj.id in by_id:
+        grouped[obj.id].append(obj)
+
+    by_id: dict[str, ScientificObject] = {}
+    for obj_id in sorted(grouped):
+        group = grouped[obj_id]
+        if len(group) != 1:
             findings.append(
                 Finding(
                     severity=Severity.ERROR,
                     code=E_DUP_ID,
-                    message=f"duplicate object id {obj.id}",
-                    object_id=obj.id,
+                    message=f"duplicate object id {obj_id}",
+                    object_id=obj_id,
                 )
             )
             continue
-        by_id[obj.id] = obj
+        by_id[obj_id] = group[0]
 
     _check_created_from(by_id, findings)
     _check_supersession(by_id, findings)
@@ -161,7 +166,8 @@ def _check_supersession(
                 continue
             graph[obj.id].append(ref)
             successors[ref].append(obj.id)
-            if str(target.status) == "withdrawn":
+            target_status = str(target.status)
+            if target_status == "withdrawn":
                 findings.append(
                     Finding(
                         severity=Severity.ERROR,
@@ -169,6 +175,20 @@ def _check_supersession(
                         message=(
                             f"{obj.id} supersedes withdrawn object {ref}; "
                             "withdrawn means abandoned without replacement"
+                        ),
+                        object_id=obj.id,
+                        field="supersedes",
+                        reference=ref,
+                    )
+                )
+            elif target_status != "superseded":
+                findings.append(
+                    Finding(
+                        severity=Severity.ERROR,
+                        code=E_SUPERSEDES_NON_SUPERSEDED,
+                        message=(
+                            f"{obj.id} supersedes {ref} whose status is "
+                            f"{target_status}, not superseded"
                         ),
                         object_id=obj.id,
                         field="supersedes",

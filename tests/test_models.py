@@ -41,6 +41,10 @@ def test_required_fields_and_unknown_fields_rejected() -> None:
         make_question(extra="nope")
     with pytest.raises(ValidationError):
         make_question(title="")
+    with pytest.raises(ValidationError):
+        make_question(title="   ")
+    with pytest.raises(ValidationError):
+        make_question(statement="\n\t")
 
 
 def test_superseded_by_is_rejected_by_schema() -> None:
@@ -132,11 +136,37 @@ def test_confidence_bounds() -> None:
         make_hypothesis(confidence=True, confidence_basis="no")
 
 
+def test_confidence_rejects_numeric_strings_and_bools() -> None:
+    base = {
+        "id": "HYP-0001",
+        "type": "hypothesis",
+        "schema_version": 1,
+        "status": "draft",
+        "title": "A hypothesis",
+        "statement": "X causes Y.",
+        "confidence_basis": "prior work",
+    }
+    with pytest.raises(ValidationError):
+        parse_object({**base, "confidence": "0.5"})
+    with pytest.raises(ValidationError):
+        parse_object({**base, "confidence": "1"})
+    with pytest.raises(ValidationError):
+        parse_object({**base, "confidence": True})
+    parsed_zero = parse_object({**base, "confidence": 0})
+    parsed_one = parse_object({**base, "confidence": 1})
+    parsed_half = parse_object({**base, "confidence": 0.5})
+    assert parsed_zero.confidence == 0.0
+    assert parsed_one.confidence == 1.0
+    assert parsed_half.confidence == 0.5
+
+
 def test_confidence_basis_coupling() -> None:
     with pytest.raises(ValidationError):
         make_hypothesis(confidence=0.4)
     with pytest.raises(ValidationError):
         make_hypothesis(confidence=0.4, confidence_basis="")
+    with pytest.raises(ValidationError):
+        make_hypothesis(confidence=0.4, confidence_basis="   ")
     with pytest.raises(ValidationError):
         make_hypothesis(confidence_basis="stated without a number")
     obj = make_hypothesis(confidence=0.2, confidence_basis="prior work")
@@ -148,6 +178,8 @@ def test_non_draft_hypothesis_requires_falsification() -> None:
         make_hypothesis(status="active", falsification=None)
     with pytest.raises(ValidationError):
         make_hypothesis(status="active", falsification="")
+    with pytest.raises(ValidationError):
+        make_hypothesis(status="active", falsification="   ")
     make_hypothesis(status="draft", falsification=None)
 
 
@@ -158,6 +190,11 @@ def test_completed_experiment_requires_provenance() -> None:
         make_experiment(
             status="completed",
             provenance={"code": "x", "config": "y", "data": "", "git_commit": "z"},
+        )
+    with pytest.raises(ValidationError):
+        make_experiment(
+            status="completed",
+            provenance={"code": "x", "config": "y", "data": "   ", "git_commit": "z"},
         )
     obj = make_experiment(status="completed")
     assert obj.provenance is not None
@@ -177,12 +214,16 @@ def test_accepted_decision_requires_alternatives() -> None:
         make_decision(status="accepted", alternatives_considered=None)
     with pytest.raises(ValidationError):
         make_decision(status="accepted", alternatives_considered=[])
+    with pytest.raises(ValidationError):
+        make_decision(status="accepted", alternatives_considered=["   "])
     make_decision(status="proposed", alternatives_considered=None)
 
 
 def test_concluded_review_requires_findings_verdict_and_digest() -> None:
     with pytest.raises(ValidationError):
         make_review(status="concluded", findings=None)
+    with pytest.raises(ValidationError):
+        make_review(status="concluded", findings="   ")
     with pytest.raises(ValidationError):
         make_review(status="concluded", verdict=None)
     with pytest.raises(ValidationError):
@@ -206,6 +247,8 @@ def test_evidence_kind_conditioned_fields() -> None:
     make_evidence(kind="literature", citation="Doe 2021")
     with pytest.raises(ValidationError):
         make_evidence(kind="literature", citation=None)
+    with pytest.raises(ValidationError):
+        make_evidence(kind="literature", citation="   ")
     make_evidence(kind="experiment", experiment="EXP-0002")
     with pytest.raises(ValidationError):
         make_evidence(kind="experiment", experiment=None)
@@ -213,6 +256,17 @@ def test_evidence_kind_conditioned_fields() -> None:
     make_evidence(kind="other", citation="internal memo", notes=None)
     with pytest.raises(ValidationError):
         make_evidence(kind="other", citation=None, notes=None)
+    with pytest.raises(ValidationError):
+        make_evidence(kind="other", citation="   ", notes="   ")
+
+
+def test_experiment_pointer_only_allowed_for_experiment_kind() -> None:
+    with pytest.raises(ValidationError):
+        make_evidence(kind="literature", citation="Smith 2020", experiment="EXP-0001")
+    with pytest.raises(ValidationError):
+        make_evidence(kind="other", notes="lab notebook", experiment="EXP-0001")
+    obj = make_evidence(kind="experiment", experiment="EXP-0001")
+    assert obj.experiment == "EXP-0001"
 
 
 def test_other_evidence_requires_citation_or_notes() -> None:
@@ -233,6 +287,42 @@ def test_other_evidence_requires_citation_or_notes() -> None:
 def test_assumption_requires_scope() -> None:
     with pytest.raises(ValidationError):
         make_assumption(scope="")
+    with pytest.raises(ValidationError):
+        make_assumption(scope="   ")
+
+
+def test_whitespace_only_required_scientific_text_rejected() -> None:
+    with pytest.raises(ValidationError):
+        make_idea(statement=" ")
+    with pytest.raises(ValidationError):
+        make_claim(statement="\t")
+    with pytest.raises(ValidationError):
+        make_decision(rationale="   ")
+    with pytest.raises(ValidationError):
+        make_experiment(purpose="\n")
+    with pytest.raises(ValidationError):
+        make_evidence(statement="   ")
+    with pytest.raises(ValidationError):
+        make_experiment(result_manifest="   ")
+    with pytest.raises(ValidationError):
+        make_experiment(artifacts=["   "])
+    Project.model_validate(
+        {
+            "id": "demo-project",
+            "title": "Demo",
+            "capsule_version": 1,
+            "status": "active",
+        }
+    )
+    with pytest.raises(ValidationError):
+        Project.model_validate(
+            {
+                "id": "demo-project",
+                "title": "   ",
+                "capsule_version": 1,
+                "status": "active",
+            }
+        )
 
 
 def test_duplicate_supersedes_rejected() -> None:

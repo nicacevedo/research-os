@@ -8,9 +8,16 @@ from __future__ import annotations
 
 import re
 from enum import StrEnum
-from typing import Any, Literal, Self
+from typing import Annotated, Any, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 from research_os.ids import (
     PREFIX_TO_TYPE,
@@ -23,6 +30,17 @@ _SUBJECT_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 _REVIEWABLE_PREFIXES = frozenset(
     {"Q", "IDEA", "HYP", "ASM", "CLAIM", "DEC", "EXP", "EVI"}
 )
+
+
+def _reject_blank(value: str) -> str:
+    """Reject whitespace-only strings without rewriting canonical text."""
+
+    if not value.strip():
+        raise ValueError("must contain at least one non-whitespace character")
+    return value
+
+
+NonBlankStr = Annotated[str, AfterValidator(_reject_blank)]
 
 
 class ObjectType(StrEnum):
@@ -143,7 +161,7 @@ class ObjectEnvelope(BaseModel):
     type: ObjectType
     schema_version: Literal[1]
     status: str
-    title: str = Field(min_length=1)
+    title: NonBlankStr
     notes: str | None = None
     created_from: list[str] = Field(default_factory=list)
 
@@ -191,28 +209,28 @@ class Provenance(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    code: str = Field(min_length=1)
-    config: str = Field(min_length=1)
-    data: str = Field(min_length=1)
-    git_commit: str = Field(min_length=1)
+    code: NonBlankStr
+    config: NonBlankStr
+    data: NonBlankStr
+    git_commit: NonBlankStr
 
 
 class Question(BaseScientificObject):
     type: Literal[ObjectType.QUESTION]
     status: QuestionStatus
-    statement: str = Field(min_length=1)
+    statement: NonBlankStr
 
 
 class Idea(BaseScientificObject):
     type: Literal[ObjectType.IDEA]
     status: IdeaStatus
-    statement: str = Field(min_length=1)
+    statement: NonBlankStr
 
 
 class Hypothesis(BaseScientificObject):
     type: Literal[ObjectType.HYPOTHESIS]
     status: HypothesisStatus
-    statement: str = Field(min_length=1)
+    statement: NonBlankStr
     falsification: str | None = None
     mechanism: str | None = None
     addresses: list[str] | None = None
@@ -242,17 +260,27 @@ class Hypothesis(BaseScientificObject):
         if value is None:
             return None
         if type(value) is bool:
-            raise ValueError("confidence must be a number between 0 and 1")
+            raise ValueError("confidence must be a numeric scalar")
         if type(value) is int:
             return float(value)
-        return value
+        if type(value) is float:
+            return value
+        raise ValueError("confidence must be a numeric scalar")
 
     @model_validator(mode="after")
     def _hypothesis_content_rules(self) -> Self:
-        if self.status is not HypothesisStatus.DRAFT and not self.falsification:
+        if self.status is not HypothesisStatus.DRAFT and (
+            self.falsification is None or not self.falsification.strip()
+        ):
             raise ValueError("non-draft hypotheses require non-empty falsification")
+        if self.confidence_basis is not None and not self.confidence_basis.strip():
+            raise ValueError(
+                "confidence_basis must contain at least one non-whitespace character"
+            )
         has_confidence = self.confidence is not None
-        has_basis = bool(self.confidence_basis)
+        has_basis = (
+            self.confidence_basis is not None and bool(self.confidence_basis.strip())
+        )
         if has_confidence and not has_basis:
             raise ValueError("confidence requires non-empty confidence_basis")
         if self.confidence_basis is not None and not has_confidence:
@@ -263,14 +291,14 @@ class Hypothesis(BaseScientificObject):
 class Assumption(BaseScientificObject):
     type: Literal[ObjectType.ASSUMPTION]
     status: AssumptionStatus
-    statement: str = Field(min_length=1)
-    scope: str = Field(min_length=1)
+    statement: NonBlankStr
+    scope: NonBlankStr
 
 
 class Claim(BaseScientificObject):
     type: Literal[ObjectType.CLAIM]
     status: ClaimStatus
-    statement: str = Field(min_length=1)
+    statement: NonBlankStr
     evidence: list[str] | None = None
     hypotheses: list[str] | None = None
 
@@ -287,8 +315,8 @@ class Claim(BaseScientificObject):
 class Decision(BaseScientificObject):
     type: Literal[ObjectType.DECISION]
     status: DecisionStatus
-    statement: str = Field(min_length=1)
-    rationale: str = Field(min_length=1)
+    statement: NonBlankStr
+    rationale: NonBlankStr
     alternatives_considered: list[str] | None = None
     related: list[str] | None = None
 
@@ -308,7 +336,7 @@ class Decision(BaseScientificObject):
                 raise ValueError(
                     "accepted decisions require non-empty alternatives_considered"
                 )
-            if any(not item for item in self.alternatives_considered):
+            if any(not item.strip() for item in self.alternatives_considered):
                 raise ValueError(
                     "alternatives_considered entries must be non-empty"
                 )
@@ -318,7 +346,7 @@ class Decision(BaseScientificObject):
 class Experiment(BaseScientificObject):
     type: Literal[ObjectType.EXPERIMENT]
     status: ExperimentStatus
-    purpose: str = Field(min_length=1)
+    purpose: NonBlankStr
     hypotheses: list[str] | None = None
     provenance: Provenance | None = None
     result_manifest: str | None = None
@@ -338,14 +366,14 @@ class Experiment(BaseScientificObject):
     def _artifact_pointers(cls, value: list[str] | None) -> list[str] | None:
         if value is None:
             return None
-        if any(not item for item in value):
+        if any(not item.strip() for item in value):
             raise ValueError("artifact pointers must be non-empty")
         return value
 
     @field_validator("result_manifest")
     @classmethod
     def _result_manifest_non_empty(cls, value: str | None) -> str | None:
-        if value is not None and not value:
+        if value is not None and not value.strip():
             raise ValueError("result_manifest must be non-empty when set")
         return value
 
@@ -389,7 +417,7 @@ class Review(ObjectEnvelope):
     @model_validator(mode="after")
     def _concluded_review_fields(self) -> Self:
         if self.status is ReviewStatus.CONCLUDED:
-            if not self.findings:
+            if self.findings is None or not self.findings.strip():
                 raise ValueError("concluded reviews require findings")
             if self.verdict is None:
                 raise ValueError("concluded reviews require verdict")
@@ -401,7 +429,7 @@ class Review(ObjectEnvelope):
 class Evidence(BaseScientificObject):
     type: Literal[ObjectType.EVIDENCE]
     status: EvidenceStatus
-    statement: str = Field(min_length=1)
+    statement: NonBlankStr
     kind: EvidenceKind
     citation: str | None = None
     global_ref: str | None = None
@@ -418,12 +446,22 @@ class Evidence(BaseScientificObject):
 
     @model_validator(mode="after")
     def _kind_conditioned_fields(self) -> Self:
-        if self.kind is EvidenceKind.LITERATURE and not self.citation:
+        if self.kind is EvidenceKind.LITERATURE and (
+            self.citation is None or not self.citation.strip()
+        ):
             raise ValueError("literature evidence requires citation")
-        if self.kind is EvidenceKind.EXPERIMENT and not self.experiment:
-            raise ValueError("experiment evidence requires an experiment id")
-        if self.kind is EvidenceKind.OTHER and not self.citation and not self.notes:
-            raise ValueError("other evidence requires citation or notes")
+        if self.kind is EvidenceKind.EXPERIMENT:
+            if not self.experiment:
+                raise ValueError("experiment evidence requires an experiment id")
+        elif self.experiment is not None:
+            raise ValueError(
+                "experiment pointer is only valid for experiment-kind evidence"
+            )
+        if self.kind is EvidenceKind.OTHER:
+            citation_ok = self.citation is not None and bool(self.citation.strip())
+            notes_ok = self.notes is not None and bool(self.notes.strip())
+            if not citation_ok and not notes_ok:
+                raise ValueError("other evidence requires citation or notes")
         return self
 
 
@@ -433,7 +471,7 @@ class Project(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     id: str
-    title: str = Field(min_length=1)
+    title: NonBlankStr
     capsule_version: Literal[1]
     status: ProjectStatus
     description: str | None = None

@@ -12,6 +12,7 @@ from research_os.errors import (
     E_NONQUALIFYING_EVIDENCE,
     E_STALE_REVIEW_DIGEST,
     E_SUPERSEDED_WITHOUT_SUCCESSOR,
+    E_SUPERSEDES_NON_SUPERSEDED,
     E_SUPERSESSION_CYCLE,
     E_WITHDRAWN_SUPERSEDED,
     E_WRONG_REF_TYPE,
@@ -67,6 +68,18 @@ def test_duplicate_ids_are_errors() -> None:
     report = validate_objects([make_question(), make_question(title="Other")])
     assert E_DUP_ID in report.codes()
     assert not report.ok
+
+
+def test_duplicate_ids_do_not_use_first_object_wins() -> None:
+    unique = make_question(id="Q-0002")
+    dup_a = make_question(id="Q-0001", title="First payload", created_from=["Q-0002"])
+    dup_b = make_question(id="Q-0001", title="Second payload", created_from=["Q-9999"])
+    first = validate_objects([dup_a, dup_b, unique])
+    second = validate_objects([dup_b, dup_a, unique])
+    third = validate_objects([unique, dup_b, dup_a])
+    assert first.findings == second.findings == third.findings
+    assert first.codes() == (E_DUP_ID,)
+    assert E_DANGLING_REF not in first.codes()
 
 
 def test_dangling_and_wrong_type_refs() -> None:
@@ -299,6 +312,25 @@ def test_merge_supersession() -> None:
     merged = make_question(id="Q-0003", supersedes=["Q-0001", "Q-0002"])
     report = validate_objects([first, second, merged])
     assert report.ok
+
+
+def test_supersedes_requires_predecessor_superseded() -> None:
+    open_pred = make_question(id="Q-0001", status="open")
+    successor = make_question(id="Q-0002", supersedes=["Q-0001"])
+    open_report = validate_objects([open_pred, successor])
+    assert E_SUPERSEDES_NON_SUPERSEDED in open_report.codes()
+    assert not open_report.ok
+
+    active_pred = make_idea(id="IDEA-0001", status="active")
+    active_succ = make_idea(id="IDEA-0002", supersedes=["IDEA-0001"])
+    active_report = validate_objects([active_pred, active_succ])
+    assert E_SUPERSEDES_NON_SUPERSEDED in active_report.codes()
+
+    superseded_pred = make_question(id="Q-0001", status="superseded")
+    ok_succ = make_question(id="Q-0002", supersedes=["Q-0001"])
+    ok_report = validate_objects([superseded_pred, ok_succ])
+    assert ok_report.ok
+    assert E_SUPERSEDES_NON_SUPERSEDED not in ok_report.codes()
 
 
 def test_supersession_cycle() -> None:

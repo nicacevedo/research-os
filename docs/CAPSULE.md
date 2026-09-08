@@ -69,6 +69,10 @@ Shared envelope on every typed YAML object (Pydantic v2, `extra='forbid'`):
 - **Forbidden:** `superseded_by` (derived only), routine timestamps, secrets,
   unknown keys
 
+Non-empty required scientific strings must contain at least one
+non-whitespace character. Validators reject whitespace-only values and do
+not rewrite canonical YAML.
+
 No timestamps as scientific provenance. Git is history.
 
 ### Project — `project.yaml`
@@ -97,7 +101,8 @@ No timestamps as scientific provenance. Git is history.
 - **Required when `status != draft`:** `falsification` (non-empty)
 - **Optional:** `mechanism`; `addresses` (Q- IDs); `assumptions` (ASM- IDs);
   `supporting_evidence` (EVI- IDs); `contrary_evidence` (EVI- IDs);
-  `confidence` (float, `0 <= x <= 1`); `confidence_basis` (string)
+  `confidence` (YAML numeric scalar, `0 <= x <= 1`; strings and booleans
+  are rejected); `confidence_basis` (string)
 - **Status:** `draft` | `active` | `testing` | `supported` | `rejected` |
   `inconclusive` | `withdrawn` | `superseded`
 
@@ -167,7 +172,9 @@ provenance:
   `statement`
 - **If `literature`:** required `citation`; optional `global_ref` (opaque,
   unresolved); optional `locator`
-- **If `experiment`:** required `experiment` (EXP- ID)
+- **If `experiment`:** required `experiment` (EXP- ID). The `experiment`
+  pointer may be present only when `kind == experiment`; it is invalid on
+  `literature` and `other`.
 - **If `other`:** at least one of `citation` or `notes` non-empty
 - **Status:** `active` | `withdrawn` | `superseded`
 - Boundary: global literature object (R1) → project-local Evidence (R0) →
@@ -269,32 +276,38 @@ Algorithm:
 
 1. Parse object to a typed model.
 2. Build a JSON-compatible projection dict with a **fixed key set per type**
-   (below). Absent optionals are JSON `null`. ID lists are de-duplicated and
-   sorted lexicographically. Strings are the parsed Unicode values (no extra
-   whitespace folding).
+   (below). Absent scalar optionals are JSON `null`. Optional reference
+   collections whose semantics are "no references" (`evidence`, `hypotheses`,
+   `addresses`, `assumptions`, `supporting_evidence`, `contrary_evidence`,
+   `related`) normalize `None` and `[]` to the same empty list. Remaining ID
+   lists are de-duplicated and sorted lexicographically. Strings are the
+   parsed Unicode values (no extra whitespace folding).
 3. Serialize: `json.dumps(projection, ensure_ascii=False, sort_keys=True,
    separators=(",", ":"), allow_nan=False).encode("utf-8")`.
 4. `subject_digest = hashlib.sha256(bytes).hexdigest()` (lowercase hex).
 
 **Excluded from every projection:** `status`, `schema_version`, `notes`,
-`created_from`, `supersedes`, `id` (identity is Review.`subject`),
-unknown/admin fields.
+`created_from`, `supersedes`, unknown/admin fields.
+
+**Included in every projection:** immutable object `id`, plus the
+type-specific scientific fields below. Identity is therefore bound in the
+digest itself; Review.`subject` still names the reviewed object.
 
 **Included (material) by type**
 
-- **question:** `type`, `title`, `statement`
-- **idea:** `type`, `title`, `statement`
-- **hypothesis:** `type`, `title`, `statement`, `falsification`, `mechanism`,
-  `addresses`, `assumptions`, `supporting_evidence`, `contrary_evidence`,
-  `confidence`, `confidence_basis`
-- **assumption:** `type`, `title`, `statement`, `scope`
-- **claim:** `type`, `title`, `statement`, `evidence`, `hypotheses`
-- **decision:** `type`, `title`, `statement`, `rationale`,
+- **question:** `id`, `type`, `title`, `statement`
+- **idea:** `id`, `type`, `title`, `statement`
+- **hypothesis:** `id`, `type`, `title`, `statement`, `falsification`,
+  `mechanism`, `addresses`, `assumptions`, `supporting_evidence`,
+  `contrary_evidence`, `confidence`, `confidence_basis`
+- **assumption:** `id`, `type`, `title`, `statement`, `scope`
+- **claim:** `id`, `type`, `title`, `statement`, `evidence`, `hypotheses`
+- **decision:** `id`, `type`, `title`, `statement`, `rationale`,
   `alternatives_considered`, `related`
-- **experiment:** `type`, `title`, `purpose`, `hypotheses`, `provenance`,
+- **experiment:** `id`, `type`, `title`, `purpose`, `hypotheses`, `provenance`,
   `result_manifest`, `artifacts`
-- **evidence:** `type`, `title`, `kind`, `statement`, `citation`, `global_ref`,
-  `locator`, `experiment`
+- **evidence:** `id`, `type`, `title`, `kind`, `statement`, `citation`,
+  `global_ref`, `locator`, `experiment`
 
 `provenance` is included as a sorted-key object of its four strings when
 present, else `null`.
@@ -364,6 +377,7 @@ supersedes:
 ```
 
 - Default empty; no duplicate IDs in the list; same type; all exist; cycles ERROR
+- Every referenced predecessor must have `status == superseded`
 - One object may supersede many predecessors; many successors may supersede one
   predecessor
 - `superseded_by` is **derived only** (index `refs` reverse); never canonical YAML
