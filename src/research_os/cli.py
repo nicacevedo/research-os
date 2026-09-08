@@ -5,9 +5,10 @@ from __future__ import annotations
 import argparse
 import shutil
 import sys
-from pathlib import Path
 
 from research_os import __version__
+from research_os.errors import EXIT_ERROR, EXIT_OK
+from research_os.paths import xdg_dir_issue, xdg_dirs
 
 
 def _doctor() -> int:
@@ -15,23 +16,23 @@ def _doctor() -> int:
 
     py_ok = sys.version_info[:2] == (3, 12)
     checks.append(
-        ("python", py_ok, f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")
+        (
+            "python",
+            py_ok,
+            f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+        )
     )
 
     for command in ("git", "sqlite3"):
         path = shutil.which(command)
         checks.append((command, path is not None, path or "not found"))
 
-    home = Path.home()
-    paths = {
-        "config": home / ".config" / "research-os",
-        "data": home / ".local" / "share" / "research-os",
-        "cache": home / ".cache" / "research-os",
-        "state": home / ".local" / "state" / "research-os",
-    }
-
-    for name, path in paths.items():
-        checks.append((name, path.is_dir(), str(path)))
+    for name, path in xdg_dirs().items():
+        issue = xdg_dir_issue(path)
+        if issue is None:
+            checks.append((name, True, str(path)))
+        else:
+            checks.append((name, False, f"{path} ({issue})"))
 
     failed = False
 
@@ -40,7 +41,7 @@ def _doctor() -> int:
         print(f"{status:4}  {name:10}  {detail}")
         failed = failed or not ok
 
-    return 1 if failed else 0
+    return EXIT_ERROR if failed else EXIT_OK
 
 
 def main() -> None:
