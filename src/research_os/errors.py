@@ -22,9 +22,19 @@ E_ACCEPTED_WITHOUT_EVIDENCE = "E_ACCEPTED_WITHOUT_EVIDENCE"
 E_ACCEPTED_WITHOUT_HUMAN_REVIEW = "E_ACCEPTED_WITHOUT_HUMAN_REVIEW"
 E_STALE_REVIEW_DIGEST = "E_STALE_REVIEW_DIGEST"
 E_REVIEW_OF_REVIEW = "E_REVIEW_OF_REVIEW"
+E_MISSING_CAPSULE_FILE = "E_MISSING_CAPSULE_FILE"
+E_YAML_PARSE = "E_YAML_PARSE"
+E_DUPLICATE_YAML_KEY = "E_DUPLICATE_YAML_KEY"
+E_SCHEMA = "E_SCHEMA"
+E_FILENAME_ID_MISMATCH = "E_FILENAME_ID_MISMATCH"
+E_WRONG_OBJECT_DIRECTORY = "E_WRONG_OBJECT_DIRECTORY"
+E_UNSAFE_PATH = "E_UNSAFE_PATH"
+E_UNEXPECTED_FILE = "E_UNEXPECTED_FILE"
 
 W_STALE_SUBJECT_DIGEST = "W_STALE_SUBJECT_DIGEST"
 W_PROMOTED_WITHOUT_HYPOTHESIS = "W_PROMOTED_WITHOUT_HYPOTHESIS"
+W_RESERVED_DIRECTORY = "W_RESERVED_DIRECTORY"
+W_UNEXPECTED_FILE = "W_UNEXPECTED_FILE"
 
 
 class ResearchOSError(Exception):
@@ -33,6 +43,34 @@ class ResearchOSError(Exception):
 
 class InvalidIdError(ResearchOSError, ValueError):
     """Raised when a scientific or project identifier is malformed."""
+
+
+class NotAGitRepositoryError(ResearchOSError):
+    """Raised when a path is not inside a Git repository."""
+
+
+class CapsuleExistsError(ResearchOSError):
+    """Raised when init-project would overwrite an existing capsule."""
+
+
+class ProjectIdRequiredError(ResearchOSError):
+    """Raised when a repository basename is not a valid project id."""
+
+
+class CapsuleError(ResearchOSError):
+    """Raised for operational capsule/project failures."""
+
+
+class RegistryError(ResearchOSError):
+    """Raised for project-registry operational failures."""
+
+
+class RegistryConflictError(RegistryError):
+    """Raised when registration would collide with a live identity or path."""
+
+
+class CapsuleCreatedRegistryFailedError(ResearchOSError):
+    """Raised when init created a capsule but could not register it."""
 
 
 class Severity(StrEnum):
@@ -56,6 +94,7 @@ class Finding:
     object_id: str | None = None
     field: str | None = None
     reference: str | None = None
+    source: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
