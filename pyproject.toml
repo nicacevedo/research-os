@@ -1,0 +1,17 @@
+[project]
+name = "research-os"
+version = "0.1.0"
+description = "Local-first orchestration for reproducible, evidence-grounded scientific research."
+readme = "README.md"
+authors = [
+    { name = "Nicolás Acevedo Villena", email = "ni.acevedo.villena@gmail.com" }
+]
+requires-python = ">=3.12,<3.13"
+dependencies = []
+
+[project.scripts]
+researchctl = "research_os.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.12.10,<0.13.0"]
+build-backend = "uv_build"
