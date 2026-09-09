@@ -9,8 +9,9 @@ writing easier to reproduce, inspect, and coordinate.
 
 `DESIGN_INVARIANTS.md` is the architectural constitution. This document describes
 system boundaries and responsibilities. `docs/CAPSULE.md` is the Research Capsule
-v1 contract. `docs/plans/R0_KERNEL_PLAN.md` is the version-controlled R0
-implementation contract.
+v1 contract and is authoritative on anything scientific. `docs/plans/` holds
+historical, superseded plans of record; `docs/CAPSULE.md` wins wherever they
+disagree.
 
 ## 1. Operating model
 
@@ -104,8 +105,7 @@ explicit later; R0 does not scan other projects or `shared_knowledge/`.
 | Kind | Location | Canonical? |
 |---|---|---|
 | Project science | `<project>/.research/*.yaml`, Markdown | yes |
-| Project index | `<project>/.research/runtime/state.sqlite` | no; rebuildable |
-| Global project registry | `~/.local/share/research-os/project_registry.sqlite` | no; disposable metadata |
+| Global project registry | `~/.local/share/research-os/project_registry.json` | no; disposable metadata |
 | Shared literature (R1+) | `~/.local/share/research-os/literature/` | later; not R0 kernel state |
 | Secrets (later) | `~/.config/research-os/secrets.env` | never Git-tracked |
 
@@ -124,7 +124,8 @@ Capsule highlights for architecture:
 - Evidence lives in `.research/evidence/`.
 - `.research/literature/`, `work_orders/`, and `handoffs/` are reserved and not
   parsed in R0.
-- `.research/runtime/` is gitignored and created on demand by index rebuild.
+- `.research/runtime/` is reserved, gitignored scratch space. Nothing in the
+  kernel writes there.
 - Missing typed object directories mean zero objects, not an error.
 
 This kernel repository itself must not contain a science capsule.
@@ -141,52 +142,58 @@ results, or other support. It is not a paper corpus.
 
 Withdrawn or superseded evidence may remain as references but does not qualify.
 
-## 7. SQLite materialization
+## 7. Global project registry
 
-`.research/runtime/state.sqlite` is a rebuildable index of canonical files.
-Files always win. There is no permissive index mode and no second state machine
-in SQL.
-
-The index records object rows, reference edges, and a
-`canonical_source_digest` over scientific files only (see `docs/CAPSULE.md`).
-Deleting or corrupting the database must be recoverable by `rebuild-index`
-(M4) without changing YAML.
-
-## 8. Global project registry
-
-`project_registry.sqlite` under the data home is **noncanonical metadata** for
+`project_registry.json` under the data home is **noncanonical metadata** for
 discovery (`project_id`, `path`, `title`, `capsule_version`, `status`,
-`last_seen`).
+`last_seen`). Canonical Git-tracked files under `.research/` are the only
+project scientific state: R0 materializes no project index, and the kernel
+depends on no database.
 
 - Deleting it must not alter project files
 - Science remains in the project Git repository
-- `last_seen` is updated only by `init-project` and `register-project` (M3)
+- `last_seen` is updated only by `init-project` and `register-project`
 - No filesystem scan of `~/research/`
-- R0 doctor must not require the registry to exist
+- Doctor must not require the registry to exist
+- Writes replace the whole file atomically (temp file in the same directory,
+  then `os.replace`), so an interrupted write leaves the previous store intact
+- The store is plain JSON and enforces no shape of its own, so everything read
+  back is validated structurally; a corrupt store is a clean error, never a
+  partially-trusted registry
 
-## 9. CLI-first interface
+## 8. CLI-first interface
 
 The user-facing interface is `researchctl` (stdlib `argparse`).
 
-R0/M1 commands that exist:
+R0 commands:
 
 - `researchctl version`
 - `researchctl doctor`
+- `researchctl init-project [path]`
+- `researchctl register-project [path]`
+- `researchctl validate-project [path]`
+- `researchctl projects`
+- `researchctl status [path]`
+- `researchctl digest <OBJECT-ID> [path]`
+- `researchctl review <CLAIM-ID> [path]`
 
-R0 commands specified for later kernel milestones (not implemented in M1):
-
-- `init-project`, `register-project`, `validate-project`, `rebuild-index`,
-  `projects`, `status`
+`digest` prints the current project-scoped semantic digest of one object, so a
+researcher never hand-computes one. `review` records a human Review of a Claim
+(see section 9). There is no `researchctl set-status` and no
+`researchctl delete`: changing a Claim's status is a deliberate, reviewable edit
+to canonical YAML.
 
 Exit codes (R0 contract): `0` success, `1` validation/project/runtime failure
 (including “not a Research OS project”), `2` usage error.
 
-Doctor checks the local environment. It must not create directories, `chmod`,
-`chown`, repair the OS, require R1-shaped subdirectories, require
-`config.toml` or `secrets.env`, require the project registry, or inspect
-firmware.
+Doctor checks the local environment: the running Python version, `git` on
+`PATH`, and that the four Research OS XDG directories exist, are directories,
+and are writable. It must not create directories, `chmod`, `chown`, repair the
+OS, require R1-shaped subdirectories, require `config.toml` or `secrets.env`,
+require the project registry, or inspect firmware. It tests only what the
+kernel actually needs.
 
-## 10. Review-gated Claim acceptance
+## 9. Review-gated Claim acceptance
 
 A Claim may be `accepted` only when all of the following hold:
 
@@ -211,14 +218,22 @@ evidence, the response to contrary evidence, or hypotheses must. Changing the
 scientific content of an Evidence object the review examined must invalidate
 the approval too, through the review's explicit `evidence_digests` map.
 
-No agent approves its own scientific work. R0 enforces this structurally; it
-does not prove reviewer identity.
+`researchctl review` is the supported way to record that approval. It renders
+the Claim, every linked Evidence object with its source pointers, and the exact
+digests the Review will bind, then requires an explicit verdict, findings, and
+confirmation from an interactive terminal. It never changes the Claim's status.
 
-## 11. Release boundaries
+No agent approves its own scientific work. R0 enforces this structurally through
+the schema and the acceptance gate; it does not prove reviewer identity. The
+interactive-terminal requirement is a usability and safety guard, not
+authentication: the binding rule that agents must not record human Reviews lives
+in `AGENTS.md`.
+
+## 10. Release boundaries
 
 | Release | Role | Status |
 |---|---|---|
-| **R0 — Kernel** | repo, CLI, capsule, schemas, Git/SQLite state | in implementation |
+| **R0 — Kernel** | repo, CLI, capsule, schemas, Git-tracked canonical state | in implementation |
 | **R1 — Literature** | APIs, shared library, PDF cache, ranking, retrieval | not started |
 | **R2 — Co-Explorer** | explorers, literature verification, hypothesis portfolio | not started |
 | **R3 — Experimentalist** | Work Orders, execution, validation, Slurm | not started |
@@ -231,7 +246,7 @@ treated as if they already exist.
 R0 includes Claim/Review/Evidence schemas as kernel state. R4 adds identity and
 frozen review-packet tooling around that kernel.
 
-## 12. Postponed technologies
+## 11. Postponed technologies
 
 R0 does not include and must not opportunistically add:
 
@@ -242,7 +257,7 @@ embeddings, unofficial browser automation, firmware/Secure Boot/MOK automation.
 
 Work Orders, Handoffs, and RUN records have no R0 schema.
 
-## 13. Human versus agent authority
+## 12. Human versus agent authority
 
 Humans retain authority over architectural invariants, schema freeze, scientific
 lifecycle semantics, Linux package/firmware changes, credentials, provider

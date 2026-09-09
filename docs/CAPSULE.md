@@ -1,9 +1,10 @@
 # Research Capsule v1
 
-This is the approved Research Capsule contract for Research OS R0.
-Implementation of schemas, validation, CLI capsule commands, and indexing is
-**not** part of M1. This document freezes the semantics those later R0
-milestones must implement.
+This is the live Research Capsule specification for Research OS R0, and it is
+authoritative on anything scientific: where any other document in this
+repository disagrees with it, this one wins. Schemas, validation, and the
+capsule CLI commands described here are implemented. Everything under
+`docs/plans/` is historical and must not be implemented from.
 
 Package version remains `0.1.0` until R0 is accepted.
 `capsule_version` is `1`. Object `schema_version` is `1`.
@@ -33,15 +34,14 @@ Research OS kernel repository itself does not contain a science capsule.
 ├── experiments/EXP-NNNN/manifest.yaml
 ├── reviews/
 ├── evidence/                     # EVI-NNNN.yaml
-└── runtime/                      # on demand; gitignored
-    └── state.sqlite
+└── runtime/                      # reserved; gitignored; nothing writes here
 ```
 
-`init-project` (M3) writes `.research/.gitignore` containing `/runtime/` and
-does **not** append to the project root `.gitignore`.
+`init-project` writes `.research/.gitignore` containing `/runtime/` and does
+**not** append to the project root `.gitignore`.
 
 Not created and not required: `work_orders/`, `handoffs/`, `literature/`,
-`runtime/` (until rebuild). No `.gitkeep`.
+`runtime/`. No `.gitkeep`.
 
 Reserved directories that contain files (`literature/`, `work_orders/`,
 `handoffs/`, and other unparsed reserved paths): **WARNING**, not indexed, not
@@ -57,12 +57,32 @@ missing capsule.
 |---|---|---|
 | Git-tracked YAML and Markdown under `.research/` | scientific truth | yes |
 | `.research/.gitignore` | operational ignore of runtime | not scientific; excluded from source digest |
-| `.research/runtime/state.sqlite` | materialized index | no; rebuildable |
-| Global `project_registry.sqlite` | discovery metadata | no; disposable |
+| `.research/runtime/` | reserved scratch space | no; nothing writes here |
+| Global `project_registry.json` | discovery metadata | no; disposable |
 | Reserved unparsed directories | future releases | not R0 kernel state |
 
-Files always win over SQLite. Deleting `runtime/` or the registry must not
-delete science.
+Canonical files are the only scientific state. R0 materializes no project index
+and depends on no database. Deleting `runtime/` or the registry must not delete
+science.
+
+## Canonical file loading
+
+Canonical YAML is **UTF-8**. The loader decodes strictly: it never guesses a
+charset, never falls back to another encoding, and never transcodes a canonical
+file, because silently reinterpreting bytes would let a malformed file parse
+into subtly different science.
+
+`E_YAML_PARSE` covers every way a canonical file fails to yield one YAML
+mapping:
+
+- bytes that are not valid UTF-8;
+- malformed YAML;
+- a document that is not a mapping;
+- an empty file, or more than one document in one file.
+
+A duplicate mapping key is the separate `E_DUPLICATE_YAML_KEY`. Any of these is
+an **ERROR**, and a file that fails to load contributes no object to validation:
+malformed input never reaches cross-object checks.
 
 ## Object types
 
@@ -391,6 +411,34 @@ Closing it needs either recursive digest resolution or an explicit
 experiment-digest map; neither is implemented, and current Experiment ID
 traceability is preserved in the meantime.
 
+### Known limitation: evidence unlinked after a concluded review
+
+If a Claim stops linking an Evidence object that one of its concluded Reviews
+recorded having examined, that stored digest becomes an `evidence_digests` key
+the Claim no longer links, which is `E_EVIDENCE_DIGEST_UNLINKED` -- a hard
+error, rather than a warning about a historically valid record. That is
+inconsistent with treating a stale concluded Review as historically valid, and
+correcting it would change review semantics, so it is deliberately left as-is
+until real use shows which reading is right.
+
+### Known limitation: an Evidence object may be both supporting and contrary
+
+Nothing prevents the same Evidence ID appearing in both `supporting_evidence`
+and `contrary_evidence` on one Claim. Whether that is incoherent or a legitimate
+record of genuinely mixed evidence is a scientific question, not a schema bug,
+so no disjointness constraint is imposed. A review packet shows such an object
+in both lists, and it is bound once in `evidence_digests`.
+
+### Recording a review
+
+Reviews of Claims are recorded with `researchctl review`, which computes the
+current subject and evidence digests, shows them to the reviewer with the
+evidence they refer to, and writes the Review only on explicit confirmation. The
+reviewed Claim must be at `evidence_linked`, and the command never changes Claim
+status. Because acceptance is existential -- *a* qualifying approve Review is
+enough -- a later verdict cannot override an approval that already satisfies the
+gate; re-reviewing means setting the Claim back to `evidence_linked` first.
+
 ## Hypothesis confidence semantics
 
 `confidence` is subjective research confidence, not a calibrated probability
@@ -524,13 +572,19 @@ empty-normalized.
 
 ## Transition graphs
 
-Two layers:
+These graphs are the canonical lifecycle semantics of the object types. They
+specify which status changes are meaningful, and a status change outside them
+should be treated as a mistake.
 
-**Layer A** (`validate-project`): current-state enums + conditioned invariants.
-No Git mining.
+They are **not enforced at runtime in R0.** `validate-project` checks current
+state -- status enums plus the invariants each status conditions -- and does no
+Git mining, so it cannot see what a status *was*. Enforcing a transition
+requires knowing the previous status, which is a question for Git history and a
+later release. R0 previously carried an unused function for this and it has been
+removed rather than left as dead weight; the semantics live here.
 
-**Layer B:** `is_valid_transition(type, old_status, new_status)`; same-status
-always valid. Not invoked by ordinary validate.
+Same-status is always meaningful: re-saving an object does not change its
+lifecycle.
 
 **Question:** `open` ↔ `paused`; `{open,paused}` → `{answered,withdrawn,superseded}`;
 `answered` → `{withdrawn,superseded}`; terminals otherwise.
@@ -552,10 +606,9 @@ otherwise.
 `accepted` → `{withdrawn, superseded}`.
 **`draft` → `accepted` is illegal.**
 
-A YAML file that is already `accepted` can still pass Layer A if evidence +
-human review + matching digest hold. Layer B rejects the skip if a caller
-supplies the old status. Current-state vs historical-transition remain distinct
-by design.
+A YAML file that is already `accepted` passes validation if evidence, human
+review, and matching digests hold, whatever status it held before. Current state
+and transition history remain distinct by design: R0 validates the former only.
 
 **Decision:** `proposed` → `{accepted,withdrawn,superseded}`; `accepted` →
 `{withdrawn,superseded}`.
@@ -590,11 +643,11 @@ supersedes:
 - Every referenced predecessor must have `status == superseded`
 - One object may supersede many predecessors; many successors may supersede one
   predecessor
-- `superseded_by` is **derived only** (index `refs` reverse); never canonical YAML
+- `superseded_by` is **derived only**, by reading the `supersedes` edges in the
+  other direction; it is never canonical YAML
 - `status: superseded` requires **at least one** derived successor
 - `withdrawn` = abandoned without replacement (must not be listed in any
   `supersedes`)
-- SQLite: one `refs(from_id, to_id, rel='supersedes')` row per predecessor
 
 Physical delete remains a Git/user action; dangling refs ERROR. No
 `researchctl delete`.
@@ -625,34 +678,6 @@ onward:
   on read is implemented, and none is required now;
 - an unknown `capsule_version` remains a hard ERROR. Migration is a deliberate,
   human-run, reviewable act, never a silent side effect of validation.
-
-## Source digest
-
-`.research/runtime/state.sqlite` (M4) stores `canonical_source_digest`.
-
-**Includes only:**
-
-- `project.yaml`
-- `CHARTER.md`
-- `STATE.md`
-- all indexed canonical object YAML files
-
-**Excludes:** `.research/.gitignore`, `runtime/`, reserved unparsed dirs/files
-(`literature/`, `work_orders/`, `handoffs/`).
-
-```text
-canonical_source_digest = sha256(
-  newline-joined UTF-8 records sorted by relative path:
-    "{relative_path}:{sha256_hex_of_file_bytes}"
-  plus trailing newline
-)
-```
-
-`working_tree_dirty` is computed over **the same path set** as the digest.
-If dirty, `git_commit` is not a complete identity of indexed bytes.
-
-Rebuild: validate ERROR-free → `state.sqlite.new` → checks → `os.replace`.
-Files win. No permissive mode.
 
 ## Reserved and deferred objects
 

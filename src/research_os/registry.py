@@ -1,33 +1,38 @@
 """Noncanonical global project-discovery registry.
 
-``project_registry.sqlite`` is disposable infrastructure. It does not store
-scientific objects and is never consulted when validating science.
+``project_registry.json`` is disposable infrastructure. It does not store
+scientific objects and is never consulted when validating science. Deleting it
+does not alter any project file; every entry can be rebuilt by running
+``researchctl register-project`` again.
+
+The store is plain JSON written by atomic replacement. It is deliberately not a
+database: at this scale a database buys nothing but a dependency and a schema
+migration story. Because JSON enforces no shape, everything read back is
+validated structurally here, so a corrupt store fails as a ``RegistryError``
+rather than as a raw ``KeyError`` or ``TypeError`` from deep inside a caller.
 """
 
 from __future__ import annotations
 
-import sqlite3
+import json
+import os
+import tempfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from research_os.errors import RegistryConflictError, RegistryError
 from research_os.models import Project
 from research_os.paths import data_home
 
-REGISTRY_FILENAME = "project_registry.sqlite"
+REGISTRY_FILENAME = "project_registry.json"
+LEGACY_REGISTRY_FILENAME = "project_registry.sqlite"
 SCHEMA_VERSION = 1
 
-_CREATE_PROJECTS = """
-CREATE TABLE projects (
-    project_id TEXT PRIMARY KEY,
-    path TEXT NOT NULL,
-    title TEXT NOT NULL,
-    capsule_version INTEGER NOT NULL,
-    status TEXT NOT NULL,
-    last_seen TEXT NOT NULL
-)
-"""
+_STR_FIELDS = ("project_id", "path", "title", "status", "last_seen")
+_INT_FIELDS = ("capsule_version",)
+_ENTRY_FIELDS = (*_STR_FIELDS, *_INT_FIELDS)
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,9 +49,15 @@ class RegistryEntry:
 
 
 def registry_path() -> Path:
-    """Return the SQLite path under the current data home."""
+    """Return the JSON registry path under the current data home."""
 
     return data_home() / REGISTRY_FILENAME
+
+
+def legacy_registry_path() -> Path:
+    """Return the superseded SQLite registry path under the data home."""
+
+    return data_home() / LEGACY_REGISTRY_FILENAME
 
 
 def register_project(project: Project, git_root: Path) -> RegistryEntry:
@@ -54,152 +65,241 @@ def register_project(project: Project, git_root: Path) -> RegistryEntry:
 
     canonical = str(git_root.resolve())
     now = _utc_now()
-    conn = _connect_rw()
-    try:
-        with conn:
-            existing_id = conn.execute(
-                "SELECT * FROM projects WHERE project_id = ?",
-                (project.id,),
-            ).fetchone()
-            existing_path = conn.execute(
-                "SELECT * FROM projects WHERE path = ?",
-                (canonical,),
-            ).fetchone()
-            if existing_path is not None and existing_path["project_id"] != project.id:
-                raise RegistryConflictError(
-                    f"path {canonical} is already registered as project "
-                    f"{existing_path['project_id']}; refusing to change identity"
-                )
-            if existing_id is not None and existing_id["path"] != canonical:
-                old_path = Path(existing_id["path"])
-                if _live_capsule(old_path):
-                    raise RegistryConflictError(
-                        f"project {project.id} is already registered at "
-                        f"{existing_id['path']}, which still exists as a live capsule"
-                    )
-                conn.execute(
-                    """
-                    UPDATE projects
-                    SET path = ?, title = ?, capsule_version = ?, status = ?,
-                        last_seen = ?
-                    WHERE project_id = ?
-                    """,
-                    (
-                        canonical,
-                        project.title,
-                        int(project.capsule_version),
-                        str(project.status),
-                        now,
-                        project.id,
-                    ),
-                )
-            elif existing_id is not None:
-                conn.execute(
-                    """
-                    UPDATE projects
-                    SET title = ?, capsule_version = ?, status = ?, last_seen = ?
-                    WHERE project_id = ? AND path = ?
-                    """,
-                    (
-                        project.title,
-                        int(project.capsule_version),
-                        str(project.status),
-                        now,
-                        project.id,
-                        canonical,
-                    ),
-                )
-            else:
-                conn.execute(
-                    """
-                    INSERT INTO projects (
-                        project_id, path, title, capsule_version, status, last_seen
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        project.id,
-                        canonical,
-                        project.title,
-                        int(project.capsule_version),
-                        str(project.status),
-                        now,
-                    ),
-                )
-        row = conn.execute(
-            "SELECT * FROM projects WHERE project_id = ?",
-            (project.id,),
-        ).fetchone()
-    except sqlite3.Error as exc:
-        raise RegistryError(f"registry write failed: {exc}") from exc
-    finally:
-        conn.close()
-    if row is None:
-        raise RegistryError(f"registry write did not persist project {project.id}")
+    entries = _load_entries()
+
+    by_id = {entry["project_id"]: entry for entry in entries}
+    by_path = {entry["path"]: entry for entry in entries}
+
+    existing_path = by_path.get(canonical)
+    if existing_path is not None and existing_path["project_id"] != project.id:
+        raise RegistryConflictError(
+            f"path {canonical} is already registered as project "
+            f"{existing_path['project_id']}; refusing to change identity"
+        )
+
+    existing_id = by_id.get(project.id)
+    if existing_id is not None and existing_id["path"] != canonical:
+        old_path = Path(existing_id["path"])
+        if _live_capsule(old_path):
+            raise RegistryConflictError(
+                f"project {project.id} is already registered at "
+                f"{existing_id['path']}, which still exists as a live capsule"
+            )
+
+    row = {
+        "project_id": project.id,
+        "path": canonical,
+        "title": project.title,
+        "capsule_version": int(project.capsule_version),
+        "status": str(project.status),
+        "last_seen": now,
+    }
+    remaining = [entry for entry in entries if entry["project_id"] != project.id]
+    remaining.append(row)
+    _write_entries(remaining)
     return _entry_from_row(row)
 
 
 def list_projects() -> tuple[RegistryEntry, ...]:
     """Return registered projects in deterministic id order.
 
-    Does not create or mutate the registry. A missing database is an empty
-    registry.
+    Does not create or mutate the registry. A missing store is an empty
+    registry, and reading never touches the file's modification time.
+    """
+
+    return tuple(_entry_from_row(row) for row in _load_entries())
+
+
+def _utc_now() -> str:
+    """Return the registration timestamp.
+
+    Its own function so tests can pin the clock: ``last_seen`` advances on every
+    explicit registration by design.
+    """
+
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _serialize(entries: list[dict[str, Any]]) -> str:
+    """Return the canonical registry document for ``entries``.
+
+    Deterministic as a function of its input: entries sorted by project id,
+    object keys sorted, and a trailing newline, so the file stays diffable.
+    """
+
+    store = {
+        "schema_version": SCHEMA_VERSION,
+        "projects": sorted(entries, key=lambda entry: entry["project_id"]),
+    }
+    return json.dumps(store, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+
+
+def _load_entries() -> list[dict[str, Any]]:
+    path = registry_path()
+    if not path.is_file():
+        _reject_legacy_registry()
+        return []
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise RegistryError(f"cannot read project registry: {exc}") from exc
+    return _validated_entries(raw, path)
+
+
+def _validated_entries(raw: bytes, path: Path) -> list[dict[str, Any]]:
+    """Return the validated project rows held in ``raw``.
+
+    JSON guarantees no shape, so the whole document is checked before any caller
+    can index into it. Every rejection names the store and says it may simply be
+    deleted, because the registry is rebuildable metadata, not science.
+    """
+
+    hint = f"delete {path} and re-register"
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise RegistryError(
+            f"cannot read project registry: not valid UTF-8: {exc.reason} "
+            f"at byte {exc.start} ({hint})"
+        ) from exc
+    try:
+        store = json.loads(text)
+    except ValueError as exc:
+        raise RegistryError(f"cannot read project registry: {exc} ({hint})") from exc
+    if not isinstance(store, dict):
+        raise RegistryError(
+            "cannot read project registry: top level is "
+            f"{type(store).__name__}, expected object ({hint})"
+        )
+    version = store.get("schema_version")
+    if not _is_int(version):
+        raise RegistryError(
+            "cannot read project registry: schema_version is missing or not "
+            f"an integer ({hint})"
+        )
+    if version != SCHEMA_VERSION:
+        raise RegistryError(f"unsupported project registry schema version {version}")
+    projects = store.get("projects")
+    if not isinstance(projects, list):
+        raise RegistryError(
+            "cannot read project registry: projects is "
+            f"{type(projects).__name__}, expected list ({hint})"
+        )
+
+    entries: list[dict[str, Any]] = []
+    for index, entry in enumerate(projects):
+        if not isinstance(entry, dict):
+            raise RegistryError(
+                f"cannot read project registry: entry {index} is "
+                f"{type(entry).__name__}, expected object ({hint})"
+            )
+        for field in _ENTRY_FIELDS:
+            if field not in entry:
+                raise RegistryError(
+                    f"cannot read project registry: entry {index} is missing "
+                    f"{field} ({hint})"
+                )
+        for field in _STR_FIELDS:
+            if not isinstance(entry[field], str):
+                raise RegistryError(
+                    f"cannot read project registry: entry {index} field "
+                    f"{field} has type {type(entry[field]).__name__}, "
+                    f"expected str ({hint})"
+                )
+        for field in _INT_FIELDS:
+            if not _is_int(entry[field]):
+                raise RegistryError(
+                    f"cannot read project registry: entry {index} field "
+                    f"{field} has type {type(entry[field]).__name__}, "
+                    f"expected int ({hint})"
+                )
+        entries.append({field: entry[field] for field in _ENTRY_FIELDS})
+
+    _reject_duplicates(entries, "project_id", "duplicate project id", hint)
+    _reject_duplicates(entries, "path", "duplicate path", hint)
+    return sorted(entries, key=lambda entry: entry["project_id"])
+
+
+def _reject_duplicates(
+    entries: list[dict[str, Any]],
+    field: str,
+    message: str,
+    hint: str,
+) -> None:
+    """Reject a duplicated key that SQLite used to make impossible.
+
+    ``register_project`` decides identity conflicts from these keys, so a store
+    holding two rows for one id or one path has no defined meaning.
+    """
+
+    seen: set[str] = set()
+    for entry in entries:
+        value = entry[field]
+        if value in seen:
+            raise RegistryError(
+                f"cannot read project registry: {message} {value} ({hint})"
+            )
+        seen.add(value)
+
+
+def _write_entries(entries: list[dict[str, Any]]) -> None:
+    """Replace the registry atomically.
+
+    The temporary file is created in the destination directory so ``os.replace``
+    is a same-filesystem rename: an interrupted write leaves either the previous
+    store or the new one, never a truncated one.
     """
 
     path = registry_path()
-    if not path.is_file():
-        return ()
-    try:
-        conn = sqlite3.connect(
-            f"file:{path.resolve().as_posix()}?mode=ro",
-            uri=True,
-        )
-    except sqlite3.Error as exc:
-        raise RegistryError(f"cannot read project registry: {exc}") from exc
-    conn.row_factory = sqlite3.Row
-    try:
-        try:
-            rows = conn.execute(
-                "SELECT * FROM projects ORDER BY project_id COLLATE BINARY"
-            ).fetchall()
-        except sqlite3.Error as exc:
-            raise RegistryError(f"cannot read project registry: {exc}") from exc
-        return tuple(_entry_from_row(row) for row in rows)
-    finally:
-        conn.close()
-
-
-def _connect_rw() -> sqlite3.Connection:
-    path = registry_path()
+    document = _serialize(entries)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(path)
     except OSError as exc:
         raise RegistryError(f"cannot create project registry: {exc}") from exc
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
     try:
-        with conn:
-            _ensure_schema(conn)
-    except sqlite3.Error as exc:
-        conn.close()
-        raise RegistryError(f"cannot initialize project registry: {exc}") from exc
-    return conn
-
-
-def _ensure_schema(conn: sqlite3.Connection) -> None:
-    version = conn.execute("PRAGMA user_version").fetchone()[0]
-    if version == 0:
-        conn.execute(_CREATE_PROJECTS)
-        conn.execute(
-            "CREATE UNIQUE INDEX idx_projects_path ON projects(path)"
+        handle_fd, tmp_name = tempfile.mkstemp(
+            dir=path.parent,
+            prefix=".project_registry.",
+            suffix=".tmp",
         )
-        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+    except OSError as exc:
+        raise RegistryError(f"cannot create project registry: {exc}") from exc
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(handle_fd, "w", encoding="utf-8") as handle:
+            handle.write(document)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except OSError as exc:
+        raise RegistryError(f"registry write failed: {exc}") from exc
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _reject_legacy_registry() -> None:
+    """Report a superseded SQLite registry instead of ignoring it.
+
+    The old store is never read, imported, or deleted. Silently starting from an
+    empty JSON registry would make ``researchctl projects`` look as though the
+    projects had vanished, and importing it would keep a database dependency in
+    the kernel for six columns of rebuildable metadata.
+    """
+
+    legacy = legacy_registry_path()
+    if not legacy.is_file():
         return
-    if version != SCHEMA_VERSION:
-        raise RegistryError(
-            f"unsupported project registry schema version {version}"
-        )
+    raise RegistryError(
+        f"a legacy SQLite project registry exists at {legacy}. The project "
+        "registry is now JSON and is disposable discovery metadata, not "
+        "scientific state. Re-register each project with "
+        "researchctl register-project <path>, then delete the legacy file. "
+        "Nothing in your project files is affected."
+    )
+
+
+def _is_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
 
 
 def _live_capsule(path: Path) -> bool:
@@ -209,11 +309,7 @@ def _live_capsule(path: Path) -> bool:
         return False
 
 
-def _utc_now() -> str:
-    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def _entry_from_row(row: sqlite3.Row) -> RegistryEntry:
+def _entry_from_row(row: dict[str, Any]) -> RegistryEntry:
     registered = Path(row["path"])
     availability = "AVAILABLE" if registered.exists() else "MISSING"
     return RegistryEntry(

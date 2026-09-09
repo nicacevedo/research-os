@@ -8,18 +8,37 @@ This is a release sequence, not a claim that later releases already exist.
 
 Durable local kernel: architecture and security documentation, Research Capsule
 v1, Git-tracked YAML scientific objects, Pydantic validation, Review-gated Claim
-acceptance, rebuildable project SQLite, noncanonical project registry, CLI.
+acceptance, a noncanonical project registry, and the CLI.
 
-R0 is under implementation on `r0/kernel-v1`.
+R0 is under implementation.
 
-Authorized R0 milestones:
+R0 milestones:
 
-- **M1** — contract freeze, documentation, XDG paths, doctor writability, pytest/ruff
-- **M2** — IDs, Pydantic models, semantic digests, transition graphs, validators
-- **M3** — capsule CLI, project registry
-- **M4** — rebuildable index, isolation and failure tests, R0 acceptance gates
+- **M1 — implemented.** Contract freeze, documentation, XDG paths, doctor
+  writability, pytest/ruff.
+- **M2 — implemented.** IDs, Pydantic models, semantic digests, cross-object
+  validators.
+- **M3 — implemented.** Capsule CLI, project registry.
+- **WP-A — implemented.** Scientific integrity corrections: Experiment
+  preregistration, supporting/contrary Evidence polarity, versioned
+  project-scoped digests, and explicit `evidence_digests` on Reviews with
+  complete-coverage enforcement.
+- **WP-B — implemented.** Usability and kernel simplification: `researchctl
+  digest`, interactive human `researchctl review`, strict UTF-8 handling, a JSON
+  project registry, and removal of unused machinery.
+- **M4 — not started.** Isolation and failure tests, R0 acceptance gates.
 
 Later milestones are not available as commands until they are implemented.
+
+Withdrawn from R0: a project-local materialized index
+(`.research/runtime/state.sqlite`, `rebuild-index`, and a whole-capsule
+`canonical_source_digest`). Canonical Git-tracked files are the only project
+scientific state, and the kernel depends on no database. `.research/runtime/`
+remains reserved, gitignored scratch space.
+
+Lifecycle status transitions for every object type are specified in
+`docs/CAPSULE.md`. R0 validates current state, not transition history, and
+enforces no transition graph at runtime.
 
 ## R1 — Literature
 

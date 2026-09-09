@@ -392,8 +392,8 @@ class Hypothesis(BaseScientificObject):
                 "confidence_basis must contain at least one non-whitespace character"
             )
         has_confidence = self.confidence is not None
-        has_basis = (
-            self.confidence_basis is not None and bool(self.confidence_basis.strip())
+        has_basis = self.confidence_basis is not None and bool(
+            self.confidence_basis.strip()
         )
         if has_confidence and not has_basis:
             raise ValueError("confidence requires non-empty confidence_basis")
@@ -484,9 +484,7 @@ class Decision(BaseScientificObject):
                     "accepted decisions require non-empty alternatives_considered"
                 )
             if any(not item.strip() for item in self.alternatives_considered):
-                raise ValueError(
-                    "alternatives_considered entries must be non-empty"
-                )
+                raise ValueError("alternatives_considered entries must be non-empty")
         return self
 
 
@@ -556,7 +554,9 @@ class Experiment(BaseScientificObject):
     @model_validator(mode="after")
     def _experiment_status_rules(self) -> Self:
         if self.status is not ExperimentStatus.DRAFT and not self.hypotheses:
-            raise ValueError("non-draft experiments require a non-empty hypotheses list")
+            raise ValueError(
+                "non-draft experiments require a non-empty hypotheses list"
+            )
         if self.status is ExperimentStatus.COMPLETED and self.provenance is None:
             raise ValueError("completed experiments require provenance")
         if self.status in _PREREGISTERED_EXPERIMENT_STATUSES:

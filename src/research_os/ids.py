@@ -13,9 +13,7 @@ OBJECT_ID_RE = re.compile(OBJECT_ID_PATTERN)
 PROJECT_ID_PATTERN = r"^[a-z][a-z0-9-]{1,62}$"
 PROJECT_ID_RE = re.compile(PROJECT_ID_PATTERN)
 
-PREFIXES = frozenset(
-    {"Q", "IDEA", "HYP", "ASM", "CLAIM", "DEC", "EXP", "REV", "EVI"}
-)
+PREFIXES = frozenset({"Q", "IDEA", "HYP", "ASM", "CLAIM", "DEC", "EXP", "REV", "EVI"})
 
 PREFIX_TO_TYPE = {
     "Q": "question",

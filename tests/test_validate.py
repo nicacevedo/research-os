@@ -72,9 +72,7 @@ def _accepted_bundle(
         statement=statement,
     )
     subject_digest_value = (
-        digest
-        if digest is not None
-        else subject_digest(claim, project_id=project_id)
+        digest if digest is not None else subject_digest(claim, project_id=project_id)
     )
     if evidence_digests is None:
         evidence_digests = {
@@ -111,9 +109,7 @@ def test_duplicate_ids_do_not_use_first_object_wins() -> None:
 
 
 def test_dangling_and_wrong_type_refs() -> None:
-    dangling = _report(
-        [make_claim(status="draft", supporting_evidence=["EVI-9999"])]
-    )
+    dangling = _report([make_claim(status="draft", supporting_evidence=["EVI-9999"])])
     assert E_DANGLING_REF in dangling.codes()
     wrong = _report(
         [
@@ -134,7 +130,9 @@ def test_created_from_cycles() -> None:
 
 
 def test_withdrawn_evidence_does_not_qualify() -> None:
-    objects = _accepted_bundle(claim_status="evidence_linked", evidence_status="withdrawn")
+    objects = _accepted_bundle(
+        claim_status="evidence_linked", evidence_status="withdrawn"
+    )
     objects = [obj for obj in objects if obj.id != "REV-0001"]
     assert E_NONQUALIFYING_EVIDENCE in _codes(objects)
     superseded = _accepted_bundle(
@@ -168,9 +166,7 @@ def test_experiment_evidence_requires_completed_experiment() -> None:
     running_report = _report([hyp, running, evi_running, claim])
     assert E_NONQUALIFYING_EVIDENCE in running_report.codes()
 
-    evi_failed = make_evidence(
-        id="EVI-0002", kind="experiment", experiment="EXP-0002"
-    )
+    evi_failed = make_evidence(id="EVI-0002", kind="experiment", experiment="EXP-0002")
     claim_failed = make_claim(
         id="CLAIM-0002", status="evidence_linked", supporting_evidence=["EVI-0002"]
     )
@@ -442,9 +438,7 @@ def test_stale_evidence_digest_invalidates_accepted_claim() -> None:
     before = _report([evidence, claim, review])
     assert before.ok
 
-    mutated = make_evidence(
-        statement="The source in fact contradicts X above 200 K."
-    )
+    mutated = make_evidence(statement="The source in fact contradicts X above 200 K.")
     after = _report([mutated, claim, review])
     assert not after.ok
     assert E_STALE_REVIEW_DIGEST in after.codes()

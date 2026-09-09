@@ -32,3 +32,6 @@ secrets.env
 *.swp
 *~
 .DS_Store
+
+# Editor-generated plan snapshots (stale duplicates of docs/plans/)
+.cursor/plans/

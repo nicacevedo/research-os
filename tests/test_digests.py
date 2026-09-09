@@ -1,9 +1,9 @@
 """Tests for Review subject semantic digests.
 
-This is the per-object Review binding digest, not the M4 capsule
-``canonical_source_digest``. Every digest is project-scoped and carries an
-explicit algorithm version, so the helpers below bind one shared test
-project; the project-scope tests call the API directly with two identities.
+This is the per-object Review binding digest over scientific content, not a
+hash of raw YAML. Every digest is project-scoped and carries an explicit
+algorithm version, so the helpers below bind one shared test project; the
+project-scope tests call the API directly with two identities.
 """
 
 from __future__ import annotations
