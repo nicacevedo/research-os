@@ -58,7 +58,11 @@ from tests.helpers import (
 
 
 def _codes(report) -> set[str]:
-    return set(report.codes() if hasattr(report, "codes") else (item.code for item in report.findings))
+    return set(
+        report.codes()
+        if hasattr(report, "codes")
+        else (item.code for item in report.findings)
+    )
 
 
 def test_non_git_path_rejected(tmp_path: Path) -> None:
@@ -100,13 +104,17 @@ def test_root_gitignore_remains_unchanged(tmp_path: Path, data_home: Path) -> No
 def test_capsule_gitignore_contains_runtime(tmp_path: Path, data_home: Path) -> None:
     repo = make_git_repo(tmp_path / "sample-project")
     init_project(repo)
-    assert (repo / ".research" / ".gitignore").read_text(encoding="utf-8") == CAPSULE_GITIGNORE
+    assert (repo / ".research" / ".gitignore").read_text(
+        encoding="utf-8"
+    ) == CAPSULE_GITIGNORE
 
 
 def test_init_writes_valid_project_yaml(tmp_path: Path, data_home: Path) -> None:
     repo = make_git_repo(tmp_path / "sample-project")
     _root, project = init_project(repo, title="Sample")
-    loaded = yaml.safe_load((repo / ".research" / "project.yaml").read_text(encoding="utf-8"))
+    loaded = yaml.safe_load(
+        (repo / ".research" / "project.yaml").read_text(encoding="utf-8")
+    )
     assert loaded["id"] == "sample-project"
     assert loaded["title"] == "Sample"
     assert loaded["capsule_version"] == 1
@@ -117,8 +125,12 @@ def test_init_writes_valid_project_yaml(tmp_path: Path, data_home: Path) -> None
 def test_charter_and_state_created(tmp_path: Path, data_home: Path) -> None:
     repo = make_git_repo(tmp_path / "sample-project")
     init_project(repo)
-    assert (repo / ".research" / "CHARTER.md").read_text(encoding="utf-8") == CHARTER_TEMPLATE
-    assert (repo / ".research" / "STATE.md").read_text(encoding="utf-8") == STATE_TEMPLATE
+    assert (repo / ".research" / "CHARTER.md").read_text(
+        encoding="utf-8"
+    ) == CHARTER_TEMPLATE
+    assert (repo / ".research" / "STATE.md").read_text(
+        encoding="utf-8"
+    ) == STATE_TEMPLATE
 
 
 def test_runtime_and_reserved_dirs_not_created(tmp_path: Path, data_home: Path) -> None:
@@ -132,7 +144,9 @@ def test_runtime_and_reserved_dirs_not_created(tmp_path: Path, data_home: Path) 
     assert not (capsule / "questions").exists()
 
 
-def test_invalid_repository_basename_requires_id(tmp_path: Path, data_home: Path) -> None:
+def test_invalid_repository_basename_requires_id(
+    tmp_path: Path, data_home: Path
+) -> None:
     repo = make_git_repo(tmp_path / "MyRepo")
     with pytest.raises(ProjectIdRequiredError):
         init_project(repo)
@@ -143,7 +157,10 @@ def test_explicit_valid_id_works(tmp_path: Path, data_home: Path) -> None:
     repo = make_git_repo(tmp_path / "MyRepo")
     _root, project = init_project(repo, project_id="explicit-id")
     assert project.id == "explicit-id"
-    assert yaml.safe_load((repo / ".research" / "project.yaml").read_text())["id"] == "explicit-id"
+    assert (
+        yaml.safe_load((repo / ".research" / "project.yaml").read_text())["id"]
+        == "explicit-id"
+    )
 
 
 def test_title_defaults_to_basename(tmp_path: Path, data_home: Path) -> None:
@@ -158,7 +175,9 @@ def test_explicit_title(tmp_path: Path, data_home: Path) -> None:
     assert project.title == "Custom Title"
 
 
-def test_missing_typed_directory_is_zero_objects(tmp_path: Path, data_home: Path) -> None:
+def test_missing_typed_directory_is_zero_objects(
+    tmp_path: Path, data_home: Path
+) -> None:
     repo = make_git_repo(tmp_path / "sample-project")
     init_project(repo)
     report = validate_project(repo)
@@ -215,7 +234,9 @@ def test_incorrectly_named_yaml_is_error(tmp_path: Path, data_home: Path) -> Non
     assert report.objects == ()
 
 
-def test_experiment_directory_manifest_id_mismatch(tmp_path: Path, data_home: Path) -> None:
+def test_experiment_directory_manifest_id_mismatch(
+    tmp_path: Path, data_home: Path
+) -> None:
     repo = make_git_repo(tmp_path / "sample-project")
     init_project(repo)
     write_yaml(
@@ -277,7 +298,9 @@ def test_unknown_schema_field_is_error(tmp_path: Path, data_home: Path) -> None:
     assert report.objects == ()
 
 
-def test_reserved_future_directory_content_is_warning(tmp_path: Path, data_home: Path) -> None:
+def test_reserved_future_directory_content_is_warning(
+    tmp_path: Path, data_home: Path
+) -> None:
     repo = make_git_repo(tmp_path / "sample-project")
     init_project(repo)
     write_yaml(
@@ -290,7 +313,9 @@ def test_reserved_future_directory_content_is_warning(tmp_path: Path, data_home:
     assert report.objects == ()
 
 
-def test_unsupported_yml_extension_is_not_ignored(tmp_path: Path, data_home: Path) -> None:
+def test_unsupported_yml_extension_is_not_ignored(
+    tmp_path: Path, data_home: Path
+) -> None:
     repo = make_git_repo(tmp_path / "sample-project")
     init_project(repo)
     write_yaml(repo / ".research" / "questions" / "Q-0001.yml", question_data())
@@ -356,7 +381,10 @@ def test_malformed_files_do_not_enter_validate_objects(
     repo = make_git_repo(tmp_path / "sample-project")
     init_project(repo)
     write_yaml(repo / ".research" / "questions" / "Q-0001.yaml", question_data())
-    write_text(repo / ".research" / "questions" / "Q-0002.yaml", "status: open\nstatus: paused\n")
+    write_text(
+        repo / ".research" / "questions" / "Q-0002.yaml",
+        "status: open\nstatus: paused\n",
+    )
     seen: list[str] = []
 
     def capture(objects, *, project_id):
@@ -425,9 +453,7 @@ def test_project_identity_scopes_the_review_digest(
             verdict="approve",
             findings="Reviewed.",
             subject_digest=subject_digest(claim, project_id=scope),
-            evidence_digests={
-                "EVI-0001": subject_digest(evidence, project_id=scope)
-            },
+            evidence_digests={"EVI-0001": subject_digest(evidence, project_id=scope)},
         )
         for scope in (project.id, OTHER_PROJECT_ID)
     }
@@ -479,7 +505,9 @@ def test_invalid_project_yaml_does_not_run_weakened_object_validation(
 def test_warning_does_not_fail_validation(tmp_path: Path, data_home: Path) -> None:
     repo = make_git_repo(tmp_path / "sample-project")
     init_project(repo)
-    write_yaml(repo / ".research" / "ideas" / "IDEA-0001.yaml", idea_data(status="promoted"))
+    write_yaml(
+        repo / ".research" / "ideas" / "IDEA-0001.yaml", idea_data(status="promoted")
+    )
     report = validate_project(repo)
     assert report.ok
     assert report.warnings
@@ -494,7 +522,9 @@ def test_missing_required_capsule_file(tmp_path: Path) -> None:
     assert not report.ok
 
 
-def test_validate_does_not_modify_canonical_files(tmp_path: Path, data_home: Path) -> None:
+def test_validate_does_not_modify_canonical_files(
+    tmp_path: Path, data_home: Path
+) -> None:
     repo = make_git_repo(tmp_path / "sample-project")
     init_project(repo)
     write_yaml(repo / ".research" / "questions" / "Q-0001.yaml", question_data())
@@ -511,7 +541,9 @@ def test_validate_does_not_create_runtime(tmp_path: Path, data_home: Path) -> No
     assert not (repo / ".research" / "runtime").exists()
 
 
-def test_markdown_in_object_directory_is_warning(tmp_path: Path, data_home: Path) -> None:
+def test_markdown_in_object_directory_is_warning(
+    tmp_path: Path, data_home: Path
+) -> None:
     repo = make_git_repo(tmp_path / "sample-project")
     init_project(repo)
     write_yaml(repo / ".research" / "questions" / "Q-0001.yaml", question_data())

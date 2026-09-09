@@ -86,10 +86,13 @@ def write_reviewable_capsule(
 
     project = write_minimal_capsule(git_root, project_id=project_id)
     capsule = git_root / ".research"
-    write_yaml(capsule / "questions" / "Q-0001.yaml", question_data(
-        title="Does X hold above 200 K?",
-        statement="Whether property X holds in the regime above 200 K.",
-    ))
+    write_yaml(
+        capsule / "questions" / "Q-0001.yaml",
+        question_data(
+            title="Does X hold above 200 K?",
+            statement="Whether property X holds in the regime above 200 K.",
+        ),
+    )
     write_yaml(capsule / "hypotheses" / "HYP-0001.yaml", hypothesis_data())
     write_yaml(
         capsule / "experiments" / "EXP-0001" / "manifest.yaml",

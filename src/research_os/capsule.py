@@ -256,13 +256,11 @@ def load_project_identity(path: Path | str) -> tuple[Path, Project]:
         raise CapsuleError(f"unsafe capsule path: {capsule}")
     project_file = capsule / "project.yaml"
     if not project_file.is_file() and not project_file.is_symlink():
-        raise CapsuleError(f"missing { _rel(project_file, git_root) }")
+        raise CapsuleError(f"missing {_rel(project_file, git_root)}")
     if not _contained(project_file, git_root):
-        raise CapsuleError(f"unsafe path: { _rel(project_file, git_root) }")
+        raise CapsuleError(f"unsafe path: {_rel(project_file, git_root)}")
     try:
-        document = load_yaml_mapping(
-            project_file, source=_rel(project_file, git_root)
-        )
+        document = load_yaml_mapping(project_file, source=_rel(project_file, git_root))
     except DuplicateYamlKeyError as exc:
         raise CapsuleError(
             f"duplicate YAML mapping key in {_rel(project_file, git_root)}: {exc.key!r}"
@@ -651,9 +649,7 @@ def _discover_objects(
                     )
                 )
             else:
-                loaded.extend(
-                    _scan_experiments(experiments, git_root, findings)
-                )
+                loaded.extend(_scan_experiments(experiments, git_root, findings))
     return loaded
 
 
@@ -940,7 +936,9 @@ def _load_scientific_object(
                 severity=Severity.ERROR,
                 code=E_SCHEMA,
                 message=_schema_message(exc),
-                object_id=mapping.get("id") if isinstance(mapping.get("id"), str) else None,
+                object_id=mapping.get("id")
+                if isinstance(mapping.get("id"), str)
+                else None,
                 field=_schema_field(exc),
                 source=source,
             )
@@ -952,7 +950,9 @@ def _load_scientific_object(
                 severity=Severity.ERROR,
                 code=E_SCHEMA,
                 message=str(exc),
-                object_id=mapping.get("id") if isinstance(mapping.get("id"), str) else None,
+                object_id=mapping.get("id")
+                if isinstance(mapping.get("id"), str)
+                else None,
                 source=source,
             )
         )

@@ -124,7 +124,9 @@ class ValidationReport:
 
     @property
     def warnings(self) -> tuple[Finding, ...]:
-        return tuple(item for item in self.findings if item.severity is Severity.WARNING)
+        return tuple(
+            item for item in self.findings if item.severity is Severity.WARNING
+        )
 
     @property
     def infos(self) -> tuple[Finding, ...]:

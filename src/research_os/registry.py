@@ -165,9 +165,7 @@ def _validated_entries(raw: bytes, path: Path) -> list[dict[str, Any]]:
     try:
         store = json.loads(text)
     except ValueError as exc:
-        raise RegistryError(
-            f"cannot read project registry: {exc} ({hint})"
-        ) from exc
+        raise RegistryError(f"cannot read project registry: {exc} ({hint})") from exc
     if not isinstance(store, dict):
         raise RegistryError(
             "cannot read project registry: top level is "

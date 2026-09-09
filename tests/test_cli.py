@@ -60,7 +60,9 @@ def _run(monkeypatch: pytest.MonkeyPatch, *argv: str) -> int:
     return 0
 
 
-def test_version(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+def test_version(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
     code = _run(monkeypatch, "version")
     captured = capsys.readouterr()
     assert code == 0
@@ -388,7 +390,9 @@ def test_status_counts_come_from_canonical_files(
     repo = make_git_repo(tmp_path / "sample-project")
     _run(monkeypatch, "init-project", str(repo))
     write_yaml(repo / ".research" / "questions" / "Q-0001.yaml", question_data())
-    write_yaml(repo / ".research" / "questions" / "Q-0002.yaml", question_data(id="Q-0002"))
+    write_yaml(
+        repo / ".research" / "questions" / "Q-0002.yaml", question_data(id="Q-0002")
+    )
     capsys.readouterr()
     code = _run(monkeypatch, "status", str(repo))
     captured = capsys.readouterr()
@@ -639,7 +643,9 @@ def test_digest_malformed_project_exit_1(
 ) -> None:
     repo = make_git_repo(tmp_path / "sample-project")
     write_minimal_capsule(repo)
-    (repo / ".research" / "project.yaml").write_text("id: Not A Slug\n", encoding="utf-8")
+    (repo / ".research" / "project.yaml").write_text(
+        "id: Not A Slug\n", encoding="utf-8"
+    )
     code = _run(monkeypatch, "digest", "CLAIM-0001", str(repo))
     captured = capsys.readouterr()
     assert code == EXIT_ERROR
@@ -751,9 +757,10 @@ def test_review_subparser_has_no_bypass_flag() -> None:
     actions = parser._subparsers._group_actions[0].choices["review"]._actions
     options = {option for action in actions for option in action.option_strings}
     assert options == {"-h", "--help"}
-    assert [
-        action.dest for action in actions if not action.option_strings
-    ] == ["object_id", "path"]
+    assert [action.dest for action in actions if not action.option_strings] == [
+        "object_id",
+        "path",
+    ]
 
 
 def test_review_packet_shows_claim_evidence_and_full_digests(

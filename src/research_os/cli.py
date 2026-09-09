@@ -280,7 +280,11 @@ def _render_packet(packet: ReviewPacket) -> str:
 
     if claim.contrary_evidence_addressed is not None:
         lines.extend(
-            ["", "contrary evidence addressed", f"  {claim.contrary_evidence_addressed}"]
+            [
+                "",
+                "contrary evidence addressed",
+                f"  {claim.contrary_evidence_addressed}",
+            ]
         )
     if packet.warnings:
         lines.append("")

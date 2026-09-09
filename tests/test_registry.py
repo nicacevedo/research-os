@@ -19,7 +19,9 @@ from research_os.registry import (
 from tests.fs_helpers import make_git_repo, snapshot_files, write_minimal_capsule
 
 
-def test_registry_created_on_init(tmp_path: Path, data_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_registry_created_on_init(
+    tmp_path: Path, data_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     from research_os.cli import main
 
     repo = make_git_repo(tmp_path / "sample-project")
@@ -44,7 +46,9 @@ def test_same_id_same_path_is_idempotent(tmp_path: Path, data_home: Path) -> Non
     assert len(list_projects()) == 1
 
 
-def test_duplicate_id_live_different_path_errors(tmp_path: Path, data_home: Path) -> None:
+def test_duplicate_id_live_different_path_errors(
+    tmp_path: Path, data_home: Path
+) -> None:
     first = make_git_repo(tmp_path / "first-project")
     second = make_git_repo(tmp_path / "second-project")
     git_a, project_a = init_project(first, project_id="shared-id")
@@ -68,7 +72,9 @@ def test_same_path_different_id_errors(tmp_path: Path, data_home: Path) -> None:
         register_project(changed, git_root)
 
 
-def test_stale_missing_path_can_be_reregistered(tmp_path: Path, data_home: Path) -> None:
+def test_stale_missing_path_can_be_reregistered(
+    tmp_path: Path, data_home: Path
+) -> None:
     original = make_git_repo(tmp_path / "sample-project")
     git_root, project = init_project(original)
     register_project(project, git_root)
@@ -451,5 +457,6 @@ def test_no_sqlite_dependency_remains() -> None:
     ]
     assert offenders == []
     assert not any(
-        "sqlite3" in path.read_text(encoding="utf-8") for path in sorted(root.glob("*.py"))
+        "sqlite3" in path.read_text(encoding="utf-8")
+        for path in sorted(root.glob("*.py"))
     )

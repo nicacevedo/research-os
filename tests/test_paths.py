@@ -19,7 +19,9 @@ def _clear_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(name, raising=False)
 
 
-def test_default_path_derivation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_default_path_derivation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     _clear_overrides(monkeypatch)
     monkeypatch.setenv("HOME", str(tmp_path))
 
