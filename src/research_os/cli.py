@@ -28,7 +28,12 @@ from research_os.errors import (
 )
 from research_os.models import Reviewable, Verdict
 from research_os.paths import xdg_dir_issue, xdg_dirs
-from research_os.registry import list_projects, register_project
+from research_os.registry import (
+    legacy_registry_path,
+    legacy_registry_present,
+    list_projects,
+    register_project,
+)
 from research_os.review import (
     EvidenceEntry,
     ExperimentEntry,
@@ -87,6 +92,7 @@ def _init_project(args: argparse.Namespace) -> int:
             f"register-project {git_root}."
         ) from exc
     print(f"Initialized project {project.id} at {git_root}")
+    _note_legacy_registry_if_present()
     return EXIT_OK
 
 
@@ -94,7 +100,24 @@ def _register_project(args: argparse.Namespace) -> int:
     git_root, project = load_project_identity(args.path)
     entry = register_project(project, git_root)
     print(f"Registered project {entry.project_id} at {entry.path}")
+    _note_legacy_registry_if_present()
     return EXIT_OK
+
+
+def _note_legacy_registry_if_present() -> None:
+    """Mention a still-present legacy SQLite registry after a successful write.
+
+    Informational only: it never affects the exit code and never touches the
+    legacy file, which is why this runs after registration succeeds rather than
+    guarding it.
+    """
+
+    if legacy_registry_present():
+        print(
+            f"note: a legacy SQLite project registry remains at "
+            f"{legacy_registry_path()}. It is never read and can be deleted.",
+            file=sys.stderr,
+        )
 
 
 def _validate_project(args: argparse.Namespace) -> int:

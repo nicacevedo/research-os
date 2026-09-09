@@ -123,8 +123,13 @@ The project registry lives at `~/.local/share/research-os/project_registry.json`
 only, is written by atomic replacement, and may be deleted freely — nothing in
 your projects depends on it, and `researchctl register-project` rebuilds any
 entry. If a registry from an older build (`project_registry.sqlite`) is still
-present, the registry commands say so and ask you to re-register and delete it;
-that file is never read, imported, or removed automatically.
+present and the JSON registry does not yet exist, `researchctl projects`
+refuses to enumerate rather than report an empty list, but `init-project` and
+`register-project` still work: the missing JSON registry is treated as empty,
+the project you named is registered, and the JSON file is created. Either
+command then notes on stderr that the legacy file is still there and can be
+deleted. That file is never read, imported, modified, or removed
+automatically, by any command.
 
 ## Development
 

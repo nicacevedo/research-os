@@ -60,6 +60,18 @@ def legacy_registry_path() -> Path:
     return data_home() / LEGACY_REGISTRY_FILENAME
 
 
+def legacy_registry_present() -> bool:
+    """Return whether a superseded SQLite registry is still on disk.
+
+    A plain existence check so a caller can mention the stale file without
+    reading, parsing, or removing it. Once the JSON store exists the enumeration
+    guard stops firing, so this is the only remaining way to tell a researcher
+    that the old file is still there and can now be deleted.
+    """
+
+    return legacy_registry_path().is_file()
+
+
 def register_project(project: Project, git_root: Path) -> RegistryEntry:
     """Insert or update discovery metadata for ``project`` at ``git_root``."""
 
@@ -105,9 +117,13 @@ def list_projects() -> tuple[RegistryEntry, ...]:
 
     Does not create or mutate the registry. A missing store is an empty
     registry, and reading never touches the file's modification time.
+
+    Enumeration is the one operation that reports a superseded SQLite store,
+    because it is the one operation that would otherwise lie: it cannot read the
+    old file, so it would answer "no projects" for a machine that has several.
     """
 
-    return tuple(_entry_from_row(row) for row in _load_entries())
+    return tuple(_entry_from_row(row) for row in _load_entries(report_legacy=True))
 
 
 def _utc_now() -> str:
@@ -134,10 +150,19 @@ def _serialize(entries: list[dict[str, Any]]) -> str:
     return json.dumps(store, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
 
 
-def _load_entries() -> list[dict[str, Any]]:
+def _load_entries(*, report_legacy: bool = False) -> list[dict[str, Any]]:
+    """Return the rows held in the JSON store, or none if it does not exist yet.
+
+    ``report_legacy`` is set only by enumeration. Registration deliberately does
+    not set it: writing the first JSON store *is* the remediation the legacy
+    report asks for, so refusing it there left the instruction impossible to
+    follow. The old file is still never read, imported, or removed.
+    """
+
     path = registry_path()
     if not path.is_file():
-        _reject_legacy_registry()
+        if report_legacy:
+            _reject_legacy_registry()
         return []
     try:
         raw = path.read_bytes()
@@ -284,6 +309,9 @@ def _reject_legacy_registry() -> None:
     empty JSON registry would make ``researchctl projects`` look as though the
     projects had vanished, and importing it would keep a database dependency in
     the kernel for six columns of rebuildable metadata.
+
+    Only enumeration calls this. The remediation it prescribes is registration,
+    so guarding registration with it made the instruction circular.
     """
 
     legacy = legacy_registry_path()

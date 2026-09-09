@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -400,34 +402,206 @@ def test_malformed_registry_also_blocks_writes(
 # --- legacy SQLite store --------------------------------------------------
 
 
-def test_legacy_sqlite_registry_is_reported_not_ignored(
+LEGACY_BYTES = b"SQLite format 3\x00 not really"
+
+
+def _write_legacy() -> Path:
+    """Put a legacy SQLite store in place without teaching tests to read one."""
+
+    legacy = legacy_registry_path()
+    legacy.write_bytes(LEGACY_BYTES)
+    return legacy
+
+
+def test_legacy_sqlite_registry_is_reported_by_projects(
     tmp_path: Path,
     data_home: Path,
 ) -> None:
-    """Detect and instruct: never read, import, delete, or silently ignore it.
+    """Enumeration reports it: never read, import, delete, or silently ignore it.
 
     Starting from an empty JSON registry would make researchctl projects look
-    as though the projects had vanished.
+    as though the projects had vanished, which is why this one operation refuses
+    rather than answering.
     """
 
-    legacy = legacy_registry_path()
-    legacy.write_bytes(b"SQLite format 3\x00 not really")
-    before = legacy.read_bytes()
+    legacy = _write_legacy()
 
     with pytest.raises(RegistryError, match="legacy SQLite project registry") as exc:
         list_projects()
     assert "register-project" in str(exc.value)
     assert str(legacy) in str(exc.value)
 
+    assert legacy.is_file()
+    assert legacy.read_bytes() == LEGACY_BYTES
+    assert not registry_path().exists()
+
+
+def test_legacy_sqlite_does_not_block_register_project(
+    tmp_path: Path,
+    data_home: Path,
+) -> None:
+    """The prescribed remediation must actually be performable.
+
+    The report tells the researcher to re-register and then delete the old file.
+    While registration was guarded by the same check, that first step was
+    impossible and the project stayed unregistered forever.
+    """
+
+    legacy = _write_legacy()
     repo = make_git_repo(tmp_path / "sample-project")
     write_minimal_capsule(repo)
     _, project = load_project_identity(repo)
-    with pytest.raises(RegistryError, match="legacy SQLite project registry"):
+
+    entry = register_project(project, repo)
+
+    assert entry.project_id == "sample-project"
+    assert entry.path == str(repo.resolve())
+    assert registry_path().is_file()
+    assert [item.project_id for item in list_projects()] == ["sample-project"]
+    assert legacy.read_bytes() == LEGACY_BYTES
+
+
+def test_legacy_sqlite_does_not_block_init_project(
+    tmp_path: Path,
+    data_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """init-project registers what it just created, legacy file or not."""
+
+    from research_os.cli import main
+
+    legacy = _write_legacy()
+    repo = make_git_repo(tmp_path / "sample-project")
+    monkeypatch.setattr("sys.argv", ["researchctl", "init-project", str(repo)])
+
+    with pytest.raises(SystemExit) as exc:
+        main()
+
+    assert exc.value.code == 0
+    assert [item.project_id for item in list_projects()] == ["sample-project"]
+    assert legacy.read_bytes() == LEGACY_BYTES
+
+
+def test_init_project_notes_the_leftover_legacy_file(
+    tmp_path: Path,
+    data_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Registration silences the report forever, so say the file is still there.
+
+    Advisory only: it goes to stderr and does not change the exit code.
+    """
+
+    from research_os.cli import main
+
+    legacy = _write_legacy()
+    repo = make_git_repo(tmp_path / "sample-project")
+    monkeypatch.setattr("sys.argv", ["researchctl", "init-project", str(repo)])
+    with pytest.raises(SystemExit) as exc:
+        main()
+
+    captured = capsys.readouterr()
+    assert exc.value.code == 0
+    assert str(legacy) in captured.err
+    assert "can be deleted" in captured.err
+    assert "Initialized project sample-project" in captured.out
+
+
+def test_no_legacy_note_when_no_legacy_file(
+    tmp_path: Path,
+    data_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from research_os.cli import main
+
+    repo = make_git_repo(tmp_path / "sample-project")
+    monkeypatch.setattr("sys.argv", ["researchctl", "init-project", str(repo)])
+    with pytest.raises(SystemExit):
+        main()
+
+    assert capsys.readouterr().err == ""
+
+
+def test_first_json_creation_over_legacy_is_well_formed(
+    tmp_path: Path,
+    data_home: Path,
+) -> None:
+    """The store written over a legacy file is an ordinary store, not a variant."""
+
+    _write_legacy()
+    repo = make_git_repo(tmp_path / "sample-project")
+    write_minimal_capsule(repo)
+    _, project = load_project_identity(repo)
+    register_project(project, repo)
+
+    text = registry_path().read_text(encoding="utf-8")
+    store = json.loads(text)
+    assert store["schema_version"] == SCHEMA_VERSION
+    assert [entry["project_id"] for entry in store["projects"]] == ["sample-project"]
+    assert set(store["projects"][0]) == {
+        "project_id",
+        "path",
+        "title",
+        "capsule_version",
+        "status",
+        "last_seen",
+    }
+    assert text.endswith("\n")
+
+
+def test_subsequent_registrations_with_legacy_present(
+    tmp_path: Path,
+    data_home: Path,
+) -> None:
+    """Once JSON exists the legacy file is inert, and further projects register."""
+
+    legacy = _write_legacy()
+    first = make_git_repo(tmp_path / "alpha-project")
+    second = make_git_repo(tmp_path / "beta-project")
+    for repo in (first, second):
+        write_minimal_capsule(repo)
+        _, project = load_project_identity(repo)
         register_project(project, repo)
 
-    assert legacy.is_file()
-    assert legacy.read_bytes() == before
-    assert not registry_path().exists()
+    assert [entry.project_id for entry in list_projects()] == [
+        "alpha-project",
+        "beta-project",
+    ]
+    assert legacy.read_bytes() == LEGACY_BYTES
+
+
+def test_legacy_file_is_never_touched(
+    tmp_path: Path,
+    data_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Byte-identical across every registry operation, including the failing one."""
+
+    from research_os.cli import main
+
+    legacy = _write_legacy()
+    digest = hashlib.sha256(legacy.read_bytes()).hexdigest()
+    stat_before = legacy.stat()
+
+    with pytest.raises(RegistryError):
+        list_projects()
+
+    repo = make_git_repo(tmp_path / "sample-project")
+    monkeypatch.setattr("sys.argv", ["researchctl", "init-project", str(repo)])
+    with pytest.raises(SystemExit):
+        main()
+    list_projects()
+
+    other = make_git_repo(tmp_path / "beta-project")
+    write_minimal_capsule(other)
+    _, project = load_project_identity(other)
+    register_project(project, other)
+
+    assert hashlib.sha256(legacy.read_bytes()).hexdigest() == digest
+    assert legacy.stat().st_mtime_ns == stat_before.st_mtime_ns
+    assert legacy.stat().st_size == stat_before.st_size
 
 
 def test_legacy_sqlite_is_ignored_once_json_exists(
