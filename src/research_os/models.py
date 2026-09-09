@@ -15,6 +15,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    ValidationInfo,
     field_validator,
     model_validator,
 )
@@ -26,7 +27,12 @@ from research_os.ids import (
     validate_project_id,
 )
 
-_SUBJECT_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+DIGEST_VERSION = 1
+DIGEST_RE = re.compile(rf"^{DIGEST_VERSION}:[0-9a-f]{{64}}$")
+DIGEST_FORMAT = f"{DIGEST_VERSION}:<64 lowercase hex>"
+
+_GIT_COMMIT_RE = re.compile(r"^[0-9a-f]{7,40}$")
+_DRIVE_PREFIX_RE = re.compile(r"^[A-Za-z]:")
 _REVIEWABLE_PREFIXES = frozenset(
     {"Q", "IDEA", "HYP", "ASM", "CLAIM", "DEC", "EXP", "EVI"}
 )
@@ -41,6 +47,32 @@ def _reject_blank(value: str) -> str:
 
 
 NonBlankStr = Annotated[str, AfterValidator(_reject_blank)]
+
+
+def _repo_relative_path(value: str) -> str:
+    """Reject pointers that cannot be a portable in-repository path.
+
+    Format validation only: nothing is resolved, normalized, or read from
+    disk. A single trailing slash is allowed because a directory pointer is
+    legitimate. The value is never rewritten, because the semantic digest
+    hashes the literal string.
+    """
+
+    if value.startswith(("/", "~")):
+        raise ValueError("must be a repository-relative path, not absolute")
+    if "\\" in value:
+        raise ValueError("must use POSIX '/' separators")
+    if _DRIVE_PREFIX_RE.match(value) is not None:
+        raise ValueError("must not be a drive-qualified path")
+    segments = value.split("/")
+    if segments[-1] == "":
+        segments = segments[:-1]
+    if not segments:
+        raise ValueError("must name at least one path segment")
+    for segment in segments:
+        if segment in {"", ".", ".."}:
+            raise ValueError("must not contain empty, '.', or '..' path segments")
+    return value
 
 
 class ObjectType(StrEnum):
@@ -205,7 +237,16 @@ class BaseScientificObject(ObjectEnvelope):
 
 
 class Provenance(BaseModel):
-    """Completed-experiment provenance pointers. Not resolved in R0."""
+    """Completed-experiment provenance pointers. Not resolved in R0.
+
+    ``code`` and ``config`` are repository-relative POSIX paths, because
+    reproducing an analysis requires the committed code and configuration.
+    ``data`` is a nonblank **opaque locator**: real datasets routinely live
+    outside Git and outside the project filesystem (scratch space,
+    institutional or HPC storage, object stores, DOIs, dataset or table
+    identifiers), so WP-A validates only that it is present. Nothing here is
+    resolved, fetched, hashed, or checked for existence.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -213,6 +254,40 @@ class Provenance(BaseModel):
     config: NonBlankStr
     data: NonBlankStr
     git_commit: NonBlankStr
+
+    @field_validator("code", "config")
+    @classmethod
+    def _repository_paths(cls, value: str) -> str:
+        return _repo_relative_path(value)
+
+    @field_validator("git_commit")
+    @classmethod
+    def _commit_hash_shape(cls, value: str) -> str:
+        if _GIT_COMMIT_RE.fullmatch(value) is None:
+            raise ValueError("git_commit must be 7-40 lowercase hexadecimal characters")
+        return value
+
+
+class Prediction(BaseModel):
+    """One ex-ante predicted outcome for a hypothesis under test.
+
+    A nested value model like ``Provenance``, not a prefixed scientific
+    object type.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    hypothesis: str
+    predicted_outcome: NonBlankStr
+    discriminates: bool
+
+    @field_validator("hypothesis")
+    @classmethod
+    def _hypothesis_id(cls, value: str) -> str:
+        validate_id(value)
+        if parse_id(value).prefix != "HYP":
+            raise ValueError("prediction hypothesis must be a HYP- id")
+        return value
 
 
 class Question(BaseScientificObject):
@@ -225,6 +300,32 @@ class Idea(BaseScientificObject):
     type: Literal[ObjectType.IDEA]
     status: IdeaStatus
     statement: NonBlankStr
+    retire_reason: str | None = None
+    revisit_if: str | None = None
+
+    @field_validator("retire_reason", "revisit_if")
+    @classmethod
+    def _optional_text_non_empty(
+        cls,
+        value: str | None,
+        info: ValidationInfo,
+    ) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError(f"{info.field_name} must be non-empty when set")
+        return value
+
+    @model_validator(mode="after")
+    def _idea_retirement_rules(self) -> Self:
+        if self.status is IdeaStatus.DISCARDED and (
+            self.retire_reason is None or not self.retire_reason.strip()
+        ):
+            raise ValueError("discarded ideas require non-empty retire_reason")
+        return self
+
+
+_RETIRED_HYPOTHESIS_STATUSES = frozenset(
+    {HypothesisStatus.REJECTED, HypothesisStatus.WITHDRAWN}
+)
 
 
 class Hypothesis(BaseScientificObject):
@@ -239,6 +340,19 @@ class Hypothesis(BaseScientificObject):
     contrary_evidence: list[str] | None = None
     confidence: float | None = Field(default=None, ge=0.0, le=1.0)
     confidence_basis: str | None = None
+    retire_reason: str | None = None
+    revisit_if: str | None = None
+
+    @field_validator("retire_reason", "revisit_if")
+    @classmethod
+    def _optional_text_non_empty(
+        cls,
+        value: str | None,
+        info: ValidationInfo,
+    ) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError(f"{info.field_name} must be non-empty when set")
+        return value
 
     @field_validator(
         "addresses",
@@ -285,6 +399,12 @@ class Hypothesis(BaseScientificObject):
             raise ValueError("confidence requires non-empty confidence_basis")
         if self.confidence_basis is not None and not has_confidence:
             raise ValueError("confidence_basis requires confidence")
+        if self.status in _RETIRED_HYPOTHESIS_STATUSES and (
+            self.retire_reason is None or not self.retire_reason.strip()
+        ):
+            raise ValueError(
+                "rejected and withdrawn hypotheses require non-empty retire_reason"
+            )
         return self
 
 
@@ -299,10 +419,12 @@ class Claim(BaseScientificObject):
     type: Literal[ObjectType.CLAIM]
     status: ClaimStatus
     statement: NonBlankStr
-    evidence: list[str] | None = None
+    supporting_evidence: list[str] | None = None
+    contrary_evidence: list[str] | None = None
+    contrary_evidence_addressed: str | None = None
     hypotheses: list[str] | None = None
 
-    @field_validator("evidence", "hypotheses")
+    @field_validator("supporting_evidence", "contrary_evidence", "hypotheses")
     @classmethod
     def _optional_id_lists(cls, value: list[str] | None) -> list[str] | None:
         if value is None:
@@ -310,6 +432,31 @@ class Claim(BaseScientificObject):
         for item in value:
             validate_id(item)
         return value
+
+    @field_validator("contrary_evidence_addressed")
+    @classmethod
+    def _addressed_non_empty(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("contrary_evidence_addressed must be non-empty when set")
+        return value
+
+    @model_validator(mode="after")
+    def _claim_content_rules(self) -> Self:
+        if self.contrary_evidence_addressed is not None and not self.contrary_evidence:
+            raise ValueError("contrary_evidence_addressed requires contrary_evidence")
+        addressed = self.contrary_evidence_addressed is not None and bool(
+            self.contrary_evidence_addressed.strip()
+        )
+        if (
+            self.status is ClaimStatus.ACCEPTED
+            and self.contrary_evidence
+            and not addressed
+        ):
+            raise ValueError(
+                "accepted claims with contrary_evidence require non-empty "
+                "contrary_evidence_addressed"
+            )
+        return self
 
 
 class Decision(BaseScientificObject):
@@ -343,11 +490,25 @@ class Decision(BaseScientificObject):
         return self
 
 
+_PREREGISTERED_EXPERIMENT_STATUSES = frozenset(
+    {
+        ExperimentStatus.SPECIFIED,
+        ExperimentStatus.RUNNING,
+        ExperimentStatus.COMPLETED,
+        ExperimentStatus.FAILED,
+        ExperimentStatus.SUPERSEDED,
+    }
+)
+
+
 class Experiment(BaseScientificObject):
     type: Literal[ObjectType.EXPERIMENT]
     status: ExperimentStatus
     purpose: NonBlankStr
     hypotheses: list[str] | None = None
+    predictions: list[Prediction] | None = None
+    primary_metrics: list[str] | None = None
+    decision_rule: str | None = None
     provenance: Provenance | None = None
     result_manifest: str | None = None
     artifacts: list[str] | None = None
@@ -370,11 +531,26 @@ class Experiment(BaseScientificObject):
             raise ValueError("artifact pointers must be non-empty")
         return value
 
-    @field_validator("result_manifest")
+    @field_validator("primary_metrics")
     @classmethod
-    def _result_manifest_non_empty(cls, value: str | None) -> str | None:
+    def _primary_metric_names(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return None
+        if any(not item.strip() for item in value):
+            raise ValueError("primary_metrics entries must be non-empty")
+        if len(set(value)) != len(value):
+            raise ValueError("primary_metrics must not contain duplicates")
+        return value
+
+    @field_validator("result_manifest", "decision_rule")
+    @classmethod
+    def _optional_text_non_empty(
+        cls,
+        value: str | None,
+        info: ValidationInfo,
+    ) -> str | None:
         if value is not None and not value.strip():
-            raise ValueError("result_manifest must be non-empty when set")
+            raise ValueError(f"{info.field_name} must be non-empty when set")
         return value
 
     @model_validator(mode="after")
@@ -383,6 +559,26 @@ class Experiment(BaseScientificObject):
             raise ValueError("non-draft experiments require a non-empty hypotheses list")
         if self.status is ExperimentStatus.COMPLETED and self.provenance is None:
             raise ValueError("completed experiments require provenance")
+        if self.status in _PREREGISTERED_EXPERIMENT_STATUSES:
+            if not self.predictions:
+                raise ValueError(
+                    "preregistered experiments require a non-empty predictions list"
+                )
+            if not self.primary_metrics:
+                raise ValueError(
+                    "preregistered experiments require at least one primary metric"
+                )
+            if self.decision_rule is None or not self.decision_rule.strip():
+                raise ValueError(
+                    "preregistered experiments require a non-empty decision_rule"
+                )
+        declared = set(self.hypotheses or [])
+        for prediction in self.predictions or []:
+            if prediction.hypothesis not in declared:
+                raise ValueError(
+                    f"prediction hypothesis {prediction.hypothesis} is not listed "
+                    "in the experiment hypotheses"
+                )
         return self
 
 
@@ -396,6 +592,7 @@ class Review(ObjectEnvelope):
     findings: str | None = None
     verdict: Verdict | None = None
     subject_digest: str | None = None
+    evidence_digests: dict[str, str] | None = None
 
     @field_validator("subject")
     @classmethod
@@ -407,11 +604,27 @@ class Review(ObjectEnvelope):
 
     @field_validator("subject_digest")
     @classmethod
-    def _lowercase_hex_digest(cls, value: str | None) -> str | None:
+    def _versioned_digest(cls, value: str | None) -> str | None:
         if value is None:
             return None
-        if _SUBJECT_DIGEST_RE.fullmatch(value) is None:
-            raise ValueError("subject_digest must be 64-char lowercase hex SHA-256")
+        if DIGEST_RE.fullmatch(value) is None:
+            raise ValueError(f"subject_digest must be {DIGEST_FORMAT!r}")
+        return value
+
+    @field_validator("evidence_digests")
+    @classmethod
+    def _evidence_digest_map(
+        cls,
+        value: dict[str, str] | None,
+    ) -> dict[str, str] | None:
+        if value is None:
+            return None
+        for key, digest in value.items():
+            validate_id(key)
+            if parse_id(key).prefix != "EVI":
+                raise ValueError("evidence_digests keys must be EVI- ids")
+            if DIGEST_RE.fullmatch(digest) is None:
+                raise ValueError(f"evidence_digests[{key}] must be {DIGEST_FORMAT!r}")
         return value
 
     @model_validator(mode="after")
@@ -423,6 +636,15 @@ class Review(ObjectEnvelope):
                 raise ValueError("concluded reviews require verdict")
             if self.subject_digest is None:
                 raise ValueError("concluded reviews require subject_digest")
+        return self
+
+    @model_validator(mode="after")
+    def _evidence_digests_target_claims(self) -> Self:
+        if (
+            self.evidence_digests is not None
+            and parse_id(self.subject).prefix != "CLAIM"
+        ):
+            raise ValueError("evidence_digests is only valid on reviews of claims")
         return self
 
 

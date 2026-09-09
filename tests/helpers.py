@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from research_os.models import (
+    DIGEST_VERSION,
     Assumption,
     Claim,
     Decision,
@@ -16,6 +17,14 @@ from research_os.models import (
     Question,
     Review,
 )
+
+TEST_PROJECT_ID = "alpha-project"
+OTHER_PROJECT_ID = "beta-project"
+
+_PREREGISTERED_STATUSES = frozenset(
+    {"specified", "running", "completed", "failed", "superseded"}
+)
+_RETIRED_HYPOTHESIS_STATUSES = frozenset({"rejected", "withdrawn"})
 
 
 def _merge(base: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]:
@@ -41,19 +50,18 @@ def make_question(**updates: Any) -> Question:
 
 
 def make_idea(**updates: Any) -> Idea:
-    return Idea.model_validate(
-        _merge(
-            {
-                "id": "IDEA-0001",
-                "type": "idea",
-                "schema_version": 1,
-                "status": "draft",
-                "title": "An idea",
-                "statement": "Perhaps a mechanism exists.",
-            },
-            updates,
-        )
-    )
+    status = updates.get("status", "draft")
+    base: dict[str, Any] = {
+        "id": "IDEA-0001",
+        "type": "idea",
+        "schema_version": 1,
+        "status": status,
+        "title": "An idea",
+        "statement": "Perhaps a mechanism exists.",
+    }
+    if status == "discarded":
+        base["retire_reason"] = "Existing data cannot identify the mechanism."
+    return Idea.model_validate(_merge(base, updates))
 
 
 def make_hypothesis(**updates: Any) -> Hypothesis:
@@ -68,6 +76,8 @@ def make_hypothesis(**updates: Any) -> Hypothesis:
     }
     if status != "draft":
         base["falsification"] = "Observe not-Y after X."
+    if status in _RETIRED_HYPOTHESIS_STATUSES:
+        base["retire_reason"] = "The mechanism is not identifiable from this data."
     return Hypothesis.model_validate(_merge(base, updates))
 
 
@@ -146,6 +156,19 @@ def make_experiment(**updates: Any) -> Experiment:
     }
     if status != "draft":
         base["hypotheses"] = ["HYP-0001"]
+    if status in _PREREGISTERED_STATUSES:
+        hypotheses = updates.get("hypotheses") or base.get("hypotheses") or ["HYP-0001"]
+        base["predictions"] = [
+            {
+                "hypothesis": hypotheses[0],
+                "predicted_outcome": "Heldout RMSE falls below 0.20.",
+                "discriminates": True,
+            }
+        ]
+        base["primary_metrics"] = ["heldout_rmse"]
+        base["decision_rule"] = (
+            "Reject the hypothesis if heldout_rmse is at least 0.20."
+        )
     if status == "completed":
         base["provenance"] = make_provenance().model_dump()
     return Experiment.model_validate(_merge(base, updates))
@@ -165,7 +188,7 @@ def make_review(**updates: Any) -> Review:
     if status == "concluded":
         base["findings"] = "Looks correct."
         base["verdict"] = "approve"
-        base["subject_digest"] = "a" * 64
+        base["subject_digest"] = f"{DIGEST_VERSION}:{'a' * 64}"
     return Review.model_validate(_merge(base, updates))
 
 

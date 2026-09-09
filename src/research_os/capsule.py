@@ -283,7 +283,13 @@ def load_project_identity(path: Path | str) -> tuple[Path, Project]:
 
 
 def validate_project(path: Path | str = ".") -> ProjectValidationReport:
-    """Validate a Research Capsule. Never writes files or consults the registry."""
+    """Validate a Research Capsule. Never writes files or consults the registry.
+
+    Cross-object scientific validation is project-scoped, so it runs only
+    when ``project.yaml`` yields a valid identity. A capsule without one
+    already reports a hard error, and validating objects without project
+    identity would silently drop the review and digest guarantees.
+    """
 
     git_root = resolve_git_root(path)
     findings: list[Finding] = []
@@ -323,8 +329,9 @@ def validate_project(path: Path | str = ".") -> ProjectValidationReport:
     _warn_reserved_directories(capsule, git_root, findings)
     loaded = _discover_objects(capsule, git_root, findings)
     objects = tuple(item.obj for item in loaded)
-    m2_report = validate_objects(objects)
-    findings.extend(_attach_sources(m2_report, loaded))
+    if project is not None:
+        m2_report = validate_objects(objects, project_id=project.id)
+        findings.extend(_attach_sources(m2_report, loaded))
     return ProjectValidationReport(
         git_root=git_root,
         capsule=capsule,

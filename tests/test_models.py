@@ -6,6 +6,7 @@ import pytest
 from pydantic import ValidationError
 
 from research_os.models import (
+    DIGEST_VERSION,
     AssumptionStatus,
     ClaimStatus,
     DecisionStatus,
@@ -14,8 +15,10 @@ from research_os.models import (
     HypothesisStatus,
     IdeaStatus,
     ObjectType,
+    Prediction,
     Project,
     ProjectStatus,
+    Provenance,
     Question,
     QuestionStatus,
     ReviewStatus,
@@ -29,6 +32,7 @@ from tests.helpers import (
     make_experiment,
     make_hypothesis,
     make_idea,
+    make_provenance,
     make_question,
     make_review,
 )
@@ -228,9 +232,62 @@ def test_concluded_review_requires_findings_verdict_and_digest() -> None:
         make_review(status="concluded", verdict=None)
     with pytest.raises(ValidationError):
         make_review(status="concluded", subject_digest=None)
-    with pytest.raises(ValidationError):
-        make_review(status="concluded", subject_digest="A" * 64)
     make_review(status="draft", findings=None, verdict=None, subject_digest=None)
+
+
+@pytest.mark.parametrize(
+    "digest",
+    [
+        "a" * 64,
+        f"{DIGEST_VERSION}:{'A' * 64}",
+        f"{DIGEST_VERSION}:{'a' * 63}",
+        f"{DIGEST_VERSION}:{'a' * 65}",
+        f"{DIGEST_VERSION}:not-hex",
+        f":{'a' * 64}",
+        f"{DIGEST_VERSION + 1}:{'a' * 64}",
+        f"sha256:{'a' * 64}",
+    ],
+)
+def test_versioned_digest_format_is_enforced(digest: str) -> None:
+    with pytest.raises(ValidationError):
+        make_review(status="concluded", subject_digest=digest)
+    with pytest.raises(ValidationError):
+        make_review(status="concluded", evidence_digests={"EVI-0001": digest})
+
+
+def test_versioned_digest_format_is_accepted() -> None:
+    valid = f"{DIGEST_VERSION}:{'a' * 64}"
+    review = make_review(status="concluded", subject_digest=valid)
+    assert review.subject_digest == valid
+    bound = make_review(
+        status="concluded",
+        subject_digest=valid,
+        evidence_digests={"EVI-0001": valid},
+    )
+    assert bound.evidence_digests == {"EVI-0001": valid}
+
+
+def test_evidence_digest_keys_must_be_evidence_ids() -> None:
+    valid = f"{DIGEST_VERSION}:{'a' * 64}"
+    for key in ("HYP-0001", "CLAIM-0002", "EVI-1", "evi-0001", "not-an-id"):
+        with pytest.raises(ValidationError):
+            make_review(status="concluded", evidence_digests={key: valid})
+
+
+def test_evidence_digests_only_valid_on_claim_subjects() -> None:
+    valid = f"{DIGEST_VERSION}:{'a' * 64}"
+    for subject in ("HYP-0001", "EXP-0001", "EVI-0001", "Q-0001"):
+        with pytest.raises(ValidationError):
+            make_review(
+                status="concluded",
+                subject=subject,
+                evidence_digests={"EVI-0001": valid},
+            )
+    make_review(
+        status="concluded",
+        subject="CLAIM-0001",
+        evidence_digests={"EVI-0001": valid},
+    )
 
 
 def test_review_of_review_rejected_by_schema() -> None:
@@ -306,6 +363,18 @@ def test_whitespace_only_required_scientific_text_rejected() -> None:
         make_experiment(result_manifest="   ")
     with pytest.raises(ValidationError):
         make_experiment(artifacts=["   "])
+    with pytest.raises(ValidationError):
+        make_experiment(status="specified", decision_rule="   ")
+    with pytest.raises(ValidationError):
+        make_claim(contrary_evidence=["EVI-0001"], contrary_evidence_addressed="  ")
+    with pytest.raises(ValidationError):
+        make_idea(status="discarded", retire_reason="   ")
+    with pytest.raises(ValidationError):
+        make_idea(revisit_if="   ")
+    with pytest.raises(ValidationError):
+        make_hypothesis(status="rejected", retire_reason="\t")
+    with pytest.raises(ValidationError):
+        make_provenance(data="   ")
     Project.model_validate(
         {
             "id": "demo-project",
@@ -387,3 +456,286 @@ def test_parse_object_dispatches_on_type() -> None:
     assert isinstance(obj, Question)
     with pytest.raises(ValueError, match="unknown object type"):
         parse_object({"type": "paper", "id": "PAPER-0001"})
+
+
+PREREGISTERED_STATUSES = ("specified", "running", "completed", "failed", "superseded")
+
+
+@pytest.mark.parametrize("status", PREREGISTERED_STATUSES)
+@pytest.mark.parametrize("missing", ["predictions", "primary_metrics", "decision_rule"])
+def test_preregistered_experiment_requires_ex_ante_commitments(
+    status: str,
+    missing: str,
+) -> None:
+    make_experiment(status=status)
+    with pytest.raises(ValidationError):
+        make_experiment(status=status, **{missing: None})
+
+
+@pytest.mark.parametrize("status", PREREGISTERED_STATUSES)
+def test_preregistered_experiment_rejects_empty_commitments(status: str) -> None:
+    with pytest.raises(ValidationError):
+        make_experiment(status=status, predictions=[])
+    with pytest.raises(ValidationError):
+        make_experiment(status=status, primary_metrics=[])
+
+
+@pytest.mark.parametrize("status", ["draft", "withdrawn"])
+def test_draft_and_withdrawn_experiments_are_exempt(status: str) -> None:
+    experiment = make_experiment(status=status)
+    assert experiment.predictions is None
+    assert experiment.primary_metrics is None
+    assert experiment.decision_rule is None
+
+
+def test_prediction_hypothesis_must_be_listed_on_experiment() -> None:
+    with pytest.raises(ValidationError):
+        make_experiment(
+            status="specified",
+            hypotheses=["HYP-0001"],
+            predictions=[
+                {
+                    "hypothesis": "HYP-0002",
+                    "predicted_outcome": "Heldout RMSE falls below 0.20.",
+                    "discriminates": True,
+                }
+            ],
+        )
+    experiment = make_experiment(
+        status="specified",
+        hypotheses=["HYP-0001", "HYP-0002"],
+        predictions=[
+            {
+                "hypothesis": "HYP-0002",
+                "predicted_outcome": "Heldout RMSE falls below 0.20.",
+                "discriminates": True,
+            }
+        ],
+    )
+    assert experiment.predictions is not None
+    assert experiment.predictions[0].hypothesis == "HYP-0002"
+
+
+def test_prediction_requires_outcome_and_discriminates() -> None:
+    Prediction.model_validate(
+        {
+            "hypothesis": "HYP-0001",
+            "predicted_outcome": "Heldout RMSE falls below 0.20.",
+            "discriminates": False,
+        }
+    )
+    with pytest.raises(ValidationError):
+        Prediction.model_validate({"hypothesis": "HYP-0001", "predicted_outcome": "x"})
+    with pytest.raises(ValidationError):
+        Prediction.model_validate(
+            {
+                "hypothesis": "HYP-0001",
+                "predicted_outcome": "   ",
+                "discriminates": True,
+            }
+        )
+    with pytest.raises(ValidationError):
+        Prediction.model_validate(
+            {
+                "hypothesis": "CLAIM-0001",
+                "predicted_outcome": "x",
+                "discriminates": True,
+            }
+        )
+    with pytest.raises(ValidationError):
+        Prediction.model_validate(
+            {
+                "hypothesis": "HYP-0001",
+                "predicted_outcome": "x",
+                "discriminates": True,
+                "confidence": 0.5,
+            }
+        )
+
+
+def test_primary_metrics_reject_blank_and_duplicate_entries() -> None:
+    with pytest.raises(ValidationError):
+        make_experiment(status="specified", primary_metrics=["heldout_rmse", "  "])
+    with pytest.raises(ValidationError):
+        make_experiment(
+            status="specified", primary_metrics=["heldout_rmse", "heldout_rmse"]
+        )
+    experiment = make_experiment(
+        status="specified", primary_metrics=["heldout_rmse", "auroc"]
+    )
+    assert experiment.primary_metrics == ["heldout_rmse", "auroc"]
+
+
+def test_accepted_claim_with_contrary_evidence_requires_a_response() -> None:
+    with pytest.raises(ValidationError):
+        make_claim(
+            status="accepted",
+            supporting_evidence=["EVI-0001"],
+            contrary_evidence=["EVI-0002"],
+        )
+    claim = make_claim(
+        status="accepted",
+        supporting_evidence=["EVI-0001"],
+        contrary_evidence=["EVI-0002"],
+        contrary_evidence_addressed="The contrary result applies below 200 K.",
+    )
+    assert claim.contrary_evidence_addressed is not None
+
+
+def test_unaccepted_claim_may_carry_unaddressed_contrary_evidence() -> None:
+    claim = make_claim(
+        status="evidence_linked",
+        supporting_evidence=["EVI-0001"],
+        contrary_evidence=["EVI-0002"],
+    )
+    assert claim.contrary_evidence == ["EVI-0002"]
+    assert claim.contrary_evidence_addressed is None
+
+
+def test_contrary_evidence_addressed_requires_contrary_evidence() -> None:
+    with pytest.raises(ValidationError):
+        make_claim(contrary_evidence_addressed="Nothing to address.")
+    with pytest.raises(ValidationError):
+        make_claim(
+            contrary_evidence=[],
+            contrary_evidence_addressed="Nothing to address.",
+        )
+
+
+def test_claim_rejects_the_old_flat_evidence_field() -> None:
+    with pytest.raises(ValidationError):
+        make_claim(evidence=["EVI-0001"])
+
+
+def test_discarded_idea_requires_retire_reason() -> None:
+    with pytest.raises(ValidationError):
+        make_idea(status="discarded", retire_reason=None)
+    idea = make_idea(
+        status="discarded",
+        retire_reason="Existing data cannot identify the mechanism.",
+        revisit_if="Facility-level cooling telemetry becomes available.",
+    )
+    assert idea.retire_reason is not None
+    assert idea.revisit_if is not None
+    for status in ("draft", "active", "promoted"):
+        assert make_idea(status=status).retire_reason is None
+
+
+@pytest.mark.parametrize("status", ["rejected", "withdrawn"])
+def test_retired_hypothesis_requires_retire_reason(status: str) -> None:
+    with pytest.raises(ValidationError):
+        make_hypothesis(status=status, retire_reason=None)
+    hypothesis = make_hypothesis(
+        status=status,
+        retire_reason="The mechanism is not identifiable from this data.",
+    )
+    assert hypothesis.retire_reason is not None
+
+
+@pytest.mark.parametrize("status", ["draft", "active", "testing", "supported"])
+def test_live_hypothesis_does_not_require_retire_reason(status: str) -> None:
+    assert make_hypothesis(status=status).retire_reason is None
+
+
+def test_superseded_objects_are_exempt_from_retire_reason() -> None:
+    assert make_idea(status="superseded").retire_reason is None
+    assert make_hypothesis(status="superseded").retire_reason is None
+
+
+@pytest.mark.parametrize(
+    "git_commit",
+    [
+        "deadbee",
+        "deadbeef",
+        "0123456789abcdef0123456789abcdef01234567",
+        "a1b2c3d",
+    ],
+)
+def test_valid_git_commit_shapes(git_commit: str) -> None:
+    assert make_provenance(git_commit=git_commit).git_commit == git_commit
+
+
+@pytest.mark.parametrize(
+    "git_commit",
+    [
+        "DEADBEEF",
+        "deadbe",
+        "not-a-commit",
+        "0123456789abcdef0123456789abcdef012345678",
+        "HEAD",
+        "deadbeef ",
+    ],
+)
+def test_invalid_git_commit_shapes_fail(git_commit: str) -> None:
+    with pytest.raises(ValidationError):
+        make_provenance(git_commit=git_commit)
+
+
+@pytest.mark.parametrize("field", ["code", "config"])
+@pytest.mark.parametrize(
+    "value",
+    [
+        "/etc/passwd",
+        "/scratch/nic/run.py",
+        "../shared/code.py",
+        "src/../../escape.py",
+        "~/code.py",
+        "src\\windows.py",
+        "C:/code.py",
+        "./src/code.py",
+        "src//code.py",
+        ".",
+        "..",
+    ],
+)
+def test_absolute_and_traversal_code_paths_fail(field: str, value: str) -> None:
+    with pytest.raises(ValidationError):
+        make_provenance(**{field: value})
+
+
+@pytest.mark.parametrize("field", ["code", "config"])
+@pytest.mark.parametrize(
+    "value",
+    ["src/experiment.py", "configs/run.toml", "data/raw/", "a", "deep/nested/path.py"],
+)
+def test_repository_relative_code_paths_pass(field: str, value: str) -> None:
+    assert getattr(make_provenance(**{field: value}), field) == value
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "data/raw/",
+        "/scratch/nic/runs/2026",
+        "/mnt/institutional/share/dataset",
+        "s3://bucket/dataset",
+        "https://example.org/dataset.csv",
+        "doi:10.5281/zenodo.1234567",
+        "warehouse.analytics.runs_2026",
+        "../shared/data",
+        "C:\\data\\raw",
+    ],
+)
+def test_data_accepts_any_nonblank_opaque_locator(value: str) -> None:
+    """Real datasets live outside Git; WP-A resolves and restricts nothing."""
+
+    assert make_provenance(data=value).data == value
+
+
+@pytest.mark.parametrize("value", ["", "   ", "\t\n"])
+def test_blank_data_locator_fails(value: str) -> None:
+    with pytest.raises(ValidationError):
+        make_provenance(data=value)
+
+
+def test_provenance_rejects_unknown_fields() -> None:
+    with pytest.raises(ValidationError):
+        Provenance.model_validate(
+            {
+                "code": "src/experiment.py",
+                "config": "configs/run.toml",
+                "data": "data/raw/",
+                "git_commit": "deadbeef",
+                "dataset_sha256": "a" * 64,
+            }
+        )

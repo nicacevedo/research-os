@@ -10,6 +10,16 @@ This file is the version-controlled implementation contract for Research OS R0.
 It is the complete final human-approved plan. Scientific decisions in the plan
 body are frozen and must not be reinterpreted during implementation.
 
+> **HISTORICAL NOTE (WP-A).** Milestones M1-M3 have since been implemented, and
+> the WP-A scientific-integrity corrections changed parts of the schema and
+> digest specification recorded below. **`docs/CAPSULE.md` is authoritative
+> wherever it and this document disagree.** The sections below are preserved as
+> the approved plan of record and are deliberately **not** rewritten to look
+> retroactively consistent. Known superseded points: the semantic-digest
+> specification in section 7 (see the marker there) and the flat Claim
+> `evidence` field, now `supporting_evidence` / `contrary_evidence` /
+> `contrary_evidence_addressed`.
+
 ---
 
 # R0 Kernel — final amended implementation-ready plan
@@ -221,6 +231,12 @@ WO, Handoff, RUN: no schema, no required directories.
 
 ### Semantic digest (new)
 
+> **SUPERSEDED BY WP-A.** This subsection is historical. The digest is now
+> project-scoped and carries an explicit algorithm version (`1:<64 hex>`), the
+> projection includes `id` and `project`, and the Claim and Experiment key sets
+> changed. See the "Semantic digest" section of `docs/CAPSULE.md`, which is
+> authoritative.
+
 Module: [src/research_os/digests.py](src/research_os/digests.py).
 
 **Goal:** hash *scientific content reviewed*, not raw YAML and not lifecycle/admin fields.
@@ -279,6 +295,12 @@ supersedes:
 ### Schema versions
 
 Package `0.1.0` until R0 accepted; `capsule_version: 1`; object `schema_version: 1`. No migrator.
+
+> **SUPERSEDED BY WP-A.** "No migrator" is no longer absolute. WP-A corrected
+> schema v1 in place because no real capsule existed; from the first persisted
+> real capsule onward, material schema changes require an explicit version bump
+> and a reviewable, human-run versioned migration. No migration framework is
+> implemented. See the migration policy in `docs/CAPSULE.md`.
 
 ---
 

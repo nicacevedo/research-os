@@ -17,6 +17,8 @@ from research_os.errors import (
     E_CREATED_FROM_CYCLE,
     E_DANGLING_REF,
     E_DUP_ID,
+    E_EVIDENCE_DIGEST_UNLINKED,
+    E_EVIDENCE_DIGESTS_INCOMPLETE,
     E_NONQUALIFYING_EVIDENCE,
     E_REVIEW_OF_REVIEW,
     E_STALE_REVIEW_DIGEST,
@@ -26,12 +28,13 @@ from research_os.errors import (
     E_WITHDRAWN_SUPERSEDED,
     E_WRONG_REF_TYPE,
     W_PROMOTED_WITHOUT_HYPOTHESIS,
+    W_STALE_EVIDENCE_DIGEST,
     W_STALE_SUBJECT_DIGEST,
     Finding,
     Severity,
     ValidationReport,
 )
-from research_os.ids import PREFIX_TO_TYPE, parse_id
+from research_os.ids import PREFIX_TO_TYPE, parse_id, validate_project_id
 from research_os.models import (
     BaseScientificObject,
     Claim,
@@ -61,7 +64,8 @@ _TYPED_REFS: tuple[tuple[type, str, str | None], ...] = (
     (Hypothesis, "assumptions", ObjectType.ASSUMPTION),
     (Hypothesis, "supporting_evidence", ObjectType.EVIDENCE),
     (Hypothesis, "contrary_evidence", ObjectType.EVIDENCE),
-    (Claim, "evidence", ObjectType.EVIDENCE),
+    (Claim, "supporting_evidence", ObjectType.EVIDENCE),
+    (Claim, "contrary_evidence", ObjectType.EVIDENCE),
     (Claim, "hypotheses", ObjectType.HYPOTHESIS),
     (Experiment, "hypotheses", ObjectType.HYPOTHESIS),
     (Decision, "related", None),
@@ -88,9 +92,49 @@ def is_qualifying_evidence(
     return True
 
 
-def validate_objects(objects: Iterable[ScientificObject]) -> ValidationReport:
-    """Validate relationships among already-parsed scientific objects."""
+def _linked_evidence(claim: Claim) -> frozenset[str]:
+    """Return every Evidence id a claim links, in either polarity."""
 
+    return frozenset(claim.supporting_evidence or []) | frozenset(
+        claim.contrary_evidence or []
+    )
+
+
+def _evidence_digests_match(
+    stored: Mapping[str, str],
+    by_id: Mapping[str, ScientificObject],
+    project_id: str,
+) -> bool:
+    """Return whether every stored evidence digest matches current content.
+
+    An unresolvable evidence id cannot match; the claim's own reference check
+    already reports it as ``E_DANGLING_REF``.
+    """
+
+    for evidence_id, digest in stored.items():
+        target = by_id.get(evidence_id)
+        if not isinstance(target, Evidence):
+            return False
+        if digest != subject_digest(target, project_id=project_id):
+            return False
+    return True
+
+
+def validate_objects(
+    objects: Iterable[ScientificObject],
+    *,
+    project_id: str,
+) -> ValidationReport:
+    """Validate relationships among already-parsed scientific objects.
+
+    ``project_id`` is required and validated. Reviewed scientific identity is
+    project-local, so there is deliberately no call shape that validates
+    claim acceptance while leaving project-scoped digest binding out of the
+    picture. Callers pass project identity explicitly; this module never
+    looks it up.
+    """
+
+    validate_project_id(project_id)
     items = list(objects)
     findings: list[Finding] = []
     grouped: dict[str, list[ScientificObject]] = defaultdict(list)
@@ -115,8 +159,8 @@ def validate_objects(objects: Iterable[ScientificObject]) -> ValidationReport:
     _check_created_from(by_id, findings)
     _check_supersession(by_id, findings)
     _check_typed_references(by_id, findings)
-    _check_reviews(by_id, findings)
-    _check_evidence_gates(by_id, findings)
+    _check_reviews(by_id, findings, project_id)
+    _check_evidence_gates(by_id, findings, project_id)
     _check_promoted_ideas(by_id, findings)
 
     return ValidationReport(findings=_sorted_findings(findings))
@@ -241,6 +285,7 @@ def _check_typed_references(
 def _check_reviews(
     by_id: Mapping[str, ScientificObject],
     findings: list[Finding],
+    project_id: str,
 ) -> None:
     for obj in by_id.values():
         if not isinstance(obj, Review):
@@ -272,7 +317,7 @@ def _check_reviews(
             continue
         if not isinstance(subject, Reviewable):
             continue
-        current = subject_digest(subject)
+        current = subject_digest(subject, project_id=project_id)
         if (
             obj.status is ReviewStatus.CONCLUDED
             and obj.subject_digest is not None
@@ -290,15 +335,71 @@ def _check_reviews(
                     reference=obj.subject,
                 )
             )
+        _check_review_evidence_digests(obj, subject, by_id, findings, project_id)
+
+
+def _check_review_evidence_digests(
+    review: Review,
+    subject: ScientificObject,
+    by_id: Mapping[str, ScientificObject],
+    findings: list[Finding],
+    project_id: str,
+) -> None:
+    """Bind a review to the Evidence content it recorded having examined.
+
+    The map is explicit and inspectable rather than a recursive hash of the
+    subject's referenced objects.
+    """
+
+    if review.evidence_digests is None or not isinstance(subject, Claim):
+        return
+    linked = _linked_evidence(subject)
+    for evidence_id in sorted(review.evidence_digests):
+        stored = review.evidence_digests[evidence_id]
+        if evidence_id not in linked:
+            findings.append(
+                Finding(
+                    severity=Severity.ERROR,
+                    code=E_EVIDENCE_DIGEST_UNLINKED,
+                    message=(
+                        f"{review.id} evidence_digests names {evidence_id}, "
+                        f"which {subject.id} does not link"
+                    ),
+                    object_id=review.id,
+                    field="evidence_digests",
+                    reference=evidence_id,
+                )
+            )
+            continue
+        target = by_id.get(evidence_id)
+        if not isinstance(target, Evidence):
+            continue
+        if review.status is not ReviewStatus.CONCLUDED:
+            continue
+        if stored != subject_digest(target, project_id=project_id):
+            findings.append(
+                Finding(
+                    severity=Severity.WARNING,
+                    code=W_STALE_EVIDENCE_DIGEST,
+                    message=(
+                        f"{review.id} evidence digest for {evidence_id} no "
+                        "longer matches that evidence"
+                    ),
+                    object_id=review.id,
+                    field="evidence_digests",
+                    reference=evidence_id,
+                )
+            )
 
 
 def _check_evidence_gates(
     by_id: Mapping[str, ScientificObject],
     findings: list[Finding],
+    project_id: str,
 ) -> None:
     for obj in by_id.values():
         if isinstance(obj, Claim):
-            _check_claim_gates(obj, by_id, findings)
+            _check_claim_gates(obj, by_id, findings, project_id)
         elif isinstance(obj, Hypothesis):
             _check_hypothesis_gates(obj, by_id, findings)
 
@@ -307,19 +408,20 @@ def _check_claim_gates(
     claim: Claim,
     by_id: Mapping[str, ScientificObject],
     findings: list[Finding],
+    project_id: str,
 ) -> None:
     if claim.status not in {ClaimStatus.EVIDENCE_LINKED, ClaimStatus.ACCEPTED}:
         return
-    refs = list(claim.evidence or [])
+    refs = list(claim.supporting_evidence or [])
     qualifying = [ref for ref in refs if _id_qualifies(ref, by_id)]
     if claim.status is ClaimStatus.ACCEPTED and not refs:
         findings.append(
             Finding(
                 severity=Severity.ERROR,
                 code=E_ACCEPTED_WITHOUT_EVIDENCE,
-                message=f"{claim.id} is accepted without evidence",
+                message=f"{claim.id} is accepted without supporting evidence",
                 object_id=claim.id,
-                field="evidence",
+                field="supporting_evidence",
             )
         )
     elif not qualifying:
@@ -329,23 +431,34 @@ def _check_claim_gates(
                 code=E_NONQUALIFYING_EVIDENCE,
                 message=(
                     f"{claim.id} status {claim.status} requires at least one "
-                    "qualifying active evidence reference"
+                    "qualifying active supporting evidence reference"
                 ),
                 object_id=claim.id,
-                field="evidence",
+                field="supporting_evidence",
             )
         )
     if claim.status is ClaimStatus.ACCEPTED:
-        _check_claim_review_gate(claim, by_id, findings)
+        _check_claim_review_gate(claim, by_id, findings, project_id)
 
 
 def _check_claim_review_gate(
     claim: Claim,
     by_id: Mapping[str, ScientificObject],
     findings: list[Finding],
+    project_id: str,
 ) -> None:
-    current = subject_digest(claim)
+    """Require a human approval bound to the claim *and* to its evidence.
+
+    A qualifying review matches the claim's current subject digest, covers
+    every currently linked Evidence object, and stores the current digest of
+    each. Anything less leaves an approval that could outlive the science it
+    examined.
+    """
+
+    current = subject_digest(claim, project_id=project_id)
+    linked = _linked_evidence(claim)
     stale_human_approve = False
+    incomplete_coverage = False
     for obj in by_id.values():
         if not isinstance(obj, Review):
             continue
@@ -357,9 +470,29 @@ def _check_claim_review_gate(
             continue
         if obj.reviewer_kind is not ReviewerKind.HUMAN:
             continue
-        if obj.subject_digest == current:
+        if obj.subject_digest != current:
+            stale_human_approve = True
+            continue
+        stored = obj.evidence_digests or {}
+        if set(stored) != linked:
+            incomplete_coverage = True
+            continue
+        if _evidence_digests_match(stored, by_id, project_id):
             return
         stale_human_approve = True
+    if incomplete_coverage:
+        findings.append(
+            Finding(
+                severity=Severity.ERROR,
+                code=E_EVIDENCE_DIGESTS_INCOMPLETE,
+                message=(
+                    f"{claim.id} is accepted but its human approval review "
+                    "does not bind every linked evidence object"
+                ),
+                object_id=claim.id,
+                field="evidence_digests",
+            )
+        )
     if stale_human_approve:
         findings.append(
             Finding(
@@ -367,12 +500,13 @@ def _check_claim_review_gate(
                 code=E_STALE_REVIEW_DIGEST,
                 message=(
                     f"{claim.id} is accepted but its human approval review "
-                    "does not match the current subject digest"
+                    "does not match the current subject and evidence digests"
                 ),
                 object_id=claim.id,
                 field="subject_digest",
             )
         )
+    if incomplete_coverage or stale_human_approve:
         return
     findings.append(
         Finding(
