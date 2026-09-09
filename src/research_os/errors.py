@@ -76,6 +76,18 @@ class CapsuleCreatedRegistryFailedError(ResearchOSError):
     """Raised when init created a capsule but could not register it."""
 
 
+class ReviewBlockedError(ResearchOSError):
+    """Raised when a capsule is not in a state where a review may be recorded.
+
+    Carries the findings that block the review so the caller can render them
+    with the ordinary validation formatter instead of restating them.
+    """
+
+    def __init__(self, message: str, findings: tuple[Finding, ...] = ()) -> None:
+        super().__init__(message)
+        self.findings = findings
+
+
 class Severity(StrEnum):
     """Finding severity for deterministic validation reports."""
 

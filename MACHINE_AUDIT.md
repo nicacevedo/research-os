@@ -24,6 +24,14 @@ Bootstrap validation already showed `uv.lock` valid, `researchctl version`
 `0.1.0`, and `researchctl doctor` passing Python, Git, SQLite, and the four XDG
 directories.
 
+> **Later change (WP-B).** The observation above is left as recorded. Doctor no
+> longer checks for `sqlite3`: the kernel never needed the `sqlite3` executable
+> -- the project registry used Python's bundled `sqlite3` module -- and since
+> WP-B replaced that registry with JSON, the kernel uses no SQLite at all.
+> Current doctor checks the running Python version, `git` on `PATH`, and the
+> four XDG directories. The `sqlite3 3.45.1` row above remains an accurate fact
+> about this host.
+
 ## XDG directories
 
 These directories already exist on this host:

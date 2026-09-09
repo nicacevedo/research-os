@@ -1,7 +1,8 @@
 """Semantic subject digests for Review binding.
 
-This hashes scientifically material content of a reviewed object. It is not
-the M4 whole-capsule ``canonical_source_digest`` and must not hash raw YAML.
+This hashes scientifically material content of a reviewed object. It must not
+hash raw YAML: two files whose bytes differ but whose science is identical have
+the same digest, and a reformatted file does not invalidate a review.
 
 Digests carry an explicit algorithm version and are project-scoped, so a
 changed digest distinguishes changed science from a changed algorithm, and an

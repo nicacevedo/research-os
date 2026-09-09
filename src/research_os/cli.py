@@ -13,17 +13,29 @@ from research_os.capsule import (
     init_project,
     load_project_identity,
     project_status,
+    resolve_object,
     validate_project,
 )
+from research_os.digests import subject_digest
 from research_os.errors import (
     EXIT_ERROR,
     EXIT_OK,
     CapsuleCreatedRegistryFailedError,
+    CapsuleError,
     Finding,
     ResearchOSError,
+    ReviewBlockedError,
 )
+from research_os.models import Reviewable, Verdict
 from research_os.paths import xdg_dir_issue, xdg_dirs
 from research_os.registry import list_projects, register_project
+from research_os.review import (
+    EvidenceEntry,
+    ReviewPacket,
+    build_review,
+    build_review_packet,
+    write_review,
+)
 
 
 def _doctor() -> int:
@@ -38,7 +50,7 @@ def _doctor() -> int:
         )
     )
 
-    for command in ("git", "sqlite3"):
+    for command in ("git",):
         path = shutil.which(command)
         checks.append((command, path is not None, path or "not found"))
 
@@ -111,11 +123,197 @@ def _status(args: argparse.Namespace) -> int:
         print(f"{object_type}: {count}")
     print(f"errors: {report.error_count}")
     print(f"warnings: {report.warning_count}")
-    print(
-        "state.sqlite: "
-        f"{'present' if report.state_sqlite_present else 'absent'}"
-    )
     return EXIT_OK
+
+
+def _digest(args: argparse.Namespace) -> int:
+    report = validate_project(args.path)
+    obj = resolve_object(report, args.object_id)
+    if not isinstance(obj, Reviewable):
+        raise CapsuleError(
+            f"{obj.id} is a {obj.type}; reviews are not reviewable subjects "
+            "and have no semantic digest"
+        )
+    assert report.project is not None  # resolve_object guarantees this
+    print(subject_digest(obj, project_id=report.project.id))
+    return EXIT_OK
+
+
+def _is_interactive() -> bool:
+    """Return whether a person is driving this invocation.
+
+    The single seam the review command consults, so the guard can be exercised
+    deliberately in tests rather than depending on how a runner happens to wire
+    standard input.
+    """
+
+    try:
+        return sys.stdin.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
+def _review(args: argparse.Namespace) -> int:
+    if not _is_interactive():
+        raise CapsuleError(
+            "researchctl review requires an interactive terminal; a "
+            "non-human process must not record a human review."
+        )
+    report = validate_project(args.path)
+    packet = build_review_packet(report, args.object_id)
+    print(_render_packet(packet), end="")
+
+    verdict = _prompt_verdict()
+    if verdict is None:
+        return _cancelled()
+    findings = _prompt_findings()
+    if findings is None:
+        return _cancelled()
+    if not _confirm(
+        f"Write {packet.review_id} as a concluded human {verdict.value} "
+        f"review of {packet.claim.id}?"
+    ):
+        return _cancelled()
+
+    review = build_review(packet, verdict=verdict, findings=findings)
+    target = write_review(packet, review)
+    print(f"Wrote {target.relative_to(packet.git_root).as_posix()}")
+
+    after = validate_project(packet.git_root)
+    print(_validation_human(after.findings, ok=after.ok), end="")
+    return EXIT_OK if after.ok else EXIT_ERROR
+
+
+def _cancelled() -> int:
+    print("cancelled: no review written", file=sys.stderr)
+    return EXIT_ERROR
+
+
+_VERDICTS: tuple[tuple[str, Verdict | None], ...] = (
+    ("approve", Verdict.APPROVE),
+    ("revise", Verdict.REVISE),
+    ("reject", Verdict.REJECT),
+    ("cancel", None),
+)
+
+
+def _prompt_verdict() -> Verdict | None:
+    """Prompt until the reviewer names one verdict, or cancels.
+
+    Accepts a full word or an unambiguous prefix. A bare ``r`` matches both
+    ``revise`` and ``reject``, so it is re-prompted rather than guessed.
+    """
+
+    while True:
+        raw = _ask("Verdict [approve/revise/reject/cancel]: ")
+        if raw is None:
+            return None
+        answer = raw.strip().lower()
+        matches = [item for item in _VERDICTS if item[0].startswith(answer)]
+        if answer and len(matches) == 1:
+            return matches[0][1]
+        print(
+            "  please answer approve, revise, reject, or cancel",
+            file=sys.stderr,
+        )
+
+
+def _prompt_findings() -> str | None:
+    """Collect the reviewer's findings, terminated by an empty line."""
+
+    while True:
+        print("Findings (required; end with an empty line):")
+        lines: list[str] = []
+        while True:
+            raw = _ask("> ")
+            if raw is None:
+                return None
+            if not raw.strip():
+                break
+            lines.append(raw.rstrip())
+        findings = "\n".join(lines).strip()
+        if findings:
+            return findings
+        print("  findings are required for a concluded review", file=sys.stderr)
+
+
+def _confirm(question: str) -> bool:
+    raw = _ask(f"{question} [y/N]: ")
+    if raw is None:
+        return False
+    return raw.strip().lower() in {"y", "yes"}
+
+
+def _ask(prompt: str) -> str | None:
+    """Read one line, treating end-of-input or interruption as a cancellation."""
+
+    try:
+        return input(prompt)
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+
+
+def _render_packet(packet: ReviewPacket) -> str:
+    """Render everything the reviewer is about to bind.
+
+    Digests print in full: the digest is the artifact being bound, and an
+    abbreviated hash invites a false sense of having checked it.
+    """
+
+    claim = packet.claim
+    lines = [
+        "",
+        f"Review packet \u2014 project {packet.project_id}",
+        "",
+        f"claim         {claim.id}  (status: {claim.status})",
+        f"title         {claim.title}",
+        f"statement     {claim.statement}",
+        f"digest        {packet.claim_digest}",
+    ]
+    for reference, title in packet.hypotheses:
+        suffix = f"  {title}" if title else ""
+        lines.append(f"hypotheses    {reference}{suffix}")
+
+    lines.extend(_render_evidence("supporting evidence", packet.supporting))
+    lines.extend(_render_evidence("contrary evidence", packet.contrary))
+
+    if claim.contrary_evidence_addressed is not None:
+        lines.extend(
+            ["", "contrary evidence addressed", f"  {claim.contrary_evidence_addressed}"]
+        )
+    if packet.warnings:
+        lines.append("")
+        lines.append("warnings")
+        for finding in packet.warnings:
+            lines.append(f"  {_format_finding(finding)}")
+
+    count = packet.evidence_count
+    plural = "digest" if count == 1 else "digests"
+    lines.extend(
+        [
+            "",
+            f"This review will bind the claim digest and all {count} evidence",
+            f"{plural} shown above. Changing any of that content afterwards",
+            "invalidates the approval.",
+            "",
+        ]
+    )
+    return "\n".join(lines) + "\n"
+
+
+def _render_evidence(heading: str, entries: Sequence[EvidenceEntry]) -> list[str]:
+    if not entries:
+        return ["", f"{heading} (none)"]
+    lines = ["", f"{heading} ({len(entries)})"]
+    for entry in entries:
+        lines.append(f"  {entry.id}  {entry.status}  {entry.kind}")
+        lines.append(f"    title       {entry.title}")
+        lines.append(f"    statement   {entry.statement}")
+        for label, value in entry.pointers():
+            lines.append(f"    {label:<11} {value}")
+        lines.append(f"    digest      {entry.digest}")
+    return lines
 
 
 def _validation_human(findings: Sequence[Finding], *, ok: bool) -> str:
@@ -206,6 +404,20 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Show file-derived capsule status.",
     )
     status_parser.add_argument("path", nargs="?", default=".")
+
+    digest_parser = subparsers.add_parser(
+        "digest",
+        help="Print the current project-scoped semantic digest of an object.",
+    )
+    digest_parser.add_argument("object_id", metavar="OBJECT-ID")
+    digest_parser.add_argument("path", nargs="?", default=".")
+
+    review_parser = subparsers.add_parser(
+        "review",
+        help="Record a human Review of a claim through an interactive prompt.",
+    )
+    review_parser.add_argument("object_id", metavar="CLAIM-ID")
+    review_parser.add_argument("path", nargs="?", default=".")
     return parser
 
 
@@ -234,9 +446,18 @@ def main() -> None:
             code = _projects(args)
         elif args.command == "status":
             code = _status(args)
+        elif args.command == "digest":
+            code = _digest(args)
+        elif args.command == "review":
+            code = _review(args)
         else:
             parser.print_help()
             return
+    except ReviewBlockedError as exc:
+        if exc.findings:
+            print(_validation_human(exc.findings, ok=False), end="")
+        print(str(exc), file=sys.stderr)
+        raise SystemExit(EXIT_ERROR) from None
     except ResearchOSError as exc:
         print(str(exc), file=sys.stderr)
         raise SystemExit(EXIT_ERROR) from None

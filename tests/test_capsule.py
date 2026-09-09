@@ -12,6 +12,8 @@ from research_os.capsule import (
     CHARTER_TEMPLATE,
     STATE_TEMPLATE,
     init_project,
+    load_project_identity,
+    resolve_object,
     validate_project,
 )
 from research_os.digests import subject_digest
@@ -27,7 +29,9 @@ from research_os.errors import (
     E_WRONG_OBJECT_DIRECTORY,
     E_YAML_PARSE,
     W_RESERVED_DIRECTORY,
+    CapsuleError,
     CapsuleExistsError,
+    InvalidIdError,
     NotAGitRepositoryError,
     ProjectIdRequiredError,
     Severity,
@@ -40,6 +44,7 @@ from tests.fs_helpers import (
     make_git_repo,
     question_data,
     snapshot_files,
+    write_bytes,
     write_minimal_capsule,
     write_text,
     write_yaml,
@@ -526,3 +531,161 @@ def test_valid_experiment_loads(tmp_path: Path, data_home: Path) -> None:
     report = validate_project(repo)
     assert report.ok
     assert [obj.id for obj in report.objects] == ["EXP-0001"]
+
+
+# --- strict UTF-8 boundary ------------------------------------------------
+#
+# Canonical YAML is UTF-8. Bytes that are not must surface as an ordinary
+# finding: before this was fixed, UnicodeDecodeError (a ValueError, not an
+# OSError) escaped every boundary in the loader and printed a traceback.
+#
+# These repositories deliberately contain a non-UTF-8 file, so none of them may
+# be passed to snapshot_files, which reads every file as UTF-8 text.
+
+LATIN1_QUESTION = (
+    b"id: Q-0001\n"
+    b"type: question\n"
+    b"schema_version: 1\n"
+    b"status: open\n"
+    b"title: caf\xe9 latin-1\n"
+    b"statement: Why does this happen?\n"
+)
+
+
+def test_non_utf8_object_file_is_yaml_parse_error(tmp_path: Path) -> None:
+    repo = make_git_repo(tmp_path / "sample-project")
+    write_minimal_capsule(repo)
+    write_bytes(repo / ".research" / "questions" / "Q-0001.yaml", LATIN1_QUESTION)
+    report = validate_project(repo)
+    assert not report.ok
+    assert E_YAML_PARSE in _codes(report)
+    assert report.objects == ()
+    finding = next(item for item in report.findings if item.code == E_YAML_PARSE)
+    assert finding.source == ".research/questions/Q-0001.yaml"
+    assert "not valid UTF-8" in finding.message
+    assert "invalid continuation byte" in finding.message
+
+
+def test_non_utf8_project_yaml_is_error_and_skips_object_validation(
+    tmp_path: Path,
+) -> None:
+    """A project whose identity cannot be read must not validate objects.
+
+    Cross-object validation is project-scoped, so running it without identity
+    would silently drop the review and digest guarantees.
+    """
+
+    repo = make_git_repo(tmp_path / "sample-project")
+    write_minimal_capsule(repo)
+    write_yaml(
+        repo / ".research" / "claims" / "CLAIM-0001.yaml",
+        claim_data(status="accepted", supporting_evidence=["EVI-0001"]),
+    )
+    write_bytes(
+        repo / ".research" / "project.yaml",
+        b"id: sample-project\ntitle: caf\xe9\ncapsule_version: 1\nstatus: active\n",
+    )
+    report = validate_project(repo)
+    assert not report.ok
+    assert report.project is None
+    assert E_YAML_PARSE in _codes(report)
+    assert E_ACCEPTED_WITHOUT_HUMAN_REVIEW not in _codes(report)
+
+
+def test_non_utf8_project_yaml_registration_fails_cleanly(tmp_path: Path) -> None:
+    repo = make_git_repo(tmp_path / "sample-project")
+    write_minimal_capsule(repo)
+    write_bytes(
+        repo / ".research" / "project.yaml",
+        b"id: sample-project\ntitle: caf\xe9\ncapsule_version: 1\nstatus: active\n",
+    )
+    with pytest.raises(CapsuleError) as exc:
+        load_project_identity(repo)
+    assert not isinstance(exc.value, UnicodeDecodeError)
+    assert ".research/project.yaml" in str(exc.value)
+    assert "not valid UTF-8" in str(exc.value)
+
+
+def test_non_utf8_bytes_are_never_reinterpreted(tmp_path: Path) -> None:
+    """The loader must not fall back to another encoding.
+
+    0xe9 is a valid Latin-1 'e-acute'. Decoding it that way would let malformed
+    canonical files parse into subtly wrong science, so it stays an error.
+    """
+
+    repo = make_git_repo(tmp_path / "sample-project")
+    write_minimal_capsule(repo)
+    write_bytes(repo / ".research" / "questions" / "Q-0001.yaml", LATIN1_QUESTION)
+    report = validate_project(repo)
+    assert report.objects == ()
+    assert not any("café" in (item.message or "") for item in report.findings)
+
+
+# --- resolve_object -------------------------------------------------------
+
+
+def _capsule_with_claim(repo: Path) -> None:
+    write_minimal_capsule(repo)
+    write_yaml(repo / ".research" / "claims" / "CLAIM-0001.yaml", claim_data())
+
+
+def test_resolve_object_returns_the_parsed_object(tmp_path: Path) -> None:
+    repo = make_git_repo(tmp_path / "sample-project")
+    _capsule_with_claim(repo)
+    obj = resolve_object(validate_project(repo), "CLAIM-0001")
+    assert obj.id == "CLAIM-0001"
+
+
+def test_resolve_object_rejects_malformed_id(tmp_path: Path) -> None:
+    repo = make_git_repo(tmp_path / "sample-project")
+    _capsule_with_claim(repo)
+    with pytest.raises(InvalidIdError):
+        resolve_object(validate_project(repo), "CLAIM-1")
+
+
+def test_resolve_object_rejects_unknown_object(tmp_path: Path) -> None:
+    repo = make_git_repo(tmp_path / "sample-project")
+    _capsule_with_claim(repo)
+    with pytest.raises(CapsuleError, match="no object CLAIM-0009"):
+        resolve_object(validate_project(repo), "CLAIM-0009")
+
+
+def test_resolve_object_rejects_missing_project_identity(tmp_path: Path) -> None:
+    repo = make_git_repo(tmp_path / "sample-project")
+    _capsule_with_claim(repo)
+    write_text(repo / ".research" / "project.yaml", "id: Not A Slug\n")
+    with pytest.raises(CapsuleError, match="cannot determine project identity"):
+        resolve_object(validate_project(repo), "CLAIM-0001")
+
+
+def test_resolve_object_rejects_duplicate_id(tmp_path: Path) -> None:
+    """A duplicated id must fail loudly rather than resolve arbitrarily.
+
+    Cross-object validation drops such ids from its own map, but both copies
+    remain in report.objects, so the lookup has to detect the multiplicity
+    itself. Filename/id binding makes this unreachable from a capsule on disk --
+    two files cannot share a stem in one directory, and a mismatched stem is
+    already an error that loads no object -- so the guard is exercised against a
+    constructed report, which is all resolve_object reads.
+    """
+
+    from research_os.capsule import ProjectValidationReport
+    from research_os.models import Project
+    from tests.helpers import make_claim
+
+    project = Project.model_validate(
+        {
+            "id": "sample-project",
+            "title": "sample-project",
+            "capsule_version": 1,
+            "status": "active",
+        }
+    )
+    report = ProjectValidationReport(
+        git_root=tmp_path,
+        capsule=tmp_path / ".research",
+        project=project,
+        objects=(make_claim(), make_claim(statement="A different statement.")),
+    )
+    with pytest.raises(CapsuleError, match="duplicate object id CLAIM-0001"):
+        resolve_object(report, "CLAIM-0001")

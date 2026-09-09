@@ -2,24 +2,54 @@
 
 This repository is the Research OS kernel. It is not an individual science project.
 
-Before significant work:
+## Live authority
 
-1. Read `DESIGN_INVARIANTS.md` (architectural constitution).
-2. Read `ARCHITECTURE.md`.
-3. Read `SECURITY.md`.
-4. Read the currently approved release plan (`docs/plans/R0_KERNEL_PLAN.md` while R0 is active).
-5. Work only on the currently authorized milestone.
+Read these, in this order, before significant work:
 
-Operating rules:
+1. `DESIGN_INVARIANTS.md` — architectural constitution.
+2. `ARCHITECTURE.md` — system boundaries and responsibilities.
+3. `docs/CAPSULE.md` — the live Research Capsule specification: layout, object
+   schemas, IDs, lifecycle, semantic digests, and the Claim acceptance rule.
+4. `SECURITY.md` — secrets, privilege, and provider boundaries.
+5. `ROADMAP.md` — release sequence and current implementation state.
 
-6. Git-tracked YAML and Markdown under a project's `.research/` directory are canonical scientific state.
-7. SQLite indexes, caches, and `project_registry.sqlite` are rebuildable and noncanonical.
+`docs/CAPSULE.md` is authoritative on anything scientific. Where any other
+document disagrees with it, it wins.
+
+Everything under `docs/plans/` is **historical**. Those documents record what was
+approved at a point in time, are not rewritten to match later decisions, and must
+never be implemented from. Do not treat a plan as the current contract.
+
+## Human review
+
+Scientific approval is a human act. Concretely:
+
+> Automated agents must not invoke `researchctl review`, must not respond to its
+> interactive prompts on behalf of the researcher, and must not author a Review
+> with `reviewer_kind: human`. Human Reviews require the researcher's direct
+> interaction.
+
+`researchctl review` requires an interactive terminal. That is a usability and
+safety guard, not proof of human identity: it makes unattended approval
+inconvenient and obvious, and it does not authenticate anyone. The boundary above
+is policy, and it binds agents regardless of what the terminal permits. An agent
+may prepare evidence, draft findings text for a person to review and edit, and
+run every read-only command; it may not record the approval.
+
+## Operating rules
+
+6. Git-tracked YAML and Markdown under a project's `.research/` directory are
+   canonical scientific state.
+7. The global project registry is rebuildable, noncanonical discovery metadata.
+   Deleting it must never alter project files.
 8. Never run `sudo` or modify host packages without explicit human authorization.
 9. Never manipulate firmware, UEFI, MOK, or Secure Boot.
 10. Never expose or commit secrets.
 11. Never opportunistically implement later-release functionality.
-12. Run deterministic validation and tests before stopping.
+12. Before stopping, run `uv run pytest`, `uv run ruff check .`, and
+    `uv run ruff format --check .`. All three must pass.
 13. Never push, merge, or enable persistent services unless explicitly instructed.
-14. Stop after the approved milestone.
+14. Stop after the approved work package.
 
-Do not invent configuration, schemas, or commands that the current milestone does not authorize.
+Do not invent configuration, schemas, or commands that the current work package
+does not authorize.

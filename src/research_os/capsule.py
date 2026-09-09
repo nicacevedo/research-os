@@ -38,7 +38,7 @@ from research_os.errors import (
     Severity,
     ValidationReport,
 )
-from research_os.ids import object_type_from_id, validate_project_id
+from research_os.ids import object_type_from_id, validate_id, validate_project_id
 from research_os.models import Project, ScientificObject, parse_object
 from research_os.validate import validate_objects
 
@@ -151,7 +151,6 @@ class ProjectStatusReport:
     object_counts: dict[str, int]
     error_count: int
     warning_count: int
-    state_sqlite_present: bool
     findings: tuple[Finding, ...] = ()
 
 
@@ -261,7 +260,9 @@ def load_project_identity(path: Path | str) -> tuple[Path, Project]:
     if not _contained(project_file, git_root):
         raise CapsuleError(f"unsafe path: { _rel(project_file, git_root) }")
     try:
-        document = load_yaml_mapping(project_file)
+        document = load_yaml_mapping(
+            project_file, source=_rel(project_file, git_root)
+        )
     except DuplicateYamlKeyError as exc:
         raise CapsuleError(
             f"duplicate YAML mapping key in {_rel(project_file, git_root)}: {exc.key!r}"
@@ -342,7 +343,11 @@ def validate_project(path: Path | str = ".") -> ProjectValidationReport:
 
 
 def project_status(path: Path | str = ".") -> ProjectStatusReport:
-    """Return file-derived capsule status. Does not create runtime or registry."""
+    """Return file-derived capsule status. Does not create runtime or registry.
+
+    Canonical files are the only project scientific state; there is no
+    materialized project index to report on.
+    """
 
     report = validate_project(path)
     if report.project is None:
@@ -350,26 +355,73 @@ def project_status(path: Path | str = ".") -> ProjectStatusReport:
     counts = {object_type: 0 for object_type in _OBJECT_TYPE_ORDER}
     for obj in report.objects:
         counts[str(obj.type)] = counts.get(str(obj.type), 0) + 1
-    state_sqlite = report.git_root / ".research" / "runtime" / "state.sqlite"
-    present = state_sqlite.is_file()
     return ProjectStatusReport(
         git_root=report.git_root,
         project=report.project,
         object_counts=counts,
         error_count=len(report.errors),
         warning_count=len(report.warnings),
-        state_sqlite_present=present,
         findings=report.findings,
     )
 
 
-def load_yaml_mapping(path: Path) -> _YamlDocument:
-    """Load a single YAML mapping with SafeLoader semantics and unique keys."""
+def resolve_object(
+    report: ProjectValidationReport,
+    object_id: str,
+) -> ScientificObject:
+    """Return the single parsed object named ``object_id`` in ``report``.
 
+    The shared lookup behind ``digest`` and ``review``. Raises ``CapsuleError``
+    when project identity is unavailable, when nothing parsed under that id, or
+    when the id is duplicated. A duplicated id must fail loudly rather than
+    resolve arbitrarily: cross-object validation drops such ids from its own
+    map, but both copies remain in ``report.objects``.
+    """
+
+    validate_id(object_id)
+    if report.project is None:
+        raise CapsuleError(
+            "cannot determine project identity from .research/project.yaml; "
+            "run researchctl validate-project"
+        )
+    matches = [obj for obj in report.objects if obj.id == object_id]
+    if len(matches) > 1:
+        raise CapsuleError(
+            f"duplicate object id {object_id} in project {report.project.id}"
+        )
+    if not matches:
+        for finding in report.errors:
+            if finding.object_id == object_id:
+                raise CapsuleError(
+                    f"{object_id} in project {report.project.id} failed "
+                    "validation and cannot be used; run researchctl "
+                    "validate-project"
+                )
+        raise CapsuleError(f"no object {object_id} in project {report.project.id}")
+    return matches[0]
+
+
+def load_yaml_mapping(path: Path, *, source: str | None = None) -> _YamlDocument:
+    """Load a single YAML mapping with SafeLoader semantics and unique keys.
+
+    Canonical YAML is UTF-8. Bytes that are not valid UTF-8 are a controlled
+    ``CapsuleError``, never a bare ``UnicodeDecodeError``: the kernel does not
+    guess charsets, fall back to Latin-1, or transcode canonical files.
+    ``source`` overrides the path shown in failure messages so callers can
+    report a repository-relative location.
+    """
+
+    label = source if source is not None else str(path)
     try:
-        text = path.read_text(encoding="utf-8")
+        raw = path.read_bytes()
     except OSError as exc:
-        raise CapsuleError(f"cannot read {path}: {exc}") from exc
+        raise CapsuleError(f"cannot read {label}: {exc}") from exc
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise CapsuleError(
+            f"{label} is not valid UTF-8: {exc.reason} at byte {exc.start}"
+        ) from exc
     try:
         documents = list(yaml.load_all(text, Loader=UniqueKeySafeLoader))
     except DuplicateYamlKeyError:
@@ -947,7 +999,7 @@ def _load_mapping_file(
 ) -> dict[str, Any] | None:
     source = _rel(path, git_root)
     try:
-        document = load_yaml_mapping(path)
+        document = load_yaml_mapping(path, source=source)
     except DuplicateYamlKeyError as exc:
         findings.append(
             Finding(

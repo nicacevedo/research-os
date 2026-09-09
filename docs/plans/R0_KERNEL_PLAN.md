@@ -1,24 +1,45 @@
-# R0 Kernel — Implementation Contract
+# R0 Kernel — Implementation Contract (HISTORICAL)
 
 ```text
-Status: HUMAN-APPROVED FOR R0 IMPLEMENTATION
+Status: HISTORICAL — SUPERSEDED. Do not implement from this document.
 Approved: 2026-09-08
+Superseded by: docs/CAPSULE.md (live specification)
 Scope: R0 Kernel only
 ```
 
-This file is the version-controlled implementation contract for Research OS R0.
-It is the complete final human-approved plan. Scientific decisions in the plan
-body are frozen and must not be reinterpreted during implementation.
+This file is the plan of record that was approved on 2026-09-08. It is kept as
+history and is **not** the current contract. The live specification is
+`docs/CAPSULE.md`, which is authoritative wherever this document disagrees. The
+instructions in this document — including the "STOP, do not implement"
+directives it opens and closes with — describe the state of the work in
+September 2026 and are no longer operative.
 
-> **HISTORICAL NOTE (WP-A).** Milestones M1-M3 have since been implemented, and
-> the WP-A scientific-integrity corrections changed parts of the schema and
-> digest specification recorded below. **`docs/CAPSULE.md` is authoritative
-> wherever it and this document disagree.** The sections below are preserved as
-> the approved plan of record and are deliberately **not** rewritten to look
-> retroactively consistent. Known superseded points: the semantic-digest
-> specification in section 7 (see the marker there) and the flat Claim
-> `evidence` field, now `supporting_evidence` / `contrary_evidence` /
-> `contrary_evidence_addressed`.
+> **HISTORICAL NOTE.** Milestones M1-M3 have since been implemented, followed by
+> WP-A (scientific-integrity corrections) and WP-B (usability and kernel
+> simplification). **`docs/CAPSULE.md` is authoritative wherever it and this
+> document disagree.** The sections below are preserved as the approved plan of
+> record and are deliberately **not** rewritten to look retroactively
+> consistent.
+>
+> Superseded by **WP-A**: the semantic-digest specification in section 7 (digests
+> are now versioned and project-scoped, and the projection includes `id` and
+> `project`); the flat Claim `evidence` field, now `supporting_evidence` /
+> `contrary_evidence` / `contrary_evidence_addressed`; the qualifying-review
+> test, which now also requires complete `evidence_digests` coverage; and the
+> Experiment schema, which now requires preregistration (`predictions`,
+> `primary_metrics`, `decision_rule`) for non-draft statuses. In-body markers
+> flag these where they occur.
+>
+> Superseded by **WP-B**: the SQLite project registry (section 9), now atomic
+> JSON; the project-local materialized index and `rebuild-index` (section 8),
+> withdrawn from R0 entirely along with `canonical_source_digest`; the
+> transition-graph module (`transitions.py`), removed as it had no caller, with
+> the lifecycle semantics kept in `docs/CAPSULE.md`; and the CLI inventory, which
+> now also includes `digest` and `review`.
+>
+> Section 4's target repository tree describes several files that were never
+> created (`index.py`, `test_index.py`, `test_isolation.py`,
+> `test_integration_rebuild.py`, `test_failures.py`, `tests/fixtures/`).
 
 ---
 
@@ -166,6 +187,11 @@ Statuses: `draft|active|testing|supported|rejected|inconclusive|withdrawn|supers
 
 **Qualifying EVI** (see Evidence rules): `supported` needs ≥1 qualifying supporting EVI; `rejected` ≥1 qualifying contrary EVI; `inconclusive` ≥1 qualifying EVI in the union of those lists.
 
+> **SUPERSEDED BY WP-A.** The flat `evidence` field below no longer exists. A
+> Claim now carries `supporting_evidence`, `contrary_evidence`, and
+> `contrary_evidence_addressed`; a capsule using `evidence:` fails as
+> `E_SCHEMA`. See `docs/CAPSULE.md`.
+
 ### Claim
 
 Required: `statement`. Optional: `evidence`, `hypotheses`. Statuses: `draft|evidence_linked|accepted|withdrawn|superseded`.
@@ -177,9 +203,17 @@ Required: `statement`. Optional: `evidence`, `hypotheses`. Statuses: `draft|evid
 
 `statement`, `rationale`; `alternatives_considered` required when `accepted`. Statuses: `proposed|accepted|withdrawn|superseded`.
 
+> **SUPERSEDED BY WP-A.** Non-draft Experiments now require preregistration:
+> `predictions`, `primary_metrics`, and `decision_rule`. See `docs/CAPSULE.md`.
+
 ### Experiment
 
 `purpose`; `hypotheses` required when not `draft`. Statuses: `draft|specified|running|completed|failed|withdrawn|superseded`. No `audited`. Completed requires `provenance.{code,config,data,git_commit}`; optional pointer-only `result_manifest`, `artifacts`.
+
+> **SUPERSEDED BY WP-A.** `subject_digest` is now a versioned, project-scoped
+> `1:<64 hex>` value, not a bare hex digest, and a qualifying human Review must
+> also carry complete `evidence_digests` coverage of the Claim's linked
+> Evidence. See `docs/CAPSULE.md`.
 
 ### Review
 
@@ -304,6 +338,10 @@ Package `0.1.0` until R0 accepted; `capsule_version: 1`; object `schema_version:
 
 ---
 
+> **SUPERSEDED BY WP-B.** The project-local materialized index, `rebuild-index`,
+> and `canonical_source_digest` were withdrawn from R0. Canonical Git-tracked
+> files are the only project scientific state.
+
 ## 8. SQLite materialized-index design
 
 `.research/runtime/state.sqlite`. Tables `meta`, `objects`, `refs` as before. `payload_json` may include computed `semantic_digest` as cache only.
@@ -332,6 +370,9 @@ If dirty, `git_commit` is not a complete identity of indexed bytes.
 Rebuild: validate ERROR-free → `state.sqlite.new` → checks → `os.replace`. Files win. No permissive mode.
 
 ---
+
+> **SUPERSEDED BY WP-B.** The project registry is atomic JSON
+> (`project_registry.json`); the kernel uses no SQLite.
 
 ## 9. Global project-registry design
 
