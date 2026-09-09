@@ -34,7 +34,7 @@ from research_os.models import (
     ScientificObject,
     Verdict,
 )
-from research_os.validate import validate_objects
+from research_os.validate import referenced_experiments, validate_objects
 
 REVIEWS_DIRECTORY = "reviews"
 
@@ -89,6 +89,49 @@ class EvidenceEntry:
 
 
 @dataclass(frozen=True, slots=True)
+class ExperimentEntry:
+    """One Experiment the review will bind, as the reviewer needs to see it.
+
+    Every digest-material field is carried, because the packet's job is to show
+    exactly what the digest binds. In real capsules the disclosure that an
+    experiment was reconstructed rather than preregistered lives inside these
+    fields -- ``notes`` is outside every projection -- so abbreviating them would
+    hide the one thing a reviewer most needs to see.
+    """
+
+    id: str
+    status: str
+    title: str
+    purpose: str
+    digest: str
+    hypotheses: tuple[str, ...] = ()
+    predictions: tuple[tuple[str, bool, str], ...] = ()
+    primary_metrics: tuple[str, ...] = ()
+    decision_rule: str | None = None
+    provenance: tuple[tuple[str, str], ...] = ()
+    result_manifest: str | None = None
+    artifacts: tuple[str, ...] = ()
+
+    def fields(self) -> tuple[tuple[str, str], ...]:
+        """Return the single-line digest-material fields as label/value pairs.
+
+        Absent optionals are omitted rather than rendered as placeholders, the
+        same convention ``EvidenceEntry.pointers`` uses.
+        """
+
+        pairs: list[tuple[str, str]] = []
+        if self.hypotheses:
+            pairs.append(("hypotheses", ", ".join(self.hypotheses)))
+        if self.primary_metrics:
+            pairs.append(("primary_metrics", ", ".join(self.primary_metrics)))
+        if self.decision_rule is not None:
+            pairs.append(("decision_rule", self.decision_rule))
+        if self.result_manifest is not None:
+            pairs.append(("result_manifest", self.result_manifest))
+        return tuple(pairs)
+
+
+@dataclass(frozen=True, slots=True)
 class ReviewPacket:
     """Everything a human needs in order to review one Claim knowingly."""
 
@@ -99,6 +142,8 @@ class ReviewPacket:
     supporting: tuple[EvidenceEntry, ...]
     contrary: tuple[EvidenceEntry, ...]
     evidence_digests: dict[str, str]
+    experiments: tuple[ExperimentEntry, ...]
+    experiment_digests: dict[str, str]
     hypotheses: tuple[tuple[str, str], ...]
     review_id: str
     objects: tuple[ScientificObject, ...]
@@ -113,6 +158,16 @@ class ReviewPacket:
         """
 
         return len(self.evidence_digests)
+
+    @property
+    def experiment_count(self) -> int:
+        """Return how many Experiment digests this review will bind.
+
+        Derived from the complete digest map for the same reason as
+        ``evidence_count``.
+        """
+
+        return len(self.experiment_digests)
 
     def entries(self) -> tuple[EvidenceEntry, ...]:
         return (*self.supporting, *self.contrary)
@@ -148,6 +203,11 @@ def build_review_packet(
     evidence_digests = {entry.id: entry.digest for entry in (*supporting, *contrary)}
     _assert_complete_coverage(obj, evidence_digests)
 
+    required = referenced_experiments(obj, by_id)
+    experiments = _experiment_entries(required, by_id, project_id)
+    experiment_digests = {entry.id: entry.digest for entry in experiments}
+    _assert_complete_experiment_coverage(obj, required, experiment_digests)
+
     return ReviewPacket(
         git_root=report.git_root,
         project_id=project_id,
@@ -156,6 +216,8 @@ def build_review_packet(
         supporting=supporting,
         contrary=contrary,
         evidence_digests=evidence_digests,
+        experiments=experiments,
+        experiment_digests=experiment_digests,
         hypotheses=_hypothesis_titles(obj, by_id),
         review_id=next_id("REV", (item.id for item in report.objects)),
         objects=report.objects,
@@ -192,6 +254,7 @@ def build_review(
             "verdict": verdict.value,
             "subject_digest": packet.claim_digest,
             "evidence_digests": dict(sorted(packet.evidence_digests.items())),
+            "experiment_digests": dict(sorted(packet.experiment_digests.items())),
         }
     )
 
@@ -302,6 +365,75 @@ def _evidence_entries(
             )
         )
     return tuple(entries)
+
+
+def _experiment_entries(
+    required: frozenset[str],
+    by_id: dict[str, ScientificObject],
+    project_id: str,
+) -> tuple[ExperimentEntry, ...]:
+    """Project each bound Experiment, ordered by id so the packet is stable."""
+
+    entries: list[ExperimentEntry] = []
+    for ref in sorted(required):
+        target = by_id.get(ref)
+        if not isinstance(target, Experiment):
+            raise CapsuleError(
+                f"experiment {ref} is missing or is not an experiment object; "
+                "run researchctl validate-project"
+            )
+        entries.append(
+            ExperimentEntry(
+                id=target.id,
+                status=str(target.status),
+                title=target.title,
+                purpose=target.purpose,
+                digest=subject_digest(target, project_id=project_id),
+                hypotheses=tuple(target.hypotheses or ()),
+                predictions=tuple(
+                    (item.hypothesis, item.discriminates, item.predicted_outcome)
+                    for item in target.predictions or ()
+                ),
+                primary_metrics=tuple(target.primary_metrics or ()),
+                decision_rule=target.decision_rule,
+                provenance=_provenance_pairs(target),
+                result_manifest=target.result_manifest,
+                artifacts=tuple(target.artifacts or ()),
+            )
+        )
+    return tuple(entries)
+
+
+def _provenance_pairs(experiment: Experiment) -> tuple[tuple[str, str], ...]:
+    """Return provenance as label/value pairs, or empty when it is absent."""
+
+    provenance = experiment.provenance
+    if provenance is None:
+        return ()
+    return (
+        ("code", provenance.code),
+        ("config", provenance.config),
+        ("data", provenance.data),
+        ("git_commit", provenance.git_commit),
+    )
+
+
+def _assert_complete_experiment_coverage(
+    claim: Claim,
+    required: frozenset[str],
+    experiment_digests: dict[str, str],
+) -> None:
+    """Guard the experiment coverage rule at the point the map is built.
+
+    The gate requires exactly the Experiments the claim's linked evidence
+    reaches, so the map the reviewer confirms must be that set and no other.
+    """
+
+    if set(experiment_digests) != required:
+        raise CapsuleError(
+            f"internal error: experiment digest map for {claim.id} covers "
+            f"{sorted(experiment_digests)}, expected {sorted(required)}"
+        )
 
 
 def _assert_complete_coverage(claim: Claim, evidence_digests: dict[str, str]) -> None:

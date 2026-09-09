@@ -10,9 +10,11 @@ Package version remains `0.1.0` until R0 is accepted.
 `capsule_version` is `1`. Object `schema_version` is `1`.
 
 WP-A corrected schema v1 **in place**, before any real research capsule
-existed, so nothing needed migrating. Beginning with the first persisted real
-capsule, scientifically material schema changes require an explicit version
-bump and a reviewable migration. See **Schema-version boundaries**.
+existed, so nothing needed migrating. The R0 dogfood integrity patch made the
+second and final such correction, under the same precondition and with the same
+verification. Beginning with the first persisted real capsule, scientifically
+material schema changes require an explicit version bump and a reviewable
+migration. See **Schema-version boundaries**.
 
 ## Capsule layout
 
@@ -218,9 +220,21 @@ decision_rule: >
   primary metric, without parsing prose.
 - `decision_rule` — non-empty statement of how the observed primary
   metric changes support for the tested hypotheses.
+There is **no** structured field distinguishing commitments frozen in advance
+from commitments reconstructed after execution. R0 does not model that
+difference, so the three fields above look identical either way and the
+preregistration requirement certifies less than it may appear to. The first real
+capsule handles this by writing the disclosure into the digest-material text
+itself — an explicit `[PRESPECIFIED]` or `[RECONSTRUCTED]` marker inside
+`predicted_outcome` and `decision_rule` — which is bound by the Experiment
+digest, and therefore by any Review that binds the Experiment. Whether that
+convention should become a schema field is a **dogfood-watch item**: it needs a
+second real project before the schema changes, because adding a required
+Experiment field would break every existing manifest.
 
 No metric registry, no secondary-outcome framework, no power analysis, no
-statistical-analysis DSL, no analysis-plan object.
+statistical-analysis DSL, no analysis-plan object. No timestamps, no
+cryptographic attestation, and no registration authority.
 
 #### Provenance
 
@@ -262,13 +276,17 @@ provenance:
 - **REV-of-REV: ERROR**
 - **Optional:** `findings`, `verdict` (`approve` | `reject` | `revise`),
   `subject_digest` (versioned digest, `1:<64-char lowercase hex>`),
-  `evidence_digests` (map of EVI- ID to versioned digest)
+  `evidence_digests` (map of EVI- ID to versioned digest),
+  `experiment_digests` (map of EXP- ID to versioned digest)
 - **When `concluded`:** `findings`, `verdict`, and `subject_digest` are required
 - Draft/submitted: `subject_digest` optional; if present it is stored but is
   not an acceptance gate
 - `evidence_digests` is valid **only** when `subject` is a Claim; every key
   must be an Evidence ID that the reviewed Claim links, in either polarity,
   otherwise **ERROR** `E_EVIDENCE_DIGEST_UNLINKED`
+- `experiment_digests` is valid **only** when `subject` is a Claim; every key
+  must be an Experiment the Claim reaches through a linked experiment-kind
+  Evidence object, otherwise **ERROR** `E_EXPERIMENT_DIGEST_UNLINKED`
 - **Status:** `draft` | `submitted` | `concluded` | `withdrawn`
 - Reviews do **not** use `supersedes`. If `supersedes` is present on a Review:
   **ERROR**
@@ -282,9 +300,27 @@ evidence_digests:
   EVI-0002: "1:<64 hex>"
 ```
 
+`experiment_digests` records the digest of each Experiment standing behind that
+evidence:
+
+```yaml
+experiment_digests:
+  EXP-0001: "1:<64 hex>"
+```
+
+The set is derived from the Claim, not authored freely: it is every Experiment
+named by a linked experiment-kind Evidence object, in either polarity and
+regardless of Evidence status. An Experiment reached through several Evidence
+objects is bound **once**. Absent and `{}` mean the same thing — this review
+bound no Experiments — so a Claim resting on literature alone needs no entry;
+`researchctl review` still writes `experiment_digests: {}` there, so the record
+says so affirmatively.
+
 Reviews have **no** semantic digest of their own, because a Review is not a
-reviewable subject. `evidence_digests` is therefore part of the review's
-validation contract, not of any hash. See **Claim acceptance rule** for the
+reviewable subject. Both maps are therefore part of the review's validation
+contract, not of any hash. They are deliberately explicit and flat: the reviewed
+Experiment content is named and hashed in the Review, never folded recursively
+into the Evidence or Claim digest. See **Claim acceptance rule** for the
 coverage requirement that makes a review qualify.
 
 ### Evidence — `evidence/EVI-NNNN.yaml`
@@ -359,6 +395,11 @@ The same applies per evidence entry: a concluded Review holding an
 digest is historically valid and emits **WARNING**
 `W_STALE_EVIDENCE_DIGEST`, and it does not qualify for Claim acceptance.
 
+The same applies per experiment entry: a concluded Review holding an
+`experiment_digests` value that no longer matches that Experiment's current
+digest is historically valid and emits **WARNING**
+`W_STALE_EXPERIMENT_DIGEST`, and it does not qualify for Claim acceptance.
+
 `independent_agent` is an actor-class enum value, not an R0 acceptance
 authority.
 
@@ -379,6 +420,8 @@ authority.
 - `evidence_digests` covers **every** Evidence object the Claim currently
   links — the full `supporting_evidence` ∪ `contrary_evidence` set — and each
   stored digest equals that Evidence object's **current** digest
+- `experiment_digests` covers **every** Experiment those Evidence objects
+  reach, and each stored digest equals that Experiment's **current** digest
 - `status == concluded`
 - `verdict == approve`
 - `reviewer_kind == human`
@@ -387,29 +430,37 @@ This is schema-enforced, not policy-only.
 
 Incomplete coverage is **ERROR** `E_EVIDENCE_DIGESTS_INCOMPLETE`: an approval
 that did not examine every linked Evidence object must not gate acceptance,
-because the unexamined evidence could then change undetected. A digest
-mismatch, on the subject or on any evidence entry, is **ERROR**
-`E_STALE_REVIEW_DIGEST`.
+because the unexamined evidence could then change undetected. Incomplete
+experiment coverage is **ERROR** `E_EXPERIMENT_DIGESTS_INCOMPLETE`, for the
+same reason one hop further back. A digest mismatch, on the subject or on any
+evidence or experiment entry, is **ERROR** `E_STALE_REVIEW_DIGEST`.
+
+A missing Experiment stays in the required set and can never match, so a broken
+pointer blocks acceptance rather than shrinking the binding to fit.
 
 Changing Claim `status` (`evidence_linked` → `accepted`) must **not** change
 the digest.
 
-### Known limitation: experiment-derived evidence
+### Experiment-derived evidence
 
-Evidence of `kind: experiment` references an Experiment by ID. That reference
-is validated and the Experiment must be `completed` to qualify, but the
-Evidence object's own digest does **not** cover the referenced Experiment's
-scientific content. Changing a completed Experiment's `provenance`,
-`predictions`, or `primary_metrics` therefore changes the Experiment digest
-without invalidating an approval bound to the derived Evidence.
+Evidence of `kind: experiment` references an Experiment by ID, and that
+Evidence object's own digest still carries the Experiment only as that ID. The
+Experiment → Evidence → Claim chain is closed at the Review instead, by the
+explicit `experiment_digests` map: changing a completed Experiment's
+`purpose`, `hypotheses`, `predictions`, `primary_metrics`, `decision_rule`,
+`provenance`, `result_manifest`, or `artifacts` invalidates every Claim approval
+bound to it.
 
-WP-A deliberately closes the demonstrated Claim → Evidence hole and stops
-there. This remaining Experiment → Evidence hop must be revisited **before**
-any automated promotion of experiment-derived Evidence, and before the system
-relies on fully transitive Experiment → Evidence → Claim review binding.
-Closing it needs either recursive digest resolution or an explicit
-experiment-digest map; neither is implemented, and current Experiment ID
-traceability is preserved in the meantime.
+This was WP-A's one deliberately deferred hole, and it is closed with the flat
+experiment-digest map rather than recursive digest resolution, so the binding
+stays inspectable in the Review file.
+
+**Still out of scope, deliberately:** `status` is excluded from every
+projection, so moving an Experiment from `completed` to `withdrawn` does not
+change its digest and does not stale a review. Such an Experiment stops
+*qualifying*, which is a separate rule and only blocks the Claim when no other
+qualifying supporting Evidence remains. The identical gap exists for Evidence
+`status`; both follow from the projection rule below and are not patched here.
 
 ### Known limitation: evidence unlinked after a concluded review
 
@@ -432,9 +483,11 @@ in both lists, and it is bound once in `evidence_digests`.
 ### Recording a review
 
 Reviews of Claims are recorded with `researchctl review`, which computes the
-current subject and evidence digests, shows them to the reviewer with the
-evidence they refer to, and writes the Review only on explicit confirmation. The
-reviewed Claim must be at `evidence_linked`, and the command never changes Claim
+current subject, evidence, and experiment digests, shows them to the reviewer
+with the evidence and experiments they refer to — every digest-material
+Experiment field, in full — and writes the Review only on explicit confirmation.
+The reviewer never computes or types a digest, and never assembles either map by
+hand. The reviewed Claim must be at `evidence_linked`, and the command never changes Claim
 status. Because acceptance is existential -- *a* qualifying approve Review is
 enough -- a later verdict cannot override an approval that already satisfies the
 gate; re-reviewing means setting the Claim back to `evidence_linked` first.
@@ -663,9 +716,35 @@ Omitting a later-material field from a semantic projection requires
 
 ### Migration policy
 
-WP-A corrected schema v1 in place because no real research capsule existed
-yet, so there was nothing to migrate. From the first persisted real capsule
-onward:
+WP-A corrected schema v1 in place because no real research capsule existed yet,
+so there was nothing to migrate.
+
+The R0 dogfood integrity patch added `Review.experiment_digests` in place
+**after** the first real capsule existed. That is permitted here, and the
+reasoning is recorded because the precondition no longer holds automatically:
+
+- no semantic projection changed, so **every existing object digest is
+  byte-identical** — pinned by `test_pre_patch_digests_are_byte_identical`;
+- Reviews have no digest of their own, so a new Review field invalidates no hash;
+- the field is optional and is enforced only where a Claim is `accepted`;
+- the only real capsule held **zero Reviews** and no accepted Claim, verified by
+  searching every capsule on disk before applying the change.
+
+Nothing needed migrating, so nothing was migrated. This is the **last** in-place
+correction of v1: from here, a scientifically material schema change goes
+through an explicit versioned migration.
+
+A required *Experiment* field — such as a structured design-basis — is the case
+this policy now forbids: it would make every existing manifest fail as
+`E_SCHEMA` with no fallback, and adding a key to a semantic projection changes
+every digest of that type.
+
+**Compatibility caveat.** Models use `extra="forbid"`, so a Review written with
+`experiment_digests` cannot be parsed by a kernel built before this patch. With
+one installed kernel this is theoretical, but it is a real forward-compatibility
+edge and is not silently assumed away.
+
+From the first persisted real capsule onward:
 
 - scientifically material schema changes are permitted, through an **explicit
   versioned migration**;

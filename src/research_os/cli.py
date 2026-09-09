@@ -28,9 +28,15 @@ from research_os.errors import (
 )
 from research_os.models import Reviewable, Verdict
 from research_os.paths import xdg_dir_issue, xdg_dirs
-from research_os.registry import list_projects, register_project
+from research_os.registry import (
+    legacy_registry_path,
+    legacy_registry_present,
+    list_projects,
+    register_project,
+)
 from research_os.review import (
     EvidenceEntry,
+    ExperimentEntry,
     ReviewPacket,
     build_review,
     build_review_packet,
@@ -86,6 +92,7 @@ def _init_project(args: argparse.Namespace) -> int:
             f"register-project {git_root}."
         ) from exc
     print(f"Initialized project {project.id} at {git_root}")
+    _note_legacy_registry_if_present()
     return EXIT_OK
 
 
@@ -93,7 +100,24 @@ def _register_project(args: argparse.Namespace) -> int:
     git_root, project = load_project_identity(args.path)
     entry = register_project(project, git_root)
     print(f"Registered project {entry.project_id} at {entry.path}")
+    _note_legacy_registry_if_present()
     return EXIT_OK
+
+
+def _note_legacy_registry_if_present() -> None:
+    """Mention a still-present legacy SQLite registry after a successful write.
+
+    Informational only: it never affects the exit code and never touches the
+    legacy file, which is why this runs after registration succeeds rather than
+    guarding it.
+    """
+
+    if legacy_registry_present():
+        print(
+            f"note: a legacy SQLite project registry remains at "
+            f"{legacy_registry_path()}. It is never read and can be deleted.",
+            file=sys.stderr,
+        )
 
 
 def _validate_project(args: argparse.Namespace) -> int:
@@ -277,6 +301,7 @@ def _render_packet(packet: ReviewPacket) -> str:
 
     lines.extend(_render_evidence("supporting evidence", packet.supporting))
     lines.extend(_render_evidence("contrary evidence", packet.contrary))
+    lines.extend(_render_experiments(packet.experiments))
 
     if claim.contrary_evidence_addressed is not None:
         lines.extend(
@@ -294,12 +319,14 @@ def _render_packet(packet: ReviewPacket) -> str:
 
     count = packet.evidence_count
     plural = "digest" if count == 1 else "digests"
+    experiments = packet.experiment_count
+    experiment_plural = "digest" if experiments == 1 else "digests"
     lines.extend(
         [
             "",
-            f"This review will bind the claim digest and all {count} evidence",
-            f"{plural} shown above. Changing any of that content afterwards",
-            "invalidates the approval.",
+            f"This review will bind the claim digest, all {count} evidence {plural},",
+            f"and all {experiments} experiment {experiment_plural} shown above.",
+            "Changing any of that content afterwards invalidates the approval.",
             "",
         ]
     )
@@ -317,6 +344,43 @@ def _render_evidence(heading: str, entries: Sequence[EvidenceEntry]) -> list[str
         for label, value in entry.pointers():
             lines.append(f"    {label:<11} {value}")
         lines.append(f"    digest      {entry.digest}")
+    return lines
+
+
+def _render_experiments(entries: Sequence[ExperimentEntry]) -> list[str]:
+    """Render the Experiments whose content this review binds.
+
+    Experiment-derived evidence names an Experiment by id, so without this
+    section a reviewer would approve a claim resting on experimental content
+    they were never shown.
+    """
+
+    if not entries:
+        return ["", "experiments (none)"]
+    lines = ["", f"experiments ({len(entries)})"]
+    for entry in entries:
+        lines.append(f"  {entry.id}  {entry.status}")
+        lines.append(f"    title           {entry.title}")
+        lines.append(f"    purpose         {entry.purpose}")
+        for label, value in entry.fields():
+            lines.append(f"    {label:<15} {value}")
+        if entry.predictions:
+            lines.append(f"    predictions ({len(entry.predictions)})")
+            for hypothesis, discriminates, outcome in entry.predictions:
+                lines.append(
+                    f"      {hypothesis}  discriminates: "
+                    f"{'yes' if discriminates else 'no'}"
+                )
+                lines.append(f"        {outcome}")
+        if entry.provenance:
+            lines.append("    provenance")
+            for label, value in entry.provenance:
+                lines.append(f"      {label:<13} {value}")
+        if entry.artifacts:
+            lines.append(f"    artifacts ({len(entry.artifacts)})")
+            for artifact in entry.artifacts:
+                lines.append(f"      {artifact}")
+        lines.append(f"    digest          {entry.digest}")
     return lines
 
 

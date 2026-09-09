@@ -99,12 +99,13 @@ Reviews are not reviewable subjects and have no digest.
 
 `review` records a human Review of a Claim. It renders a review packet — the
 Claim, its digest, every linked supporting and contrary Evidence object with its
-source pointers and current digest, the `contrary_evidence_addressed` note, and
-the referenced hypotheses — then asks for a verdict (`approve`, `revise`,
-`reject`, or `cancel`), findings, and a final confirmation, and writes one
-canonical `.research/reviews/REV-NNNN.yaml` atomically. It binds the Claim digest
-and the digest of *every* linked Evidence object, which is what the acceptance
-rule requires.
+source pointers and current digest, every Experiment that evidence rests on —
+each digest-material field in full, plus its current digest — the
+`contrary_evidence_addressed` note, and the referenced hypotheses — then asks for a verdict (`approve`,
+`revise`, `reject`, or `cancel`), findings, and a final confirmation, and writes
+one canonical `.research/reviews/REV-NNNN.yaml` atomically. It binds the Claim
+digest, the digest of *every* linked Evidence object, and the digest of *every*
+Experiment they reach, which is what the acceptance rule requires.
 
 The Claim must be at `status: evidence_linked`. `review` requires an interactive
 terminal, has no noninteractive approval flag, and **never** changes the Claim's
@@ -122,8 +123,13 @@ The project registry lives at `~/.local/share/research-os/project_registry.json`
 only, is written by atomic replacement, and may be deleted freely — nothing in
 your projects depends on it, and `researchctl register-project` rebuilds any
 entry. If a registry from an older build (`project_registry.sqlite`) is still
-present, the registry commands say so and ask you to re-register and delete it;
-that file is never read, imported, or removed automatically.
+present and the JSON registry does not yet exist, `researchctl projects`
+refuses to enumerate rather than report an empty list, but `init-project` and
+`register-project` still work: the missing JSON registry is treated as empty,
+the project you named is registered, and the JSON file is created. Either
+command then notes on stderr that the legacy file is still there and can be
+deleted. That file is never read, imported, modified, or removed
+automatically, by any command.
 
 ## Development
 

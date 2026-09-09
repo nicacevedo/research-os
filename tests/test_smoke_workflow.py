@@ -170,7 +170,7 @@ def test_workflow_never_required_a_hand_computed_digest(
     write_reviewable_capsule(repo, project_id="smoke")
 
     printed: dict[str, str] = {}
-    for object_id in ("CLAIM-0001", "EVI-0001", "EVI-0002", "EVI-0003"):
+    for object_id in ("CLAIM-0001", "EVI-0001", "EVI-0002", "EVI-0003", "EXP-0001"):
         assert _run(monkeypatch, "digest", object_id, str(repo)) == 0
         printed[object_id] = capsys.readouterr().out.strip()
 
@@ -187,3 +187,45 @@ def test_workflow_never_required_a_hand_computed_digest(
         "EVI-0002": printed["EVI-0002"],
         "EVI-0003": printed["EVI-0003"],
     }
+    assert review["experiment_digests"] == {"EXP-0001": printed["EXP-0001"]}
+
+
+def test_experiment_edit_invalidates_an_accepted_claim_end_to_end(
+    tmp_path: Path,
+    data_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Changing a completed Experiment must break the approval that relied on it.
+
+    CLAIM-0001 reaches EXP-0001 only through EVI-0003, and neither the Claim nor
+    any Evidence object is touched here, so this passes only because the review
+    binds Experiment content directly.
+    """
+
+    repo = make_git_repo(tmp_path / "smoke")
+    write_reviewable_capsule(repo, project_id="smoke")
+
+    _interactive_review(monkeypatch, "approve", "Checked the sweep.", "", "y")
+    assert _run(monkeypatch, "review", "CLAIM-0001", str(repo)) == 0
+    capsys.readouterr()
+
+    _set_claim_status(repo, "evidence_linked", "accepted")
+    assert _run(monkeypatch, "validate-project", str(repo)) == 0
+    assert capsys.readouterr().out.strip() == "OK"
+
+    manifest = repo / ".research" / "experiments" / "EXP-0001" / "manifest.yaml"
+    manifest.write_text(
+        manifest.read_text(encoding="utf-8").replace(
+            "data: institutional-store://runs/2026-09",
+            "data: institutional-store://runs/2026-10",
+        ),
+        encoding="utf-8",
+    )
+
+    assert _run(monkeypatch, "validate-project", str(repo)) == EXIT_ERROR
+    out = capsys.readouterr().out
+    assert "W_STALE_EXPERIMENT_DIGEST" in out
+    assert "E_STALE_REVIEW_DIGEST" in out
+    assert "W_STALE_SUBJECT_DIGEST" not in out
+    assert "W_STALE_EVIDENCE_DIGEST" not in out
