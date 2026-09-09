@@ -593,6 +593,7 @@ class Review(ObjectEnvelope):
     verdict: Verdict | None = None
     subject_digest: str | None = None
     evidence_digests: dict[str, str] | None = None
+    experiment_digests: dict[str, str] | None = None
 
     @field_validator("subject")
     @classmethod
@@ -627,6 +628,22 @@ class Review(ObjectEnvelope):
                 raise ValueError(f"evidence_digests[{key}] must be {DIGEST_FORMAT!r}")
         return value
 
+    @field_validator("experiment_digests")
+    @classmethod
+    def _experiment_digest_map(
+        cls,
+        value: dict[str, str] | None,
+    ) -> dict[str, str] | None:
+        if value is None:
+            return None
+        for key, digest in value.items():
+            validate_id(key)
+            if parse_id(key).prefix != "EXP":
+                raise ValueError("experiment_digests keys must be EXP- ids")
+            if DIGEST_RE.fullmatch(digest) is None:
+                raise ValueError(f"experiment_digests[{key}] must be {DIGEST_FORMAT!r}")
+        return value
+
     @model_validator(mode="after")
     def _concluded_review_fields(self) -> Self:
         if self.status is ReviewStatus.CONCLUDED:
@@ -639,12 +656,19 @@ class Review(ObjectEnvelope):
         return self
 
     @model_validator(mode="after")
-    def _evidence_digests_target_claims(self) -> Self:
-        if (
-            self.evidence_digests is not None
-            and parse_id(self.subject).prefix != "CLAIM"
-        ):
+    def _digest_maps_target_claims(self) -> Self:
+        """Both content bindings describe a Claim's evidence, so both are claim-only.
+
+        Only the Claim acceptance gate consults them; carrying either on a review
+        of some other subject would record a binding nothing enforces.
+        """
+
+        if parse_id(self.subject).prefix == "CLAIM":
+            return self
+        if self.evidence_digests is not None:
             raise ValueError("evidence_digests is only valid on reviews of claims")
+        if self.experiment_digests is not None:
+            raise ValueError("experiment_digests is only valid on reviews of claims")
         return self
 
 

@@ -290,6 +290,57 @@ def test_evidence_digests_only_valid_on_claim_subjects() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "digest",
+    [
+        "a" * 64,
+        f"{DIGEST_VERSION}:{'A' * 64}",
+        f"{DIGEST_VERSION}:{'a' * 63}",
+        f"{DIGEST_VERSION}:not-hex",
+        f":{'a' * 64}",
+        f"{DIGEST_VERSION + 1}:{'a' * 64}",
+        f"sha256:{'a' * 64}",
+    ],
+)
+def test_experiment_digest_format_is_enforced(digest: str) -> None:
+    with pytest.raises(ValidationError):
+        make_review(status="concluded", experiment_digests={"EXP-0001": digest})
+
+
+def test_experiment_digest_keys_must_be_experiment_ids() -> None:
+    valid = f"{DIGEST_VERSION}:{'a' * 64}"
+    for key in ("EVI-0001", "CLAIM-0002", "HYP-0001", "EXP-1", "exp-0001", "nope"):
+        with pytest.raises(ValidationError):
+            make_review(status="concluded", experiment_digests={key: valid})
+    bound = make_review(status="concluded", experiment_digests={"EXP-0001": valid})
+    assert bound.experiment_digests == {"EXP-0001": valid}
+
+
+def test_experiment_digests_only_valid_on_claim_subjects() -> None:
+    valid = f"{DIGEST_VERSION}:{'a' * 64}"
+    for subject in ("HYP-0001", "EXP-0001", "EVI-0001", "Q-0001"):
+        with pytest.raises(ValidationError):
+            make_review(
+                status="concluded",
+                subject=subject,
+                experiment_digests={"EXP-0001": valid},
+            )
+    make_review(
+        status="concluded",
+        subject="CLAIM-0001",
+        experiment_digests={"EXP-0001": valid},
+    )
+
+
+def test_experiment_digests_absent_and_empty_are_both_accepted() -> None:
+    """``None`` and ``{}`` both mean "this review bound no experiments"."""
+
+    assert make_review(status="concluded").experiment_digests is None
+    assert (
+        make_review(status="concluded", experiment_digests={}).experiment_digests == {}
+    )
+
+
 def test_review_of_review_rejected_by_schema() -> None:
     with pytest.raises(ValidationError):
         make_review(subject="REV-0002")
@@ -462,7 +513,10 @@ PREREGISTERED_STATUSES = ("specified", "running", "completed", "failed", "supers
 
 
 @pytest.mark.parametrize("status", PREREGISTERED_STATUSES)
-@pytest.mark.parametrize("missing", ["predictions", "primary_metrics", "decision_rule"])
+@pytest.mark.parametrize(
+    "missing",
+    ["predictions", "primary_metrics", "decision_rule"],
+)
 def test_preregistered_experiment_requires_ex_ante_commitments(
     status: str,
     missing: str,

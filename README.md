@@ -99,12 +99,13 @@ Reviews are not reviewable subjects and have no digest.
 
 `review` records a human Review of a Claim. It renders a review packet — the
 Claim, its digest, every linked supporting and contrary Evidence object with its
-source pointers and current digest, the `contrary_evidence_addressed` note, and
-the referenced hypotheses — then asks for a verdict (`approve`, `revise`,
-`reject`, or `cancel`), findings, and a final confirmation, and writes one
-canonical `.research/reviews/REV-NNNN.yaml` atomically. It binds the Claim digest
-and the digest of *every* linked Evidence object, which is what the acceptance
-rule requires.
+source pointers and current digest, every Experiment that evidence rests on —
+each digest-material field in full, plus its current digest — the
+`contrary_evidence_addressed` note, and the referenced hypotheses — then asks for a verdict (`approve`,
+`revise`, `reject`, or `cancel`), findings, and a final confirmation, and writes
+one canonical `.research/reviews/REV-NNNN.yaml` atomically. It binds the Claim
+digest, the digest of *every* linked Evidence object, and the digest of *every*
+Experiment they reach, which is what the acceptance rule requires.
 
 The Claim must be at `status: evidence_linked`. `review` requires an interactive
 terminal, has no noninteractive approval flag, and **never** changes the Claim's

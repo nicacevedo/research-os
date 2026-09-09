@@ -12,10 +12,11 @@ from research_os.capsule import resolve_object, validate_project
 from research_os.digests import subject_digest
 from research_os.errors import (
     E_EVIDENCE_DIGESTS_INCOMPLETE,
+    E_EXPERIMENT_DIGESTS_INCOMPLETE,
     CapsuleError,
     ReviewBlockedError,
 )
-from research_os.models import Claim, Review, Verdict, parse_object
+from research_os.models import Claim, Experiment, Review, Verdict, parse_object
 from research_os.review import (
     build_review,
     build_review_packet,
@@ -125,6 +126,66 @@ def test_packet_evidence_digests_are_canonical_and_complete(tmp_path: Path) -> N
     for evidence_id, digest in packet.evidence_digests.items():
         target = resolve_object(report, evidence_id)
         assert digest == subject_digest(target, project_id="sample-project")
+
+
+def test_packet_experiment_digests_cover_experiment_derived_evidence(
+    tmp_path: Path,
+) -> None:
+    """The packet binds the Experiment behind EVI-0003, not just its id."""
+
+    repo = _repo(tmp_path)
+    report = validate_project(repo)
+    packet = build_review_packet(report, "CLAIM-0001")
+
+    assert set(packet.experiment_digests) == {"EXP-0001"}
+    experiment = resolve_object(report, "EXP-0001")
+    assert isinstance(experiment, Experiment)
+    assert packet.experiment_digests["EXP-0001"] == subject_digest(
+        experiment, project_id="sample-project"
+    )
+
+
+def test_packet_carries_every_digest_material_experiment_field(
+    tmp_path: Path,
+) -> None:
+    """The packet shows exactly what the digest binds, in full.
+
+    Real capsules put their honesty disclosures -- whether an experiment was
+    preregistered or reconstructed after the fact -- inside these fields
+    precisely because ``notes`` is outside every projection. Carrying anything
+    less would hide them from the reviewer.
+    """
+
+    packet = _packet(_repo(tmp_path))
+    (entry,) = packet.experiments
+    assert entry.id == "EXP-0001"
+    assert entry.status == "completed"
+    assert entry.title == "Calibrated probe sweep"
+    assert entry.purpose == "Measure X between 180 K and 260 K."
+    assert entry.hypotheses == ("HYP-0001",)
+    assert entry.predictions == (("HYP-0001", True, "X is observed above 200 K."),)
+    assert entry.primary_metrics == ("x_amplitude",)
+    assert entry.decision_rule == (
+        "Reject the hypothesis if x_amplitude stays below 0.1."
+    )
+    assert entry.provenance == (
+        ("code", "src/sweep.py"),
+        ("config", "configs/sweep.toml"),
+        ("data", "institutional-store://runs/2026-09"),
+        ("git_commit", "deadbeef"),
+    )
+    assert entry.digest == packet.experiment_digests["EXP-0001"]
+
+    labels = dict(entry.fields())
+    assert labels["hypotheses"] == "HYP-0001"
+    assert labels["primary_metrics"] == "x_amplitude"
+    assert "decision_rule" in labels
+
+
+def test_experiment_count_is_derived_from_the_digest_map(tmp_path: Path) -> None:
+    packet = _packet(_repo(tmp_path))
+    assert packet.experiment_count == len(packet.experiment_digests) == 1
+    assert packet.experiment_count == len(packet.experiments)
 
 
 def test_evidence_count_is_derived_from_the_digest_map(tmp_path: Path) -> None:
@@ -361,3 +422,57 @@ def test_review_file_is_canonical_yaml(tmp_path: Path) -> None:
     assert "id: REV-0001" in text
     for evidence_id in packet.evidence_digests:
         assert evidence_id in text
+
+
+def test_written_review_binds_the_experiment_digest(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    packet = _packet(repo)
+    review = build_review(packet, verdict=Verdict.APPROVE, findings=FINDINGS)
+    target = write_review(packet, review)
+
+    reloaded = parse_object(yaml.safe_load(target.read_text(encoding="utf-8")))
+    assert isinstance(reloaded, Review)
+    assert reloaded.experiment_digests == packet.experiment_digests
+    assert reloaded.experiment_digests == dict(
+        sorted(packet.experiment_digests.items())
+    )
+
+
+def test_partial_experiment_coverage_would_not_gate_acceptance(
+    tmp_path: Path,
+) -> None:
+    """Hand-dropping the Experiment binding must not leave the approval standing."""
+
+    repo = _repo(tmp_path)
+    packet = _packet(repo)
+    review = build_review(packet, verdict=Verdict.APPROVE, findings=FINDINGS)
+
+    payload = review.model_dump(mode="json", exclude_none=True)
+    payload["experiment_digests"] = {}
+    write_yaml(repo / ".research" / "reviews" / "REV-0001.yaml", payload)
+
+    claim_path = repo / ".research" / "claims" / "CLAIM-0001.yaml"
+    claim_path.write_text(
+        claim_path.read_text(encoding="utf-8").replace(
+            "status: evidence_linked", "status: accepted"
+        ),
+        encoding="utf-8",
+    )
+
+    report = validate_project(repo)
+    assert E_EXPERIMENT_DIGESTS_INCOMPLETE in {item.code for item in report.findings}
+    assert not report.ok
+
+
+def test_review_binding_a_foreign_experiment_is_not_written(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    packet = _packet(repo)
+    review = build_review(packet, verdict=Verdict.APPROVE, findings=FINDINGS)
+    before = snapshot_files(repo)
+
+    tampered = review.model_copy(
+        update={"experiment_digests": {"EXP-9999": packet.claim_digest}}
+    )
+    with pytest.raises(ReviewBlockedError, match="refusing to write an invalid review"):
+        write_review(packet, tampered)
+    assert snapshot_files(repo) == before

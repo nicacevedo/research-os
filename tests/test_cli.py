@@ -795,6 +795,20 @@ def test_review_packet_shows_claim_evidence_and_full_digests(
         assert digest in out
     assert "all 3 evidence" in out
 
+    assert "experiments (1)" in out
+    assert "EXP-0001  completed" in out
+    assert "Measure X between 180 K and 260 K." in out
+    assert "hypotheses      HYP-0001" in out
+    assert "primary_metrics x_amplitude" in out
+    assert "Reject the hypothesis if x_amplitude stays below 0.1." in out
+    assert "predictions (1)" in out
+    assert "X is observed above 200 K." in out
+    assert "git_commit    deadbeef" in out
+    assert "Calibrated probe sweep" in out
+    for digest in packet.experiment_digests.values():
+        assert digest in out
+    assert "all 1 experiment digest" in out
+
 
 def test_review_approve_writes_review_and_gate_accepts(
     tmp_path: Path,
@@ -820,6 +834,7 @@ def test_review_approve_writes_review_and_gate_accepts(
     assert written["status"] == "concluded"
     assert written["verdict"] == "approve"
     assert set(written["evidence_digests"]) == {"EVI-0001", "EVI-0002", "EVI-0003"}
+    assert set(written["experiment_digests"]) == {"EXP-0001"}
 
     _accept_claim(repo)
     assert _run(monkeypatch, "validate-project", str(repo)) == 0
@@ -1089,3 +1104,80 @@ def test_re_review_after_resetting_status_binds_the_same_digest(
     assert second["subject_digest"] == first["subject_digest"]
     assert second["evidence_digests"] == first["evidence_digests"]
     assert second["findings"] == "Second pass."
+
+
+def test_review_packet_renders_no_experiments_for_a_literature_only_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A claim resting on literature alone binds an empty experiment map."""
+
+    import yaml
+
+    from research_os.capsule import validate_project
+    from research_os.review import build_review_packet
+
+    repo = _review_repo(tmp_path)
+    claim_path = repo / ".research" / "claims" / "CLAIM-0001.yaml"
+    claim_path.write_text(
+        claim_path.read_text(encoding="utf-8").replace("\n- EVI-0003", ""),
+        encoding="utf-8",
+    )
+
+    packet = build_review_packet(validate_project(repo), "CLAIM-0001")
+    assert packet.experiment_digests == {}
+
+    _interactive(monkeypatch)
+    _answers(monkeypatch, "approve", "Literature only.", "", "y")
+    _run(monkeypatch, "review", "CLAIM-0001", str(repo))
+    out = capsys.readouterr().out
+
+    assert "experiments (none)" in out
+    assert "all 0 experiment digests" in out
+
+    written = yaml.safe_load(
+        (repo / ".research" / "reviews" / "REV-0001.yaml").read_text(encoding="utf-8")
+    )
+    assert written["experiment_digests"] == {}
+
+    _accept_claim(repo)
+    assert _run(monkeypatch, "validate-project", str(repo)) == 0
+
+
+def test_review_then_experiment_edit_invalidates_the_approval(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """End to end: approve, accept, then change only the Experiment.
+
+    The Claim and every Evidence object are untouched, so nothing but the
+    experiment binding can catch this.
+    """
+
+    repo = _review_repo(tmp_path)
+    _interactive(monkeypatch)
+    _answers(monkeypatch, "approve", "Checked the sweep.", "", "y")
+    _run(monkeypatch, "review", "CLAIM-0001", str(repo))
+    capsys.readouterr()
+
+    _accept_claim(repo)
+    assert _run(monkeypatch, "validate-project", str(repo)) == 0
+    assert capsys.readouterr().out.strip() == "OK"
+
+    manifest = repo / ".research" / "experiments" / "EXP-0001" / "manifest.yaml"
+    manifest.write_text(
+        manifest.read_text(encoding="utf-8").replace(
+            "Reject the hypothesis if x_amplitude stays below 0.1.",
+            "Reject the hypothesis if x_amplitude stays below 0.4.",
+        ),
+        encoding="utf-8",
+    )
+
+    assert _run(monkeypatch, "validate-project", str(repo)) == EXIT_ERROR
+    out = capsys.readouterr().out
+    assert "W_STALE_EXPERIMENT_DIGEST" in out
+    assert "E_STALE_REVIEW_DIGEST" in out
+    assert "W_STALE_SUBJECT_DIGEST" not in out
+    assert "W_STALE_EVIDENCE_DIGEST" not in out

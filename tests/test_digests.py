@@ -197,6 +197,13 @@ def test_experiment_decision_rule_changes_digest() -> None:
     assert _projection(base)["decision_rule"] == "Reject above 0.20."
 
 
+def test_experiment_digest_is_project_scoped() -> None:
+    experiment = make_experiment(status="completed")
+    alpha = subject_digest(experiment, project_id=TEST_PROJECT_ID)
+    beta = subject_digest(experiment, project_id=OTHER_PROJECT_ID)
+    assert alpha != beta
+
+
 def test_administrative_notes_and_lifecycle_fields_excluded() -> None:
     base = make_claim()
     noisy = make_claim(
@@ -345,3 +352,49 @@ def test_evidence_projection_includes_kind_fields() -> None:
     assert projection["experiment"] is None
     other = make_evidence(kind="literature", citation="Jones 2021")
     assert _digest(literature) != _digest(other)
+
+
+#: Digests computed at 43e5c8d, before Experiment binding was added.
+#:
+#: The Experiment-binding patch is additive: it stores Experiment digests in a
+#: Review rather than folding them into any projection. These pins fail loudly
+#: if a later change moves the algorithm, which would silently invalidate every
+#: approval recorded in a real capsule.
+PRE_PATCH_DIGESTS = {
+    "experiment_completed": (
+        "1:114b0a15b8c2b68f6bebfcafcf475167cc3b1850825c4e366e6e89a88f8b2fc9"
+    ),
+    "experiment_draft": (
+        "1:8bea106a0c881401828692c3636fcadbeb232d34b8fc890f72645939263a760b"
+    ),
+    "evidence_experiment": (
+        "1:21f779aeb234af45c570c7e6cce69646ec473a83e2571b1bd37fa4d5cd9be0eb"
+    ),
+    "evidence_literature": (
+        "1:7ea0b7fa63b9105feef766591d172bd2c3198c541be4c3da955d1c65f79cbecc"
+    ),
+    "claim": "1:1719d3fa3166d917e9358fb71c9bf77ffa132d0a16332cd0ae7fb92017303f7b",
+    "hypothesis": (
+        "1:8a4b08f9c5e8ec122d23717054bae1b19495d485ed01bfb6eb42ecc061fb48e6"
+    ),
+    "question": "1:7096800b420f013ff11318c5d7a61920dbe2ea92a8122a5ff8d2b9094c2a19e4",
+}
+
+
+def test_pre_patch_digests_are_byte_identical() -> None:
+    """No object digest moved, so no existing capsule needs migrating."""
+
+    current = {
+        "experiment_completed": _digest(make_experiment(status="completed")),
+        "experiment_draft": _digest(make_experiment(status="draft")),
+        "evidence_experiment": _digest(
+            make_evidence(kind="experiment", experiment="EXP-0001")
+        ),
+        "evidence_literature": _digest(make_evidence()),
+        "claim": _digest(
+            make_claim(status="evidence_linked", supporting_evidence=["EVI-0001"])
+        ),
+        "hypothesis": _digest(make_hypothesis(status="active")),
+        "question": _digest(make_question()),
+    }
+    assert current == PRE_PATCH_DIGESTS

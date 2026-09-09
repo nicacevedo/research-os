@@ -216,11 +216,15 @@ Lifecycle-only Claim changes (`evidence_linked` → `accepted`) must not change
 the semantic digest. Changing title, statement, supporting or contrary
 evidence, the response to contrary evidence, or hypotheses must. Changing the
 scientific content of an Evidence object the review examined must invalidate
-the approval too, through the review's explicit `evidence_digests` map.
+the approval too, through the review's explicit `evidence_digests` map, and so
+must changing an Experiment that evidence rests on, through the review's
+explicit `experiment_digests` map. Both maps are flat and inspectable; neither
+digest is resolved recursively.
 
 `researchctl review` is the supported way to record that approval. It renders
-the Claim, every linked Evidence object with its source pointers, and the exact
-digests the Review will bind, then requires an explicit verdict, findings, and
+the Claim, every linked Evidence object with its source pointers, every
+Experiment that evidence rests on with all of its digest-material content, and
+the exact digests the Review will bind, then requires an explicit verdict, findings, and
 confirmation from an interactive terminal. It never changes the Claim's status.
 
 No agent approves its own scientific work. R0 enforces this structurally through
