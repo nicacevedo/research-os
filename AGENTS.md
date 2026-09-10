@@ -12,6 +12,8 @@ Read these, in this order, before significant work:
    schemas, IDs, lifecycle, semantic digests, and the Claim acceptance rule.
 4. `SECURITY.md` — secrets, privilege, and provider boundaries.
 5. `ROADMAP.md` — release sequence and current implementation state.
+6. `docs/AUTOMATION_MVP.md` — the automation control plane: what it may do,
+   what stays human, and the isolation and budget boundaries it enforces.
 
 `docs/CAPSULE.md` is authoritative on anything scientific. Where any other
 document disagrees with it, it wins.

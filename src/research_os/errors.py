@@ -91,6 +91,62 @@ class ReviewBlockedError(ResearchOSError):
         self.findings = findings
 
 
+class AutomationError(ResearchOSError):
+    """Base class for automation control-plane failures.
+
+    Runtime automation is not scientific state, so these never indicate a
+    corrupt capsule. They are raised, reported, and recorded in the run ledger.
+    """
+
+
+class PreflightError(AutomationError):
+    """Raised when a project is not in a state an automation run may start from."""
+
+
+class GitError(AutomationError):
+    """Raised when a deterministic Git inspection or worktree command fails."""
+
+
+class RunStoreError(AutomationError):
+    """Raised when the runtime run store cannot be read or written."""
+
+
+class RunNotFoundError(AutomationError):
+    """Raised when a run id names no run directory."""
+
+
+class RunStateError(AutomationError):
+    """Raised on an undeclared run-state transition."""
+
+
+class BudgetExceededError(AutomationError):
+    """Raised before an invocation that would exceed a declared run budget."""
+
+
+class ProviderUnavailableError(AutomationError):
+    """Raised when a configured provider is not usable on this machine."""
+
+
+class ProviderInvocationError(AutomationError):
+    """Raised when a provider ran but produced no usable result."""
+
+
+class PlanValidationError(AutomationError):
+    """Raised when planner output is not a valid, in-policy work plan."""
+
+
+class WorktreeError(AutomationError):
+    """Raised when an isolated automation worktree cannot be created or removed."""
+
+
+class WorktreeIsolationError(WorktreeError):
+    """Raised when a write-enabled worker would run outside its own worktree.
+
+    An enforced invariant rather than a prompt instruction: the controller
+    checks the resolved working directory before every write invocation.
+    """
+
+
 class Severity(StrEnum):
     """Finding severity for deterministic validation reports."""
 

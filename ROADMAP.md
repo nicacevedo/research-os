@@ -40,6 +40,18 @@ Lifecycle status transitions for every object type are specified in
 `docs/CAPSULE.md`. R0 validates current state, not transition history, and
 enforces no transition graph at runtime.
 
+## Automation MVP — implemented, outside the R0 kernel
+
+A deterministic planner/executor/reviewer control plane (`researchctl auto`),
+authorised by explicit human instruction rather than by the R0 milestone
+sequence. It automates software work under isolation, budgets, and deterministic
+acceptance checks. It automates no scientific judgement: no capsule file is
+written, no Review authored, no Claim accepted, nothing merged or pushed. See
+`docs/AUTOMATION_MVP.md`.
+
+This supersedes the earlier "Claude Code / Codex execution adapters" postponement
+for orchestration only. Every other postponed technology below still stands.
+
 ## R1 — Literature
 
 Shared literature library, provider APIs, PDF cache, local ranking, and
@@ -69,5 +81,5 @@ Not started.
 ## Postponed until a later release proves them necessary
 
 Docker, Podman, Apptainer, PostgreSQL, vector databases, MCP, LangGraph,
-PaperQA, local LLMs, Ollama, web UI, systemd services, Claude Code / Codex
-execution adapters, Slurm, HPC abstraction.
+PaperQA, local LLMs, Ollama, web UI, systemd services, Slurm, HPC abstraction,
+automatic merge, automatic scientific acceptance.

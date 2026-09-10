@@ -9,6 +9,8 @@ import sys
 from collections.abc import Sequence
 
 from research_os import __version__
+from research_os.automation.commands import add_auto_parser
+from research_os.automation.commands import dispatch as auto_dispatch
 from research_os.capsule import (
     init_project,
     load_project_identity,
@@ -486,6 +488,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     review_parser.add_argument("object_id", metavar="CLAIM-ID")
     review_parser.add_argument("path", nargs="?", default=".")
+
+    add_auto_parser(subparsers)
     return parser
 
 
@@ -518,6 +522,8 @@ def main() -> None:
             code = _digest(args)
         elif args.command == "review":
             code = _review(args)
+        elif args.command == "auto":
+            code = auto_dispatch(args)
         else:
             parser.print_help()
             return

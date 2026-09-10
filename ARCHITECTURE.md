@@ -250,18 +250,36 @@ treated as if they already exist.
 R0 includes Claim/Review/Evidence schemas as kernel state. R4 adds identity and
 frozen review-packet tooling around that kernel.
 
-## 11. Postponed technologies
+## 11. Automation control plane
 
-R0 does not include and must not opportunistically add:
+The R0 scientific kernel is frozen. Alongside it, and outside it, sits an
+explicitly human-authorised automation control plane
+(`research_os.automation`, `researchctl auto`). It is orchestration, not
+science: a deterministic Python controller that plans bounded work with a
+read-only model, dispatches a coding agent into an isolated Git worktree, runs
+acceptance commands itself, obtains an independent read-only review, and stops
+at `READY_FOR_HUMAN`.
+
+It holds to every invariant in `DESIGN_INVARIANTS.md`. In particular it never
+writes a capsule file, never authors a Review, never accepts a Claim, never
+merges, and never pushes. Its runtime state lives under the state home and is
+disposable. `docs/AUTOMATION_MVP.md` is its live specification.
+
+Work Orders, Handoffs, and RUN records still have no *scientific* schema. The
+runtime work-order and run records the control plane keeps are orchestration
+state under `~/.local/state/research-os/`, not capsule objects.
+
+## 12. Postponed technologies
+
+Research OS does not include and must not opportunistically add:
 
 Docker, Podman, Apptainer, PostgreSQL, vector database servers, MCP, LangGraph,
-PaperQA, local LLMs, Ollama, web UI, background systemd services, Claude Code
-execution adapter, Codex adapter, Slurm, HPC abstraction, literature APIs,
-embeddings, unofficial browser automation, firmware/Secure Boot/MOK automation.
+PaperQA, local LLMs, Ollama, web UI, background systemd services, Slurm, HPC
+abstraction, literature APIs, embeddings, unofficial browser automation,
+firmware/Secure Boot/MOK automation, automatic merge, and automatic scientific
+acceptance.
 
-Work Orders, Handoffs, and RUN records have no R0 schema.
-
-## 12. Human versus agent authority
+## 13. Human versus agent authority
 
 Humans retain authority over architectural invariants, schema freeze, scientific
 lifecycle semantics, Linux package/firmware changes, credentials, provider
