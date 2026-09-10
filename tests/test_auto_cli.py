@@ -102,7 +102,7 @@ def test_dry_run_plans_without_touching_the_project(
     assert code == 0
     assert "DRY RUN" in out
     assert "T-001" in out
-    assert "python -m pytest -q" in out
+    assert "pytest -q" in out
     assert "git diff --check HEAD   (added by the controller)" in out
     assert "no write worker was invoked" in out
     assert working_snapshot(repo) == before

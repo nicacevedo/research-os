@@ -42,7 +42,14 @@ def provider_family(name: str) -> str:
 
 @dataclass(frozen=True, slots=True)
 class InvocationRequest:
-    """One bounded worker invocation the controller is about to make."""
+    """One bounded worker invocation the controller is about to make.
+
+    A read-only request carries no tools, whatever it was constructed with. The
+    configuration layer already refuses a read-only role that declares tools;
+    this is the second, independent enforcement, placed where every adapter must
+    pass through it, so no future caller can assemble a read-only invocation
+    that still hands a model something to act with.
+    """
 
     role: Role
     prompt: str
@@ -53,6 +60,10 @@ class InvocationRequest:
     effort: str | None = None
     tools: tuple[str, ...] = ()
     json_schema: dict[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        if self.read_only and self.tools:
+            object.__setattr__(self, "tools", ())
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,9 +109,15 @@ class ClaudeCodeProvider:
     ``-p`` for non-interactive output, ``--output-format json`` for a parseable
     result envelope, ``--json-schema`` for validated structured output,
     ``--tools`` to bound the tool set, ``--restricted`` to confine file tools to
-    the working directory and remove command-running tools, and
-    ``--permission-prompts none`` so anything that would ask a human is denied
-    instead of hanging.
+    the working directory and remove command-running tools,
+    ``--strict-mcp-config`` so the run uses only MCP servers named on this
+    command line -- and none are -- instead of whatever this machine happens to
+    have configured, and ``--permission-prompts none`` so anything that would
+    ask a human is denied instead of hanging.
+
+    The local ``--help`` for ``--restricted`` says in as many words to add
+    ``--strict-mcp-config`` to skip MCP servers too, so restricted mode on its
+    own would still have inherited them.
     """
 
     name: str = "claude"
@@ -118,7 +135,14 @@ class ClaudeCodeProvider:
             )
         version = self._first_line(self._capture([path, "--version"]))
         help_text = self._capture([path, "--help"]) or ""
-        required = ("--print", "--output-format", "--json-schema", "--tools")
+        required = (
+            "--print",
+            "--output-format",
+            "--json-schema",
+            "--tools",
+            "--restricted",
+            "--strict-mcp-config",
+        )
         missing = [flag for flag in required if flag not in help_text]
         auth = self._auth_status(path)
         detail = "non-interactive print mode verified from local --help"
@@ -174,13 +198,14 @@ class ClaudeCodeProvider:
             "--output-format",
             "json",
             "--restricted",
+            "--strict-mcp-config",
             "--permission-prompts",
             "none",
             "--no-session-persistence",
             "--permission-mode",
             "plan" if request.read_only else "acceptEdits",
             "--tools",
-            ",".join(request.tools),
+            ",".join(() if request.read_only else request.tools),
         ]
         if request.model:
             argv.extend(["--model", request.model])

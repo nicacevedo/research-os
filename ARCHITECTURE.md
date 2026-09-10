@@ -265,6 +265,12 @@ writes a capsule file, never authors a Review, never accepts a Claim, never
 merges, and never pushes. Its runtime state lives under the state home and is
 disposable. `docs/AUTOMATION_MVP.md` is its live specification.
 
+It is scoped to trusted local repositories. Running a project's acceptance
+checks runs that project's code — including code a worker has just modified —
+with the permissions of the `researchctl` process. Worktree isolation protects
+the canonical checkout; it is not an OS sandbox, and no network or process
+sandboxing is provided. `docs/AUTOMATION_MVP.md` states that boundary in full.
+
 Work Orders, Handoffs, and RUN records still have no *scientific* schema. The
 runtime work-order and run records the control plane keeps are orchestration
 state under `~/.local/state/research-os/`, not capsule objects.

@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from research_os.automation.filescope import outbound_symlinks
 from research_os.automation.gitutil import (
     changed_paths,
     head_commit,
@@ -32,10 +33,21 @@ class ExecutionEvidence:
     diff_stat: str
     head_commit: str
     scope_violations: tuple[str, ...]
+    outbound_symlinks: tuple[str, ...] = ()
 
     @property
     def produced_changes(self) -> bool:
         return bool(self.changed_paths)
+
+    @property
+    def contained(self) -> bool:
+        """Return whether every symlink in the worktree still resolves inside it.
+
+        Read before ``scope_violations`` means anything: Git evidence describes
+        the worktree, so a write that left through a symlink is invisible to it.
+        """
+
+        return not self.outbound_symlinks
 
 
 def build_coder_prompt(order: WorkOrder, *, context_text: str) -> str:
@@ -100,6 +112,7 @@ and why you believe the completion condition is met.
 def collect_evidence(order: WorkOrder, *, worktree: Path) -> ExecutionEvidence:
     """Read the worktree and decide, locally, what the worker actually did."""
 
+    escaping = outbound_symlinks(worktree)
     stage_intent_to_add(worktree)
     changed = changed_paths(worktree)
     diff = working_diff(worktree)
@@ -115,6 +128,7 @@ def collect_evidence(order: WorkOrder, *, worktree: Path) -> ExecutionEvidence:
             allowed=tuple(order.allowed_paths),
             forbidden=tuple(order.forbidden_paths),
         ),
+        outbound_symlinks=escaping,
     )
 
 

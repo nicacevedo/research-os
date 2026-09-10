@@ -4,10 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
-
 from research_os.automation.checks import (
-    assert_programs_allowed,
     run_acceptance_command,
     tail,
 )
@@ -120,18 +117,6 @@ def test_shell_metacharacters_are_not_interpreted(tmp_path: Path) -> None:
 
     assert result.ok is True
     assert (tmp_path / "out.txt").read_text(encoding="utf-8") == "a && b\n"
-
-
-def test_the_program_allowlist_is_enforced() -> None:
-    assert_programs_allowed(
-        [AcceptanceCommand(argv=["pytest", "-q"])],
-        ("pytest", "ruff"),
-    )
-    with pytest.raises(ValueError, match="not allowed"):
-        assert_programs_allowed(
-            [AcceptanceCommand(argv=["curl", "http://example.invalid"])],
-            ("pytest", "ruff"),
-        )
 
 
 def test_tail_marks_what_it_dropped() -> None:

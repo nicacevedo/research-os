@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from research_os.automation.config import (
     DEFAULT_ALLOWED_CHECK_PROGRAMS,
@@ -13,7 +14,11 @@ from research_os.automation.config import (
     load_config,
     resolve_roles,
 )
-from research_os.automation.models import Independence, ProviderProbe
+from research_os.automation.models import (
+    Independence,
+    ProviderProbe,
+    RoleSetting,
+)
 from research_os.errors import AutomationError, ProviderUnavailableError
 from research_os.paths import config_home
 
@@ -159,3 +164,82 @@ def test_an_explicit_reviewer_is_not_moved(automation_home: Path) -> None:
 
     assert resolved.roles["reviewer"].provider == "claude"
     assert resolved.independence is Independence.DEGRADED_SAME_PROVIDER_FAMILY
+
+
+# -- audit regression: a read-only role may not carry tools ------------------
+
+
+@pytest.mark.parametrize("tools", [["Write"], ["Bash"], ["Write", "Bash"], ["Read"]])
+def test_a_read_only_role_with_tools_is_refused(
+    automation_home: Path, tools: list[str]
+) -> None:
+    """Fail closed rather than silently correcting a contradictory config.
+
+    A read-only role that declares ``Write`` or ``Bash`` does not express a
+    preference the controller can quietly tighten; it expresses two
+    incompatible intentions, and the researcher should be told which one the
+    file got wrong.
+    """
+
+    target = config_home() / "automation.yaml"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        f"planner:\n  provider: claude\n  read_only: true\n  tools: {tools}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(AutomationError, match="read_only role must declare no tools"):
+        load_config(target)
+
+
+def test_a_read_only_role_setting_cannot_be_constructed_with_tools() -> None:
+    with pytest.raises(ValidationError, match="read_only role must declare no tools"):
+        RoleSetting(provider="claude", read_only=True, tools=["Write"])
+
+    RoleSetting(provider="claude", read_only=True, tools=[])
+    RoleSetting(provider="claude", read_only=False, tools=["Write"])
+
+
+def test_the_reviewer_may_not_be_given_tools_either(automation_home: Path) -> None:
+    target = config_home() / "automation.yaml"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        "reviewer:\n  provider: claude\n  read_only: true\n  tools: [Bash]\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(AutomationError, match="read_only role must declare no tools"):
+        load_config(target)
+
+
+# -- audit regression: configuration may only narrow the command grammar -----
+
+
+def test_the_default_check_programs_exclude_interpreters_and_git() -> None:
+    assert DEFAULT_ALLOWED_CHECK_PROGRAMS == ("uv", "pytest", "ruff")
+    for program in ("python", "python3", "git", "bash", "sh"):
+        assert program not in DEFAULT_ALLOWED_CHECK_PROGRAMS
+
+
+@pytest.mark.parametrize("program", ["python", "python3", "git", "bash", "curl"])
+def test_a_config_cannot_widen_the_command_grammar(
+    automation_home: Path, program: str
+) -> None:
+    """Adding a program to the config does not create a grammar for it."""
+
+    target = config_home() / "automation.yaml"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        f"allowed_check_programs: [pytest, {program}]\n", encoding="utf-8"
+    )
+
+    with pytest.raises(AutomationError, match="no grammar for"):
+        load_config(target)
+
+
+def test_a_config_may_narrow_the_command_grammar(automation_home: Path) -> None:
+    target = config_home() / "automation.yaml"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("allowed_check_programs: [pytest]\n", encoding="utf-8")
+
+    assert load_config(target).allowed_check_programs == ("pytest",)

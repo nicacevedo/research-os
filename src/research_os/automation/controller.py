@@ -15,11 +15,17 @@ from __future__ import annotations
 import time
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import NoReturn
 
 from research_os.automation.checks import run_acceptance_command
+from research_os.automation.command_policy import authorize_planner_commands
 from research_os.automation.config import AutomationConfig, ResolvedRoles, resolve_roles
 from research_os.automation.context import ContextPacket, build_context, render_context
 from research_os.automation.executor import build_coder_prompt, collect_evidence
+from research_os.automation.filescope import (
+    assert_contained_symlinks,
+    outbound_symlinks,
+)
 from research_os.automation.gitutil import (
     current_branch,
     has_commits,
@@ -71,6 +77,7 @@ from research_os.errors import (
     PreflightError,
     ProviderInvocationError,
     ProviderUnavailableError,
+    SymlinkScopeError,
 )
 
 PLANNER_TIMEOUT_SECONDS = 600
@@ -80,11 +87,23 @@ DEFAULT_WORK_ORDER_TIMEOUT_SECONDS = 1800
 # One coder invocation plus one reviewer invocation per work order.
 MODEL_CALLS_PER_WORK_ORDER = 2
 
+#: A Git observation the controller injects itself. It is deliberately outside
+#: the planner acceptance-command grammar: no planner may name ``git``, and this
+#: command never passes through ``authorize_planner_commands`` because it did
+#: not come from a model.
 WHITESPACE_CHECK = AcceptanceCommand(
     argv=["git", "diff", "--check", "HEAD"],
     description="controller-added: reject whitespace damage in the diff",
     required=True,
 )
+
+#: Where read-only workers are invoked from, relative to the run directory.
+#:
+#: The planner and reviewer have no tools and receive everything they reason
+#: about in the context packet, so there is no reason for their process to sit
+#: in the researcher's repository. It runs in runtime-owned space instead, and
+#: the canonical path appears only as data in the packet.
+READ_ONLY_CWD_PARTS: tuple[str, ...] = ("context",)
 
 
 class AutomationController:
@@ -271,7 +290,7 @@ class AutomationController:
             role=Role.PLANNER,
             setting=planner,
             prompt=prompt,
-            cwd=Path(run.project_path),
+            cwd=store.path(*READ_ONLY_CWD_PARTS),
             timeout_seconds=PLANNER_TIMEOUT_SECONDS,
             json_schema=PLAN_SCHEMA,
         )
@@ -343,6 +362,13 @@ class AutomationController:
         assert_isolated(record, canonical_repository=Path(run.project_path))
 
         worktree = Path(record.path)
+        self._assert_symlinks_contained(
+            store,
+            run,
+            task_id,
+            worktree,
+            stage="before the writer was invoked",
+        )
         packet = build_context(project_path=worktree, goal=run.goal)
         prompt = build_coder_prompt(order, context_text=render_context(packet))
         setting = RoleSetting(
@@ -393,6 +419,14 @@ class AutomationController:
             )
 
         evidence = collect_evidence(order, worktree=worktree)
+        if not evidence.contained:
+            self._fail_order_on_symlinks(
+                store,
+                run,
+                task_id,
+                evidence.outbound_symlinks,
+                stage="while collecting execution evidence",
+            )
         diff_path = store.write_text(f"execution/{task_id}/diff.patch", evidence.diff)
         store.write_text(f"execution/{task_id}/diff.stat.txt", evidence.diff_stat)
         store.append_event(
@@ -448,6 +482,25 @@ class AutomationController:
     ) -> AutomationRun:
         order = run.order(task_id)
         worktree = Path(order.worktree_path or "")
+        try:
+            authorize_planner_commands(
+                order.acceptance_commands,
+                self.config.allowed_check_programs,
+            )
+        except AutomationError as exc:
+            run = self._update_order(
+                store,
+                run,
+                task_id,
+                status=WorkOrderStatus.CHECKS_FAILED,
+                failure_reason=str(exc),
+            )
+            store.append_event(
+                "command_refused",
+                task_id=task_id,
+                detail=str(exc),
+            )
+            raise
         commands = [*order.acceptance_commands, WHITESPACE_CHECK]
         results = []
         for index, command in enumerate(commands, start=1):
@@ -520,7 +573,7 @@ class AutomationController:
             role=Role.REVIEWER,
             setting=setting,
             prompt=prompt,
-            cwd=Path(run.project_path),
+            cwd=store.path(*READ_ONLY_CWD_PARTS),
             timeout_seconds=REVIEWER_TIMEOUT_SECONDS,
             json_schema=REVIEW_SCHEMA,
             task_id=task_id,
@@ -601,7 +654,9 @@ class AutomationController:
             raise ProviderUnavailableError(
                 f"no adapter for provider {setting.provider!r}"
             )
-        if not setting.read_only:
+        if setting.read_only:
+            self._assert_read_only_cwd(run, cwd)
+        else:
             self._assert_write_isolation(run, cwd, task_id)
 
         invocation_id = f"INV-{len(run.invocations) + 1:04d}"
@@ -616,7 +671,7 @@ class AutomationController:
             timeout_seconds=timeout_seconds,
             model=setting.model,
             effort=setting.effort,
-            tools=tuple(setting.tools),
+            tools=() if setting.read_only else tuple(setting.tools),
             json_schema=json_schema,
         )
         result = adapter.invoke(request)
@@ -731,6 +786,72 @@ class AutomationController:
                 f"write-enabled worker would run in {cwd}, not its worktree "
                 f"{record.path}"
             )
+        assert_contained_symlinks(Path(record.path))
+
+    @staticmethod
+    def _assert_read_only_cwd(run: AutomationRun, cwd: Path) -> None:
+        """Refuse to start a read-only worker inside the canonical repository.
+
+        A read-only worker has no tools, so this is not what stops it writing.
+        It is the second half of the same idea: a process with nothing to act
+        with also has no reason to be standing in the researcher's checkout, and
+        keeping it out means a future change to its tool set cannot silently
+        inherit that position.
+        """
+
+        canonical = Path(run.project_path).resolve()
+        resolved = cwd.resolve()
+        if resolved == canonical or canonical in resolved.parents:
+            raise AutomationError(
+                f"a read-only worker would run in {resolved}, inside the "
+                f"canonical repository {canonical}; read-only workers run from "
+                "runtime-owned space and receive the project as context"
+            )
+
+    def _assert_symlinks_contained(
+        self,
+        store: RunStore,
+        run: AutomationRun,
+        task_id: str,
+        worktree: Path,
+        *,
+        stage: str,
+    ) -> None:
+        """Fail the order unless every symlink in the worktree stays inside it."""
+
+        escaping = outbound_symlinks(worktree)
+        if escaping:
+            self._fail_order_on_symlinks(store, run, task_id, escaping, stage=stage)
+
+    def _fail_order_on_symlinks(
+        self,
+        store: RunStore,
+        run: AutomationRun,
+        task_id: str,
+        escaping: tuple[str, ...],
+        *,
+        stage: str,
+    ) -> NoReturn:
+        """Record an outbound-symlink refusal and stop the order."""
+
+        reason = (
+            f"symlinks resolving outside the isolated worktree, detected {stage}: "
+            + ", ".join(escaping)
+        )
+        store.append_event(
+            "symlink_scope_violation",
+            task_id=task_id,
+            stage=stage,
+            paths=list(escaping),
+        )
+        self._update_order(
+            store,
+            run,
+            task_id,
+            status=WorkOrderStatus.FAILED,
+            failure_reason=reason,
+        )
+        raise SymlinkScopeError(f"{task_id}: {reason}")
 
     def _transition(
         self,

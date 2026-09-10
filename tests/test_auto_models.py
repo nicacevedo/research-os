@@ -10,6 +10,7 @@ from research_os.automation.models import (
     AcceptanceCommand,
     AutomationRun,
     Budget,
+    CommandResult,
     ModelInvocation,
     RiskClass,
     Role,
@@ -238,6 +239,58 @@ def test_invocation_id_shape_is_enforced() -> None:
 
 
 def test_required_checks_passed_is_false_without_any_check() -> None:
+    """An unverified work order must never read as a verified one.
+
+    ``all([])`` is True, so a naive implementation reports that every required
+    check passed on an order where nothing ran at all.
+    """
+
     order = make_order()
-    assert order.required_checks_passed is True
     assert order.check_results == []
+    assert order.required_checks_passed is False
+
+
+# -- audit regression: nothing checked is not the same as checks passed ------
+
+
+def command_result(*, required: bool, exit_code: int) -> CommandResult:
+    now = utc_now()
+    return CommandResult(
+        argv=["pytest", "-q"],
+        cwd="/tmp/worktree",
+        required=required,
+        exit_code=exit_code,
+        timed_out=False,
+        timeout_seconds=60,
+        started_at=now,
+        ended_at=now,
+        duration_ms=1,
+    )
+
+
+def test_an_order_with_only_optional_checks_has_not_passed_its_required_ones() -> None:
+    """``all([])`` would call this verified; no required check ever ran."""
+
+    order = make_order(check_results=[command_result(required=False, exit_code=0)])
+
+    assert order.check_results != []
+    assert order.required_checks_passed is False
+
+
+def test_required_checks_passed_is_true_only_when_a_required_check_succeeded() -> None:
+    passing = make_order(check_results=[command_result(required=True, exit_code=0)])
+    failing = make_order(check_results=[command_result(required=True, exit_code=1)])
+
+    assert passing.required_checks_passed is True
+    assert failing.required_checks_passed is False
+
+
+def test_a_failing_optional_check_does_not_sink_a_passing_required_one() -> None:
+    order = make_order(
+        check_results=[
+            command_result(required=True, exit_code=0),
+            command_result(required=False, exit_code=1),
+        ]
+    )
+
+    assert order.required_checks_passed is True

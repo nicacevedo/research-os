@@ -4,6 +4,9 @@ The controller runs these itself. A worker reporting that the tests pass is a
 claim; an exit code the controller observed is evidence, and only the second one
 gates a run. Commands are argument vectors executed without a shell, inside the
 task's own worktree, under an enforced timeout.
+
+Whether a planner-originated command may run at all is decided in
+``command_policy``, before anything here is called.
 """
 
 from __future__ import annotations
@@ -16,25 +19,6 @@ from pathlib import Path
 from research_os.automation.models import AcceptanceCommand, CommandResult, utc_now
 
 MAX_CAPTURE_CHARS = 200_000
-
-
-def assert_programs_allowed(
-    commands: list[AcceptanceCommand],
-    allowed: tuple[str, ...],
-) -> None:
-    """Raise ``ValueError`` naming the first command outside the allowlist.
-
-    The controller executes these commands, so the set of programs a plan may
-    name is policy, not a suggestion from the planner.
-    """
-
-    for command in commands:
-        program = command.argv[0]
-        if program not in allowed:
-            raise ValueError(
-                f"acceptance command program {program!r} is not allowed; "
-                f"permitted programs: {', '.join(sorted(allowed))}"
-            )
 
 
 def run_acceptance_command(

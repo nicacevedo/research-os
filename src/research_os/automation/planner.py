@@ -14,7 +14,10 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from research_os.automation.checks import assert_programs_allowed
+from research_os.automation.command_policy import (
+    SUPPORTED_COMMAND_FORMS,
+    authorize_planner_commands,
+)
 from research_os.automation.models import (
     TASK_ID_RE,
     AcceptanceCommand,
@@ -26,7 +29,7 @@ from research_os.automation.models import (
     WorkOrder,
 )
 from research_os.automation.structured import extract_json_object
-from research_os.errors import PlanValidationError
+from research_os.errors import CommandPolicyError, PlanValidationError
 from research_os.models import NonBlankStr
 
 PLAN_SCHEMA: dict[str, Any] = {
@@ -134,6 +137,7 @@ def build_planner_prompt(
     """
 
     programs = ", ".join(sorted(allowed_programs))
+    forms = "\n".join(f"    {item}" for item in SUPPORTED_COMMAND_FORMS)
     return f"""You are the planning worker of a deterministic research automation
 controller. You have no tools and no repository access. Plan only from the
 context below.
@@ -162,9 +166,13 @@ rejected by the controller before anything runs:
   leading "/", no "..", no "~"). The controller fails the task if the worker
   changes anything outside them.
 - "acceptance_commands" must be non-empty for every task. Each is an argument
-  vector run by the controller, without a shell, in the task's worktree. The
-  first element must be one of: {programs}. No shell operators, pipes,
-  redirection, or "&&" - they will not be interpreted.
+  vector run by the controller, without a shell, in the task's worktree. Only
+  these command forms are authorised, and only these programs are available:
+  {programs}.
+{forms}
+  Every path argument must be relative to the worktree: no leading "/", no
+  "..", no "~". No shell operators, pipes, redirection, or "&&" - they are not
+  interpreted, and a command containing them is rejected.
 - Prefer the narrowest commands that actually prove the goal was met, for
   example a specific test file rather than the entire suite.
 - "completion_condition" must be an objective, checkable statement.
@@ -235,7 +243,7 @@ def validate_plan(
             )
         if not task.allowed_paths:
             raise PlanValidationError(f"task {task.id} has an empty allowed_paths")
-        if any(item.startswith(".research/") for item in task.allowed_paths):
+        if any(_is_research_scope(item) for item in task.allowed_paths):
             raise PlanValidationError(
                 f"task {task.id} would write under .research/; canonical "
                 "scientific files are never written by an automated worker"
@@ -256,15 +264,27 @@ def validate_plan(
 
     try:
         for task in plan.tasks:
-            assert_programs_allowed(
+            authorize_planner_commands(
                 [
                     AcceptanceCommand(argv=list(command.argv))
                     for command in task.acceptance_commands
                 ],
                 allowed_programs,
             )
-    except (ValueError, ValidationError) as exc:
+    except (CommandPolicyError, ValueError, ValidationError) as exc:
         raise PlanValidationError(str(exc)) from exc
+
+
+def _is_research_scope(entry: str) -> bool:
+    """Return whether a scope entry names the capsule directory itself.
+
+    ``.research`` and ``.research/`` grant exactly the authority ``.research/x``
+    does, so all three are refused here rather than only the last one. Execution
+    time refuses them again from the observed diff.
+    """
+
+    normalised = entry.rstrip("/")
+    return normalised == ".research" or normalised.startswith(".research/")
 
 
 def plan_to_work_orders(

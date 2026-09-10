@@ -14,6 +14,7 @@ from typing import Any
 import yaml
 from pydantic import BaseModel, ConfigDict, ValidationError
 
+from research_os.automation.command_policy import SUPPORTED_PROGRAMS
 from research_os.automation.models import Budget, Independence, RoleSetting
 from research_os.automation.providers import provider_family
 from research_os.errors import AutomationError, ProviderUnavailableError
@@ -23,14 +24,13 @@ CONFIG_FILENAME = "automation.yaml"
 
 ROLE_NAMES: tuple[str, ...] = ("planner", "coder", "reviewer")
 
-DEFAULT_ALLOWED_CHECK_PROGRAMS: tuple[str, ...] = (
-    "uv",
-    "python",
-    "python3",
-    "pytest",
-    "ruff",
-    "git",
-)
+#: The check programs a plan may name by default.
+#:
+#: Narrower than "programs the controller could run": ``python`` executes
+#: arbitrary source with ``-c`` and ``git`` reaches the network with ``push``,
+#: so neither is reachable from planner output. ``command_policy`` decides the
+#: authorised command forms; this list may only narrow that grammar further.
+DEFAULT_ALLOWED_CHECK_PROGRAMS: tuple[str, ...] = ("uv", "pytest", "ruff")
 
 DEFAULT_CODER_TOOLS: tuple[str, ...] = ("Read", "Write", "Edit", "Glob", "Grep")
 
@@ -148,6 +148,14 @@ def load_config(path: Path | None = None) -> AutomationConfig:
         if document.allowed_check_programs is not None
         else DEFAULT_ALLOWED_CHECK_PROGRAMS
     )
+    unsupported = [item for item in programs if item not in SUPPORTED_PROGRAMS]
+    if unsupported:
+        raise AutomationError(
+            f"invalid automation config at {target}: allowed_check_programs "
+            f"names {', '.join(sorted(unsupported))}, which the acceptance "
+            "command policy has no grammar for. Configuration may only narrow "
+            f"the supported programs: {', '.join(SUPPORTED_PROGRAMS)}"
+        )
     return AutomationConfig(
         roles=roles,
         budget=document.budget or Budget(),

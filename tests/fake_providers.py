@@ -29,6 +29,7 @@ class ScriptedResponse:
     stderr: str = ""
     write_files: dict[str, str] = field(default_factory=dict)
     delete_files: tuple[str, ...] = ()
+    create_symlinks: dict[str, str] = field(default_factory=dict)
     total_cost_usd: float | None = 0.01
     input_tokens: int | None = 100
     output_tokens: int | None = 20
@@ -59,7 +60,7 @@ class FakeProvider:
     def invoke(self, request: InvocationRequest) -> InvocationResult:
         self.calls.append(request)
         response = self._next(request.role)
-        if response.write_files or response.delete_files:
+        if response.write_files or response.delete_files or response.create_symlinks:
             if request.read_only:
                 raise AssertionError(
                     f"a read-only {request.role} invocation attempted to write"
@@ -106,6 +107,10 @@ class FakeProvider:
             target.write_text(content, encoding="utf-8")
         for relative in response.delete_files:
             (cwd / relative).unlink(missing_ok=True)
+        for relative, destination in response.create_symlinks.items():
+            link = cwd / relative
+            link.parent.mkdir(parents=True, exist_ok=True)
+            link.symlink_to(destination)
 
 
 @dataclass

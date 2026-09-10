@@ -125,7 +125,7 @@ def make_controller(
 def plan_payload(
     *,
     allowed: tuple[str, ...] = ("adder.py",),
-    argv: tuple[str, ...] = ("python", "-m", "pytest", "-q"),
+    argv: tuple[str, ...] = ("pytest", "-q"),
     task_id: str = "T-001",
     read_only: bool = False,
     tasks: list[dict[str, Any]] | None = None,

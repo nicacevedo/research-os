@@ -26,7 +26,7 @@ def test_structured_output_is_used_directly() -> None:
     plan = parse_plan(structured=plan_payload(), text=None)
     assert plan.summary == "Implement the missing function."
     assert [task.id for task in plan.tasks] == ["T-001"]
-    assert plan.tasks[0].acceptance_commands[0].argv == ["python", "-m", "pytest", "-q"]
+    assert plan.tasks[0].acceptance_commands[0].argv == ["pytest", "-q"]
 
 
 def test_a_fenced_json_body_is_recovered() -> None:
@@ -122,13 +122,27 @@ def test_a_task_without_a_scope_is_rejected() -> None:
         validate_plan(plan, budget=Budget(), allowed_programs=PROGRAMS)
 
 
-def test_a_task_that_would_write_science_is_rejected() -> None:
-    plan = parse_plan(
-        structured=plan_payload(allowed=(".research/claims",)),
-        text=None,
-    )
+@pytest.mark.parametrize(
+    "scope",
+    [".research/claims", ".research", ".research/", ".research/claims/CL-0001.yaml"],
+)
+def test_a_task_that_would_write_science_is_rejected(scope: str) -> None:
+    """The capsule directory itself grants exactly what a path inside it does.
+
+    ``.research`` as an allowed path authorises every file beneath it, so plan
+    validation refuses the bare directory on the same terms as ``.research/x``.
+    """
+
+    plan = parse_plan(structured=plan_payload(allowed=(scope,)), text=None)
     with pytest.raises(PlanValidationError, match=r"\.research/"):
         validate_plan(plan, budget=Budget(), allowed_programs=PROGRAMS)
+
+
+def test_an_ordinary_path_that_merely_starts_with_the_same_letters_is_allowed() -> None:
+    """``.researchers`` is not the capsule; the check is on path segments."""
+
+    plan = parse_plan(structured=plan_payload(allowed=(".researchers",)), text=None)
+    validate_plan(plan, budget=Budget(), allowed_programs=PROGRAMS)
 
 
 def test_a_task_without_acceptance_commands_is_rejected() -> None:
@@ -202,6 +216,8 @@ def test_the_planner_prompt_states_the_enforced_limits() -> None:
     assert "implement add" in prompt
     assert "At most 3 tasks" in prompt
     assert "at most\n  1 of them may write" in prompt
-    assert "git, pytest, python, python3, ruff, uv" in prompt
+    assert "pytest, ruff, uv" in prompt
+    assert "uv run ruff format --check [options] [paths]" in prompt
+    assert 'no leading "/", no' in prompt
     assert ".research/" in prompt
     assert "# context" in prompt

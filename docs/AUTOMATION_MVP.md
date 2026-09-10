@@ -119,7 +119,7 @@ budget:
   max_wall_clock_seconds: 3600
   max_write_work_orders: 2
   max_work_orders: 4
-allowed_check_programs: [uv, python, python3, pytest, ruff, git]
+allowed_check_programs: [uv, pytest, ruff]
 ```
 
 ### Review independence
@@ -141,21 +141,104 @@ is not independent.
 
 - **Read-only roles get no tools at all.** The planner and reviewer are invoked
   with an empty tool set, so they cannot read or write the repository even if
-  their prompt is subverted. They see only the packet the controller built.
+  their prompt is subverted. They see only the packet the controller built. This
+  is enforced twice: a role configuration that declares `read_only: true`
+  together with any tool is rejected when the config is loaded, and the
+  invocation layer independently forces the effective tool set empty for every
+  read-only request, whatever it was constructed with.
+- **Read-only workers do not run in your repository.** The planner and reviewer
+  processes are started from a runtime-owned directory under the run
+  (`<run>/context/`), not from the project checkout. The project path reaches
+  them as data in the context packet. Each invocation records the directory it
+  actually ran in.
 - **The coding agent gets no command-running tool.** The default tool set is
   `Read, Write, Edit, Glob, Grep`. It runs under the provider's restricted mode,
-  which confines file tools to the working directory, and with permission
-  prompts denied rather than escalated.
+  which confines file tools to the working directory, with `--strict-mcp-config`
+  so the run cannot inherit MCP servers configured elsewhere on the machine, and
+  with permission prompts denied rather than escalated.
 - **Scope is enforced, not requested.** After execution the controller reads the
   worktree itself and fails the work order if anything outside `allowed_paths`
   changed. Any change under `.research/` fails unconditionally, even if a plan
-  named it.
-- **Acceptance commands are argument vectors on an allowlist.** They run without
-  a shell, so there is no quoting or metacharacter surface, and only programs in
-  `allowed_check_programs` may be named.
+  named it. `.research` and `.research/...` are refused identically at plan
+  validation, because naming the directory grants exactly what naming a file
+  inside it grants.
+- **Symlinks may not leave the worktree.** Git-level isolation is not
+  filesystem-level isolation: a symlink inside the worktree that points outside
+  it would carry a write past the isolation boundary, and because the link
+  itself does not change, `git diff` would report a clean, in-scope run. Before
+  a writer is invoked, and again when evidence is collected, the controller
+  scans the worktree and refuses the work order if any symlink resolves outside
+  it. This does not depend on the provider's restricted mode, which is
+  defence in depth only.
+- **Acceptance commands are authorised as whole argument vectors.** Not by
+  program name: `python -c`, `git push`, and `uv run python -c` are all
+  reachable from an `argv[0]` allowlist. See *Acceptance commands* below.
 - **No external content ingestion.** There is no literature or web retrieval in
   this MVP. The rule that raw retrieved external content must never flow into a
   tool-enabled write agent is preserved by not having such a path at all.
+
+### Acceptance commands
+
+The controller runs acceptance commands itself, so which command shapes a plan
+may name is policy. A planner-originated command is authorised against a small
+explicit grammar, and anything the grammar does not recognise is refused before
+the argument vector reaches the operating system. These are the supported forms:
+
+```text
+pytest [options] [test paths]
+ruff check [options] [paths]
+ruff format --check [options] [paths]
+uv run pytest [options] [test paths]
+uv run ruff check [options] [paths]
+uv run ruff format --check [options] [paths]
+```
+
+- Options are an approved set per tool, not a pass-through: pytest accepts
+  `-q`, `-qq`, `--quiet`, `-v`, `-vv`, `--verbose`, `-x`, `--exitfirst`,
+  `--no-header`, `--no-summary`, `--strict-config`, `--strict-markers`,
+  `--maxfail=N`, and `--tb=STYLE`; ruff accepts `-q`, `--quiet`, `--no-cache`,
+  `--exit-non-zero-on-fix`, `--no-fix` (check), and `--diff` (format). An
+  unrecognised option is rejected rather than forwarded. The set is deliberately
+  small and will grow only when a real plan needs a flag.
+- Path arguments must be relative to the worktree. Absolute paths, `..`, and `~`
+  are refused, as is any token carrying shell syntax.
+- `python`, `python3`, `git`, `bash`, `sh`, `zsh`, and their `uv run` forms are
+  not reachable from planner output at all.
+- `allowed_check_programs` may only narrow this grammar. Naming a program the
+  grammar has no rule for is a configuration error, not a way to enable it.
+- Nothing runs through a shell: `subprocess.run` is always given a list.
+- The controller injects one Git observation of its own, `git diff --check
+  HEAD`. It does not come from a model and deliberately does not use the
+  planner authorisation path.
+
+### Trusted-project execution boundary
+
+**Research OS Automation MVP is currently intended for trusted local
+repositories. Acceptance checks such as pytest execute repository code,
+including code an automation worker has just modified, with the permissions of
+the `researchctl` process. Worktree isolation protects the canonical Git
+checkout; it is not an OS sandbox.**
+
+This is intentional for the current MVP, and it is the boundary to understand
+before pointing `auto` at anything:
+
+- Running a project's own tests means running the project's own code. A worker
+  that edits a module the test suite imports has, by that edit, chosen what the
+  controller will execute next. No acceptance-command policy can change this;
+  the policy limits which *commands* may run, not what a project's code does
+  when it runs.
+- There is no network or process-level sandboxing. Check subprocesses inherit
+  the environment of the `researchctl` process, including any credentials in it.
+- Do not pass an arbitrary untrusted or freshly cloned repository to
+  `researchctl auto`. Read the code you are automating first, exactly as you
+  would before running its test suite by hand.
+- Containers and sandboxed execution are deferred. They are the right answer for
+  untrusted repositories and this MVP does not pretend to provide them.
+
+What worktree isolation *does* give you: a write-enabled worker cannot reach the
+canonical checkout, cannot commit, merge, or push, and cannot change scientific
+files. Those are Git-level and controller-level guarantees, and they hold. They
+are not a claim about what a process can do to the machine it runs on.
 
 ## Worktree isolation
 
@@ -170,6 +253,12 @@ One writing worker, one dedicated worktree. This is enforced:
 - `assert_isolated` runs immediately before every write invocation and refuses
   the canonical checkout, a path inside the project, a missing worktree, a
   missing lock, or a lock held for a different path;
+- the worktree is scanned for symlinks that resolve outside it, before the
+  writer is invoked and again during evidence collection. Any such link fails
+  the work order, because a write through it would land outside the isolation
+  boundary without appearing in `git diff`. A symlink whose target stays inside
+  the worktree is fine; an absolute link back at the canonical checkout is not,
+  since that is the checkout the worktree exists to protect;
 - a run refuses to start at all if the project tree is dirty, so the base commit
   is unambiguous;
 - failed worktrees are deliberately left in place. They are removed only by

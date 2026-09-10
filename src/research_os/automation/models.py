@@ -368,7 +368,18 @@ class WorkOrder(BaseModel):
 
     @property
     def required_checks_passed(self) -> bool:
-        return all(item.ok for item in self.check_results if item.required)
+        """Return whether every required check ran *and* succeeded.
+
+        Fail-closed: a work order with no required check result has not been
+        verified, so it reports False rather than the vacuous truth of
+        ``all([])``. Nothing may treat "nothing was checked" as "the checks
+        passed".
+        """
+
+        required = [item for item in self.check_results if item.required]
+        if not required:
+            return False
+        return all(item.ok for item in required)
 
 
 class ReviewFinding(BaseModel):
@@ -420,6 +431,25 @@ class RoleSetting(BaseModel):
     effort: str | None = None
     read_only: bool
     tools: list[NonBlankStr] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _read_only_roles_have_no_tools(self) -> Self:
+        """Refuse a read-only role that was given tools.
+
+        "Read-only" is enforced by handing the worker nothing to act with, so a
+        read-only role configured with ``Write`` or ``Bash`` is not a stricter
+        preference the invocation can quietly correct; it is a configuration
+        that means two contradictory things. It is rejected here, and the
+        invocation layer independently forces the effective tool set empty.
+        """
+
+        if self.read_only and self.tools:
+            raise ValueError(
+                "a read_only role must declare no tools, but this one declares "
+                f"{', '.join(self.tools)}; read-only workers are given an empty "
+                "tool set so they cannot act on the repository at all"
+            )
+        return self
 
 
 class ProviderProbe(BaseModel):

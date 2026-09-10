@@ -259,7 +259,10 @@ def test_probing_verifies_the_flags_the_adapter_depends_on(
         if argv[1] == "--version":
             out = "9.9.9 (Claude Code)\n"
         elif argv[1] == "--help":
-            out = "--print --output-format --json-schema --tools"
+            out = (
+                "--print --output-format --json-schema --tools "
+                "--restricted --strict-mcp-config"
+            )
         else:
             out = json.dumps({"loggedIn": True, "authMethod": "claude.ai"})
         return subprocess.CompletedProcess(argv, 0, out, "")
@@ -321,3 +324,115 @@ def test_probing_the_registry_returns_one_probe_per_provider(
 
     assert set(probes) == {"claude", "codex", "gemini"}
     assert all(probe.available is False for probe in probes.values())
+
+
+# -- audit regression: read-only invocations have no tools, whatever is asked -
+
+
+def test_a_read_only_request_drops_tools_it_was_constructed_with() -> None:
+    """The second, independent enforcement of the read-only invariant.
+
+    Configuration already refuses a read-only role with tools. This is what
+    holds if some future caller assembles a request directly.
+    """
+
+    built = InvocationRequest(
+        role=Role.PLANNER,
+        prompt="plan",
+        cwd=Path("/tmp"),
+        read_only=True,
+        timeout_seconds=60,
+        tools=("Write", "Bash"),
+    )
+
+    assert built.tools == ()
+
+
+def test_a_write_request_keeps_the_tools_it_was_given() -> None:
+    built = InvocationRequest(
+        role=Role.CODER,
+        prompt="code",
+        cwd=Path("/tmp/worktree"),
+        read_only=False,
+        timeout_seconds=60,
+        tools=("Read", "Write", "Edit"),
+    )
+
+    assert built.tools == ("Read", "Write", "Edit")
+
+
+def test_a_read_only_invocation_names_no_tool_on_the_command_line(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = Recorder(stdout=envelope())
+    monkeypatch.setattr(subprocess, "run", recorder)
+    ClaudeCodeProvider().invoke(request(tools=("Write", "Bash")))
+
+    argv = recorder.argv
+    assert argv[argv.index("--tools") + 1] == ""
+    assert "Write" not in argv
+    assert "Bash" not in argv
+    assert argv[argv.index("--permission-mode") + 1] == "plan"
+
+
+# -- adjacent hardening: no ambient MCP tooling -----------------------------
+
+
+def test_the_invocation_does_not_inherit_ambient_mcp_servers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--restricted`` alone still loads the machine's MCP configuration.
+
+    The local ``--help`` for ``--restricted`` says to add ``--strict-mcp-config``
+    to skip MCP servers too, so both flags are passed and no ``--mcp-config`` is
+    supplied, leaving the worker with exactly the tools named by ``--tools``.
+    """
+
+    recorder = Recorder(stdout=envelope())
+    monkeypatch.setattr(subprocess, "run", recorder)
+    ClaudeCodeProvider().invoke(request())
+
+    argv = recorder.argv
+    assert "--restricted" in argv
+    assert "--strict-mcp-config" in argv
+    assert "--mcp-config" not in argv
+
+
+def test_a_write_invocation_is_equally_strict_about_mcp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = Recorder(stdout=envelope())
+    monkeypatch.setattr(subprocess, "run", recorder)
+    ClaudeCodeProvider().invoke(
+        request(role=Role.CODER, read_only=False, tools=("Read", "Write"))
+    )
+
+    argv = recorder.argv
+    assert "--strict-mcp-config" in argv
+    assert "--mcp-config" not in argv
+    assert argv[argv.index("--tools") + 1] == "Read,Write"
+
+
+def test_a_cli_without_strict_mcp_config_is_not_usable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The flag is part of the capability the adapter depends on, not a bonus."""
+
+    monkeypatch.setattr(
+        "research_os.automation.providers.shutil.which",
+        lambda _: "/fake/bin/claude",
+    )
+
+    def capture(argv: list[str], **kwargs: Any) -> Any:
+        out = (
+            "--print --output-format --json-schema --tools --restricted"
+            if argv[1] == "--help"
+            else "1.0"
+        )
+        return subprocess.CompletedProcess(argv, 0, out, "")
+
+    monkeypatch.setattr(subprocess, "run", capture)
+    probe = ClaudeCodeProvider().probe()
+
+    assert probe.available is False
+    assert "--strict-mcp-config" in probe.detail

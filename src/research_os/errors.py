@@ -135,6 +135,15 @@ class PlanValidationError(AutomationError):
     """Raised when planner output is not a valid, in-policy work plan."""
 
 
+class CommandPolicyError(AutomationError):
+    """Raised when a planner-originated acceptance command is not authorised.
+
+    The controller executes acceptance commands itself, so which command shapes
+    a plan may name is policy. Raised before the argument vector reaches
+    ``subprocess.run``, never after.
+    """
+
+
 class WorktreeError(AutomationError):
     """Raised when an isolated automation worktree cannot be created or removed."""
 
@@ -144,6 +153,16 @@ class WorktreeIsolationError(WorktreeError):
 
     An enforced invariant rather than a prompt instruction: the controller
     checks the resolved working directory before every write invocation.
+    """
+
+
+class SymlinkScopeError(WorktreeIsolationError):
+    """Raised when a symlink in the worktree resolves outside it.
+
+    A writer told to change an in-scope path writes through whatever that path
+    is. If the path is a symlink out of the worktree, the write lands outside
+    the isolation boundary and Git never sees it, so the run is refused before
+    the writer is invoked.
     """
 
 

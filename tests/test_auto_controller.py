@@ -20,6 +20,7 @@ from research_os.automation.controller import (
 )
 from research_os.automation.gitutil import branch_exists, porcelain_status
 from research_os.automation.models import (
+    AcceptanceCommand,
     AutomationRun,
     Budget,
     Independence,
@@ -236,7 +237,7 @@ def test_the_reviewer_sees_the_diff_and_the_observed_exit_codes(
     prompt = ctx.provider.requests_for(Role.REVIEWER)[0].prompt
 
     assert "return left + right" in prompt
-    assert "python -m pytest -q" in prompt
+    assert "pytest -q" in prompt
     assert "exit_code: 0" in prompt
     assert "an unverified claim, not evidence" in prompt
 
@@ -896,7 +897,269 @@ def test_the_allowlist_comes_from_configuration(
     )
     controller = make_controller({"fake": scripted()}, config=narrowed)
 
-    with pytest.raises(PlanValidationError, match="not allowed"):
+    with pytest.raises(PlanValidationError, match="allowed check programs"):
         controller.start(project_path=repo, goal="implement add")
 
     assert DEFAULT_ALLOWED_CHECK_PROGRAMS != ("ruff",)
+
+
+# -- audit regression: outbound symlink under write scope --------------------
+
+
+def symlink_escape_repo(tmp_path: Path) -> tuple[Path, Path]:
+    """A repository whose in-scope path is a symlink to a file outside it.
+
+    This is the shape the security audit exercised: the link is committed, so it
+    arrives in every worktree created from the base commit, and the file it
+    points at belongs to nobody in the run.
+    """
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target = outside / "secret.txt"
+    target.write_text("canonical content\n", encoding="utf-8")
+
+    repo = init_repo(tmp_path / "project")
+    (repo / "src").mkdir()
+    (repo / "src" / "real.py").write_text("value = 1\n", encoding="utf-8")
+    (repo / "src" / "notes.txt").symlink_to(target)
+    commit_all(repo, "add an outbound symlink")
+    return repo, target
+
+
+def test_an_outbound_symlink_stops_the_run_before_the_writer_is_invoked(
+    automation_home: Path, tmp_path: Path
+) -> None:
+    """The audit's escape: an in-scope path that is a link out of the worktree.
+
+    A writer told it may change ``src/`` would write straight through the link.
+    The file outside changes, the link does not, so ``git diff`` reports a clean
+    in-scope run and scope enforcement -- which reads Git -- sees nothing.
+    """
+
+    repo, target = symlink_escape_repo(tmp_path)
+    before = target.read_bytes()
+    provider = scripted(
+        plan=plan_payload(allowed=("src",), argv=("pytest", "-q")),
+        coder=ScriptedResponse(
+            text="updated the notes",
+            write_files={"src/notes.txt": "written through the symlink\n"},
+        ),
+    )
+    controller = make_controller({"fake": provider})
+    store, _ = controller.start(project_path=repo, goal="update the notes")
+
+    with pytest.raises(AutomationError, match="resolving outside"):
+        controller.execute(store)
+
+    assert provider.requests_for(Role.CODER) == [], "the writer was invoked"
+    assert target.read_bytes() == before, "the file outside the worktree changed"
+
+    final = store.load()
+    assert final.state is RunState.FAILED
+    assert final.state is not RunState.READY_FOR_HUMAN
+    assert final.order("T-001").status is WorkOrderStatus.FAILED
+    assert "src/notes.txt" in (final.order("T-001").failure_reason or "")
+
+
+def test_the_outbound_symlink_refusal_is_in_the_ledger(
+    automation_home: Path, tmp_path: Path
+) -> None:
+    repo, _ = symlink_escape_repo(tmp_path)
+    controller = make_controller(
+        {"fake": scripted(plan=plan_payload(allowed=("src",), argv=("pytest", "-q")))}
+    )
+    store, _ = controller.start(project_path=repo, goal="update the notes")
+
+    with pytest.raises(AutomationError):
+        controller.execute(store)
+
+    events = [record["event"] for record in store.iter_events()]
+    assert "symlink_scope_violation" in events
+    violation = next(
+        record
+        for record in store.iter_events()
+        if record["event"] == "symlink_scope_violation"
+    )
+    assert violation["task_id"] == "T-001"
+    assert violation["paths"] == ["src/notes.txt"]
+    assert violation["stage"] == "before the writer was invoked"
+
+
+def test_a_symlink_the_worker_creates_is_caught_at_the_evidence_stage(
+    automation_home: Path, tmp_path: Path
+) -> None:
+    """The second gate: the worktree was clean when the writer started.
+
+    The pre-invocation check cannot see a link that does not exist yet, so
+    evidence collection repeats it before scope enforcement is allowed to pass.
+    """
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target = outside / "secret.txt"
+    target.write_text("canonical content\n", encoding="utf-8")
+
+    repo = init_repo(tmp_path / "project")
+    provider = scripted(
+        coder=ScriptedResponse(
+            text="implemented add",
+            write_files={"adder.py": FIXED_MODULE},
+            create_symlinks={"escape.txt": str(target)},
+        )
+    )
+    controller = make_controller({"fake": provider})
+    store, _ = controller.start(project_path=repo, goal="implement add")
+
+    with pytest.raises(AutomationError, match="resolving outside"):
+        controller.execute(store)
+
+    assert provider.requests_for(Role.CODER), "this gate runs after the writer"
+    final = store.load()
+    assert final.state is RunState.FAILED
+    assert final.order("T-001").status is WorkOrderStatus.FAILED
+
+    violation = next(
+        record
+        for record in store.iter_events()
+        if record["event"] == "symlink_scope_violation"
+    )
+    assert violation["stage"] == "while collecting execution evidence"
+    assert violation["paths"] == ["escape.txt"]
+
+
+def test_a_symlink_that_stays_inside_the_worktree_does_not_block_a_run(
+    automation_home: Path, tmp_path: Path
+) -> None:
+    """Containment, not a ban on symlinks."""
+
+    repo = init_repo(tmp_path / "project")
+    # Relative, so it still points inside whichever worktree it is checked out
+    # into. An absolute link back at the canonical checkout would be an escape.
+    (repo / "alias.py").symlink_to("adder.py")
+    commit_all(repo, "add an internal symlink")
+
+    controller = make_controller({"fake": scripted()})
+    store, _ = controller.start(project_path=repo, goal="implement add")
+    final = controller.execute(store)
+
+    assert final.state is RunState.READY_FOR_HUMAN
+
+
+def test_an_ordinary_allowed_path_still_works(
+    automation_home: Path, tmp_path: Path
+) -> None:
+    """The repair must not have made the normal case stricter."""
+
+    ctx = start_run(tmp_path)
+    final = ctx.controller.execute(ctx.store)
+
+    assert final.state is RunState.READY_FOR_HUMAN
+    assert final.order("T-001").changed_paths == ["adder.py"]
+
+
+# -- audit regression: read-only workers run outside the canonical repository -
+
+
+def test_read_only_workers_do_not_run_in_the_canonical_repository(
+    automation_home: Path, tmp_path: Path
+) -> None:
+    """A worker with no tools also has no reason to stand in the researcher's tree.
+
+    The planner and reviewer receive everything they reason about in the context
+    packet, so the canonical path appears to them as data. Keeping the process
+    out of the checkout means a later change to their tool set cannot silently
+    inherit that position.
+    """
+
+    ctx = start_run(tmp_path)
+    final = ctx.controller.execute(ctx.store)
+    canonical = ctx.repo.resolve()
+
+    for role in (Role.PLANNER, Role.REVIEWER):
+        calls = ctx.provider.requests_for(role)
+        assert calls, f"{role} was never invoked"
+        for call in calls:
+            cwd = Path(call.cwd).resolve()
+            assert cwd != canonical
+            assert canonical not in cwd.parents
+            assert cwd == ctx.store.path("context").resolve()
+
+    for invocation in final.invocations:
+        recorded = Path(invocation.cwd).resolve()
+        if invocation.read_only:
+            assert recorded != canonical
+            assert canonical not in recorded.parents
+
+
+def test_the_recorded_cwd_says_where_each_worker_actually_ran(
+    automation_home: Path, tmp_path: Path
+) -> None:
+    ctx = start_run(tmp_path)
+    final = ctx.controller.execute(ctx.store)
+
+    by_role = {item.role: Path(item.cwd) for item in final.invocations}
+    assert by_role[Role.PLANNER] == ctx.store.path("context")
+    assert by_role[Role.REVIEWER] == ctx.store.path("context")
+    assert by_role[Role.CODER] == worktree_path(final.run_id, "T-001")
+
+
+def test_a_read_only_worker_pointed_at_the_repository_is_refused(
+    automation_home: Path, tmp_path: Path
+) -> None:
+    """The invariant is enforced in code, not merely arranged by the caller."""
+
+    ctx = start_run(tmp_path, skip_planner=True)
+    setting = ctx.run.roles["planner"]
+
+    with pytest.raises(AutomationError, match="inside the canonical repository"):
+        ctx.controller._invoke(
+            ctx.store,
+            ctx.run,
+            role=Role.PLANNER,
+            setting=setting,
+            prompt="plan",
+            cwd=ctx.repo,
+            timeout_seconds=60,
+        )
+
+    assert ctx.provider.requests_for(Role.PLANNER) == []
+
+
+def test_a_refused_acceptance_command_is_never_executed(
+    automation_home: Path, tmp_path: Path
+) -> None:
+    """Execution-time fail-closed, independent of plan validation.
+
+    Plan validation already refuses these, so this asserts the second gate: an
+    order carrying an unauthorised command fails its checks without the command
+    reaching the operating system.
+    """
+
+    ctx = start_run(tmp_path)
+    run = ctx.store.load()
+    order = run.order("T-001")
+    smuggled = order.model_copy(
+        update={
+            "acceptance_commands": [
+                AcceptanceCommand(argv=["python", "-c", "print(1)"])
+            ]
+        }
+    )
+    ctx.store.save(run.model_copy(update={"work_orders": [smuggled]}))
+
+    with pytest.raises(AutomationError, match="not authorised"):
+        ctx.controller.execute(ctx.store)
+
+    final = ctx.store.load()
+    assert final.state is RunState.FAILED
+    assert final.order("T-001").status is WorkOrderStatus.CHECKS_FAILED
+    executed = [
+        record["command"]
+        for record in ctx.store.iter_events()
+        if record["event"] == "command_executed"
+    ]
+    assert executed == []
+    assert any(
+        record["event"] == "command_refused" for record in ctx.store.iter_events()
+    )

@@ -133,6 +133,12 @@ a scientific Review or accepts a Claim. Runtime state lives under
 `~/.local/state/research-os/runs/` and can be deleted without affecting any
 project. See `docs/AUTOMATION_MVP.md`.
 
+`auto` is for repositories you trust. Its acceptance checks run the project's
+own code, including code a worker has just written, as your user. Worktree
+isolation keeps a worker out of your canonical checkout; it is not an OS
+sandbox, and containers are not yet provided. Do not point `auto` at an
+untrusted or freshly cloned repository.
+
 Exit codes: `0` success, `1` project/validation/runtime failure (including a
 path that is not a Research OS project), `2` usage/argument error.
 
