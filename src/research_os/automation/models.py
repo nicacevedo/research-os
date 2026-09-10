@@ -12,7 +12,7 @@ from __future__ import annotations
 import re
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Self
+from typing import Any, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -25,6 +25,8 @@ RUN_ID_RE = re.compile(r"^RUN-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$")
 TASK_ID_RE = re.compile(r"^T-[0-9]{3}$")
 INVOCATION_ID_RE = re.compile(r"^INV-[0-9]{4}$")
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+FINDING_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$")
 
 
 def utc_now() -> str:
@@ -91,17 +93,52 @@ def assert_transition(current: RunState, target: RunState) -> None:
 
 
 class Role(StrEnum):
-    """The three bounded worker roles this MVP dispatches."""
+    """The bounded worker roles this MVP dispatches."""
 
     PLANNER = "planner"
+    ANALYST = "analyst"
     CODER = "coder"
     REVIEWER = "reviewer"
+
+
+class Access(StrEnum):
+    """What a worker is allowed to reach. The smallest distinction that is needed.
+
+    Not a permission framework: three named positions, each with one meaning.
+
+    ``CONTEXT_ONLY`` is the planner and the reviewer. They receive no tools at
+    all and run from runtime-owned space, so they cannot reach a repository
+    even if their prompt is subverted.
+
+    ``SNAPSHOT_READ`` is the analysis worker. It receives exactly the read-only
+    file tools in :data:`READ_ONLY_TOOLS` and runs inside an isolated Git
+    snapshot pinned to the run's base commit, never the researcher's checkout.
+    It is still read-only: the controller compares the snapshot before and
+    after and fails the run if anything moved.
+
+    ``ISOLATED_WRITE`` is the coding worker, with write tools inside its own
+    disposable worktree.
+    """
+
+    CONTEXT_ONLY = "context_only"
+    SNAPSHOT_READ = "snapshot_read"
+    ISOLATED_WRITE = "isolated_write"
+
+
+#: The only tools a snapshot-read worker may ever be given.
+#:
+#: Verified against the local ``claude --help`` built-in tool set. None of them
+#: can modify a file or run a command: there is no ``Write``, no ``Edit``, and
+#: no ``Bash``, so the analysis worker has nothing to act with, which is a
+#: stronger guarantee than instructing it not to act.
+READ_ONLY_TOOLS: frozenset[str] = frozenset({"Read", "Glob", "Grep"})
 
 
 class RiskClass(StrEnum):
     """How much authority a work order needs."""
 
     READ_ONLY = "read_only"
+    SNAPSHOT_READ = "snapshot_read"
     WRITE_ISOLATED = "write_isolated"
 
 
@@ -116,6 +153,7 @@ class WorkOrderStatus(StrEnum):
     PENDING = "pending"
     RUNNING = "running"
     EXECUTED = "executed"
+    ANALYZED = "analyzed"
     CHECKS_PASSED = "checks_passed"
     CHECKS_FAILED = "checks_failed"
     REVIEWED = "reviewed"
@@ -287,6 +325,139 @@ class WorktreeRecord(BaseModel):
         return value
 
 
+class DependencyArtifact(BaseModel):
+    """The exact archived artifact one work order consumed from another.
+
+    Recorded with its digest so the handoff is reconstructible: a reader can
+    tell which parsed analysis a coding worker actually saw, rather than
+    inferring it from the order the tasks happen to appear in.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    task_id: str
+    role: Role
+    path: str
+    sha256: str
+
+    @field_validator("sha256")
+    @classmethod
+    def _digest_shape(cls, value: str) -> str:
+        if SHA256_RE.fullmatch(value) is None:
+            raise ValueError("sha256 must be 64 lowercase hexadecimal characters")
+        return value
+
+
+class Importance(StrEnum):
+    """How much one analysis finding matters. Advisory: it gates nothing."""
+
+    CRITICAL = "critical"
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+
+
+class Confidence(StrEnum):
+    """How sure the analyst says it is. Advisory: it gates nothing."""
+
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+
+
+class AnalystFinding(BaseModel):
+    """One thing an analysis worker claims to have found.
+
+    Data, not instruction. Nothing here can change a tool set, a scope, an
+    acceptance command, a budget, a worktree path, or run state; a downstream
+    work order that consumes it keeps every bound the plan gave it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: NonBlankStr
+    statement: NonBlankStr
+    importance: Importance
+    file_refs: list[str] = Field(default_factory=list)
+    confidence: Confidence
+
+    @field_validator("id")
+    @classmethod
+    def _finding_id_shape(cls, value: str) -> str:
+        if FINDING_ID_RE.fullmatch(value) is None:
+            raise ValueError(
+                "a finding id must be 1-32 characters of letters, digits, "
+                "'-', '_', or '.'"
+            )
+        return value
+
+    @field_validator("file_refs")
+    @classmethod
+    def _repository_relative_refs(cls, value: list[str]) -> list[str]:
+        """Refuse a file reference that points outside the snapshot.
+
+        A reference is a pointer the human and the downstream worker will
+        follow, so an absolute path, a ``~``, or a ``..`` segment is refused
+        rather than normalised: it is the one field of analyst output that
+        names the filesystem, and it is checked exactly like a scope entry.
+        """
+
+        return [_relative_path(item) for item in value]
+
+
+class AnalystEvidence(BaseModel):
+    """One concrete observation an analysis finding rests on."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    finding_id: NonBlankStr
+    file_ref: str
+    detail: NonBlankStr
+
+    @field_validator("file_ref")
+    @classmethod
+    def _repository_relative_ref(cls, value: str) -> str:
+        return _relative_path(value)
+
+
+class AnalystReport(BaseModel):
+    """A snapshot-read worker's validated structured findings."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    task_id: str
+    summary: NonBlankStr
+    findings: list[AnalystFinding] = Field(default_factory=list)
+    evidence: list[AnalystEvidence] = Field(default_factory=list)
+    uncertainties: list[NonBlankStr] = Field(default_factory=list)
+    recommended_action: NonBlankStr
+    provider: NonBlankStr
+    model: str | None = None
+    invocation_id: str
+    snapshot_commit: str
+    raw_output_path: str | None = None
+
+    @field_validator("snapshot_commit")
+    @classmethod
+    def _full_commit(cls, value: str) -> str:
+        if COMMIT_RE.fullmatch(value) is None:
+            raise ValueError("snapshot_commit must be a full 40-character commit sha")
+        return value
+
+    @model_validator(mode="after")
+    def _findings_are_uniquely_identified(self) -> Self:
+        ids = [item.id for item in self.findings]
+        if len(set(ids)) != len(ids):
+            raise ValueError("analyst finding ids must not repeat")
+        unknown = sorted({item.finding_id for item in self.evidence} - set(ids))
+        if unknown:
+            raise ValueError(
+                "analyst evidence refers to findings that were not reported: "
+                + ", ".join(unknown)
+            )
+        return self
+
+
 class WorkOrder(BaseModel):
     """One bounded unit of dispatched work.
 
@@ -307,6 +478,7 @@ class WorkOrder(BaseModel):
     read_only: bool
     allowed_paths: list[str] = Field(default_factory=list)
     forbidden_paths: list[str] = Field(default_factory=list)
+    read_paths: list[str] = Field(default_factory=list)
     acceptance_commands: list[AcceptanceCommand] = Field(default_factory=list)
     expected_artifacts: list[NonBlankStr] = Field(default_factory=list)
     completion_condition: NonBlankStr
@@ -323,6 +495,10 @@ class WorkOrder(BaseModel):
     diff_path: str | None = None
     invocation_ids: list[str] = Field(default_factory=list)
     check_results: list[CommandResult] = Field(default_factory=list)
+    analysis_path: str | None = None
+    dependency_artifacts: list[DependencyArtifact] = Field(default_factory=list)
+    repair_attempts: int = Field(default=0, ge=0)
+    repair_reason: str | None = None
     failure_reason: str | None = None
 
     @field_validator("task_id")
@@ -339,7 +515,7 @@ class WorkOrder(BaseModel):
             raise ValueError("base_commit must be a full 40-character commit sha")
         return value
 
-    @field_validator("allowed_paths", "forbidden_paths")
+    @field_validator("allowed_paths", "forbidden_paths", "read_paths")
     @classmethod
     def _scope_paths(cls, value: list[str]) -> list[str]:
         return [_relative_path(item) for item in value]
@@ -356,12 +532,51 @@ class WorkOrder(BaseModel):
 
     @model_validator(mode="after")
     def _authority_matches_risk(self) -> Self:
+        if self.role is Role.ANALYST:
+            return self._validate_analysis_order()
         if self.read_only and self.risk_class is not RiskClass.READ_ONLY:
             raise ValueError("read-only work orders must use the read_only risk class")
         if not self.read_only and self.risk_class is RiskClass.READ_ONLY:
             raise ValueError("write work orders must not use the read_only risk class")
         if not self.read_only and not self.allowed_paths:
             raise ValueError("write work orders require a non-empty allowed_paths")
+        if self.risk_class is RiskClass.SNAPSHOT_READ:
+            raise ValueError(
+                "the snapshot_read risk class belongs to an analyst work order"
+            )
+        if self.task_id in self.dependencies:
+            raise ValueError("a work order cannot depend on itself")
+        return self
+
+    def _validate_analysis_order(self) -> Self:
+        """Refuse an analysis work order that carries any write authority.
+
+        An analyst reads a pinned snapshot and produces findings. It therefore
+        has a read scope and nothing else: no writable paths, and no acceptance
+        command, because the controller never runs a command on its behalf.
+        """
+
+        if not self.read_only:
+            raise ValueError("an analyst work order must be read-only")
+        if self.risk_class is not RiskClass.SNAPSHOT_READ:
+            raise ValueError(
+                "an analyst work order must use the snapshot_read risk class"
+            )
+        if not self.read_paths:
+            raise ValueError(
+                "an analyst work order requires a non-empty read_paths; the "
+                "plan must state explicitly what the analyst may read"
+            )
+        if self.allowed_paths:
+            raise ValueError(
+                "an analyst work order must declare no allowed_paths; it "
+                "changes nothing, so there is no write scope to grant"
+            )
+        if self.acceptance_commands:
+            raise ValueError(
+                "an analyst work order must declare no acceptance commands; "
+                "the controller runs commands only against changed code"
+            )
         if self.task_id in self.dependencies:
             raise ValueError("a work order cannot depend on itself")
         return self
@@ -419,10 +634,17 @@ class Budget(BaseModel):
     max_wall_clock_seconds: int | None = Field(default=3600, ge=1)
     max_write_work_orders: int = Field(default=2, ge=0, le=10)
     max_work_orders: int = Field(default=4, ge=1, le=20)
+    max_repair_attempts: int = Field(default=1, ge=0, le=1)
+    """How many bounded repair attempts one work order may make.
+
+    The upper bound is one, enforced by the field itself rather than by the
+    controller, so no configuration file, CLI flag, or future caller can turn
+    the single bounded repair into a loop.
+    """
 
 
 class RoleSetting(BaseModel):
-    """Provider and model preference for one worker role."""
+    """Provider, model, and reach for one worker role."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -430,24 +652,78 @@ class RoleSetting(BaseModel):
     model: str | None = None
     effort: str | None = None
     read_only: bool
+    access: Access = Access.CONTEXT_ONLY
     tools: list[NonBlankStr] = Field(default_factory=list)
 
-    @model_validator(mode="after")
-    def _read_only_roles_have_no_tools(self) -> Self:
-        """Refuse a read-only role that was given tools.
+    @model_validator(mode="before")
+    @classmethod
+    def _default_access_from_authority(cls, data: Any) -> Any:
+        """Derive ``access`` from ``read_only`` when it was not stated.
 
-        "Read-only" is enforced by handing the worker nothing to act with, so a
-        read-only role configured with ``Write`` or ``Bash`` is not a stricter
-        preference the invocation can quietly correct; it is a configuration
-        that means two contradictory things. It is rejected here, and the
-        invocation layer independently forces the effective tool set empty.
+        Snapshot-read is the one position that must be asked for by name. A
+        configuration that merely says ``read_only: true`` still means the
+        context-only planner or reviewer, so an existing config file cannot
+        acquire file tools by accident.
         """
 
-        if self.read_only and self.tools:
+        if not isinstance(data, dict) or data.get("access") is not None:
+            return data
+        authority = data.get("read_only")
+        if not isinstance(authority, bool):
+            return data
+        derived = Access.CONTEXT_ONLY if authority else Access.ISOLATED_WRITE
+        return {**data, "access": derived}
+
+    @model_validator(mode="after")
+    def _tools_match_access(self) -> Self:
+        """Refuse any role whose declared reach and tool set disagree.
+
+        Each position is enforced by what the worker is handed, not by what it
+        is asked to do, so a role that declares two contradictory things is a
+        configuration error rather than a preference the invocation layer may
+        quietly correct. The invocation layer independently re-applies the same
+        rule.
+        """
+
+        if self.access is Access.CONTEXT_ONLY:
+            if not self.read_only:
+                raise ValueError(
+                    "a context_only role must be read_only; it is given no "
+                    "tools and cannot write anything"
+                )
+            if self.tools:
+                raise ValueError(
+                    "a read_only role must declare no tools, but this one "
+                    f"declares {', '.join(self.tools)}; context-only workers "
+                    "are given an empty tool set so they cannot act on the "
+                    "repository at all"
+                )
+            return self
+        if self.access is Access.SNAPSHOT_READ:
+            if not self.read_only:
+                raise ValueError(
+                    "a snapshot_read role must be read_only; it reads a pinned "
+                    "snapshot and never writes"
+                )
+            if not self.tools:
+                raise ValueError(
+                    "a snapshot_read role must declare at least one read-only "
+                    f"tool from {', '.join(sorted(READ_ONLY_TOOLS))}, otherwise "
+                    "it has nothing to read the snapshot with"
+                )
+            forbidden = [item for item in self.tools if item not in READ_ONLY_TOOLS]
+            if forbidden:
+                raise ValueError(
+                    "a snapshot_read role may only declare the read-only tools "
+                    f"{', '.join(sorted(READ_ONLY_TOOLS))}, but this one "
+                    f"declares {', '.join(forbidden)}; a snapshot reader is "
+                    "never given a tool that can change a file or run a command"
+                )
+            return self
+        if self.read_only:
             raise ValueError(
-                "a read_only role must declare no tools, but this one declares "
-                f"{', '.join(self.tools)}; read-only workers are given an empty "
-                "tool set so they cannot act on the repository at all"
+                "an isolated_write role must not be read_only; write work runs "
+                "in its own disposable worktree"
             )
         return self
 

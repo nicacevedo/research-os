@@ -10,10 +10,12 @@ short of merging on purpose.
 from __future__ import annotations
 
 from research_os.automation.config import AutomationConfig, ResolvedRoles
-from research_os.automation.controller import ready_for_human_blockers
+from research_os.automation.controller import final_reviews, ready_for_human_blockers
 from research_os.automation.models import (
+    AnalystReport,
     AutomationRun,
     ProviderProbe,
+    Role,
     RunState,
     WorkOrder,
 )
@@ -82,28 +84,38 @@ def _render_order_intent(run: AutomationRun, order: WorkOrder) -> list[str]:
     writes = "yes" if not order.read_only else "no"
     tree = order.worktree_path or worktree_path(run.run_id, order.task_id)
     branch = order.branch or branch_name(run.run_id, order.task_id)
+    analysis = order.role is Role.ANALYST
     lines = [
         "",
         f"{order.task_id}  {order.title}   [{order.status}]",
+        f"  role              {order.role}",
         f"  goal              {order.goal}",
         f"  completion        {order.completion_condition}",
         f"  writes            {writes}  ({order.risk_class})",
-        f"  allowed paths     {', '.join(order.allowed_paths) or '-'}",
     ]
+    if analysis:
+        lines.append(f"  read scope        {', '.join(order.read_paths) or '-'}")
+    else:
+        lines.append(f"  allowed paths     {', '.join(order.allowed_paths) or '-'}")
     if order.forbidden_paths:
         lines.append(f"  forbidden paths   {', '.join(order.forbidden_paths)}")
     lines.extend(
         [
-            f"  worktree          {tree}",
+            f"  {'snapshot' if analysis else 'worktree'}          {tree}",
             f"  branch            {branch}",
         ]
     )
     if order.dependencies:
         lines.append(f"  depends on        {', '.join(order.dependencies)}")
-    lines.append("  acceptance commands run by the controller:")
-    for command in order.acceptance_commands:
-        lines.append(f"    {command.display}")
-    lines.append("    git diff --check HEAD   (added by the controller)")
+    if analysis:
+        lines.append(
+            "  no acceptance command runs: an analyst changes nothing to check"
+        )
+    else:
+        lines.append("  acceptance commands run by the controller:")
+        for command in order.acceptance_commands:
+            lines.append(f"    {command.display}")
+        lines.append("    git diff --check HEAD   (added by the controller)")
     if order.expected_artifacts:
         lines.append(f"  expected artifacts {', '.join(order.expected_artifacts)}")
     if order.failure_reason:
@@ -130,17 +142,35 @@ def render_status(run: AutomationRun, store: RunStore) -> str:
         f"independence {run.independence or 'unknown'}",
         f"run_dir      {store.directory}",
     ]
+    lines.append(f"repairs      {_repair_total(run)}/{run.budget.max_repair_attempts}")
     for order in run.work_orders:
         checks = ", ".join(
             f"{item.display}={_exit(item)}" for item in order.check_results
         )
-        lines.append(f"{order.task_id}       {order.status}  {order.title}")
+        lines.append(
+            f"{order.task_id}       {order.status}  [{order.role}]  {order.title}"
+        )
         if order.branch:
             lines.append(f"             branch {order.branch}")
         if order.worktree_path:
-            lines.append(f"             worktree {order.worktree_path}")
+            label = "snapshot" if order.role is Role.ANALYST else "worktree"
+            lines.append(f"             {label} {order.worktree_path}")
+        if order.role is Role.ANALYST:
+            lines.append(f"             read scope {', '.join(order.read_paths)}")
+            if order.analysis_path:
+                lines.append(f"             analysis {order.analysis_path}")
+        for artifact in order.dependency_artifacts:
+            lines.append(
+                f"             dependency input {artifact.task_id} "
+                f"[{artifact.role}] {artifact.path}"
+            )
         if checks:
             lines.append(f"             checks {checks}")
+        if order.repair_attempts:
+            lines.append(
+                f"             repairs {order.repair_attempts} "
+                f"({order.repair_reason or 'no reason recorded'})"
+            )
     for outcome in run.reviews:
         lines.append(
             f"review       {outcome.task_id} {outcome.verdict} "
@@ -174,25 +204,44 @@ def render_report(run: AutomationRun, store: RunStore) -> str:
         f"                  {run.independence_note or ''}",
         "",
         f"model calls       {run.model_calls_used} of {run.budget.max_model_calls}",
+        (
+            f"repair attempts   {_repair_total(run)} of "
+            f"{run.budget.max_repair_attempts} allowed per work order"
+        ),
         f"provider cost     {'unknown' if cost is None else f'USD {cost:.4f}'}",
         f"runtime ledger    {store.directory}",
     ]
 
+    reviews = {outcome.task_id: outcome for outcome in final_reviews(run)}
     for order in run.work_orders:
+        if order.role is Role.ANALYST:
+            lines.extend(_render_analysis(order, store))
+            continue
         lines.extend(
             [
                 "",
                 "-" * 72,
-                f"{order.task_id}  {order.title}   [{order.status}]",
+                f"{order.task_id}  {order.title}   [{order.status}]  [coder]",
                 "-" * 72,
                 f"branch            {order.branch or '-'}",
                 f"worktree          {order.worktree_path or '-'}",
                 f"worktree HEAD     {order.head_commit or '-'}",
                 f"diff              {order.diff_path or '-'}",
-                "",
-                "files changed",
+                (
+                    f"repair attempts   {order.repair_attempts} of "
+                    f"{run.budget.max_repair_attempts}"
+                ),
             ]
         )
+        if order.repair_reason:
+            lines.append(f"repair reason     {order.repair_reason}")
+        if order.dependency_artifacts:
+            lines.append("")
+            lines.append("inputs from earlier work orders")
+            for artifact in order.dependency_artifacts:
+                lines.append(f"  {artifact.task_id} [{artifact.role}]  {artifact.path}")
+                lines.append(f"    sha256 {artifact.sha256}")
+        lines.extend(["", "files changed"])
         lines.extend(f"  {item}" for item in order.changed_paths or ["(none)"])
         lines.extend(["", "deterministic checks run by the controller"])
         if not order.check_results:
@@ -206,13 +255,15 @@ def render_report(run: AutomationRun, store: RunStore) -> str:
             )
             if item.error:
                 lines.append(f"        {item.error}")
-        outcome = next(
-            (entry for entry in run.reviews if entry.task_id == order.task_id), None
-        )
+        outcome = reviews.get(order.task_id)
         lines.extend(["", "independent review"])
         if outcome is None:
             lines.append("  (no review was recorded)")
         else:
+            recorded = [item for item in run.reviews if item.task_id == order.task_id]
+            if len(recorded) > 1:
+                earlier = ", ".join(str(item.verdict) for item in recorded[:-1])
+                lines.append(f"  earlier verdict {earlier}  (before the repair)")
             lines.append(f"  verdict         {outcome.verdict}")
             lines.append(
                 f"  reviewer        {outcome.provider} / "
@@ -236,11 +287,80 @@ def render_report(run: AutomationRun, store: RunStore) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _render_analysis(order: WorkOrder, store: RunStore) -> list[str]:
+    """Render one analysis work order and what it actually established."""
+
+    lines = [
+        "",
+        "-" * 72,
+        f"{order.task_id}  {order.title}   [{order.status}]  [analyst]",
+        "-" * 72,
+        f"snapshot          {order.worktree_path or '-'}",
+        f"snapshot commit   {order.head_commit or order.base_commit}",
+        f"read scope        {', '.join(order.read_paths) or '-'}",
+        "tools             Read, Glob, Grep  (no Write, no Edit, no Bash)",
+        f"analysis          {order.analysis_path or '-'}",
+        "",
+        "The analyst changed nothing: the controller compared this snapshot",
+        "before and after it ran. No acceptance command was run for it.",
+    ]
+    report = _load_analysis(order, store)
+    if report is None:
+        if order.failure_reason:
+            lines.extend(["", f"failure           {order.failure_reason}"])
+        return lines
+    lines.extend(["", "summary", f"  {report.summary}", "", "findings"])
+    if not report.findings:
+        lines.append("  (none reported)")
+    for finding in report.findings:
+        refs = ", ".join(finding.file_refs) or "no file named"
+        lines.append(
+            f"  {finding.id}  [{finding.importance}/{finding.confidence}]  {refs}"
+        )
+        lines.append(f"    {finding.statement}")
+    lines.extend(["", "uncertainties the analyst reported"])
+    if not report.uncertainties:
+        lines.append("  (none)")
+    lines.extend(f"  - {item}" for item in report.uncertainties)
+    lines.extend(["", "recommended action", f"  {report.recommended_action}"])
+    if order.failure_reason:
+        lines.extend(["", f"failure           {order.failure_reason}"])
+    return lines
+
+
+def _load_analysis(order: WorkOrder, store: RunStore) -> AnalystReport | None:
+    """Return the archived analysis for one order, or ``None`` if unusable."""
+
+    if not order.analysis_path:
+        return None
+    try:
+        raw = store.path(*order.analysis_path.split("/")).read_text(encoding="utf-8")
+        return AnalystReport.model_validate_json(raw)
+    except (OSError, ValueError):
+        return None
+
+
+def _repair_total(run: AutomationRun) -> int:
+    return sum(order.repair_attempts for order in run.work_orders)
+
+
 def _next_action(run: AutomationRun) -> list[str]:
     """Say exactly what the human does next. Nothing was merged for them."""
 
     if run.state is RunState.READY_FOR_HUMAN:
-        order = run.work_orders[-1]
+        written = [item for item in run.work_orders if item.role is not Role.ANALYST]
+        if not written:
+            return [
+                "This run only analysed the repository. Nothing was changed,",
+                "so there is no diff to merge; the findings are in the report",
+                "above and archived under the run directory.",
+                "",
+                (
+                    "Release the snapshot when you are done: "
+                    f"researchctl auto cleanup {run.run_id}"
+                ),
+            ]
+        order = written[-1]
         lines = [
             "Nothing has been merged, pushed, or scientifically accepted.",
             "",
@@ -342,13 +462,15 @@ def render_providers(
         lines.append("no provider is available, so no role could be assigned")
         return "\n".join(lines) + "\n"
     lines.append("Role assignment")
-    for role in ("planner", "coder", "reviewer"):
-        setting = resolved.roles[role]
-        access = "read-only" if setting.read_only else "write"
+    for role in ("planner", "analyst", "coder", "reviewer"):
+        setting = resolved.roles.get(role)
+        if setting is None:
+            continue
         tools = ", ".join(setting.tools) or "none"
         lines.append(
             f"  {role:9} {setting.provider} / "
-            f"{setting.model or 'provider default'}  [{access}; tools: {tools}]"
+            f"{setting.model or 'provider default'}  "
+            f"[{setting.access}; tools: {tools}]"
         )
     for substitution in resolved.substitutions:
         lines.append(f"  note: {substitution}")

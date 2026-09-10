@@ -38,6 +38,7 @@ _SUBDIRECTORIES = (
     "model_outputs",
     "logs",
     "plan",
+    "analysis",
     "checks",
     "execution",
     "reviews",

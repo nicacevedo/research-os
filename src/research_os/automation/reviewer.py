@@ -27,6 +27,10 @@ from research_os.errors import ProviderInvocationError
 MAX_DIFF_CHARS = 60_000
 MAX_REPORT_CHARS = 6_000
 
+#: The delimiters that fence reviewer findings inside a repair prompt.
+FINDINGS_BEGIN = "----- BEGIN REVIEWER FINDINGS (ADVISORY DATA) -----"
+FINDINGS_END = "----- END REVIEWER FINDINGS (ADVISORY DATA) -----"
+
 REVIEW_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
@@ -138,6 +142,40 @@ solve the problem.
 
 {context_text}
 """
+
+
+def render_review_findings(outcome: ReviewOutcome) -> str:
+    """Render one review's findings as a delimited data block.
+
+    Rendered from the parsed outcome for the same reason the analyst block is:
+    what a repair worker sees has already passed validation, and it arrives
+    fenced and labelled as advisory text rather than as instruction.
+    """
+
+    lines = [
+        FINDINGS_BEGIN,
+        f"verdict: {outcome.verdict}",
+        f"reviewer: {outcome.provider} / {outcome.model or 'provider default'}",
+        f"summary: {_flatten(outcome.summary)}",
+        "",
+        "findings:",
+    ]
+    if not outcome.findings:
+        lines.append("  (the reviewer recorded no individual finding)")
+    for finding in outcome.findings:
+        where = f" [{finding.path}]" if finding.path else ""
+        lines.append(f"  - {finding.severity}{where}: {_flatten(finding.message)}")
+    lines.append(FINDINGS_END)
+    return "\n".join(lines)
+
+
+def _flatten(value: str) -> str:
+    """Return ``value`` on one line, with the block delimiters removed."""
+
+    flattened = " ".join(value.split())
+    for marker in (FINDINGS_BEGIN, FINDINGS_END):
+        flattened = flattened.replace(marker, "[removed delimiter]")
+    return flattened[:MAX_REPORT_CHARS]
 
 
 def parse_review(

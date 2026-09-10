@@ -580,11 +580,21 @@ def test_a_budget_that_cannot_cover_the_plan_is_refused_up_front(
 def test_an_exhausted_model_call_budget_refuses_the_next_call(
     automation_home: Path, tmp_path: Path
 ) -> None:
-    ctx = start_run(tmp_path, budget=Budget(max_model_calls=1))
+    """The budget is re-checked immediately before every invocation.
+
+    The budget is tightened after planning rather than started at one call,
+    because a plan needing two calls inside a one-call budget is now refused as
+    impossible before it is ever dispatched. What is under test here is the
+    per-invocation guard, not plan validation, so the run is taken to an
+    exhausted budget the same way the wall-clock case below is.
+    """
+
+    ctx = start_run(tmp_path, budget=Budget(max_model_calls=2))
 
     assert ctx.run.model_calls_used == 1
+    spent = ctx.store.load().model_copy(update={"budget": Budget(max_model_calls=1)})
     with pytest.raises(BudgetExceededError, match="model-call budget exhausted"):
-        ctx.controller.assert_budget(ctx.store.load())
+        ctx.controller.assert_budget(spent)
 
 
 def test_an_exhausted_wall_clock_budget_refuses_the_next_call(
@@ -605,10 +615,10 @@ def test_an_exhausted_wall_clock_budget_refuses_the_next_call(
 def test_the_configured_budget_applies_when_no_override_is_given(
     automation_home: Path, tmp_path: Path
 ) -> None:
-    ctx = start_run(tmp_path, config=fake_config(budget=Budget(max_model_calls=1)))
+    ctx = start_run(tmp_path, config=fake_config(budget=Budget(max_model_calls=3)))
 
     assert ctx.run.model_calls_used == 1
-    assert ctx.run.budget.max_model_calls == 1
+    assert ctx.run.budget.max_model_calls == 3
 
 
 # -- preflight and providers ------------------------------------------------

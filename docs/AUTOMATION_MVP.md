@@ -41,14 +41,23 @@ The orchestrator is ordinary deterministic Python
 goal
   ↓  deterministic preflight (git state, clean tree, base commit)
   ↓  deterministic context packet (capsule inventories, digests, validation)
-  ↓  planner model            read-only, no tools, JSON-schema output
+  ↓  planner model            context-only, no tools, JSON-schema output
   ↓  local plan validation    scope, budget, command allowlist
+  ↓  snapshot manager         isolated read-only checkout, pinned to the base
+  ↓  analyst model            snapshot-read: Read, Glob, Grep and nothing else
+  ↓  structured findings      schema-validated, archived, treated as data
   ↓  worktree manager         isolated checkout + exclusive lock
   ↓  coder model              write-enabled, only inside that worktree
   ↓  deterministic checks     run by the controller, never by the model
-  ↓  reviewer model           read-only, no tools, frozen review packet
+  ↓  reviewer model           context-only, no tools, frozen review packet
+  ↓  one bounded repair       at most once, same worktree, same scope
+  ↓  checks + reviewer again  every required check re-established
   ↓  READY_FOR_HUMAN
 ```
+
+The analysis step is optional: a plan contains an analyst task only when the
+planner asks for one. A plan that needs no investigation is still the single
+coder task it was before.
 
 No model ever sets run state, decides whether a check passed, or authorises the
 next step.
@@ -60,8 +69,10 @@ CREATED → PREFLIGHTED → PLANNING → PLAN_READY → EXECUTING → CHECKING
         → REVIEWING → READY_FOR_HUMAN
 ```
 
-`CHECKING` and `REVIEWING` may also return to `EXECUTING` for a later work
-order. Any non-terminal state may move to `FAILED` or `CANCELLED`.
+`CHECKING` and `REVIEWING` may also return to `EXECUTING`, either for a later
+work order or for the single bounded repair, which re-enters execution and then
+comes back through `CHECKING`. Any non-terminal state may move to `FAILED` or
+`CANCELLED`.
 `READY_FOR_HUMAN`, `FAILED`, and `CANCELLED` are terminal and have no successor:
 a failed run can never be walked back into a ready one.
 
@@ -71,15 +82,40 @@ event ledger.
 ## The READY_FOR_HUMAN gate
 
 Re-evaluated from persisted state, not from what the controller believes
-happened. A run may only become `READY_FOR_HUMAN` when, for every work order:
+happened. A run may only become `READY_FOR_HUMAN` when, for every coding work
+order:
 
 - its status is `reviewed`;
 - it ran at least one acceptance command;
 - every required acceptance command passed;
 - a review was recorded and its verdict is not `FAIL`.
 
-A reviewer verdict of `PASS_WITH_REPAIR` reaches `READY_FOR_HUMAN` with its
-findings listed as unresolved. A verdict of `FAIL` fails the run.
+An analyst work order is judged differently, because it changed nothing: its
+status must be `analyzed` and it must have archived a schema-valid report. No
+acceptance command is run for it and no review is recorded, so requiring either
+would be requiring evidence that cannot exist.
+
+A verdict of `FAIL` fails the run and is never repaired. A verdict of
+`PASS_WITH_REPAIR` spends the single bounded repair if one remains, after which
+every deterministic check and the reviewer both run again; if the reviewer asks
+for a repair a second time, the run reaches `READY_FOR_HUMAN` with the
+remaining findings listed as unresolved.
+
+## The single bounded repair
+
+One repair attempt per work order, `max_repair_attempts: 1` by default and
+capped at one by the budget model itself, so no configuration file or flag can
+turn it into a loop. It is triggered by a failed required check or by a
+reviewer returning `PASS_WITH_REPAIR`, never by `FAIL`.
+
+The repair runs in the same worktree, and is given more evidence rather than
+more authority: the original work order, the current diff, the exact failed
+command with its captured output, the reviewer findings, and the analyst
+findings. Its `allowed_paths`, `forbidden_paths`, acceptance commands, and tool
+set are the ones the plan produced. It spends an ordinary model call from
+`max_model_calls`. Afterwards **every** required check runs again, not only the
+one that failed, so a repair that breaks something that previously passed is
+caught.
 
 ## Provider configuration
 
@@ -103,6 +139,13 @@ planner:
   model: sonnet
   effort: high
   read_only: true
+analyst:
+  provider: claude
+  model: sonnet
+  effort: high
+  read_only: true
+  access: snapshot_read
+  tools: [Read, Glob, Grep]
 coder:
   provider: claude
   model: opus
@@ -118,6 +161,7 @@ budget:
   max_command_timeout_seconds: 900
   max_wall_clock_seconds: 3600
   max_write_work_orders: 2
+  max_repair_attempts: 1
   max_work_orders: 4
 allowed_check_programs: [uv, pytest, ruff]
 ```
@@ -139,18 +183,44 @@ is not independent.
 
 ## Security boundary
 
-- **Read-only roles get no tools at all.** The planner and reviewer are invoked
-  with an empty tool set, so they cannot read or write the repository even if
-  their prompt is subverted. They see only the packet the controller built. This
-  is enforced twice: a role configuration that declares `read_only: true`
-  together with any tool is rejected when the config is loaded, and the
-  invocation layer independently forces the effective tool set empty for every
-  read-only request, whatever it was constructed with.
+- **Three named positions, not a permission framework.** Every role declares
+  one `access` value and is given exactly what that position allows.
+  `context_only` is the planner and reviewer: no tools at all. `snapshot_read`
+  is the analyst: the read-only file tools, in a pinned snapshot.
+  `isolated_write` is the coder: write tools, in its own worktree. A role whose
+  declared reach and tool set disagree is rejected when the config is loaded,
+  and the invocation layer independently re-applies the same rule, so no future
+  caller can assemble an invocation that hands a model more than its position
+  allows.
+- **Context-only roles get no tools at all.** The planner and reviewer are
+  invoked with an empty tool set, so they cannot read or write the repository
+  even if their prompt is subverted. They see only the packet the controller
+  built. A configuration that declares `read_only: true` together with any tool
+  is refused; asking for file tools requires naming `access: snapshot_read`
+  explicitly, so an existing config cannot acquire them by accident.
 - **Read-only workers do not run in your repository.** The planner and reviewer
   processes are started from a runtime-owned directory under the run
   (`<run>/context/`), not from the project checkout. The project path reaches
-  them as data in the context packet. Each invocation records the directory it
+  them as data in the context packet. The analyst runs in its own snapshot,
+  never the canonical checkout. Each invocation records the directory it
   actually ran in.
+- **The analyst cannot act, and is proved not to have.** It receives only
+  `Read`, `Glob`, and `Grep` — no `Write`, no `Edit`, no `Bash` — so there is
+  nothing for it to change a file or run a command with. That is not taken on
+  trust: the controller records the snapshot's `HEAD` and `git status` before
+  the invocation and requires both unchanged afterwards. A changed snapshot
+  fails the work order and the run and is recorded in the ledger. Nothing is
+  quietly restored, because restoring it would destroy the only evidence that a
+  boundary did not hold.
+- **Analyst output is data, never instruction.** The parsed report is quoted
+  into a downstream prompt inside a labelled block, with the closing delimiter
+  stripped from every field so a finding cannot forge the end of the fence. It
+  cannot change tool permissions, allowed paths, acceptance commands, budgets,
+  worktree paths, or run state: those are fixed on the work order when the plan
+  is validated, and the controller re-checks them from the work order after the
+  worker has stopped. Only the validated artifact crosses; no provider session
+  or free-form prior output is carried across, and the exact artifact used is
+  recorded with its SHA-256.
 - **The coding agent gets no command-running tool.** The default tool set is
   `Read, Write, Edit, Glob, Grep`. It runs under the provider's restricted mode,
   which confines file tools to the working directory, with `--strict-mcp-config`
@@ -299,7 +369,8 @@ scientific object references one.
 Enforced before every model call, not audited afterwards:
 
 - `max_model_calls` per run. A plan is refused up front when the remaining
-  budget cannot cover it (one coder call plus one reviewer call per work order);
+  budget cannot cover it (one coder call plus one reviewer call per coding work
+  order, one call per analyst work order);
 - `max_command_timeout_seconds` per acceptance command;
 - `max_wall_clock_seconds` per run;
 - `max_write_work_orders` and `max_work_orders` per plan.

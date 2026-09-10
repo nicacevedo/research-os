@@ -12,16 +12,31 @@ pushes, and never touches scientific acceptance.
 
 from __future__ import annotations
 
+import hashlib
 import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import NoReturn
 
-from research_os.automation.checks import run_acceptance_command
+from pydantic import ValidationError
+
+from research_os.automation.analyst import (
+    ANALYST_SCHEMA,
+    build_analyst_prompt,
+    parse_analyst_report,
+    render_analyst_data,
+    snapshot_evidence,
+    snapshot_state,
+)
+from research_os.automation.checks import run_acceptance_command, tail
 from research_os.automation.command_policy import authorize_planner_commands
 from research_os.automation.config import AutomationConfig, ResolvedRoles, resolve_roles
 from research_os.automation.context import ContextPacket, build_context, render_context
-from research_os.automation.executor import build_coder_prompt, collect_evidence
+from research_os.automation.executor import (
+    build_coder_prompt,
+    build_repair_prompt,
+    collect_evidence,
+)
 from research_os.automation.filescope import (
     assert_contained_symlinks,
     outbound_symlinks,
@@ -35,9 +50,14 @@ from research_os.automation.gitutil import (
 from research_os.automation.models import (
     TIMESTAMP_FORMAT,
     AcceptanceCommand,
+    Access,
+    AnalystReport,
     AutomationRun,
     Budget,
+    CommandResult,
+    DependencyArtifact,
     ModelInvocation,
+    ReviewOutcome,
     ReviewVerdict,
     Role,
     RoleSetting,
@@ -48,6 +68,8 @@ from research_os.automation.models import (
     utc_now,
 )
 from research_os.automation.planner import (
+    MODEL_CALLS_PER_ANALYSIS_TASK,
+    MODEL_CALLS_PER_CODING_TASK,
     PLAN_SCHEMA,
     build_planner_prompt,
     parse_plan,
@@ -64,6 +86,7 @@ from research_os.automation.reviewer import (
     REVIEW_SCHEMA,
     build_reviewer_prompt,
     parse_review,
+    render_review_findings,
 )
 from research_os.automation.store import RunStore, make_run_id
 from research_os.automation.worktree import (
@@ -72,20 +95,40 @@ from research_os.automation.worktree import (
     release_worktree,
 )
 from research_os.errors import (
+    AnalystOutputError,
     AutomationError,
     BudgetExceededError,
     PreflightError,
     ProviderInvocationError,
     ProviderUnavailableError,
+    SnapshotMutationError,
     SymlinkScopeError,
 )
 
 PLANNER_TIMEOUT_SECONDS = 600
 REVIEWER_TIMEOUT_SECONDS = 600
 DEFAULT_WORK_ORDER_TIMEOUT_SECONDS = 1800
+DEFAULT_ANALYST_TIMEOUT_SECONDS = 900
 
-# One coder invocation plus one reviewer invocation per work order.
-MODEL_CALLS_PER_WORK_ORDER = 2
+# One coder invocation plus one reviewer invocation per write work order.
+MODEL_CALLS_PER_WORK_ORDER = MODEL_CALLS_PER_CODING_TASK
+
+
+def minimum_model_calls(orders: list[WorkOrder]) -> int:
+    """Return the fewest model calls these work orders could possibly need.
+
+    A bounded repair is deliberately not counted. It is optional, so requiring
+    budget for one up front would refuse plans that never need it; the repair
+    path checks the live budget itself before it spends anything.
+    """
+
+    return sum(
+        MODEL_CALLS_PER_ANALYSIS_TASK
+        if order.role is Role.ANALYST
+        else MODEL_CALLS_PER_CODING_TASK
+        for order in orders
+    )
+
 
 #: A Git observation the controller injects itself. It is deliberately outside
 #: the planner acceptance-command grammar: no planner may name ``git``, and this
@@ -104,6 +147,21 @@ WHITESPACE_CHECK = AcceptanceCommand(
 #: in the researcher's repository. It runs in runtime-owned space instead, and
 #: the canonical path appears only as data in the packet.
 READ_ONLY_CWD_PARTS: tuple[str, ...] = ("context",)
+
+#: The work-order statuses that actually satisfy a dependency.
+#:
+#: A coding order is usable once it has executed and, if it got that far,
+#: passed its checks. An analysis order is usable once it has produced a
+#: validated report. Nothing else counts, so a dependent order never runs on
+#: findings that were never produced.
+SATISFIED_DEPENDENCY_STATUSES: frozenset[WorkOrderStatus] = frozenset(
+    {
+        WorkOrderStatus.EXECUTED,
+        WorkOrderStatus.CHECKS_PASSED,
+        WorkOrderStatus.REVIEWED,
+        WorkOrderStatus.ANALYZED,
+    }
+)
 
 
 class AutomationController:
@@ -208,7 +266,7 @@ class AutomationController:
         if not run.work_orders:
             raise AutomationError(f"{run.run_id} has no work orders to execute")
 
-        required = MODEL_CALLS_PER_WORK_ORDER * len(run.work_orders)
+        required = minimum_model_calls(list(run.work_orders))
         remaining = run.budget.max_model_calls - run.model_calls_used
         if remaining < required:
             reason = (
@@ -310,7 +368,9 @@ class AutomationController:
             project_path=Path(run.project_path),
             base_commit=run.base_commit,
             coder=resolved.roles["coder"],
+            analyst=resolved.roles.get("analyst"),
             timeout_seconds=DEFAULT_WORK_ORDER_TIMEOUT_SECONDS,
+            analyst_timeout_seconds=DEFAULT_ANALYST_TIMEOUT_SECONDS,
         )
         run = store.save(
             run.model_copy(update={"work_orders": orders, "plan_summary": plan.summary})
@@ -318,7 +378,9 @@ class AutomationController:
         store.append_event(
             "plan_accepted",
             tasks=[order.task_id for order in orders],
+            roles=[str(order.role) for order in orders],
             summary=plan.summary,
+            minimum_model_calls=minimum_model_calls(orders),
         )
         return self._transition(store, run, RunState.PLAN_READY)
 
@@ -328,23 +390,308 @@ class AutomationController:
         run: AutomationRun,
         task_id: str,
     ) -> AutomationRun:
+        run = self._assert_dependencies_met(store, run, task_id)
+        if run.order(task_id).role is Role.ANALYST:
+            return self._execute_analysis_order(store, run, task_id)
+        return self._execute_coding_order(store, run, task_id)
+
+    def _assert_dependencies_met(
+        self,
+        store: RunStore,
+        run: AutomationRun,
+        task_id: str,
+    ) -> AutomationRun:
+        """Block a work order whose dependencies have not actually succeeded.
+
+        A dependency is met only in a status that means the work behind it is
+        done: executed or checked for a coding task, analysed for an analysis
+        task. Anything else - pending, running, failed, blocked - blocks the
+        dependent order rather than letting it run on absent findings.
+        """
+
         order = run.order(task_id)
         blocked = [
             dependency
             for dependency in order.dependencies
-            if run.order(dependency).status
-            not in {WorkOrderStatus.EXECUTED, WorkOrderStatus.CHECKS_PASSED}
+            if run.order(dependency).status not in SATISFIED_DEPENDENCY_STATUSES
         ]
-        if blocked:
+        if not blocked:
+            return run
+        detail = ", ".join(
+            f"{dependency} is {run.order(dependency).status}" for dependency in blocked
+        )
+        run = self._update_order(
+            store,
+            run,
+            task_id,
+            status=WorkOrderStatus.BLOCKED,
+            failure_reason=f"unmet dependencies: {detail}",
+        )
+        store.append_event(
+            "dependency_unmet",
+            task_id=task_id,
+            dependencies=list(blocked),
+            detail=detail,
+        )
+        raise AutomationError(f"{task_id} is blocked by {', '.join(blocked)}")
+
+    def _execute_analysis_order(
+        self,
+        store: RunStore,
+        run: AutomationRun,
+        task_id: str,
+    ) -> AutomationRun:
+        """Run one bounded, read-only analysis inside a pinned Git snapshot.
+
+        The snapshot is created here, pinned to the work order's base commit,
+        and is never the researcher's checkout. The worker is given exactly the
+        read-only file tools its role declares. Its output is parsed and
+        archived as data; before any of it is believed, the snapshot is
+        compared with what it was before the invocation, and a run whose
+        analyst changed anything fails outright.
+        """
+
+        order = run.order(task_id)
+        record = create_worktree(
+            run_id=run.run_id,
+            task_id=task_id,
+            repository=Path(run.project_path),
+            base_commit=order.base_commit,
+        )
+        run = store.save(run.model_copy(update={"worktrees": [*run.worktrees, record]}))
+        store.append_event(
+            "worktree_created",
+            task_id=task_id,
+            path=record.path,
+            branch=record.branch,
+            base_commit=record.base_commit,
+            purpose="analysis snapshot",
+        )
+        assert_isolated(record, canonical_repository=Path(run.project_path))
+
+        snapshot = Path(record.path)
+        self._assert_symlinks_contained(
+            store,
+            run,
+            task_id,
+            snapshot,
+            stage="before the analyst was invoked",
+        )
+        setting = self._analyst_setting(run, order)
+        before = snapshot_state(
+            head=head_commit(snapshot),
+            status=porcelain_status(snapshot),
+        )
+        run = self._update_order(
+            store,
+            run,
+            task_id,
+            status=WorkOrderStatus.RUNNING,
+            worktree_path=record.path,
+            branch=record.branch,
+        )
+        if not before["clean"]:
+            return self._fail_snapshot(
+                store,
+                run,
+                task_id,
+                before=before,
+                after=before,
+                detail=(
+                    "the analysis snapshot was already dirty before the worker "
+                    "ran, so no read-only guarantee could be established"
+                ),
+            )
+
+        packet = build_context(project_path=snapshot, goal=run.goal)
+        prompt = build_analyst_prompt(order, context_text=render_context(packet))
+        run, invocation, result = self._invoke(
+            store,
+            run,
+            role=Role.ANALYST,
+            setting=setting,
+            prompt=prompt,
+            cwd=snapshot,
+            timeout_seconds=order.timeout_seconds,
+            json_schema=ANALYST_SCHEMA,
+            task_id=task_id,
+        )
+        run = self._update_order(
+            store,
+            run,
+            task_id,
+            invocation_ids=[
+                *run.order(task_id).invocation_ids,
+                invocation.invocation_id,
+            ],
+        )
+        store.append_event(
+            "analyst_invoked",
+            task_id=task_id,
+            invocation_id=invocation.invocation_id,
+            snapshot_path=record.path,
+            snapshot_commit=before["head"],
+            read_paths=list(order.read_paths),
+            tools=list(setting.tools),
+            access=str(setting.access),
+        )
+
+        # The mutation gate runs before anything the worker said is believed,
+        # and regardless of whether the invocation succeeded: a worker that
+        # failed or timed out could still have changed the snapshot.
+        after = snapshot_state(
+            head=head_commit(snapshot),
+            status=porcelain_status(snapshot),
+        )
+        store.write_text(
+            f"analysis/{task_id}.snapshot.json",
+            snapshot_evidence(before=before, after=after),
+        )
+        if after["head"] != before["head"] or not after["clean"]:
+            return self._fail_snapshot(
+                store,
+                run,
+                task_id,
+                before=before,
+                after=after,
+                detail="the analysis worker changed the snapshot it was reading",
+            )
+        store.append_event(
+            "analyst_snapshot_verified",
+            task_id=task_id,
+            snapshot_commit=after["head"],
+            head_unchanged=True,
+            clean=True,
+        )
+
+        if not result.ok:
             run = self._update_order(
                 store,
                 run,
                 task_id,
-                status=WorkOrderStatus.BLOCKED,
-                failure_reason=f"unmet dependencies: {', '.join(blocked)}",
+                status=WorkOrderStatus.FAILED,
+                failure_reason=invocation.error or "analyst invocation failed",
             )
-            raise AutomationError(f"{task_id} is blocked by {', '.join(blocked)}")
+            raise ProviderInvocationError(
+                f"{task_id}: analyst invocation failed: "
+                f"{invocation.error or 'unknown error'}"
+            )
 
+        try:
+            report = parse_analyst_report(
+                structured=result.structured,
+                text=result.text,
+                task_id=task_id,
+                provider=setting.provider,
+                model=invocation.model or setting.model,
+                invocation_id=invocation.invocation_id,
+                snapshot_commit=after["head"],
+            )
+        except AnalystOutputError as exc:
+            store.append_event(
+                "analyst_output_rejected",
+                task_id=task_id,
+                invocation_id=invocation.invocation_id,
+                detail=str(exc),
+            )
+            self._update_order(
+                store,
+                run,
+                task_id,
+                status=WorkOrderStatus.FAILED,
+                failure_reason=f"analyst output is not usable: {exc}",
+            )
+            raise
+        report = report.model_copy(
+            update={"raw_output_path": invocation.raw_output_path}
+        )
+        analysis_path = store.write_json(
+            f"analysis/{task_id}.json", report.model_dump(mode="json")
+        )
+        store.append_event(
+            "analyst_output_validated",
+            task_id=task_id,
+            invocation_id=invocation.invocation_id,
+            artifact=analysis_path,
+            findings=len(report.findings),
+            evidence=len(report.evidence),
+            uncertainties=len(report.uncertainties),
+        )
+        return self._update_order(
+            store,
+            run,
+            task_id,
+            status=WorkOrderStatus.ANALYZED,
+            analysis_path=analysis_path,
+            head_commit=after["head"],
+        )
+
+    def _fail_snapshot(
+        self,
+        store: RunStore,
+        run: AutomationRun,
+        task_id: str,
+        *,
+        before: dict[str, object],
+        after: dict[str, object],
+        detail: str,
+    ) -> NoReturn:
+        """Record a snapshot-read violation and stop. Nothing is restored.
+
+        Quietly resetting the snapshot and carrying on would hide the only
+        evidence that a read-only boundary did not hold, so the work order and
+        the run both fail and the violation is ledgered.
+        """
+
+        reason = (
+            f"{detail}: HEAD was {before['head']} and is now {after['head']}; "
+            f"working tree {'clean' if after['clean'] else 'dirty'}"
+        )
+        store.append_event(
+            "analyst_snapshot_violation",
+            task_id=task_id,
+            head_before=before["head"],
+            head_after=after["head"],
+            clean_before=before["clean"],
+            clean_after=after["clean"],
+            status_after=after["status"],
+            detail=detail,
+        )
+        self._update_order(
+            store,
+            run,
+            task_id,
+            status=WorkOrderStatus.FAILED,
+            failure_reason=reason,
+        )
+        raise SnapshotMutationError(f"{task_id}: {reason}")
+
+    def _analyst_setting(self, run: AutomationRun, order: WorkOrder) -> RoleSetting:
+        """Return the analysis role, refusing anything but a snapshot reader."""
+
+        setting = run.roles.get("analyst")
+        if setting is None:
+            raise AutomationError(
+                f"{order.task_id} is an analysis work order but this run has no "
+                "analyst role configured"
+            )
+        if setting.access is not Access.SNAPSHOT_READ:
+            raise AutomationError(
+                f"the analyst role declares {setting.access} access; an "
+                "analysis work order is only ever dispatched to a snapshot_read "
+                "role with read-only file tools"
+            )
+        return setting.model_copy(
+            update={"provider": order.provider, "model": order.model}
+        )
+
+    def _execute_coding_order(
+        self,
+        store: RunStore,
+        run: AutomationRun,
+        task_id: str,
+    ) -> AutomationRun:
+        order = run.order(task_id)
         record = create_worktree(
             run_id=run.run_id,
             task_id=task_id,
@@ -370,14 +717,13 @@ class AutomationController:
             stage="before the writer was invoked",
         )
         packet = build_context(project_path=worktree, goal=run.goal)
-        prompt = build_coder_prompt(order, context_text=render_context(packet))
-        setting = RoleSetting(
-            provider=order.provider,
-            model=order.model,
-            effort=run.roles["coder"].effort if "coder" in run.roles else None,
-            read_only=False,
-            tools=list(run.roles["coder"].tools) if "coder" in run.roles else [],
+        dependency_data, artifacts = self._dependency_data(store, run, order)
+        prompt = build_coder_prompt(
+            order,
+            context_text=render_context(packet),
+            dependency_data=dependency_data,
         )
+        setting = self._coder_setting(run, order)
         run = self._update_order(
             store,
             run,
@@ -385,7 +731,17 @@ class AutomationController:
             status=WorkOrderStatus.RUNNING,
             worktree_path=record.path,
             branch=record.branch,
+            dependency_artifacts=artifacts,
         )
+        for artifact in artifacts:
+            store.append_event(
+                "dependency_input_used",
+                task_id=task_id,
+                source_task_id=artifact.task_id,
+                source_role=str(artifact.role),
+                artifact=artifact.path,
+                sha256=artifact.sha256,
+            )
         run, invocation, result = self._invoke(
             store,
             run,
@@ -474,21 +830,136 @@ class AutomationController:
             raise AutomationError(f"{task_id} produced no changes")
         return self._update_order(store, run, task_id, status=WorkOrderStatus.EXECUTED)
 
+    @staticmethod
+    def _coder_setting(run: AutomationRun, order: WorkOrder) -> RoleSetting:
+        """Return the write role for one coding order.
+
+        Built in one place so a repair invocation cannot be given a tool set
+        the first attempt did not have: both paths call this, and both get the
+        provider and model recorded on the work order together with the tools
+        the configured role declares.
+        """
+
+        configured = run.roles.get("coder")
+        return RoleSetting(
+            provider=order.provider,
+            model=order.model,
+            effort=configured.effort if configured is not None else None,
+            read_only=False,
+            access=Access.ISOLATED_WRITE,
+            tools=list(configured.tools) if configured is not None else [],
+        )
+
+    def _dependency_data(
+        self,
+        store: RunStore,
+        run: AutomationRun,
+        order: WorkOrder,
+    ) -> tuple[str | None, list[DependencyArtifact]]:
+        """Load the archived, validated output of this order's dependencies.
+
+        Only the parsed artifact is read, and it is re-validated on the way in,
+        so what reaches a downstream prompt has passed the same schema as when
+        it was archived. No provider session, transcript, or free-form prior
+        output is carried across: a work order's inputs are the deterministic
+        order itself plus these named artifacts, and nothing else.
+        """
+
+        blocks: list[str] = []
+        artifacts: list[DependencyArtifact] = []
+        for dependency in order.dependencies:
+            source = run.order(dependency)
+            if source.role is not Role.ANALYST or not source.analysis_path:
+                continue
+            target = store.path(*source.analysis_path.split("/"))
+            raw = target.read_text(encoding="utf-8")
+            try:
+                report = AnalystReport.model_validate_json(raw)
+            except ValidationError as exc:
+                raise AnalystOutputError(
+                    f"the archived analysis for {dependency} at "
+                    f"{source.analysis_path} is not a valid report: {exc}"
+                ) from exc
+            blocks.append(
+                render_analyst_data(report, artifact_path=source.analysis_path)
+            )
+            artifacts.append(
+                DependencyArtifact(
+                    task_id=dependency,
+                    role=Role.ANALYST,
+                    path=source.analysis_path,
+                    sha256=hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+                )
+            )
+        return ("\n\n".join(blocks) or None), artifacts
+
     def _check_order(
         self,
         store: RunStore,
         run: AutomationRun,
         task_id: str,
     ) -> AutomationRun:
-        order = run.order(task_id)
-        worktree = Path(order.worktree_path or "")
+        """Run every acceptance command, allowing at most one bounded repair.
+
+        An analysis order is skipped: it changed nothing, so there is nothing
+        to check, and the controller never runs a command on its behalf.
+        """
+
+        if run.order(task_id).role is Role.ANALYST:
+            return run
+        self._authorize_checks(store, run, task_id)
+        run, failed = self._run_all_checks(store, run, task_id, attempt=1)
+        if not failed:
+            return self._update_order(
+                store, run, task_id, status=WorkOrderStatus.CHECKS_PASSED
+            )
+
+        reason = _failed_check_reason(failed)
+        if not self._repair_available(store, run, task_id, trigger=reason):
+            return self._fail_checks(store, run, task_id, failed)
+
+        run = self._repair(
+            store,
+            run,
+            task_id,
+            reason=(
+                "A required acceptance command the controller ran against your "
+                "change failed."
+            ),
+            failed_checks=failed,
+        )
+        run, failed = self._run_all_checks(store, run, task_id, attempt=2)
+        if failed:
+            store.append_event(
+                "repair_budget_exhausted",
+                task_id=task_id,
+                repair_attempts=run.order(task_id).repair_attempts,
+                trigger="required_check_failure",
+                detail=(
+                    "required checks failed again after the single bounded "
+                    "repair; there is no second attempt"
+                ),
+            )
+            return self._fail_checks(store, run, task_id, failed)
+        return self._update_order(
+            store, run, task_id, status=WorkOrderStatus.CHECKS_PASSED
+        )
+
+    def _authorize_checks(
+        self,
+        store: RunStore,
+        run: AutomationRun,
+        task_id: str,
+    ) -> None:
+        """Refuse to run an acceptance command the policy does not authorise."""
+
         try:
             authorize_planner_commands(
-                order.acceptance_commands,
+                run.order(task_id).acceptance_commands,
                 self.config.allowed_check_programs,
             )
         except AutomationError as exc:
-            run = self._update_order(
+            self._update_order(
                 store,
                 run,
                 task_id,
@@ -501,15 +972,39 @@ class AutomationController:
                 detail=str(exc),
             )
             raise
+
+    def _run_all_checks(
+        self,
+        store: RunStore,
+        run: AutomationRun,
+        task_id: str,
+        *,
+        attempt: int,
+    ) -> tuple[AutomationRun, list[CommandResult]]:
+        """Run every acceptance command once and return the failures.
+
+        Every required command runs on every attempt. A repair is never
+        credited by re-running only what failed: the controller re-establishes
+        the whole result, so a fix that breaks a check that previously passed
+        is caught.
+        """
+
+        order = run.order(task_id)
+        worktree = Path(order.worktree_path or "")
+        suffix = "" if attempt == 1 else f".repair{attempt - 1}"
         commands = [*order.acceptance_commands, WHITESPACE_CHECK]
-        results = []
+        results: list[CommandResult] = []
         for index, command in enumerate(commands, start=1):
             result = run_acceptance_command(
                 command,
                 cwd=worktree,
                 timeout_seconds=run.budget.max_command_timeout_seconds,
-                stdout_path=store.path("checks", task_id, f"{index:02d}.stdout.txt"),
-                stderr_path=store.path("checks", task_id, f"{index:02d}.stderr.txt"),
+                stdout_path=store.path(
+                    "checks", task_id, f"{index:02d}{suffix}.stdout.txt"
+                ),
+                stderr_path=store.path(
+                    "checks", task_id, f"{index:02d}{suffix}.stderr.txt"
+                ),
             )
             results.append(result)
             store.append_event(
@@ -521,28 +1016,30 @@ class AutomationController:
                 timed_out=result.timed_out,
                 required=result.required,
                 duration_ms=result.duration_ms,
+                attempt=attempt,
             )
         run = self._update_order(store, run, task_id, check_results=results)
-        store.write_json(
-            f"checks/{task_id}/results.json",
-            [item.model_dump(mode="json") for item in results],
+        payload = [item.model_dump(mode="json") for item in results]
+        store.write_json(f"checks/{task_id}/results.json", payload)
+        store.write_json(f"checks/{task_id}/attempt-{attempt}.json", payload)
+        return run, [item for item in results if item.required and not item.ok]
+
+    def _fail_checks(
+        self,
+        store: RunStore,
+        run: AutomationRun,
+        task_id: str,
+        failed: list[CommandResult],
+    ) -> NoReturn:
+        reason = _failed_check_reason(failed)
+        self._update_order(
+            store,
+            run,
+            task_id,
+            status=WorkOrderStatus.CHECKS_FAILED,
+            failure_reason=reason,
         )
-        failed = [item for item in results if item.required and not item.ok]
-        if failed:
-            reason = "required acceptance commands failed: " + ", ".join(
-                item.display for item in failed
-            )
-            run = self._update_order(
-                store,
-                run,
-                task_id,
-                status=WorkOrderStatus.CHECKS_FAILED,
-                failure_reason=reason,
-            )
-            raise AutomationError(f"{task_id}: {reason}")
-        return self._update_order(
-            store, run, task_id, status=WorkOrderStatus.CHECKS_PASSED
-        )
+        raise AutomationError(f"{task_id}: {reason}")
 
     def _review_order(
         self,
@@ -550,6 +1047,104 @@ class AutomationController:
         run: AutomationRun,
         task_id: str,
     ) -> AutomationRun:
+        """Have one finished coding order reviewed, with at most one repair.
+
+        ``FAIL`` is terminal: the run stops, and no repair is attempted, so a
+        reviewer cannot drive the controller round a loop by refusing to pass.
+        ``PASS_WITH_REPAIR`` spends the single repair if it is still available,
+        after which every deterministic check and the reviewer both run again.
+        A second ``PASS_WITH_REPAIR`` is not a third attempt: the order is
+        reviewed and the unresolved findings go to the human.
+        """
+
+        if run.order(task_id).role is Role.ANALYST:
+            return run
+        run, outcome = self._invoke_reviewer(store, run, task_id)
+        if outcome.verdict is ReviewVerdict.FAIL:
+            self._update_order(
+                store,
+                run,
+                task_id,
+                status=WorkOrderStatus.FAILED,
+                failure_reason=f"independent review returned FAIL: {outcome.summary}",
+            )
+            raise AutomationError(f"{task_id}: review returned FAIL")
+        if outcome.verdict is ReviewVerdict.PASS:
+            return self._update_order(
+                store, run, task_id, status=WorkOrderStatus.REVIEWED
+            )
+
+        trigger = f"reviewer returned PASS_WITH_REPAIR: {outcome.summary}"
+        if not self._repair_available(store, run, task_id, trigger=trigger):
+            return self._update_order(
+                store, run, task_id, status=WorkOrderStatus.REVIEWED
+            )
+
+        run = self._repair(
+            store,
+            run,
+            task_id,
+            reason=(
+                "The deterministic checks passed, but the independent reviewer "
+                "returned PASS_WITH_REPAIR and asked for the findings below to "
+                "be repaired."
+            ),
+            failed_checks=[],
+            reviewer_findings=render_review_findings(outcome),
+        )
+        run, failed = self._run_all_checks(store, run, task_id, attempt=2)
+        if failed:
+            store.append_event(
+                "repair_budget_exhausted",
+                task_id=task_id,
+                repair_attempts=run.order(task_id).repair_attempts,
+                trigger="reviewer_pass_with_repair",
+                detail=(
+                    "the repair broke a required check; there is no second "
+                    "repair attempt"
+                ),
+            )
+            return self._fail_checks(store, run, task_id, failed)
+        run = self._update_order(
+            store, run, task_id, status=WorkOrderStatus.CHECKS_PASSED
+        )
+
+        run = self._transition(store, run, RunState.REVIEWING)
+        run, second = self._invoke_reviewer(store, run, task_id)
+        if second.verdict is ReviewVerdict.FAIL:
+            self._update_order(
+                store,
+                run,
+                task_id,
+                status=WorkOrderStatus.FAILED,
+                failure_reason=(
+                    f"independent review returned FAIL after the repair: "
+                    f"{second.summary}"
+                ),
+            )
+            raise AutomationError(f"{task_id}: review returned FAIL")
+        if second.verdict is ReviewVerdict.PASS_WITH_REPAIR:
+            store.append_event(
+                "repair_budget_exhausted",
+                task_id=task_id,
+                repair_attempts=run.order(task_id).repair_attempts,
+                trigger="reviewer_pass_with_repair",
+                unresolved_findings=len(second.findings),
+                detail=(
+                    "the reviewer asked for a repair again after the single "
+                    "bounded attempt; the remaining findings go to the human"
+                ),
+            )
+        return self._update_order(store, run, task_id, status=WorkOrderStatus.REVIEWED)
+
+    def _invoke_reviewer(
+        self,
+        store: RunStore,
+        run: AutomationRun,
+        task_id: str,
+    ) -> tuple[AutomationRun, ReviewOutcome]:
+        """Run one independent review over the frozen packet and record it."""
+
         order = run.order(task_id)
         setting = run.roles["reviewer"]
         diff = ""
@@ -596,7 +1191,11 @@ class AutomationController:
         outcome = outcome.model_copy(
             update={"raw_output_path": invocation.raw_output_path}
         )
-        store.write_json(f"reviews/{task_id}.json", outcome.model_dump(mode="json"))
+        attempt = 1 + sum(1 for item in run.reviews if item.task_id == task_id)
+        suffix = "" if attempt == 1 else f".{attempt}"
+        store.write_json(
+            f"reviews/{task_id}{suffix}.json", outcome.model_dump(mode="json")
+        )
         run = store.save(run.model_copy(update={"reviews": [*run.reviews, outcome]}))
         store.append_event(
             "review_recorded",
@@ -604,17 +1203,238 @@ class AutomationController:
             verdict=str(outcome.verdict),
             findings=len(outcome.findings),
             independence=str(outcome.independence),
+            attempt=attempt,
         )
-        if outcome.verdict is ReviewVerdict.FAIL:
+        return run, outcome
+
+    # -- the single bounded repair ---------------------------------------
+
+    def _repair_available(
+        self,
+        store: RunStore,
+        run: AutomationRun,
+        task_id: str,
+        *,
+        trigger: str,
+    ) -> bool:
+        """Return whether this order may still make its one repair attempt.
+
+        Records the refusal when it may not, so a run that stopped without
+        repairing says why in the ledger rather than looking as though repair
+        was never considered.
+        """
+
+        order = run.order(task_id)
+        allowed = run.budget.max_repair_attempts
+        if order.repair_attempts < allowed:
+            return True
+        store.append_event(
+            "repair_budget_exhausted",
+            task_id=task_id,
+            repair_attempts=order.repair_attempts,
+            max_repair_attempts=allowed,
+            trigger=trigger,
+            detail=(
+                "no repair attempt remains for this work order"
+                if allowed
+                else "this run allows no repair attempt"
+            ),
+        )
+        return False
+
+    def _repair(
+        self,
+        store: RunStore,
+        run: AutomationRun,
+        task_id: str,
+        *,
+        reason: str,
+        failed_checks: list[CommandResult],
+        reviewer_findings: str | None = None,
+    ) -> AutomationRun:
+        """Make the one bounded repair attempt, in the same isolated worktree.
+
+        Nothing about the order is widened for it. The worktree, the allowed
+        paths, the forbidden paths, the acceptance commands, and the tool set
+        are the ones the plan produced; the repair is given more *evidence* -
+        the diff so far, the exact failed command and its output, the reviewer
+        findings, the analyst findings - and no more *authority*. It spends a
+        model call from the ordinary budget and increments the repair counter,
+        so it cannot recur.
+
+        The run re-enters EXECUTING for the attempt and returns to CHECKING,
+        because that is what actually happens: a write-enabled worker runs
+        again, and every deterministic check is then re-established.
+        """
+
+        order = run.order(task_id)
+        worktree = Path(order.worktree_path or "")
+        store.append_event(
+            "repair_started",
+            task_id=task_id,
+            attempt=order.repair_attempts + 1,
+            max_repair_attempts=run.budget.max_repair_attempts,
+            trigger="required_check_failure" if failed_checks else "reviewer_verdict",
+            reason=reason,
+            failed_commands=[item.display for item in failed_checks],
+            allowed_paths=list(order.allowed_paths),
+            model_calls_used=run.model_calls_used,
+        )
+        run = self._transition(
+            store, run, RunState.EXECUTING, reason="bounded repair", task_id=task_id
+        )
+
+        self._assert_symlinks_contained(
+            store,
+            run,
+            task_id,
+            worktree,
+            stage="before the repair worker was invoked",
+        )
+        diff = ""
+        if order.diff_path:
+            diff = store.path(*order.diff_path.split("/")).read_text(encoding="utf-8")
+        dependency_data, _ = self._dependency_data(store, run, order)
+
+        # What the worktree already looks like, before the repair worker runs.
+        #
+        # By this point the controller has run the acceptance commands itself,
+        # and those leave byproducts behind: compiled bytecode, caches,
+        # coverage files. Those paths sit outside the work order's scope but
+        # they are not the repair's doing, so the check below judges the repair
+        # on what it actually introduced. Anything new is still refused, so
+        # this narrows attribution rather than enforcement.
+        baseline = set(collect_evidence(order, worktree=worktree).changed_paths)
+
+        packet = build_context(project_path=worktree, goal=run.goal)
+        prompt = build_repair_prompt(
+            order,
+            reason=reason,
+            diff=diff,
+            failed_checks=failed_checks,
+            check_output=self._check_output(failed_checks),
+            reviewer_findings=reviewer_findings,
+            dependency_data=dependency_data,
+            context_text=render_context(packet),
+        )
+        run, invocation, result = self._invoke(
+            store,
+            run,
+            role=Role.CODER,
+            setting=self._coder_setting(run, order),
+            prompt=prompt,
+            cwd=worktree,
+            timeout_seconds=order.timeout_seconds,
+            task_id=task_id,
+        )
+        attempt = run.order(task_id).repair_attempts + 1
+        run = self._update_order(
+            store,
+            run,
+            task_id,
+            invocation_ids=[
+                *run.order(task_id).invocation_ids,
+                invocation.invocation_id,
+            ],
+            repair_attempts=attempt,
+            repair_reason=reason,
+        )
+        if not result.ok:
             run = self._update_order(
                 store,
                 run,
                 task_id,
                 status=WorkOrderStatus.FAILED,
-                failure_reason=f"independent review returned FAIL: {outcome.summary}",
+                failure_reason=invocation.error or "repair invocation failed",
             )
-            raise AutomationError(f"{task_id}: review returned FAIL")
-        return self._update_order(store, run, task_id, status=WorkOrderStatus.REVIEWED)
+            raise ProviderInvocationError(
+                f"{task_id}: repair invocation failed: "
+                f"{invocation.error or 'unknown error'}"
+            )
+
+        evidence = collect_evidence(run.order(task_id), worktree=worktree)
+        if not evidence.contained:
+            self._fail_order_on_symlinks(
+                store,
+                run,
+                task_id,
+                evidence.outbound_symlinks,
+                stage="while collecting repair evidence",
+            )
+        diff_path = store.write_text(f"execution/{task_id}/diff.patch", evidence.diff)
+        store.write_text(f"execution/{task_id}/diff.stat.txt", evidence.diff_stat)
+        store.write_text(
+            f"execution/{task_id}/diff.repair{attempt}.patch", evidence.diff
+        )
+        introduced = tuple(
+            item for item in evidence.scope_violations if item not in baseline
+        )
+        # Report what the repair actually touched. A path that already differed
+        # before it ran *and* was never in its scope is a byproduct of the
+        # controller's own acceptance commands, and listing it as a changed
+        # file would tell the reviewer this worker edited something it did not.
+        # Everything in scope, and everything newly introduced, is kept.
+        byproducts = set(baseline) & set(evidence.scope_violations)
+        attributed = [item for item in evidence.changed_paths if item not in byproducts]
+        run = self._update_order(
+            store,
+            run,
+            task_id,
+            changed_paths=attributed,
+            diff_path=diff_path,
+            head_commit=evidence.head_commit,
+        )
+        if introduced:
+            store.append_event(
+                "scope_violation",
+                task_id=task_id,
+                paths=list(introduced),
+                stage="repair",
+            )
+            run = self._update_order(
+                store,
+                run,
+                task_id,
+                status=WorkOrderStatus.FAILED,
+                failure_reason=(
+                    "the repair changed paths outside the authorised scope: "
+                    + ", ".join(introduced)
+                ),
+            )
+            raise AutomationError(
+                f"{task_id} repair changed paths outside its scope: "
+                + ", ".join(introduced)
+            )
+        store.append_event(
+            "repair_completed",
+            task_id=task_id,
+            attempt=attempt,
+            invocation_id=invocation.invocation_id,
+            changed_paths=attributed,
+            head_commit=evidence.head_commit,
+            model_calls_used=run.model_calls_used,
+        )
+        return self._transition(store, run, RunState.CHECKING)
+
+    def _check_output(self, failed: list[CommandResult]) -> str:
+        """Return the captured output of the failed checks, verbatim but bounded."""
+
+        if not failed:
+            return "(every required acceptance command passed)"
+        blocks: list[str] = []
+        for item in failed:
+            blocks.append(f"$ {item.display}")
+            blocks.append(f"exit_code: {item.exit_code}  timed_out: {item.timed_out}")
+            for label, stored in (
+                ("stdout", item.stdout_path),
+                ("stderr", item.stderr_path),
+            ):
+                captured = _read_captured(stored)
+                blocks.append(f"--- {label} ---")
+                blocks.append(tail(captured) if captured else "(empty)")
+            if item.error:
+                blocks.append(f"--- error ---\n{item.error}")
+        return "\n".join(blocks)
 
     def _finish(self, store: RunStore, run: AutomationRun) -> AutomationRun:
         """Re-check every gate locally before declaring the run ready."""
@@ -654,8 +1474,13 @@ class AutomationController:
             raise ProviderUnavailableError(
                 f"no adapter for provider {setting.provider!r}"
             )
-        if setting.read_only:
+        if setting.access is Access.CONTEXT_ONLY:
             self._assert_read_only_cwd(run, cwd)
+        elif setting.access is Access.SNAPSHOT_READ:
+            # Both halves apply: out of the canonical checkout, and inside the
+            # snapshot registered for this task and nothing else.
+            self._assert_read_only_cwd(run, cwd)
+            self._assert_snapshot_isolation(run, cwd, task_id)
         else:
             self._assert_write_isolation(run, cwd, task_id)
 
@@ -671,7 +1496,8 @@ class AutomationController:
             timeout_seconds=timeout_seconds,
             model=setting.model,
             effort=setting.effort,
-            tools=() if setting.read_only else tuple(setting.tools),
+            access=setting.access,
+            tools=tuple(setting.tools),
             json_schema=json_schema,
         )
         result = adapter.invoke(request)
@@ -731,6 +1557,8 @@ class AutomationController:
             provider=setting.provider,
             model=invocation.model,
             read_only=setting.read_only,
+            access=str(setting.access),
+            tools=list(request.tools),
             cwd=str(cwd),
             task_id=task_id,
             exit_code=result.exit_code,
@@ -784,6 +1612,37 @@ class AutomationController:
         if cwd.resolve() != Path(record.path).resolve():
             raise AutomationError(
                 f"write-enabled worker would run in {cwd}, not its worktree "
+                f"{record.path}"
+            )
+        assert_contained_symlinks(Path(record.path))
+
+    def _assert_snapshot_isolation(
+        self,
+        run: AutomationRun,
+        cwd: Path,
+        task_id: str | None,
+    ) -> None:
+        """Refuse a snapshot-read invocation outside this task's own snapshot.
+
+        The mirror of the write-isolation check, and for the same reason: a
+        reader pointed at the researcher's checkout would be reading live,
+        possibly uncommitted state instead of the pinned commit the run is
+        reasoning about, and the before-and-after comparison that proves it
+        changed nothing would be meaningless.
+        """
+
+        if task_id is None:
+            raise AutomationError("a snapshot-read invocation must belong to a task")
+        record = next((item for item in run.worktrees if item.task_id == task_id), None)
+        if record is None:
+            raise AutomationError(
+                f"no isolated snapshot is registered for {task_id}; refusing to "
+                "run a snapshot-read worker"
+            )
+        assert_isolated(record, canonical_repository=Path(run.project_path))
+        if cwd.resolve() != Path(record.path).resolve():
+            raise AutomationError(
+                f"snapshot-read worker would run in {cwd}, not its snapshot "
                 f"{record.path}"
             )
         assert_contained_symlinks(Path(record.path))
@@ -988,15 +1847,22 @@ def ready_for_human_blockers(run: AutomationRun) -> list[str]:
         blockers.append("the run was cancelled")
     if not run.work_orders:
         blockers.append("the run has no work orders")
+    reviewed = {outcome.task_id for outcome in run.reviews}
     for order in run.work_orders:
+        if order.role is Role.ANALYST:
+            # An analysis order changed nothing, so there is no diff to check
+            # or review. What it must have is a validated, archived report.
+            if order.status is not WorkOrderStatus.ANALYZED:
+                blockers.append(f"{order.task_id} is {order.status}, not analyzed")
+            if not order.analysis_path:
+                blockers.append(f"{order.task_id} archived no validated analysis")
+            continue
         if order.status is not WorkOrderStatus.REVIEWED:
             blockers.append(f"{order.task_id} is {order.status}, not reviewed")
         if not order.check_results:
             blockers.append(f"{order.task_id} ran no acceptance commands")
         elif not order.required_checks_passed:
             blockers.append(f"{order.task_id} has failing required checks")
-    reviewed = {outcome.task_id for outcome in run.reviews}
-    for order in run.work_orders:
         if order.task_id not in reviewed:
             blockers.append(f"{order.task_id} has no recorded review")
     for outcome in run.reviews:
@@ -1005,14 +1871,50 @@ def ready_for_human_blockers(run: AutomationRun) -> list[str]:
     return blockers
 
 
+def final_reviews(run: AutomationRun) -> list[ReviewOutcome]:
+    """Return the last recorded review per task, in work-order order.
+
+    A task that was repaired has more than one review. The one that describes
+    the code a human is about to read is the last, so that is the one reported;
+    the earlier verdicts stay in the ledger and in ``run.reviews``.
+    """
+
+    latest: dict[str, ReviewOutcome] = {}
+    for outcome in run.reviews:
+        latest[outcome.task_id] = outcome
+    return list(latest.values())
+
+
 def unresolved_findings(run: AutomationRun) -> list[tuple[str, str, str]]:
-    """Return every reviewer finding a human still has to judge."""
+    """Return every reviewer finding a human still has to judge.
+
+    Taken from the final review of each task. A finding the repair resolved is
+    not something the human still has to judge, and a finding the reviewer
+    repeated after the repair is.
+    """
 
     return [
         (outcome.task_id, finding.severity, finding.message)
-        for outcome in run.reviews
+        for outcome in final_reviews(run)
         for finding in outcome.findings
     ]
+
+
+def _failed_check_reason(failed: list[CommandResult]) -> str:
+    return "required acceptance commands failed: " + ", ".join(
+        item.display for item in failed
+    )
+
+
+def _read_captured(stored: str | None) -> str:
+    """Return a captured stdout or stderr file, or empty when unavailable."""
+
+    if not stored:
+        return ""
+    try:
+        return Path(stored).read_text(encoding="utf-8")
+    except OSError:
+        return ""
 
 
 def _elapsed_seconds(start: str, end: str) -> int:

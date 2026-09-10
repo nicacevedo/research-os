@@ -21,7 +21,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
-from research_os.automation.models import ProviderProbe, Role
+from research_os.automation.models import (
+    READ_ONLY_TOOLS,
+    Access,
+    ProviderProbe,
+    Role,
+)
 
 PROVIDER_FAMILIES: dict[str, str] = {
     "claude": "anthropic",
@@ -44,11 +49,18 @@ def provider_family(name: str) -> str:
 class InvocationRequest:
     """One bounded worker invocation the controller is about to make.
 
-    A read-only request carries no tools, whatever it was constructed with. The
-    configuration layer already refuses a read-only role that declares tools;
-    this is the second, independent enforcement, placed where every adapter must
-    pass through it, so no future caller can assemble a read-only invocation
-    that still hands a model something to act with.
+    The effective tool set is decided here, from ``access``, and not taken on
+    trust from the caller. The configuration layer already refuses a role whose
+    declared reach and tools disagree; this is the second, independent
+    enforcement, placed where every adapter must pass through it, so no future
+    caller can assemble an invocation that hands a model more than its position
+    allows.
+
+    A context-only request is silently emptied, because "no tools" is the whole
+    of that position and there is nothing to report. A snapshot-read request
+    carrying a tool that could write or run a command is refused outright: that
+    is not an over-specified preference, it is an attempt to give a read-only
+    worker authority, and it must fail loudly rather than be trimmed.
     """
 
     role: Role
@@ -58,12 +70,37 @@ class InvocationRequest:
     timeout_seconds: int
     model: str | None = None
     effort: str | None = None
+    access: Access | None = None
     tools: tuple[str, ...] = ()
     json_schema: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
-        if self.read_only and self.tools:
+        if self.access is None:
+            derived = Access.CONTEXT_ONLY if self.read_only else Access.ISOLATED_WRITE
+            object.__setattr__(self, "access", derived)
+        if self.access is Access.CONTEXT_ONLY:
+            if not self.read_only:
+                raise ValueError("a context_only invocation must be read-only")
             object.__setattr__(self, "tools", ())
+            return
+        if self.access is Access.SNAPSHOT_READ:
+            if not self.read_only:
+                raise ValueError("a snapshot_read invocation must be read-only")
+            forbidden = [item for item in self.tools if item not in READ_ONLY_TOOLS]
+            if forbidden:
+                raise ValueError(
+                    "a snapshot_read invocation may only carry the read-only "
+                    f"tools {', '.join(sorted(READ_ONLY_TOOLS))}, but this one "
+                    f"carries {', '.join(forbidden)}"
+                )
+            if not self.tools:
+                raise ValueError(
+                    "a snapshot_read invocation needs at least one read-only "
+                    "tool to read the snapshot with"
+                )
+            return
+        if self.read_only:
+            raise ValueError("an isolated_write invocation must not be read-only")
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,7 +242,7 @@ class ClaudeCodeProvider:
             "--permission-mode",
             "plan" if request.read_only else "acceptEdits",
             "--tools",
-            ",".join(() if request.read_only else request.tools),
+            ",".join(request.tools),
         ]
         if request.model:
             argv.extend(["--model", request.model])

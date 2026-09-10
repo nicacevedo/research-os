@@ -15,14 +15,18 @@ import yaml
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from research_os.automation.command_policy import SUPPORTED_PROGRAMS
-from research_os.automation.models import Budget, Independence, RoleSetting
+from research_os.automation.models import Access, Budget, Independence, RoleSetting
 from research_os.automation.providers import provider_family
 from research_os.errors import AutomationError, ProviderUnavailableError
 from research_os.paths import config_home
 
 CONFIG_FILENAME = "automation.yaml"
 
-ROLE_NAMES: tuple[str, ...] = ("planner", "coder", "reviewer")
+ROLE_NAMES: tuple[str, ...] = ("planner", "analyst", "coder", "reviewer")
+
+#: The roles every run needs. The analyst is optional: a plan that contains no
+#: analysis task never dispatches one, and a plan that does is refused by name.
+REQUIRED_ROLE_NAMES: tuple[str, ...] = ("planner", "coder", "reviewer")
 
 #: The check programs a plan may name by default.
 #:
@@ -33,6 +37,12 @@ ROLE_NAMES: tuple[str, ...] = ("planner", "coder", "reviewer")
 DEFAULT_ALLOWED_CHECK_PROGRAMS: tuple[str, ...] = ("uv", "pytest", "ruff")
 
 DEFAULT_CODER_TOOLS: tuple[str, ...] = ("Read", "Write", "Edit", "Glob", "Grep")
+
+#: The only tools the analysis role is given.
+#:
+#: Read-only by construction: no ``Write``, no ``Edit``, no ``Bash``. The role
+#: model refuses anything else here, and the invocation layer refuses it again.
+DEFAULT_ANALYST_TOOLS: tuple[str, ...] = ("Read", "Glob", "Grep")
 
 
 def config_path() -> Path:
@@ -56,12 +66,22 @@ def _default_roles() -> dict[str, RoleSetting]:
             model="sonnet",
             effort="high",
             read_only=True,
+            access=Access.CONTEXT_ONLY,
             tools=[],
+        ),
+        "analyst": RoleSetting(
+            provider="claude",
+            model="sonnet",
+            effort="high",
+            read_only=True,
+            access=Access.SNAPSHOT_READ,
+            tools=list(DEFAULT_ANALYST_TOOLS),
         ),
         "coder": RoleSetting(
             provider="claude",
             model="opus",
             read_only=False,
+            access=Access.ISOLATED_WRITE,
             tools=list(DEFAULT_CODER_TOOLS),
         ),
         "reviewer": RoleSetting(
@@ -69,6 +89,7 @@ def _default_roles() -> dict[str, RoleSetting]:
             model="sonnet",
             effort="high",
             read_only=True,
+            access=Access.CONTEXT_ONLY,
             tools=[],
         ),
     }
@@ -81,6 +102,7 @@ class ConfigDocument(BaseModel):
 
     schema_version: int = 1
     planner: RoleSetting | None = None
+    analyst: RoleSetting | None = None
     coder: RoleSetting | None = None
     reviewer: RoleSetting | None = None
     budget: Budget | None = None
@@ -201,6 +223,12 @@ def resolve_roles(
     roles: dict[str, RoleSetting] = {}
     substitutions: list[str] = []
     for name in ROLE_NAMES:
+        if name not in config.roles:
+            # A configuration loaded from disk always carries every role,
+            # because the defaults are the starting point. One built in code
+            # may omit an optional role such as the analyst; the work that
+            # needs it then refuses by name rather than failing here.
+            continue
         setting = config.role(name)
         if setting.provider in available:
             roles[name] = setting
@@ -211,6 +239,14 @@ def resolve_roles(
         )
         roles[name] = setting.model_copy(
             update={"provider": replacement, "model": None}
+        )
+
+    missing = [name for name in REQUIRED_ROLE_NAMES if name not in roles]
+    if missing:
+        raise AutomationError(
+            "this automation configuration declares no "
+            f"{', '.join(missing)} role; a run cannot plan, implement, and "
+            "review without all three"
         )
 
     reviewer = roles["reviewer"]

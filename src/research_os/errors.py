@@ -166,6 +166,24 @@ class SymlinkScopeError(WorktreeIsolationError):
     """
 
 
+class AnalystOutputError(AutomationError):
+    """Raised when an analysis worker's structured findings are not usable.
+
+    Analyst output is data the controller parses, never instruction it follows,
+    so a report that does not validate is a failed work order rather than
+    something to interpret generously.
+    """
+
+
+class SnapshotMutationError(AutomationError):
+    """Raised when a snapshot-read worker changed the checkout it was reading.
+
+    The analysis worker is given read-only file tools and a pinned snapshot, so
+    a changed HEAD or a dirty tree means an enforcement boundary did not hold.
+    The run fails and the violation is recorded; nothing is quietly restored.
+    """
+
+
 class Severity(StrEnum):
     """Finding severity for deterministic validation reports."""
 
