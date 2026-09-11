@@ -117,6 +117,28 @@ set are the ones the plan produced. It spends an ordinary model call from
 one that failed, so a repair that breaks something that previously passed is
 caught.
 
+A repair only starts if the run can still afford to finish it. A repair commits
+the controller to a continuation — the repair invocation, and then the review
+that every coding order must end with — so the controller reserves that whole
+continuation before it begins, and checks it again from live state immediately
+before the repair worker is invoked. Deterministic checks cost nothing here,
+because the controller runs them itself.
+
+When the continuation does not fit, what happens depends on what asked for the
+repair:
+
+- **A required check failed.** No repair is started, the work order fails on
+  its checks with the original check evidence intact, and the failure reason
+  says that the repair was not attempted because the model-call budget could
+  not cover it. The ledger records `repair_budget_exhausted`.
+- **The reviewer returned `PASS_WITH_REPAIR`.** No repair is started and the
+  run ends at `READY_FOR_HUMAN`. That is safe: every deterministic check has
+  already passed, and the reviewer's verdict is authoritative. Its findings are
+  carried to the human as unresolved, and the work order records that the
+  repair was not made because the budget was exhausted.
+
+`FAIL` remains terminal and is never repaired.
+
 ## Provider configuration
 
 Providers are discovered locally. Nothing is assumed about a CLI that is not
@@ -212,15 +234,39 @@ is not independent.
   fails the work order and the run and is recorded in the ledger. Nothing is
   quietly restored, because restoring it would destroy the only evidence that a
   boundary did not hold.
+- **`read_paths` is scope, not enforcement.** An analyst work order's
+  `read_paths` describe the intended analysis scope supplied to the model and
+  recorded for provenance. They are validated as plain repository-relative
+  paths — no absolute path, no `~`, no `..`, no backslash, no control
+  character — so a plan cannot name something outside the repository, and they
+  are stated to the analyst in its prompt. They are **not** a per-file
+  filesystem permission: the controller does not carve the snapshot down to
+  them, and a read outside them is not blocked. The v0.1 security boundary for
+  an analyst is the isolated snapshot pinned to the base commit, the read-only
+  tool set, and the before-and-after snapshot check — not per-path read
+  enforcement. Per-path enforcement is deliberately deferred.
 - **Analyst output is data, never instruction.** The parsed report is quoted
-  into a downstream prompt inside a labelled block, with the closing delimiter
-  stripped from every field so a finding cannot forge the end of the fence. It
-  cannot change tool permissions, allowed paths, acceptance commands, budgets,
-  worktree paths, or run state: those are fixed on the work order when the plan
-  is validated, and the controller re-checks them from the work order after the
-  worker has stopped. Only the validated artifact crosses; no provider session
-  or free-form prior output is carried across, and the exact artifact used is
+  into a downstream prompt inside a labelled block. Every model-originated
+  string in that block — free text and path reference alike — is rendered by
+  one prompt-safe serializer (`research_os.automation.promptdata`), which folds
+  every control character to a space, replaces every known delimiter wherever
+  it appears, and then re-reads the assembled block: it leaves that module only
+  when exactly one opening and one closing delimiter stand alone on their own
+  lines. Path-like fields are
+  refused outright at schema validation if they carry a control character, so a
+  file reference cannot forge a line at all. Analyst output cannot change tool
+  permissions, allowed paths, acceptance commands, budgets, worktree paths, or
+  run state: those are fixed on the work order when the plan is validated, and
+  the controller re-checks them from the work order after the worker has
+  stopped. Only the validated artifact crosses; no provider session or
+  free-form prior output is carried across, and the exact artifact used is
   recorded with its SHA-256.
+- **One serializer for every model-to-model handoff.** The same rule covers
+  reviewer findings quoted into a repair prompt, the captured output of the
+  acceptance commands, the diff, and the planner-written title, goal, and
+  completion condition that appear in a worker's prompt. There is one
+  rendering boundary rather than one per call site, so a field added later
+  either goes through it or is caught by the block check.
 - **The coding agent gets no command-running tool.** The default tool set is
   `Read, Write, Edit, Glob, Grep`. It runs under the provider's restricted mode,
   which confines file tools to the working directory, with `--strict-mcp-config`
@@ -370,7 +416,11 @@ Enforced before every model call, not audited afterwards:
 
 - `max_model_calls` per run. A plan is refused up front when the remaining
   budget cannot cover it (one coder call plus one reviewer call per coding work
-  order, one call per analyst work order);
+  order, one call per analyst work order). The optional bounded repair is not
+  reserved at plan time, because most runs never need one; instead the repair
+  path reserves its own whole continuation — the repair call plus every review
+  the run still owes — before it starts, and re-checks it from live state
+  immediately before the repair worker is invoked;
 - `max_command_timeout_seconds` per acceptance command;
 - `max_wall_clock_seconds` per run;
 - `max_write_work_orders` and `max_work_orders` per plan.

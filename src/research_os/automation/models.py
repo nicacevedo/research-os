@@ -16,6 +16,7 @@ from typing import Any, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from research_os.automation.promptdata import CONTROL_CHARS
 from research_os.errors import RunStateError
 from research_os.models import NonBlankStr
 
@@ -186,20 +187,41 @@ class Independence(StrEnum):
     DEGRADED_SAME_MODEL = "DEGRADED_SAME_MODEL"
 
 
-def _relative_path(value: str) -> str:
-    """Reject a scope pointer that is not a portable repository-relative path."""
+def safe_relative_path(value: str) -> str:
+    """Reject a path pointer that is not a portable repository-relative path.
+
+    The single path rule. Every model-originated path-like field uses it: a
+    planner scope entry, an analyst file reference, a reviewer finding's
+    pointer. They are all the same kind of value - a repository-relative name a
+    human or a downstream worker may follow - so they are all checked the same
+    way rather than each acquiring its own nearly-identical rule.
+
+    Control characters are refused alongside the traversal forms. A newline or a
+    carriage return in a path would forge the line structure of a prompt data
+    block, and a NUL would truncate the value for anything that hands it to a C
+    API, so a path carrying one is not a path and is refused here rather than
+    repaired later.
+
+    Nothing is normalised and nothing is dereferenced: a pointer either is a
+    plain repository-relative path or it is refused.
+    """
 
     if not value.strip():
-        raise ValueError("path scope entries must be non-empty")
+        raise ValueError("path entries must be non-empty")
+    control = sorted({f"U+{ord(item):04X}" for item in value if item in CONTROL_CHARS})
+    if control:
+        raise ValueError(
+            "path entries must not contain control characters: " + ", ".join(control)
+        )
     if value.startswith(("/", "~")):
-        raise ValueError("path scope entries must be repository-relative")
+        raise ValueError("path entries must be repository-relative")
     if "\\" in value:
-        raise ValueError("path scope entries must use POSIX '/' separators")
+        raise ValueError("path entries must use POSIX '/' separators")
     segments = [item for item in value.split("/") if item != ""]
     if not segments:
-        raise ValueError("path scope entries must name at least one segment")
+        raise ValueError("path entries must name at least one segment")
     if any(item in {".", ".."} for item in segments):
-        raise ValueError("path scope entries must not contain '.' or '..' segments")
+        raise ValueError("path entries must not contain '.' or '..' segments")
     return value
 
 
@@ -397,12 +419,13 @@ class AnalystFinding(BaseModel):
         """Refuse a file reference that points outside the snapshot.
 
         A reference is a pointer the human and the downstream worker will
-        follow, so an absolute path, a ``~``, or a ``..`` segment is refused
-        rather than normalised: it is the one field of analyst output that
-        names the filesystem, and it is checked exactly like a scope entry.
+        follow, so an absolute path, a ``~``, a ``..`` segment, or a control
+        character is refused rather than normalised: it is the one field of
+        analyst output that names the filesystem, and it is checked exactly
+        like a scope entry.
         """
 
-        return [_relative_path(item) for item in value]
+        return [safe_relative_path(item) for item in value]
 
 
 class AnalystEvidence(BaseModel):
@@ -414,10 +437,28 @@ class AnalystEvidence(BaseModel):
     file_ref: str
     detail: NonBlankStr
 
+    @field_validator("finding_id")
+    @classmethod
+    def _finding_id_shape(cls, value: str) -> str:
+        """Check a pointer to a finding exactly like the finding's own id.
+
+        The report-level check that every pointer names a reported finding
+        already implies this, but only for a report; the shape belongs on the
+        field, so an evidence entry cannot carry arbitrary text in an id
+        position wherever it is constructed.
+        """
+
+        if FINDING_ID_RE.fullmatch(value) is None:
+            raise ValueError(
+                "a finding id must be 1-32 characters of letters, digits, "
+                "'-', '_', or '.'"
+            )
+        return value
+
     @field_validator("file_ref")
     @classmethod
     def _repository_relative_ref(cls, value: str) -> str:
-        return _relative_path(value)
+        return safe_relative_path(value)
 
 
 class AnalystReport(BaseModel):
@@ -479,6 +520,15 @@ class WorkOrder(BaseModel):
     allowed_paths: list[str] = Field(default_factory=list)
     forbidden_paths: list[str] = Field(default_factory=list)
     read_paths: list[str] = Field(default_factory=list)
+    """The analysis scope the plan asked for, recorded for provenance.
+
+    Advisory focus, not a filesystem permission. It is supplied to the analysis
+    worker as the paths it is asked to look at and recorded here so a reader
+    knows what was asked; the controller does not restrict the snapshot to it.
+    What actually bounds an analyst is the isolated snapshot pinned to the base
+    commit, the read-only tool set, and the before-and-after snapshot check.
+    """
+
     acceptance_commands: list[AcceptanceCommand] = Field(default_factory=list)
     expected_artifacts: list[NonBlankStr] = Field(default_factory=list)
     completion_condition: NonBlankStr
@@ -518,7 +568,7 @@ class WorkOrder(BaseModel):
     @field_validator("allowed_paths", "forbidden_paths", "read_paths")
     @classmethod
     def _scope_paths(cls, value: list[str]) -> list[str]:
-        return [_relative_path(item) for item in value]
+        return [safe_relative_path(item) for item in value]
 
     @field_validator("dependencies")
     @classmethod
@@ -552,8 +602,10 @@ class WorkOrder(BaseModel):
         """Refuse an analysis work order that carries any write authority.
 
         An analyst reads a pinned snapshot and produces findings. It therefore
-        has a read scope and nothing else: no writable paths, and no acceptance
-        command, because the controller never runs a command on its behalf.
+        has an analysis scope and nothing else: no writable paths, and no
+        acceptance command, because the controller never runs a command on its
+        behalf. ``read_paths`` is required so the plan has to state what it is
+        asking to be analysed; it is provenance and focus, not enforcement.
         """
 
         if not self.read_only:
@@ -565,7 +617,7 @@ class WorkOrder(BaseModel):
         if not self.read_paths:
             raise ValueError(
                 "an analyst work order requires a non-empty read_paths; the "
-                "plan must state explicitly what the analyst may read"
+                "plan must state explicitly what it is asking to be analysed"
             )
         if self.allowed_paths:
             raise ValueError(
@@ -605,6 +657,21 @@ class ReviewFinding(BaseModel):
     severity: NonBlankStr
     message: NonBlankStr
     path: str | None = None
+
+    @field_validator("path")
+    @classmethod
+    def _repository_relative_path(cls, value: str | None) -> str | None:
+        """Check a reviewer pointer exactly like an analyst file reference.
+
+        It is the same kind of value and it reaches the same places - a repair
+        prompt and a human's report - so it gets the same rule. A finding that
+        names no file is ordinary and stays ``None``; a finding that names one
+        must name it as a plain repository-relative path.
+        """
+
+        if value is None:
+            return None
+        return safe_relative_path(value)
 
 
 class ReviewOutcome(BaseModel):

@@ -184,6 +184,17 @@ class SnapshotMutationError(AutomationError):
     """
 
 
+class PromptDataError(AutomationError):
+    """Raised when model-originated text would forge a prompt data boundary.
+
+    The controller renders every model-originated string through one prompt-safe
+    serializer, so this is a programming error rather than a hostile input: it
+    means a field reached a data block without passing that boundary. It fails
+    closed, because a prompt whose fence is ambiguous has already lost the
+    distinction between data and instruction.
+    """
+
+
 class Severity(StrEnum):
     """Finding severity for deterministic validation reports."""
 

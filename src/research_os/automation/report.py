@@ -94,7 +94,10 @@ def _render_order_intent(run: AutomationRun, order: WorkOrder) -> list[str]:
         f"  writes            {writes}  ({order.risk_class})",
     ]
     if analysis:
-        lines.append(f"  read scope        {', '.join(order.read_paths) or '-'}")
+        lines.append(
+            f"  analysis scope    {', '.join(order.read_paths) or '-'}  "
+            "(focus supplied to the analyst, not a per-file permission)"
+        )
     else:
         lines.append(f"  allowed paths     {', '.join(order.allowed_paths) or '-'}")
     if order.forbidden_paths:
@@ -156,7 +159,9 @@ def render_status(run: AutomationRun, store: RunStore) -> str:
             label = "snapshot" if order.role is Role.ANALYST else "worktree"
             lines.append(f"             {label} {order.worktree_path}")
         if order.role is Role.ANALYST:
-            lines.append(f"             read scope {', '.join(order.read_paths)}")
+            lines.append(
+                f"             analysis scope {', '.join(order.read_paths)} (advisory)"
+            )
             if order.analysis_path:
                 lines.append(f"             analysis {order.analysis_path}")
         for artifact in order.dependency_artifacts:
@@ -234,7 +239,8 @@ def render_report(run: AutomationRun, store: RunStore) -> str:
             ]
         )
         if order.repair_reason:
-            lines.append(f"repair reason     {order.repair_reason}")
+            label = "repair reason" if order.repair_attempts else "repair not made"
+            lines.append(f"{label:<18}{order.repair_reason}")
         if order.dependency_artifacts:
             lines.append("")
             lines.append("inputs from earlier work orders")
@@ -297,7 +303,11 @@ def _render_analysis(order: WorkOrder, store: RunStore) -> list[str]:
         "-" * 72,
         f"snapshot          {order.worktree_path or '-'}",
         f"snapshot commit   {order.head_commit or order.base_commit}",
-        f"read scope        {', '.join(order.read_paths) or '-'}",
+        f"analysis scope    {', '.join(order.read_paths) or '-'}",
+        "                  advisory focus supplied to the analyst and recorded",
+        "                  here for provenance; it is not a per-file read",
+        "                  permission. The enforced boundary is the isolated",
+        "                  snapshot above plus the read-only tool set below.",
         "tools             Read, Glob, Grep  (no Write, no Edit, no Bash)",
         f"analysis          {order.analysis_path or '-'}",
         "",

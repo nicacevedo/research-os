@@ -13,22 +13,29 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 import pytest
+from pydantic import ValidationError
 
 from research_os.automation.controller import (
     AutomationController,
+    pending_review_calls,
     ready_for_human_blockers,
+    repair_continuation_calls,
     unresolved_findings,
 )
 from research_os.automation.models import (
+    AcceptanceCommand,
     AutomationRun,
     Budget,
+    ExpectedOutput,
     ReviewVerdict,
+    RiskClass,
     Role,
     RunState,
     WorkOrderStatus,
+    utc_now,
 )
 from research_os.automation.store import RunStore
-from research_os.errors import AutomationError
+from research_os.errors import AutomationError, BudgetExceededError
 from tests.automation_helpers import (
     BROKEN_MODULE,
     FIXED_MODULE,
@@ -632,3 +639,266 @@ def test_the_broken_module_fixture_really_fails_its_tests(
     assert "NotImplementedError" in BROKEN_MODULE
     assert "return 0" in WRONG_MODULE
     assert "return left + right" in FIXED_MODULE
+
+
+# -- the repair budget reserves its own continuation --------------------------
+#
+# A repair is not one model call, it is a commitment: the repair itself, and
+# then the review every coding order must end with. Starting one the run cannot
+# finish spends the last call, overwrites the diff that failed, and still hands
+# the human nothing reviewable. So the whole continuation is reserved before a
+# repair begins, and checked again from live state immediately before it runs.
+
+
+def budgeted(calls: int) -> Budget:
+    return Budget(max_model_calls=calls)
+
+
+def test_repair_continuation_counts_the_repair_and_every_owed_review() -> None:
+    """The reservation is derived from execution, not asserted as a constant."""
+
+    run = _run_with_orders(
+        [
+            (Role.ANALYST, WorkOrderStatus.ANALYZED),
+            (Role.CODER, WorkOrderStatus.EXECUTED),
+            (Role.CODER, WorkOrderStatus.REVIEWED),
+        ]
+    )
+
+    # The analysis order is never reviewed and the reviewed order owes nothing,
+    # so only the executed coding order still costs a reviewer call.
+    assert pending_review_calls(run) == 1
+    assert repair_continuation_calls(run) == 2
+
+
+def test_a_repair_happens_on_exactly_sufficient_budget(
+    automation_home: Path, tmp_path: Path
+) -> None:
+    """Planner, coder, repair, reviewer: four calls, and four are allowed."""
+
+    ctx = start_run(
+        tmp_path,
+        provider=scripted(coder=[wrote(WRONG_MODULE), wrote(FIXED_MODULE)]),
+        budget=budgeted(4),
+    )
+    final = ctx.controller.execute(ctx.store)
+
+    assert final.state is RunState.READY_FOR_HUMAN
+    assert final.order("T-001").repair_attempts == 1
+    assert final.model_calls_used == 4
+    assert ready_for_human_blockers(final) == []
+    assert events(ctx.store, "repair_started")
+
+
+def test_a_failed_check_does_not_repair_when_the_re_review_would_not_fit(
+    automation_home: Path, tmp_path: Path
+) -> None:
+    """One call short: enough for the repair, not for the review after it."""
+
+    ctx = start_run(
+        tmp_path,
+        provider=scripted(coder=[wrote(WRONG_MODULE), wrote(FIXED_MODULE)]),
+        budget=budgeted(3),
+    )
+
+    with pytest.raises(AutomationError, match="required acceptance commands failed"):
+        ctx.controller.execute(ctx.store)
+
+    final = ctx.store.load()
+    order = final.order("T-001")
+    assert final.state is RunState.FAILED
+    assert order.repair_attempts == 0
+    assert events(ctx.store, "repair_started") == [], "a repair was started anyway"
+    assert len(ctx.provider.requests_for(Role.CODER)) == 1
+    assert final.model_calls_used == 2, "the last call was not spent"
+
+    # The original evidence survives, and the reason says both why the checks
+    # failed and why nothing was done about it.
+    assert order.status is WorkOrderStatus.CHECKS_FAILED
+    assert [(item.display, item.ok) for item in order.check_results] == [
+        ("pytest -q", False),
+        ("git diff --check HEAD", True),
+    ]
+    assert order.failure_reason is not None
+    assert "required acceptance commands failed: pytest -q" in order.failure_reason
+    assert "no bounded repair was attempted" in order.failure_reason
+    assert "model call" in order.failure_reason
+    assert final.failure_reason
+    assert "no bounded repair was attempted" in final.failure_reason
+
+    exhausted = events(ctx.store, "repair_budget_exhausted")
+    assert exhausted and "the bounded repair needs" in exhausted[-1]["detail"]
+    assert exhausted[-1]["model_calls_required"] == 2
+
+
+def test_pass_with_repair_ends_ready_when_the_re_review_would_not_fit(
+    automation_home: Path, tmp_path: Path
+) -> None:
+    """Checks already passed and the verdict is authoritative, so it is kept."""
+
+    unresolved = review_payload(
+        "PASS_WITH_REPAIR",
+        findings=[{"severity": "major", "message": "no docstring", "path": "adder.py"}],
+    )
+    ctx = start_run(
+        tmp_path,
+        provider=scripted(
+            coder=[wrote(FIXED_MODULE), wrote(TYPED_MODULE)],
+            review=[unresolved, review_payload()],
+        ),
+        budget=budgeted(4),
+    )
+    final = ctx.controller.execute(ctx.store)
+
+    order = final.order("T-001")
+    assert final.state is RunState.READY_FOR_HUMAN
+    assert order.status is WorkOrderStatus.REVIEWED
+    assert order.repair_attempts == 0
+    assert events(ctx.store, "repair_started") == []
+    assert len(ctx.provider.requests_for(Role.CODER)) == 1
+    assert final.model_calls_used == 3
+
+    # The verdict that gated the run is not lost, and neither are its findings.
+    assert [item.verdict for item in final.reviews] == [ReviewVerdict.PASS_WITH_REPAIR]
+    assert unresolved_findings(final) == [("T-001", "major", "no docstring")]
+    assert order.repair_reason is not None
+    assert "no bounded repair was attempted" in order.repair_reason
+    assert "model call" in order.repair_reason
+
+    exhausted = events(ctx.store, "repair_budget_exhausted")
+    assert exhausted[-1]["trigger"].startswith("reviewer returned PASS_WITH_REPAIR")
+    assert exhausted[-1]["model_calls_required"] == 2
+
+
+def test_the_budget_reservation_reports_the_unmet_repair_in_the_handoff(
+    automation_home: Path, tmp_path: Path
+) -> None:
+    from research_os.automation.report import render_report
+
+    unresolved = review_payload(
+        "PASS_WITH_REPAIR",
+        findings=[{"severity": "major", "message": "no docstring", "path": None}],
+    )
+    ctx = start_run(
+        tmp_path,
+        provider=scripted(
+            coder=[wrote(FIXED_MODULE), wrote(TYPED_MODULE)],
+            review=[unresolved, review_payload()],
+        ),
+        budget=budgeted(4),
+    )
+    final = ctx.controller.execute(ctx.store)
+    rendered = render_report(final, ctx.store)
+
+    assert "repair not made" in rendered
+    assert "no docstring" in rendered
+    assert "repair attempts   0 of 1" in rendered
+
+
+def test_no_repair_is_attempted_with_no_repair_budget_at_all(
+    automation_home: Path, tmp_path: Path
+) -> None:
+    """The attempt bound is checked first and is independent of model calls."""
+
+    ctx = start_run(
+        tmp_path,
+        provider=scripted(coder=[wrote(WRONG_MODULE), wrote(FIXED_MODULE)]),
+        budget=Budget(max_model_calls=8, max_repair_attempts=0),
+    )
+
+    with pytest.raises(AutomationError, match="required acceptance commands failed"):
+        ctx.controller.execute(ctx.store)
+
+    final = ctx.store.load()
+    assert final.order("T-001").repair_attempts == 0
+    assert events(ctx.store, "repair_started") == []
+    exhausted = events(ctx.store, "repair_budget_exhausted")
+    assert exhausted and "allows no repair attempt" in exhausted[0]["detail"]
+    assert final.model_calls_used == 2, "budget remained, the attempt bound did not"
+
+
+def test_the_repair_budget_correction_did_not_raise_the_repair_cap() -> None:
+    """Reserving more calls must not turn one repair into two."""
+
+    assert Budget().max_repair_attempts == 1
+    with pytest.raises(ValidationError):
+        Budget(max_repair_attempts=2)
+
+
+def test_the_live_guard_refuses_a_repair_the_budget_can_no_longer_cover(
+    automation_home: Path, tmp_path: Path
+) -> None:
+    """Plan-time arithmetic is not the last word: the repair path asks again.
+
+    The decision helper is stubbed out so it always permits, which is exactly
+    what a future refactor or a concurrent state change could do by accident.
+    The guard immediately before the invocation still stops it, so no model
+    call is spent and the ledger says why.
+    """
+
+    ctx = start_run(
+        tmp_path,
+        provider=scripted(coder=[wrote(WRONG_MODULE), wrote(FIXED_MODULE)]),
+        budget=budgeted(3),
+    )
+    ctx.controller._repair_refusal = lambda *args, **kwargs: None  # type: ignore[method-assign]
+
+    with pytest.raises(BudgetExceededError, match="the bounded repair needs"):
+        ctx.controller.execute(ctx.store)
+
+    final = ctx.store.load()
+    assert final.model_calls_used == 2, "a model call was spent past the guard"
+    assert events(ctx.store, "repair_started") == []
+    assert len(ctx.provider.requests_for(Role.CODER)) == 1
+    guarded = [
+        item
+        for item in events(ctx.store, "repair_budget_exhausted")
+        if item["trigger"] == "repair_invocation_guard"
+    ]
+    assert guarded and "the bounded repair needs" in guarded[0]["detail"]
+
+
+def _run_with_orders(
+    shape: list[tuple[Role, WorkOrderStatus]],
+) -> AutomationRun:
+    """Return a run carrying work orders in the given roles and statuses."""
+
+    orders = []
+    for index, (role, status) in enumerate(shape, start=1):
+        analysis = role is Role.ANALYST
+        orders.append(
+            {
+                "task_id": f"T-{index:03d}",
+                "title": "t",
+                "goal": "g",
+                "role": role,
+                "risk_class": RiskClass.SNAPSHOT_READ
+                if analysis
+                else RiskClass.WRITE_ISOLATED,
+                "project_path": "/tmp/project",
+                "base_commit": "a" * 40,
+                "read_only": analysis,
+                "allowed_paths": [] if analysis else ["adder.py"],
+                "read_paths": ["adder.py"] if analysis else [],
+                "acceptance_commands": []
+                if analysis
+                else [AcceptanceCommand(argv=["pytest", "-q"])],
+                "completion_condition": "c",
+                "timeout_seconds": 60,
+                "provider": "fake",
+                "expected_output": ExpectedOutput.REPORT
+                if analysis
+                else ExpectedOutput.DIFF,
+                "status": status,
+            }
+        )
+    now = utc_now()
+    return AutomationRun(
+        run_id="RUN-20260909T101500Z-0a1b2c3d",
+        project_path="/tmp/project",
+        goal="g",
+        base_commit="a" * 40,
+        created_at=now,
+        updated_at=now,
+        work_orders=orders,
+    )

@@ -28,6 +28,7 @@ from research_os.automation.models import (
     Role,
     RoleSetting,
     WorkOrder,
+    safe_relative_path,
 )
 from research_os.automation.structured import extract_json_object
 from research_os.errors import CommandPolicyError, PlanValidationError
@@ -211,8 +212,11 @@ rejected by the controller before anything runs:
 For an "analyst" task:
 - "read_only" must be true.
 - "read_paths" must be non-empty and must list the repository-relative paths
-  the analyst may read (POSIX separators, no leading "/", no "..", no "~").
-  There is no scope meaning "the whole filesystem".
+  the analysis should concentrate on (POSIX separators, no leading "/", no
+  "..", no "~", no control characters). It states the focus of the task and is
+  recorded with the run; what actually bounds the analyst is the isolated
+  snapshot it runs in and its three read-only tools, so name the paths that
+  make the task clear rather than trying to describe a permission.
 - "allowed_paths" and "acceptance_commands" must both be empty. An analyst
   writes nothing, so it has no write scope, and the controller runs no command
   on its behalf.
@@ -389,10 +393,13 @@ def _validate_coding_task(task: PlannedTask) -> None:
 def _validate_analysis_task(task: PlannedTask) -> None:
     """Reject an analysis task that asks for anything but a bounded read.
 
-    The read scope must be stated explicitly and must be a set of
-    repository-relative paths inside the pinned snapshot. There is no scope
-    that means "the whole filesystem": an absolute path, a ``~``, or a ``..``
-    segment is refused here, and refused again when the work order is built.
+    The analysis scope must be stated explicitly and must be a set of
+    repository-relative paths inside the pinned snapshot: an absolute path, a
+    ``~``, or a ``..`` segment is refused here, and refused again when the work
+    order is built. That validation keeps the field a set of plain in-repository
+    names; it does not make it a filesystem permission. The analyst's boundary
+    is the snapshot it runs in and the read-only tool set it is given, and
+    ``read_paths`` is the focus the plan asked for, recorded for provenance.
     """
 
     if not task.read_only:
@@ -404,15 +411,16 @@ def _validate_analysis_task(task: PlannedTask) -> None:
         raise PlanValidationError(
             f"task {task.id} is an analyst task with an empty read_paths; the "
             "plan must state explicitly which repository-relative paths the "
-            "analyst may read"
+            "analysis is meant to concentrate on"
         )
     for entry in task.read_paths:
-        if entry.startswith(("/", "~")) or ".." in entry.split("/"):
+        try:
+            safe_relative_path(entry)
+        except ValueError as exc:
             raise PlanValidationError(
-                f"task {task.id} asks to read {entry!r}; an analyst read scope "
-                "may only name paths relative to the pinned snapshot, with no "
-                "leading '/', no '~', and no '..' segment"
-            )
+                f"task {task.id} asks to analyse {entry!r}; an analysis scope "
+                f"may only name paths relative to the pinned snapshot: {exc}"
+            ) from exc
     if task.allowed_paths:
         raise PlanValidationError(
             f"task {task.id} is an analyst task but declares allowed_paths; an "

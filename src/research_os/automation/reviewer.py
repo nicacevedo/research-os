@@ -20,16 +20,28 @@ from research_os.automation.models import (
     ReviewOutcome,
     ReviewVerdict,
     WorkOrder,
+    safe_relative_path,
+)
+from research_os.automation.promptdata import (
+    REVIEW_FENCE,
+    prompt_safe,
+    prompt_safe_block,
+    render_data_block,
 )
 from research_os.automation.structured import extract_json_object
 from research_os.errors import ProviderInvocationError
 
 MAX_DIFF_CHARS = 60_000
 MAX_REPORT_CHARS = 6_000
+MAX_PATH_CHARS = 512
+MAX_LABEL_CHARS = 128
 
 #: The delimiters that fence reviewer findings inside a repair prompt.
-FINDINGS_BEGIN = "----- BEGIN REVIEWER FINDINGS (ADVISORY DATA) -----"
-FINDINGS_END = "----- END REVIEWER FINDINGS (ADVISORY DATA) -----"
+#:
+#: Owned by :mod:`research_os.automation.promptdata`, which is the one place
+#: that writes them, and named here for the callers that read them.
+FINDINGS_BEGIN = REVIEW_FENCE.begin
+FINDINGS_END = REVIEW_FENCE.end
 
 REVIEW_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -71,25 +83,32 @@ def build_reviewer_prompt(
 ) -> str:
     """Return the frozen review packet as prompt text."""
 
-    truncated_diff = diff
-    if len(truncated_diff) > MAX_DIFF_CHARS:
-        truncated_diff = (
-            truncated_diff[:MAX_DIFF_CHARS] + "\n[diff truncated for review]\n"
-        )
-    report = (worker_report or "(the implementation worker produced no report)")[
-        :MAX_REPORT_CHARS
-    ]
+    truncated_diff = prompt_safe_block(diff, limit=MAX_DIFF_CHARS)
+    if len(diff) > MAX_DIFF_CHARS:
+        truncated_diff = truncated_diff + "\n[diff truncated for review]\n"
+    report = prompt_safe_block(
+        worker_report or "(the implementation worker produced no report)",
+        limit=MAX_REPORT_CHARS,
+    )
     checks = (
         "\n".join(
-            f"- {item.display}\n"
+            f"- {prompt_safe(item.display, limit=MAX_LABEL_CHARS)}\n"
             f"    exit_code: {item.exit_code if item.exit_code is not None else 'none'}"
             f"  timed_out: {item.timed_out}  required: {item.required}"
             for item in check_results
         )
         or "- (no acceptance commands were declared)"
     )
-    allowed = "\n".join(f"- {item}" for item in order.allowed_paths)
-    changed = "\n".join(f"- {item}" for item in order.changed_paths) or "- (none)"
+    allowed = "\n".join(
+        f"- {prompt_safe(item, limit=MAX_PATH_CHARS)}" for item in order.allowed_paths
+    )
+    changed = (
+        "\n".join(
+            f"- {prompt_safe(item, limit=MAX_PATH_CHARS)}"
+            for item in order.changed_paths
+        )
+        or "- (none)"
+    )
 
     return f"""You are the review worker of a deterministic research automation
 controller. You have no tools and no repository access. Review only the frozen
@@ -100,13 +119,13 @@ not by the implementer, so their exit codes are established facts. Do not
 re-litigate whether they passed; judge whether what passed is actually correct
 and in scope.
 
-TASK {order.task_id}: {order.title}
+TASK {order.task_id}: {prompt_safe(order.title, limit=MAX_LABEL_CHARS)}
 
 GOAL
-{order.goal}
+{prompt_safe_block(order.goal, limit=MAX_REPORT_CHARS)}
 
 COMPLETION CONDITION
-{order.completion_condition}
+{prompt_safe_block(order.completion_condition, limit=MAX_REPORT_CHARS)}
 
 BASE COMMIT
 {order.base_commit}
@@ -149,33 +168,54 @@ def render_review_findings(outcome: ReviewOutcome) -> str:
 
     Rendered from the parsed outcome for the same reason the analyst block is:
     what a repair worker sees has already passed validation, and it arrives
-    fenced and labelled as advisory text rather than as instruction.
+    fenced and labelled as advisory text rather than as instruction. Every
+    field goes through the same prompt-safe serializer the analyst block uses,
+    including ``severity`` and ``path``, and the assembled block is checked
+    before it is returned.
     """
 
-    lines = [
-        FINDINGS_BEGIN,
+    body = [
         f"verdict: {outcome.verdict}",
-        f"reviewer: {outcome.provider} / {outcome.model or 'provider default'}",
-        f"summary: {_flatten(outcome.summary)}",
+        (
+            "reviewer: "
+            f"{prompt_safe(outcome.provider, limit=MAX_LABEL_CHARS)} / "
+            f"{prompt_safe(outcome.model or 'provider default', limit=MAX_LABEL_CHARS)}"
+        ),
+        f"summary: {prompt_safe(outcome.summary, limit=MAX_REPORT_CHARS)}",
         "",
         "findings:",
     ]
     if not outcome.findings:
-        lines.append("  (the reviewer recorded no individual finding)")
+        body.append("  (the reviewer recorded no individual finding)")
     for finding in outcome.findings:
-        where = f" [{finding.path}]" if finding.path else ""
-        lines.append(f"  - {finding.severity}{where}: {_flatten(finding.message)}")
-    lines.append(FINDINGS_END)
-    return "\n".join(lines)
+        where = (
+            f" [{prompt_safe(finding.path, limit=MAX_PATH_CHARS)}]"
+            if finding.path
+            else ""
+        )
+        severity = prompt_safe(finding.severity, limit=MAX_LABEL_CHARS)
+        message = prompt_safe(finding.message, limit=MAX_REPORT_CHARS)
+        body.append(f"  - {severity}{where}: {message}")
+    return render_data_block(REVIEW_FENCE, body)
 
 
-def _flatten(value: str) -> str:
-    """Return ``value`` on one line, with the block delimiters removed."""
+def _usable_path(value: Any) -> str | None:
+    """Return the advisory path a finding may carry, or ``None``.
 
-    flattened = " ".join(value.split())
-    for marker in (FINDINGS_BEGIN, FINDINGS_END):
-        flattened = flattened.replace(marker, "[removed delimiter]")
-    return flattened[:MAX_REPORT_CHARS]
+    A reviewer pointer is advisory: it names a file for a human to open and for
+    a repair worker to look at. A value that is not a safe repository-relative
+    path is therefore dropped rather than allowed to invalidate an
+    authoritative verdict - the message carries the content, and the verdict
+    gates the run. What is refused is refused by the same rule an analyst file
+    reference is refused by, so nothing unchecked reaches a prompt.
+    """
+
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return safe_relative_path(value)
+    except ValueError:
+        return None
 
 
 def parse_review(
@@ -208,12 +248,11 @@ def parse_review(
         message = str(item.get("message") or "").strip()
         if not message:
             continue
-        path = item.get("path")
         findings.append(
             ReviewFinding(
                 severity=str(item.get("severity") or "note").strip() or "note",
                 message=message,
-                path=str(path) if isinstance(path, str) and path.strip() else None,
+                path=_usable_path(item.get("path")),
             )
         )
     summary = str(payload.get("summary") or "").strip()

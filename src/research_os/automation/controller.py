@@ -113,6 +113,9 @@ DEFAULT_ANALYST_TIMEOUT_SECONDS = 900
 # One coder invocation plus one reviewer invocation per write work order.
 MODEL_CALLS_PER_WORK_ORDER = MODEL_CALLS_PER_CODING_TASK
 
+#: What the repair invocation itself costs.
+MODEL_CALLS_PER_REPAIR = 1
+
 
 def minimum_model_calls(orders: list[WorkOrder]) -> int:
     """Return the fewest model calls these work orders could possibly need.
@@ -127,6 +130,59 @@ def minimum_model_calls(orders: list[WorkOrder]) -> int:
         if order.role is Role.ANALYST
         else MODEL_CALLS_PER_CODING_TASK
         for order in orders
+    )
+
+
+def pending_review_calls(run: AutomationRun) -> int:
+    """Return how many reviewer invocations this run still owes.
+
+    Every coding order must end reviewed, so one that is not yet ``REVIEWED``
+    still costs a reviewer call. An analysis order changed nothing and is never
+    reviewed, so it costs none. Read from persisted order status rather than
+    from the phase the controller believes it is in.
+    """
+
+    return sum(
+        1
+        for order in run.work_orders
+        if order.role is not Role.ANALYST
+        and order.status is not WorkOrderStatus.REVIEWED
+    )
+
+
+def repair_continuation_calls(run: AutomationRun) -> int:
+    """Return the model calls a repair starting now would still have to make.
+
+    The repair invocation itself, plus every reviewer invocation the run still
+    owes - which always includes the repaired order, because a repaired diff is
+    never handed to a human unreviewed. Deterministic checks are absent because
+    the controller runs them itself and they cost no model call.
+
+    Derived from what execution actually does rather than asserted as a
+    constant, so a plan with a second unreviewed coding order reserves that
+    order's review too instead of discovering it is one call short later.
+    """
+
+    return MODEL_CALLS_PER_REPAIR + pending_review_calls(run)
+
+
+def repair_budget_refusal(run: AutomationRun) -> str | None:
+    """Return why a repair may not start on budget grounds, or ``None``.
+
+    A repair is worth starting only if the whole mandatory continuation fits.
+    Spending the last call on a repair whose result can never be reviewed
+    destroys the evidence of the original failure and buys nothing, so the
+    controller refuses to begin one it cannot finish.
+    """
+
+    required = repair_continuation_calls(run)
+    remaining = run.budget.max_model_calls - run.model_calls_used
+    if remaining >= required:
+        return None
+    return (
+        f"the bounded repair needs {required} model call(s) to finish - the "
+        "repair itself and the review that must follow it - and only "
+        f"{remaining} of {run.budget.max_model_calls} remain"
     )
 
 
@@ -915,8 +971,19 @@ class AutomationController:
             )
 
         reason = _failed_check_reason(failed)
-        if not self._repair_available(store, run, task_id, trigger=reason):
-            return self._fail_checks(store, run, task_id, failed)
+        refusal = self._repair_refusal(store, run, task_id, trigger=reason)
+        if refusal is not None:
+            # Say which of the two bounds stopped the repair. A run that failed
+            # its checks and could not afford to try again is a different fact
+            # from one that simply failed its checks, and the human reading the
+            # handoff has to be able to tell them apart.
+            return self._fail_checks(
+                store,
+                run,
+                task_id,
+                failed,
+                note=f"no bounded repair was attempted: {refusal}",
+            )
 
         run = self._repair(
             store,
@@ -1030,8 +1097,20 @@ class AutomationController:
         run: AutomationRun,
         task_id: str,
         failed: list[CommandResult],
+        *,
+        note: str | None = None,
     ) -> NoReturn:
+        """Fail one order on its checks, keeping the evidence that failed it.
+
+        The reason always names the commands the controller observed failing.
+        ``note`` adds why nothing was done about it, when there is something to
+        add; the check results themselves are already persisted on the order
+        and are not touched here.
+        """
+
         reason = _failed_check_reason(failed)
+        if note:
+            reason = f"{reason}; {note}"
         self._update_order(
             store,
             run,
@@ -1075,9 +1154,18 @@ class AutomationController:
             )
 
         trigger = f"reviewer returned PASS_WITH_REPAIR: {outcome.summary}"
-        if not self._repair_available(store, run, task_id, trigger=trigger):
+        refusal = self._repair_refusal(store, run, task_id, trigger=trigger)
+        if refusal is not None:
+            # Deterministic checks have already passed, and this verdict is the
+            # authoritative one. Ending here keeps it, and keeps its findings in
+            # front of the human, which is strictly better than spending a
+            # repair the run cannot finish reviewing.
             return self._update_order(
-                store, run, task_id, status=WorkOrderStatus.REVIEWED
+                store,
+                run,
+                task_id,
+                status=WorkOrderStatus.REVIEWED,
+                repair_reason=f"no bounded repair was attempted: {refusal}",
             )
 
         run = self._repair(
@@ -1209,38 +1297,61 @@ class AutomationController:
 
     # -- the single bounded repair ---------------------------------------
 
-    def _repair_available(
+    def _repair_refusal(
         self,
         store: RunStore,
         run: AutomationRun,
         task_id: str,
         *,
         trigger: str,
-    ) -> bool:
-        """Return whether this order may still make its one repair attempt.
+    ) -> str | None:
+        """Return why this order may not repair now, or ``None`` if it may.
 
-        Records the refusal when it may not, so a run that stopped without
-        repairing says why in the ledger rather than looking as though repair
-        was never considered.
+        Two independent bounds, checked in order. The attempt bound asks
+        whether this work order has a repair left at all. The budget bound asks
+        whether the run can still afford the *whole* continuation a repair
+        commits it to - the repair call and the review that must follow it -
+        because a repair the run cannot finish is worse than no repair: it
+        spends the last call, overwrites the diff that failed, and still cannot
+        put a reviewed change in front of a human.
+
+        Records the refusal either way, so a run that stopped without repairing
+        says why in the ledger rather than looking as though repair was never
+        considered.
         """
 
         order = run.order(task_id)
         allowed = run.budget.max_repair_attempts
-        if order.repair_attempts < allowed:
-            return True
-        store.append_event(
-            "repair_budget_exhausted",
-            task_id=task_id,
-            repair_attempts=order.repair_attempts,
-            max_repair_attempts=allowed,
-            trigger=trigger,
-            detail=(
+        if order.repair_attempts >= allowed:
+            detail = (
                 "no repair attempt remains for this work order"
                 if allowed
                 else "this run allows no repair attempt"
-            ),
-        )
-        return False
+            )
+            store.append_event(
+                "repair_budget_exhausted",
+                task_id=task_id,
+                repair_attempts=order.repair_attempts,
+                max_repair_attempts=allowed,
+                trigger=trigger,
+                detail=detail,
+            )
+            return detail
+        refusal = repair_budget_refusal(run)
+        if refusal is not None:
+            store.append_event(
+                "repair_budget_exhausted",
+                task_id=task_id,
+                repair_attempts=order.repair_attempts,
+                max_repair_attempts=allowed,
+                trigger=trigger,
+                model_calls_used=run.model_calls_used,
+                model_call_budget=run.budget.max_model_calls,
+                model_calls_required=repair_continuation_calls(run),
+                detail=refusal,
+            )
+            return refusal
+        return None
 
     def _repair(
         self,
@@ -1268,6 +1379,29 @@ class AutomationController:
         """
 
         order = run.order(task_id)
+        # The live guard. `_repair_refusal` answered from the run as it stood
+        # when the decision was taken; this asks again, from the run as it
+        # stands now, immediately before anything is spent. They agree on every
+        # ordinary path, and that is the point: a repair never begins on the
+        # strength of arithmetic done earlier.
+        refusal = repair_budget_refusal(run)
+        if refusal is not None:
+            store.append_event(
+                "repair_budget_exhausted",
+                task_id=task_id,
+                repair_attempts=order.repair_attempts,
+                max_repair_attempts=run.budget.max_repair_attempts,
+                trigger="repair_invocation_guard",
+                model_calls_used=run.model_calls_used,
+                model_call_budget=run.budget.max_model_calls,
+                model_calls_required=repair_continuation_calls(run),
+                detail=refusal,
+            )
+            raise BudgetExceededError(f"{task_id}: {refusal}")
+        if order.repair_attempts >= run.budget.max_repair_attempts:
+            raise BudgetExceededError(
+                f"{task_id}: no repair attempt remains for this work order"
+            )
         worktree = Path(order.worktree_path or "")
         store.append_event(
             "repair_started",

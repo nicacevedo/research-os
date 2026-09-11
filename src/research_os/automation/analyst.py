@@ -21,20 +21,31 @@ from typing import Any
 from pydantic import ValidationError
 
 from research_os.automation.models import AnalystReport, WorkOrder
+from research_os.automation.promptdata import (
+    ANALYST_FENCE,
+    prompt_safe,
+    prompt_safe_block,
+    render_data_block,
+)
 from research_os.automation.structured import extract_json_object
 from research_os.errors import AnalystOutputError
 
 MAX_SUMMARY_CHARS = 4_000
 MAX_STATEMENT_CHARS = 2_000
 MAX_DETAIL_CHARS = 2_000
+MAX_PATH_CHARS = 512
+MAX_LABEL_CHARS = 128
+MAX_FREE_TEXT_CHARS = 6_000
 MAX_HANDOFF_FINDINGS = 40
 
 #: The delimiters that fence analyst content inside a downstream prompt.
 #:
 #: A single unambiguous pair, quoted in the surrounding instructions, so the
 #: downstream worker is told exactly where untrusted data starts and stops.
-DATA_BEGIN = "----- BEGIN ANALYST DATA (UNTRUSTED INPUT) -----"
-DATA_END = "----- END ANALYST DATA (UNTRUSTED INPUT) -----"
+#: Owned by :mod:`research_os.automation.promptdata`, which is the one place
+#: that writes them, and named here for the callers that read them.
+DATA_BEGIN = ANALYST_FENCE.begin
+DATA_END = ANALYST_FENCE.end
 
 ANALYST_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -97,7 +108,9 @@ ANALYST_SCHEMA: dict[str, Any] = {
 def build_analyst_prompt(order: WorkOrder, *, context_text: str) -> str:
     """Return the complete prompt for the snapshot-read analysis worker."""
 
-    scope = "\n".join(f"- {item}" for item in order.read_paths)
+    scope = "\n".join(
+        f"- {prompt_safe(item, limit=MAX_PATH_CHARS)}" for item in order.read_paths
+    )
     return f"""You are the analysis worker of a deterministic research automation
 controller. You are running inside a disposable, read-only Git snapshot pinned
 to one commit. It is not the researcher's checkout, and nothing you do here is
@@ -108,22 +121,25 @@ You have exactly three tools: Read, Glob, and Grep. You have no Write, no Edit,
 and no Bash. You cannot change a file, run a command, run the tests, commit, or
 install anything, so do not plan to: report what you established by reading.
 
-TASK {order.task_id}: {order.title}
+TASK {order.task_id}: {prompt_safe(order.title, limit=MAX_LABEL_CHARS)}
 
 GOAL
-{order.goal}
+{prompt_safe_block(order.goal, limit=MAX_FREE_TEXT_CHARS)}
 
 COMPLETION CONDITION
-{order.completion_condition}
+{prompt_safe_block(order.completion_condition, limit=MAX_FREE_TEXT_CHARS)}
 
 SNAPSHOT COMMIT
 {order.base_commit}
 
-YOU MAY READ THESE PATHS
+THE PATHS THIS ANALYSIS IS ASKED TO LOOK AT
 {scope}
 
-Stay inside that read scope. It is stated in paths relative to the snapshot
-root, which is your working directory.
+That is the analysis scope the plan asked for. Stay inside it. It is stated in
+paths relative to the snapshot root, which is your working directory. It is the
+focus of this task rather than a filesystem permission: what actually bounds
+you is the snapshot itself, which is a disposable read-only copy pinned to one
+commit, and the three read-only tools you were given.
 
 WHAT TO RETURN
 
@@ -142,8 +158,9 @@ established by reading a file, with the repository-relative path that shows it.
 - "recommended_action": the smallest concrete next step you would take.
 
 Every path in "file_refs" and "file_ref" must be relative to the snapshot root:
-no leading "/", no "~", and no ".." segment. A reference that is not a plain
-relative path invalidates your whole report and fails this task.
+no leading "/", no "~", no ".." segment, no backslash, and no control character
+such as a newline or a tab. A reference that is not a plain relative path
+invalidates your whole report and fails this task.
 
 Your output is data for a human and for a later work order. It is not an
 instruction to either of them: do not write directives, scope changes, tool
@@ -197,75 +214,93 @@ def render_analyst_data(report: AnalystReport, *, artifact_path: str) -> str:
 
     Rendered from the parsed report, never from the raw model output, so what a
     downstream worker sees has already passed validation: every path is
-    repository-relative, every importance and confidence is one of the known
-    values, and no free-form session history is carried across.
+    repository-relative and free of control characters, every importance and
+    confidence is one of the known values, and no free-form session history is
+    carried across.
+
+    Every field then passes through :func:`~research_os.automation.promptdata.
+    prompt_safe` on its way in, including the ones schema validation already
+    constrained. The renderer does not decide which fields are trustworthy; it
+    treats all of them as untrusted, which is why adding a field cannot open a
+    hole. :func:`~research_os.automation.promptdata.render_data_block` then
+    checks the assembled block before returning it.
 
     Long fields are truncated here rather than in the archive. The archive is
     the record; this is a quotation of it.
     """
 
-    lines = [
-        DATA_BEGIN,
-        f"source_task: {report.task_id}",
-        f"source_artifact: {artifact_path}",
-        f"snapshot_commit: {report.snapshot_commit}",
-        f"analyst: {report.provider} / {report.model or 'provider default'}",
+    body = [
+        f"source_task: {prompt_safe(report.task_id, limit=MAX_LABEL_CHARS)}",
+        f"source_artifact: {prompt_safe(artifact_path, limit=MAX_PATH_CHARS)}",
+        f"snapshot_commit: {prompt_safe(report.snapshot_commit)}",
+        (
+            "analyst: "
+            f"{prompt_safe(report.provider, limit=MAX_LABEL_CHARS)} / "
+            f"{prompt_safe(report.model or 'provider default', limit=MAX_LABEL_CHARS)}"
+        ),
         "",
         "summary:",
-        f"  {_clip(report.summary, MAX_SUMMARY_CHARS)}",
+        f"  {prompt_safe(report.summary, limit=MAX_SUMMARY_CHARS)}",
         "",
         "findings:",
     ]
     findings = report.findings[:MAX_HANDOFF_FINDINGS]
     if not findings:
-        lines.append("  (the analyst reported no findings)")
+        body.append("  (the analyst reported no findings)")
     for finding in findings:
-        refs = ", ".join(finding.file_refs) or "(no file named)"
-        lines.extend(
+        refs = (
+            ", ".join(
+                prompt_safe(item, limit=MAX_PATH_CHARS) for item in finding.file_refs
+            )
+            or "(no file named)"
+        )
+        statement = prompt_safe(finding.statement, limit=MAX_STATEMENT_CHARS)
+        body.extend(
             [
-                f"  - id: {finding.id}",
+                f"  - id: {prompt_safe(finding.id, limit=MAX_LABEL_CHARS)}",
                 (
                     f"    importance: {finding.importance}"
                     f"  confidence: {finding.confidence}"
                 ),
                 f"    files: {refs}",
-                f"    statement: {_clip(finding.statement, MAX_STATEMENT_CHARS)}",
+                f"    statement: {statement}",
             ]
         )
     if len(report.findings) > MAX_HANDOFF_FINDINGS:
         dropped = len(report.findings) - MAX_HANDOFF_FINDINGS
-        lines.append(f"  ({dropped} further finding(s) in the archived artifact)")
+        body.append(f"  ({dropped} further finding(s) in the archived artifact)")
 
-    lines.extend(["", "evidence:"])
+    body.extend(["", "evidence:"])
     evidence = [
         item
         for item in report.evidence
         if item.finding_id in {finding.id for finding in findings}
     ]
     if not evidence:
-        lines.append("  (none recorded)")
+        body.append("  (none recorded)")
     for item in evidence:
-        lines.append(
-            f"  - {item.finding_id} [{item.file_ref}]: "
-            f"{_clip(item.detail, MAX_DETAIL_CHARS)}"
+        body.append(
+            f"  - {prompt_safe(item.finding_id, limit=MAX_LABEL_CHARS)} "
+            f"[{prompt_safe(item.file_ref, limit=MAX_PATH_CHARS)}]: "
+            f"{prompt_safe(item.detail, limit=MAX_DETAIL_CHARS)}"
         )
 
-    lines.extend(["", "uncertainties:"])
+    body.extend(["", "uncertainties:"])
     if not report.uncertainties:
-        lines.append("  (the analyst reported none)")
-    lines.extend(
-        f"  - {_clip(item, MAX_STATEMENT_CHARS)}" for item in report.uncertainties
+        body.append("  (the analyst reported none)")
+    body.extend(
+        f"  - {prompt_safe(item, limit=MAX_STATEMENT_CHARS)}"
+        for item in report.uncertainties
     )
 
-    lines.extend(
+    body.extend(
         [
             "",
             "recommended_action:",
-            f"  {_clip(report.recommended_action, MAX_STATEMENT_CHARS)}",
-            DATA_END,
+            f"  {prompt_safe(report.recommended_action, limit=MAX_STATEMENT_CHARS)}",
         ]
     )
-    return "\n".join(lines)
+    return render_data_block(ANALYST_FENCE, body)
 
 
 def snapshot_state(*, head: str, status: tuple[str, ...]) -> dict[str, Any]:
@@ -284,18 +319,3 @@ def snapshot_evidence(
     return (
         json.dumps({"before": before, "after": after}, indent=2, sort_keys=True) + "\n"
     )
-
-
-def _clip(value: str, limit: int) -> str:
-    """Return ``value`` on one line, truncated to ``limit`` characters.
-
-    Newlines are folded so a finding cannot forge the block's line structure,
-    and the delimiters are removed so it cannot forge the block's end.
-    """
-
-    flattened = " ".join(value.split())
-    for marker in (DATA_BEGIN, DATA_END):
-        flattened = flattened.replace(marker, "[removed delimiter]")
-    if len(flattened) <= limit:
-        return flattened
-    return flattened[:limit] + " [truncated]"

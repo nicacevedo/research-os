@@ -170,15 +170,27 @@ def test_a_malformed_analyst_task_is_refused(
         start_research_run(tmp_path, provider=provider)
 
 
-@pytest.mark.parametrize("scope", ["/etc", "~/secrets", "../elsewhere", "a/../../b"])
+@pytest.mark.parametrize(
+    "scope",
+    [
+        "/etc",
+        "~/secrets",
+        "../elsewhere",
+        "a/../../b",
+        "adder.py\ninjected",
+        "adder.py\x00etc",
+    ],
+)
 def test_an_analyst_read_scope_outside_the_snapshot_is_refused(
     automation_home: Path, tmp_path: Path, scope: str
 ) -> None:
-    """There is no read scope that means the whole filesystem."""
+    """No analysis scope may name anything but a plain in-snapshot path."""
 
     payload = {"summary": "analyse", "tasks": [analysis_task(read_paths=(scope,))]}
 
-    with pytest.raises(PlanValidationError, match="read scope|not a valid work order"):
+    with pytest.raises(
+        PlanValidationError, match="analysis scope|not a valid work order"
+    ):
         start_research_run(tmp_path, provider=scripted_research(plan=payload))
 
 
