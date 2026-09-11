@@ -238,7 +238,11 @@ def _cleanup(args: argparse.Namespace) -> int:
         print(f"{run.run_id}: no live worktrees to remove")
         return EXIT_OK
     for path in removed:
-        print(f"removed worktree {path}")
+        # A worktree sits under the worktrees root; a check environment sits
+        # inside the run directory. Naming them apart keeps the line honest
+        # about what was actually deleted.
+        inside_run = Path(path).is_relative_to(store.directory)
+        print(f"removed {'check environment' if inside_run else 'worktree'} {path}")
     print(
         "Branches were kept. The run record and its ledger remain at "
         f"{store.directory}."

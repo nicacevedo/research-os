@@ -7,18 +7,62 @@ task's own worktree, under an enforced timeout.
 
 Whether a planner-originated command may run at all is decided in
 ``command_policy``, before anything here is called.
+
+One command needs its execution environment placed for it. ``uv run``
+materialises the project's environment before it runs anything, and by default
+that is ``<project>/.venv`` - inside the worktree, holding interpreter symlinks
+that point at the uv-managed Python outside it. Those are real outbound
+symlinks, so the containment gate that runs before a repair worker is invoked
+refuses them, and a work order whose checks use ``uv run`` becomes unrepairable
+through no fault of the worker. The controller therefore tells uv where to put
+the environment: somewhere the controller owns, outside every worktree.
 """
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import time
+from collections.abc import Sequence
 from pathlib import Path
 
 from research_os.automation.models import AcceptanceCommand, CommandResult, utc_now
 
 MAX_CAPTURE_CHARS = 200_000
+
+#: The program whose project environment the controller relocates.
+UV_PROGRAM = "uv"
+
+#: The uv setting that names where a project environment is materialised.
+UV_PROJECT_ENVIRONMENT = "UV_PROJECT_ENVIRONMENT"
+
+
+def check_environment(
+    argv: Sequence[str],
+    *,
+    uv_project_environment: Path | None,
+) -> dict[str, str] | None:
+    """Return the environment for one acceptance command, or ``None`` to inherit.
+
+    Only a ``uv`` invocation is touched, and only to move its project
+    environment out of the worktree. Everything else - a bare ``pytest``, a bare
+    ``ruff`` - runs in exactly the environment it ran in before, because nothing
+    about it creates a directory inside the worktree.
+
+    The controller's path always wins. An inherited ``UV_PROJECT_ENVIRONMENT``
+    is a setting from the researcher's shell about the researcher's own work; it
+    must not decide where an isolated work order materialises its environment,
+    so it is overwritten rather than respected.
+    """
+
+    if uv_project_environment is None:
+        return None
+    if not argv or argv[0] != UV_PROGRAM:
+        return None
+    environment = dict(os.environ)
+    environment[UV_PROJECT_ENVIRONMENT] = str(uv_project_environment)
+    return environment
 
 
 def run_acceptance_command(
@@ -28,8 +72,13 @@ def run_acceptance_command(
     timeout_seconds: int,
     stdout_path: Path | None = None,
     stderr_path: Path | None = None,
+    uv_project_environment: Path | None = None,
 ) -> CommandResult:
-    """Run one acceptance command and record exactly what happened."""
+    """Run one acceptance command and record exactly what happened.
+
+    ``uv_project_environment`` is where a ``uv`` command must materialise the
+    project environment. It is ignored by every other program.
+    """
 
     started = utc_now()
     monotonic = time.monotonic()
@@ -63,6 +112,7 @@ def run_acceptance_command(
             text=True,
             stdin=subprocess.DEVNULL,
             timeout=timeout_seconds,
+            env=check_environment(argv, uv_project_environment=uv_project_environment),
         )
         exit_code = completed.returncode
         stdout = completed.stdout or ""

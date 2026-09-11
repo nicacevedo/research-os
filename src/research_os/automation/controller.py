@@ -13,6 +13,7 @@ pushes, and never touches scientific acceptance.
 from __future__ import annotations
 
 import hashlib
+import shutil
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -28,7 +29,7 @@ from research_os.automation.analyst import (
     snapshot_evidence,
     snapshot_state,
 )
-from research_os.automation.checks import run_acceptance_command, tail
+from research_os.automation.checks import UV_PROGRAM, run_acceptance_command, tail
 from research_os.automation.command_policy import authorize_planner_commands
 from research_os.automation.config import AutomationConfig, ResolvedRoles, resolve_roles
 from research_os.automation.context import ContextPacket, build_context, render_context
@@ -88,7 +89,7 @@ from research_os.automation.reviewer import (
     parse_review,
     render_review_findings,
 )
-from research_os.automation.store import RunStore, make_run_id
+from research_os.automation.store import RUNTIME_DIRNAME, RunStore, make_run_id
 from research_os.automation.worktree import (
     assert_isolated,
     create_worktree,
@@ -195,6 +196,18 @@ WHITESPACE_CHECK = AcceptanceCommand(
     description="controller-added: reject whitespace damage in the diff",
     required=True,
 )
+
+#: Where a task's controller-owned uv project environment lives, relative to
+#: the run directory.
+#:
+#: Deterministic from the run id and the task id, so every check for one task -
+#: the first attempt and the one after a repair - uses the same environment,
+#: and no two tasks or runs share one. It is inside runtime-owned state and
+#: therefore outside the canonical repository and outside every worktree, which
+#: is the whole point: an environment materialised inside the worktree would
+#: put outbound interpreter symlinks where the containment gate must refuse
+#: them.
+UV_ENVIRONMENT_PARTS: tuple[str, ...] = (RUNTIME_DIRNAME, "uv")
 
 #: Where read-only workers are invoked from, relative to the run directory.
 #:
@@ -377,8 +390,38 @@ class AutomationController:
                 path=record.path,
                 branch=record.branch,
             )
+        removed.extend(self._release_check_environments(store))
         run = store.save(run.model_copy(update={"worktrees": records}))
         return run, tuple(removed)
+
+    @staticmethod
+    def _release_check_environments(store: RunStore) -> list[str]:
+        """Remove the controller-owned check environments this run created.
+
+        They are the one part of a run directory that is bulk rather than
+        evidence: an interpreter and its installed packages, reconstructible
+        from the project's own lock file. Everything a run is judged by - the
+        record, the ledger, the prompts, the model outputs, the check output,
+        the reviews - is untouched.
+
+        The path comes from ``RunStore.path``, which refuses anything outside
+        the run directory, so this can only ever delete runtime-owned state.
+        """
+
+        root = store.path(*UV_ENVIRONMENT_PARTS)
+        if not root.is_dir():
+            return []
+        try:
+            shutil.rmtree(root)
+        except OSError as exc:
+            store.append_event(
+                "check_environment_retained",
+                path=str(root),
+                detail=f"could not be removed: {exc}",
+            )
+            return []
+        store.append_event("check_environment_removed", path=str(root))
+        return [str(root)]
 
     # -- phases ----------------------------------------------------------
 
@@ -1060,6 +1103,15 @@ class AutomationController:
         worktree = Path(order.worktree_path or "")
         suffix = "" if attempt == 1 else f".repair{attempt - 1}"
         commands = [*order.acceptance_commands, WHITESPACE_CHECK]
+        # Only a plan that actually runs uv gets an environment prepared for
+        # it. A plan that runs bare pytest needs nothing placed anywhere, and
+        # creating a directory for an environment that will never exist would
+        # leave a run looking as though one had been.
+        uv_environment = (
+            self._uv_environment(store, task_id)
+            if any(command.argv[0] == UV_PROGRAM for command in commands)
+            else None
+        )
         results: list[CommandResult] = []
         for index, command in enumerate(commands, start=1):
             result = run_acceptance_command(
@@ -1072,6 +1124,7 @@ class AutomationController:
                 stderr_path=store.path(
                     "checks", task_id, f"{index:02d}{suffix}.stderr.txt"
                 ),
+                uv_project_environment=uv_environment,
             )
             results.append(result)
             store.append_event(
@@ -1084,12 +1137,32 @@ class AutomationController:
                 required=result.required,
                 duration_ms=result.duration_ms,
                 attempt=attempt,
+                **(
+                    {"uv_project_environment": str(uv_environment)}
+                    if uv_environment is not None
+                    else {}
+                ),
             )
         run = self._update_order(store, run, task_id, check_results=results)
         payload = [item.model_dump(mode="json") for item in results]
         store.write_json(f"checks/{task_id}/results.json", payload)
         store.write_json(f"checks/{task_id}/attempt-{attempt}.json", payload)
         return run, [item for item in results if item.required and not item.ok]
+
+    @staticmethod
+    def _uv_environment(store: RunStore, task_id: str) -> Path:
+        """Return the controller-owned uv project environment for one task.
+
+        ``RunStore.path`` refuses anything that would escape the run directory,
+        and ``task_id`` was validated when the work order was built, so the
+        result is inside runtime-owned state by construction. Only the parent is
+        created here: uv makes the environment itself, and creating it early
+        would make an empty directory look like a prepared environment.
+        """
+
+        target = store.path(*UV_ENVIRONMENT_PARTS, task_id)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        return target
 
     def _fail_checks(
         self,

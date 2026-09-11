@@ -42,7 +42,16 @@ _SUBDIRECTORIES = (
     "checks",
     "execution",
     "reviews",
+    "runtime",
 )
+
+#: Where the controller materialises the execution environments it owns.
+#:
+#: Ephemeral orchestration state, never evidence: a reader who deletes it loses
+#: nothing a run is judged by. It lives under the run rather than beside the
+#: project because it must be outside every worktree, and under the run rather
+#: than in a shared root so two runs cannot collide.
+RUNTIME_DIRNAME = "runtime"
 
 
 def runs_root() -> Path:

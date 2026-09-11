@@ -278,6 +278,22 @@ is not independent.
   named it. `.research` and `.research/...` are refused identically at plan
   validation, because naming the directory grants exactly what naming a file
   inside it grants.
+- **Check environments are placed, not exempted.** `uv run` materialises the
+  project environment before it runs anything, and left to itself it builds
+  `<project>/.venv` — inside the worktree, holding `bin/python` symlinks that
+  point at the uv-managed interpreter outside it. Those are real outbound
+  symlinks, so the containment gate below would refuse the worktree, and a work
+  order whose checks used the advertised `uv run pytest` form could run its
+  first attempt and then never be repairable. The controller therefore tells uv
+  where to put the environment, via `UV_PROJECT_ENVIRONMENT`, at
+  `<run>/runtime/uv/<task-id>` — deterministic from the run and task, unique to
+  them, reused by every attempt including the one after a repair, and outside
+  both the project and every worktree. The controller's path always wins: an
+  inherited `UV_PROJECT_ENVIRONMENT` from the researcher's shell is overwritten
+  rather than respected. Only a `uv` command is touched; a bare `pytest` or
+  `ruff` runs in exactly the environment it always did. This is a placement
+  rule, not an exception: no pathname is excused from the symlink gate, and a
+  `.venv/bin/python` a worker creates itself still fails the work order.
 - **Symlinks may not leave the worktree.** Git-level isolation is not
   filesystem-level isolation: a symlink inside the worktree that points outside
   it would carry a write past the isolation boundary, and because the link
@@ -393,6 +409,7 @@ Runtime state lives under the Research OS state home, which
   runs/RUN-<utc>-<hash>/
     run.json          atomic whole-file replacement
     events.jsonl      append-only ledger
+    runtime/uv/       controller-owned check environments, outside every worktree
     worktrees.json    projection of the run's worktrees
     context/          the context packet, as JSON and as supplied text
     prompts/          every prompt sent, verbatim
@@ -483,8 +500,11 @@ researchctl auto cleanup RUN-20260909T101500Z-0a1b2c3d
   is inspected and a new run started. Its worktree and branch are kept so no
   work is lost.
 - **Clean up**: `researchctl auto cleanup RUN_ID` removes the worktrees and
-  releases their locks. Branches, run records, and ledgers are kept. Delete a
-  run directory by hand when you no longer want the provenance.
+  releases their locks, and removes the run's `runtime/uv` check environments,
+  which are bulk rather than evidence: an interpreter and installed packages a
+  project's own lock file reconstructs. Branches, run records, ledgers,
+  prompts, model outputs, check output, and reviews are all kept. Delete a run
+  directory by hand when you no longer want the provenance.
 
 ## Not implemented here
 
