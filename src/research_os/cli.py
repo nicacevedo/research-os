@@ -32,6 +32,8 @@ from research_os.literature.commands import add_lit_parser
 from research_os.literature.commands import dispatch as lit_dispatch
 from research_os.models import Reviewable, Verdict
 from research_os.paths import xdg_dir_issue, xdg_dirs
+from research_os.proposal.commands import add_propose_parser
+from research_os.proposal.commands import dispatch as propose_dispatch
 from research_os.registry import (
     legacy_registry_path,
     legacy_registry_present,
@@ -493,6 +495,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     add_auto_parser(subparsers)
     add_lit_parser(subparsers)
+    add_propose_parser(subparsers)
     return parser
 
 
@@ -529,6 +532,8 @@ def main() -> None:
             code = auto_dispatch(args)
         elif args.command == "lit":
             code = lit_dispatch(args)
+        elif args.command == "propose":
+            code = propose_dispatch(args)
         else:
             parser.print_help()
             return

@@ -222,6 +222,42 @@ class ExtractionError(LiteratureError):
     """Raised when local text extraction from a stored file cannot be completed."""
 
 
+class ProposalError(ResearchOSError):
+    """Base class for scientific-proposal failures.
+
+    A proposal is runtime state, not science, so none of these ever indicates a
+    corrupt capsule. The one that touches a capsule -- promotion -- raises
+    ``CapsuleError`` for filesystem problems and these for everything it refuses.
+    """
+
+
+class ProposalValidationError(ProposalError):
+    """Raised when proposal output is not a usable, grounded proposal.
+
+    Fail-closed. A proposal is what a researcher decides from, so output that
+    does not validate is a failed task rather than something to interpret
+    generously -- and a proposal citing something this run never had is refused
+    outright rather than trimmed.
+    """
+
+
+class ProposalStoreError(ProposalError):
+    """Raised when the proposal store cannot be read or written."""
+
+
+class ProposalNotFoundError(ProposalError):
+    """Raised when a proposal id names no proposal directory."""
+
+
+class PromotionRefusedError(ProposalError):
+    """Raised when a promotion would cross a boundary only a human may cross.
+
+    Never raised because a proposal was poor. It is raised when something other
+    than an interactive human asked for scientific state to be written, or when
+    the promotion would produce something stronger than a draft.
+    """
+
+
 class Severity(StrEnum):
     """Finding severity for deterministic validation reports."""
 
