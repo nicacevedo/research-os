@@ -22,10 +22,19 @@ from research_os.paths import config_home
 
 CONFIG_FILENAME = "automation.yaml"
 
-ROLE_NAMES: tuple[str, ...] = ("planner", "analyst", "coder", "reviewer")
+ROLE_NAMES: tuple[str, ...] = (
+    "planner",
+    "analyst",
+    "literature",
+    "coder",
+    "reviewer",
+)
 
-#: The roles every run needs. The analyst is optional: a plan that contains no
-#: analysis task never dispatches one, and a plan that does is refused by name.
+#: The roles every run needs.
+#:
+#: The analyst and the literature reader are both optional: a plan that contains
+#: no task of that kind never dispatches one, and a plan that does is refused by
+#: name rather than silently substituting a role with different authority.
 REQUIRED_ROLE_NAMES: tuple[str, ...] = ("planner", "coder", "reviewer")
 
 #: The check programs a plan may name by default.
@@ -77,6 +86,14 @@ def _default_roles() -> dict[str, RoleSetting]:
             access=Access.SNAPSHOT_READ,
             tools=list(DEFAULT_ANALYST_TOOLS),
         ),
+        "literature": RoleSetting(
+            provider="claude",
+            model="sonnet",
+            effort="high",
+            read_only=True,
+            access=Access.CONTEXT_ONLY,
+            tools=[],
+        ),
         "coder": RoleSetting(
             provider="claude",
             model="opus",
@@ -103,6 +120,7 @@ class ConfigDocument(BaseModel):
     schema_version: int = 1
     planner: RoleSetting | None = None
     analyst: RoleSetting | None = None
+    literature: RoleSetting | None = None
     coder: RoleSetting | None = None
     reviewer: RoleSetting | None = None
     budget: Budget | None = None

@@ -94,10 +94,11 @@ def assert_transition(current: RunState, target: RunState) -> None:
 
 
 class Role(StrEnum):
-    """The bounded worker roles this MVP dispatches."""
+    """The bounded worker roles the controller dispatches."""
 
     PLANNER = "planner"
     ANALYST = "analyst"
+    LITERATURE = "literature"
     CODER = "coder"
     REVIEWER = "reviewer"
 

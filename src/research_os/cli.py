@@ -28,6 +28,8 @@ from research_os.errors import (
     ResearchOSError,
     ReviewBlockedError,
 )
+from research_os.literature.commands import add_lit_parser
+from research_os.literature.commands import dispatch as lit_dispatch
 from research_os.models import Reviewable, Verdict
 from research_os.paths import xdg_dir_issue, xdg_dirs
 from research_os.registry import (
@@ -490,6 +492,7 @@ def _build_parser() -> argparse.ArgumentParser:
     review_parser.add_argument("path", nargs="?", default=".")
 
     add_auto_parser(subparsers)
+    add_lit_parser(subparsers)
     return parser
 
 
@@ -524,6 +527,8 @@ def main() -> None:
             code = _review(args)
         elif args.command == "auto":
             code = auto_dispatch(args)
+        elif args.command == "lit":
+            code = lit_dispatch(args)
         else:
             parser.print_help()
             return

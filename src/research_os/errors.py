@@ -195,6 +195,33 @@ class PromptDataError(AutomationError):
     """
 
 
+class LiteratureError(ResearchOSError):
+    """Base class for literature-subsystem failures.
+
+    The literature index is shared, rebuildable infrastructure, not scientific
+    truth, so none of these ever indicates a corrupt capsule. They are reported
+    and, where a run is involved, recorded in its ledger.
+    """
+
+
+class LiteratureStoreError(LiteratureError):
+    """Raised when the shared scholarly store cannot be opened, read, or written."""
+
+
+class SourceUnavailableError(LiteratureError):
+    """Raised when a literature provider cannot be used on this machine.
+
+    A missing credential, an unreachable host, and an exhausted rate budget are
+    all this: the provider is not usable right now. It is a reportable state
+    rather than a crash, so the rest of a retrieval can continue and say plainly
+    which source was skipped.
+    """
+
+
+class ExtractionError(LiteratureError):
+    """Raised when local text extraction from a stored file cannot be completed."""
+
+
 class Severity(StrEnum):
     """Finding severity for deterministic validation reports."""
 

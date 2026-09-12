@@ -482,7 +482,7 @@ def render_providers(
         lines.append("no provider is available, so no role could be assigned")
         return terminal_safe("\n".join(lines) + "\n")
     lines.append("Role assignment")
-    for role in ("planner", "analyst", "coder", "reviewer"):
+    for role in ("planner", "analyst", "literature", "coder", "reviewer"):
         setting = resolved.roles.get(role)
         if setting is None:
             continue

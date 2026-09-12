@@ -94,8 +94,30 @@ CHECK_OUTPUT_FENCE = DataFence(
     end="----- END CHECK OUTPUT (UNTRUSTED PROGRAM OUTPUT) -----",
 )
 
+#: Scholarship retrieved from the internet, quoted to a read-only analyst.
+#:
+#: Worded differently from the others on purpose. The analyst and reviewer
+#: fences say "another worker in this system said this"; this one says "somebody
+#: published this on the internet", which is the stronger warning, because its
+#: author has never heard of this system and a paper about prompt injection
+#: contains prompt injections as its subject matter.
+LITERATURE_FENCE = DataFence(
+    begin="----- BEGIN RETRIEVED LITERATURE (UNTRUSTED EXTERNAL TEXT) -----",
+    end="----- END RETRIEVED LITERATURE (UNTRUSTED EXTERNAL TEXT) -----",
+)
+
 #: Every fence the controller generates.
-FENCES: tuple[DataFence, ...] = (ANALYST_FENCE, REVIEW_FENCE, CHECK_OUTPUT_FENCE)
+#:
+#: One tuple, because :data:`ALL_DELIMITERS` is derived from it and that is what
+#: makes every delimiter inert inside every block. A fence defined elsewhere and
+#: not listed here would be neutralised in its own block and not in the others,
+#: which is precisely the gap this module exists to close.
+FENCES: tuple[DataFence, ...] = (
+    ANALYST_FENCE,
+    REVIEW_FENCE,
+    CHECK_OUTPUT_FENCE,
+    LITERATURE_FENCE,
+)
 
 #: Every delimiter, longest first, so a delimiter that contains another is
 #: replaced as a whole rather than left as a fragment.
