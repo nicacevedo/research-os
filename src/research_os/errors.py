@@ -339,6 +339,46 @@ class InsightPromotionRefusedError(InsightError):
     """
 
 
+class PaperError(ResearchOSError):
+    """Base class for manuscript-writing failures.
+
+    A draft is prose about science, never science. None of these means a corrupt
+    capsule, and none of them means anything was accepted: a writing task ends
+    with a diff on a branch that a human reads.
+    """
+
+
+class PaperPacketError(PaperError):
+    """Raised when the sources a writing task would use cannot be assembled.
+
+    Most often because a Claim was asked for that is not accepted, or whose
+    human approval no longer binds its current evidence. That is a refusal
+    rather than a malfunction: a manuscript may only state what the project has
+    actually accepted, as it stands now.
+    """
+
+
+class PaperManifestError(PaperError):
+    """Raised when a writer produced no usable record of what it wrote from.
+
+    Fail-closed. Without a manifest the prose cannot be checked against
+    anything, so prose with no provenance record is an incomplete task rather
+    than a task with a missing extra.
+    """
+
+
+class PaperWritingError(PaperError):
+    """Raised when a writing task is refused or its writer left its scope."""
+
+
+class PaperStoreError(PaperError):
+    """Raised when the draft store cannot be read or written."""
+
+
+class DraftNotFoundError(PaperError):
+    """Raised when a draft id names no draft directory."""
+
+
 class Severity(StrEnum):
     """Finding severity for deterministic validation reports."""
 

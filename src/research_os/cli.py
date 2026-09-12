@@ -35,6 +35,8 @@ from research_os.insights.commands import dispatch as insight_dispatch
 from research_os.literature.commands import add_lit_parser
 from research_os.literature.commands import dispatch as lit_dispatch
 from research_os.models import Reviewable, Verdict
+from research_os.paper.commands import add_paper_parser
+from research_os.paper.commands import dispatch as paper_dispatch
 from research_os.paths import xdg_dir_issue, xdg_dirs
 from research_os.proposal.commands import add_propose_parser
 from research_os.proposal.commands import dispatch as propose_dispatch
@@ -502,6 +504,7 @@ def _build_parser() -> argparse.ArgumentParser:
     add_propose_parser(subparsers)
     add_experiment_parser(subparsers)
     add_insight_parser(subparsers)
+    add_paper_parser(subparsers)
     return parser
 
 
@@ -544,6 +547,8 @@ def main() -> None:
             code = experiment_dispatch(args)
         elif args.command == "insight":
             code = insight_dispatch(args)
+        elif args.command == "paper":
+            code = paper_dispatch(args)
         else:
             parser.print_help()
             return

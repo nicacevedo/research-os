@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
 
 from research_os.digests import subject_digest
 from research_os.errors import (
@@ -554,24 +555,49 @@ def _check_claim_gates(
         _check_claim_review_gate(claim, by_id, findings, project_id)
 
 
-def _check_claim_review_gate(
+@dataclass(frozen=True, slots=True)
+class ClaimApproval:
+    """What a search for a Claim's qualifying human approval actually found.
+
+    ``review`` is the approval that qualifies, or ``None``. The three flags say
+    why the ones that did not qualify did not, which is what turns "this claim
+    is not approved" into a message a researcher can act on.
+    """
+
+    review: Review | None = None
+    stale: bool = False
+    incomplete_evidence: bool = False
+    incomplete_experiments: bool = False
+
+    @property
+    def qualifies(self) -> bool:
+        return self.review is not None
+
+
+def claim_approval(
     claim: Claim,
     by_id: Mapping[str, ScientificObject],
-    findings: list[Finding],
     project_id: str,
-) -> None:
-    """Require a human approval bound to the claim, its evidence, and its experiments.
+) -> ClaimApproval:
+    """Return the human approval that lets ``claim`` be accepted, if there is one.
 
     A qualifying review matches the claim's current subject digest, covers every
     currently linked Evidence object and every Experiment those objects reach,
     and stores the current digest of each. Anything less leaves an approval that
     could outlive the science it examined.
+
+    Public and returning the review itself, rather than only reporting findings,
+    because more than one caller needs this answer: the validator, which turns a
+    missing approval into an error, and anything that has to show a reader *which*
+    approval stands behind an accepted Claim. Two implementations of this rule
+    would eventually disagree, and the one that disagreed quietly would be the
+    one that let an unapproved claim be quoted.
     """
 
     current = subject_digest(claim, project_id=project_id)
     linked = _linked_evidence(claim)
     experiments = referenced_experiments(claim, by_id)
-    stale_human_approve = False
+    stale = False
     incomplete_coverage = False
     incomplete_experiments = False
     for obj in by_id.values():
@@ -586,7 +612,7 @@ def _check_claim_review_gate(
         if obj.reviewer_kind is not ReviewerKind.HUMAN:
             continue
         if obj.subject_digest != current:
-            stale_human_approve = True
+            stale = True
             continue
         stored = obj.evidence_digests or {}
         if set(stored) != linked:
@@ -599,8 +625,29 @@ def _check_claim_review_gate(
         if _evidence_digests_match(
             stored, by_id, project_id
         ) and _experiment_digests_match(stored_experiments, by_id, project_id):
-            return
-        stale_human_approve = True
+            return ClaimApproval(review=obj)
+        stale = True
+    return ClaimApproval(
+        stale=stale,
+        incomplete_evidence=incomplete_coverage,
+        incomplete_experiments=incomplete_experiments,
+    )
+
+
+def _check_claim_review_gate(
+    claim: Claim,
+    by_id: Mapping[str, ScientificObject],
+    findings: list[Finding],
+    project_id: str,
+) -> None:
+    """Report why an accepted claim has no qualifying human approval."""
+
+    approval = claim_approval(claim, by_id, project_id)
+    if approval.qualifies:
+        return
+    stale_human_approve = approval.stale
+    incomplete_coverage = approval.incomplete_evidence
+    incomplete_experiments = approval.incomplete_experiments
     if incomplete_coverage:
         findings.append(
             Finding(
