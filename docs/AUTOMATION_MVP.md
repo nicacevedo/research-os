@@ -294,6 +294,20 @@ is not independent.
   `ruff` runs in exactly the environment it always did. This is a placement
   rule, not an exception: no pathname is excused from the symlink gate, and a
   `.venv/bin/python` a worker creates itself still fails the work order.
+- **A check never changes the project's dependency state.** The same `uv run`
+  also resolves `uv.lock`, and left alone it writes one into the tree it is
+  standing in. A check is an observation, so neither outcome is allowed to
+  stand. When the project already has a lock, the controller sets `UV_FROZEN`
+  — uv's documented "run without updating the lockfile" mode — so the file is
+  used and not rewritten, and it re-establishes the bytes it observed if
+  anything changed them anyway. When the project has no lock, `UV_FROZEN`
+  cannot be used at all (uv refuses it outright with "unable to find lockfile"),
+  so uv is allowed to resolve and the controller removes the file its own check
+  caused, recording a `uv_lock_settled` event so the run says plainly that it
+  resolved dependencies rather than leaving an unexplained artifact behind.
+  An inherited `UV_FROZEN` is overwritten or removed the same way
+  `UV_PROJECT_ENVIRONMENT` is. A `uv.lock` that is a symlink is reported and
+  left untouched rather than written through.
 - **Symlinks may not leave the worktree.** Git-level isolation is not
   filesystem-level isolation: a symlink inside the worktree that points outside
   it would carry a write past the isolation boundary, and because the link

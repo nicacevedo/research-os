@@ -16,6 +16,10 @@ symlinks, so the containment gate that runs before a repair worker is invoked
 refuses them, and a work order whose checks use ``uv run`` becomes unrepairable
 through no fault of the worker. The controller therefore tells uv where to put
 the environment: somewhere the controller owns, outside every worktree.
+
+The same command also resolves the project's dependency lock. ``uvlock`` decides
+what that is allowed to do to the project; this module only carries the decision
+into the environment uv is given.
 """
 
 from __future__ import annotations
@@ -28,6 +32,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from research_os.automation.models import AcceptanceCommand, CommandResult, utc_now
+from research_os.automation.uvlock import UV_FROZEN
 
 MAX_CAPTURE_CHARS = 200_000
 
@@ -42,18 +47,22 @@ def check_environment(
     argv: Sequence[str],
     *,
     uv_project_environment: Path | None,
+    uv_frozen: bool = False,
 ) -> dict[str, str] | None:
     """Return the environment for one acceptance command, or ``None`` to inherit.
 
-    Only a ``uv`` invocation is touched, and only to move its project
-    environment out of the worktree. Everything else - a bare ``pytest``, a bare
-    ``ruff`` - runs in exactly the environment it ran in before, because nothing
-    about it creates a directory inside the worktree.
+    Only a ``uv`` invocation is touched, and only to say where its project
+    environment goes and whether it may rewrite the project's lock. Everything
+    else - a bare ``pytest``, a bare ``ruff`` - runs in exactly the environment
+    it ran in before, because nothing about it creates a directory inside the
+    worktree or resolves a dependency set.
 
-    The controller's path always wins. An inherited ``UV_PROJECT_ENVIRONMENT``
-    is a setting from the researcher's shell about the researcher's own work; it
-    must not decide where an isolated work order materialises its environment,
-    so it is overwritten rather than respected.
+    The controller's decisions always win. An inherited
+    ``UV_PROJECT_ENVIRONMENT`` or ``UV_FROZEN`` is a setting from the
+    researcher's shell about the researcher's own work; neither may decide what
+    an isolated work order does, so both are overwritten rather than respected.
+    ``UV_FROZEN`` is explicitly *removed* when the controller did not ask for
+    it, because a project with no lock file cannot run under it at all.
     """
 
     if uv_project_environment is None:
@@ -62,6 +71,10 @@ def check_environment(
         return None
     environment = dict(os.environ)
     environment[UV_PROJECT_ENVIRONMENT] = str(uv_project_environment)
+    if uv_frozen:
+        environment[UV_FROZEN] = "1"
+    else:
+        environment.pop(UV_FROZEN, None)
     return environment
 
 
@@ -73,11 +86,13 @@ def run_acceptance_command(
     stdout_path: Path | None = None,
     stderr_path: Path | None = None,
     uv_project_environment: Path | None = None,
+    uv_frozen: bool = False,
 ) -> CommandResult:
     """Run one acceptance command and record exactly what happened.
 
     ``uv_project_environment`` is where a ``uv`` command must materialise the
-    project environment. It is ignored by every other program.
+    project environment, and ``uv_frozen`` says whether it may resolve a new
+    dependency lock. Both are ignored by every other program.
     """
 
     started = utc_now()
@@ -112,7 +127,11 @@ def run_acceptance_command(
             text=True,
             stdin=subprocess.DEVNULL,
             timeout=timeout_seconds,
-            env=check_environment(argv, uv_project_environment=uv_project_environment),
+            env=check_environment(
+                argv,
+                uv_project_environment=uv_project_environment,
+                uv_frozen=uv_frozen,
+            ),
         )
         exit_code = completed.returncode
         stdout = completed.stdout or ""

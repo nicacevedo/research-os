@@ -90,6 +90,7 @@ from research_os.automation.reviewer import (
     render_review_findings,
 )
 from research_os.automation.store import RUNTIME_DIRNAME, RunStore, make_run_id
+from research_os.automation.uvlock import UvLockGuard
 from research_os.automation.worktree import (
     assert_isolated,
     create_worktree,
@@ -1107,47 +1108,85 @@ class AutomationController:
         # it. A plan that runs bare pytest needs nothing placed anywhere, and
         # creating a directory for an environment that will never exist would
         # leave a run looking as though one had been.
-        uv_environment = (
-            self._uv_environment(store, task_id)
-            if any(command.argv[0] == UV_PROGRAM for command in commands)
-            else None
-        )
+        runs_uv = any(command.argv[0] == UV_PROGRAM for command in commands)
+        uv_environment = self._uv_environment(store, task_id) if runs_uv else None
+        # What the project's dependency lock looked like before the controller
+        # ran anything. A check is an observation, not a change to the project,
+        # so whatever uv does to the lock while running one is undone afterwards.
+        lock = UvLockGuard.observe(worktree) if runs_uv else None
         results: list[CommandResult] = []
-        for index, command in enumerate(commands, start=1):
-            result = run_acceptance_command(
-                command,
-                cwd=worktree,
-                timeout_seconds=run.budget.max_command_timeout_seconds,
-                stdout_path=store.path(
-                    "checks", task_id, f"{index:02d}{suffix}.stdout.txt"
-                ),
-                stderr_path=store.path(
-                    "checks", task_id, f"{index:02d}{suffix}.stderr.txt"
-                ),
-                uv_project_environment=uv_environment,
-            )
-            results.append(result)
-            store.append_event(
-                "command_executed",
-                task_id=task_id,
-                command=result.display,
-                cwd=result.cwd,
-                exit_code=result.exit_code,
-                timed_out=result.timed_out,
-                required=result.required,
-                duration_ms=result.duration_ms,
-                attempt=attempt,
-                **(
-                    {"uv_project_environment": str(uv_environment)}
-                    if uv_environment is not None
-                    else {}
-                ),
-            )
+        try:
+            for index, command in enumerate(commands, start=1):
+                result = run_acceptance_command(
+                    command,
+                    cwd=worktree,
+                    timeout_seconds=run.budget.max_command_timeout_seconds,
+                    stdout_path=store.path(
+                        "checks", task_id, f"{index:02d}{suffix}.stdout.txt"
+                    ),
+                    stderr_path=store.path(
+                        "checks", task_id, f"{index:02d}{suffix}.stderr.txt"
+                    ),
+                    uv_project_environment=uv_environment,
+                    uv_frozen=lock.frozen if lock is not None else False,
+                )
+                results.append(result)
+                store.append_event(
+                    "command_executed",
+                    task_id=task_id,
+                    command=result.display,
+                    cwd=result.cwd,
+                    exit_code=result.exit_code,
+                    timed_out=result.timed_out,
+                    required=result.required,
+                    duration_ms=result.duration_ms,
+                    attempt=attempt,
+                    **(
+                        {
+                            "uv_project_environment": str(uv_environment),
+                            "uv_frozen": lock.frozen if lock is not None else False,
+                        }
+                        if uv_environment is not None
+                        else {}
+                    ),
+                )
+        finally:
+            if lock is not None:
+                self._settle_uv_lock(store, task_id, lock, attempt=attempt)
         run = self._update_order(store, run, task_id, check_results=results)
         payload = [item.model_dump(mode="json") for item in results]
         store.write_json(f"checks/{task_id}/results.json", payload)
         store.write_json(f"checks/{task_id}/attempt-{attempt}.json", payload)
         return run, [item for item in results if item.required and not item.ok]
+
+    @staticmethod
+    def _settle_uv_lock(
+        store: RunStore,
+        task_id: str,
+        lock: UvLockGuard,
+        *,
+        attempt: int,
+    ) -> None:
+        """Return the project's dependency lock to the state the checks found it in.
+
+        Runs whether the check sequence finished, failed, or raised, so a run
+        cannot leave the lock the controller's own commands touched behind. The
+        outcome is ledgered when there was anything to do, so a project with no
+        committed lock says in its ledger that dependencies were resolved for
+        the check rather than silently gaining and losing a file.
+        """
+
+        outcome = lock.settle()
+        if not outcome.notable:
+            return
+        store.append_event(
+            "uv_lock_settled",
+            task_id=task_id,
+            attempt=attempt,
+            action=outcome.action,
+            path=outcome.path,
+            detail=outcome.detail,
+        )
 
     @staticmethod
     def _uv_environment(store: RunStore, task_id: str) -> Path:

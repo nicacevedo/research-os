@@ -103,11 +103,13 @@ def uv_project(path: Path, *, module: str = STUB) -> Path:
         "package = false\n",
         encoding="utf-8",
     )
-    # uv writes a lock file beside the project. It is ignored rather than
-    # committed so the fixture does not need a resolution baked into the test,
-    # and an ignored file is not a changed path.
+    # uv.lock is deliberately *not* ignored. This fixture is a project that
+    # does not commit a lock, which is the case in which uv would otherwise
+    # leave one behind in the worktree; the controller removes the file its own
+    # check caused, so the fixture needs no exemption for it. See
+    # test_auto_uv_lock.py.
     (path / ".gitignore").write_text(
-        ".venv/\nuv.lock\n__pycache__/\n.pytest_cache/\n", encoding="utf-8"
+        ".venv/\n__pycache__/\n.pytest_cache/\n", encoding="utf-8"
     )
     (path / "adder.py").write_text(module, encoding="utf-8")
     (path / "test_adder.py").write_text(TESTS, encoding="utf-8")
