@@ -314,6 +314,31 @@ class SchedulerUnavailableError(ExperimentError):
     """
 
 
+class InsightError(ResearchOSError):
+    """Base class for cross-project insight failures.
+
+    An insight is durable shared knowledge but never scientific truth: it holds
+    nobody's Claim and rests on nobody's Evidence. These failures are therefore
+    operational, and none of them indicates a corrupt capsule.
+    """
+
+
+class InsightStoreError(InsightError):
+    """Raised when the insight corpus cannot be read or written."""
+
+
+class InsightNotFoundError(InsightError):
+    """Raised when an insight or nomination id names nothing."""
+
+
+class InsightPromotionRefusedError(InsightError):
+    """Raised when something other than a human tried to promote an insight.
+
+    Promotion is the only operation that puts knowledge where another project's
+    workers will read it. An agent may nominate; the crossing is a human act.
+    """
+
+
 class Severity(StrEnum):
     """Finding severity for deterministic validation reports."""
 

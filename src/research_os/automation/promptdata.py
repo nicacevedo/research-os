@@ -106,6 +106,16 @@ LITERATURE_FENCE = DataFence(
     end="----- END RETRIEVED LITERATURE (UNTRUSTED EXTERNAL TEXT) -----",
 )
 
+#: Another project's promoted knowledge, quoted into this project's reasoning.
+#:
+#: "TRANSFERRED" is doing real work in the delimiter. A worker skimming a long
+#: prompt needs to see, at the boundary, that what follows was true somewhere
+#: else under stated conditions rather than here.
+INSIGHT_FENCE = DataFence(
+    begin="----- BEGIN TRANSFERRED INSIGHTS (ANOTHER PROJECT'S FINDINGS) -----",
+    end="----- END TRANSFERRED INSIGHTS (ANOTHER PROJECT'S FINDINGS) -----",
+)
+
 #: Every fence the controller generates.
 #:
 #: One tuple, because :data:`ALL_DELIMITERS` is derived from it and that is what
@@ -117,6 +127,7 @@ FENCES: tuple[DataFence, ...] = (
     REVIEW_FENCE,
     CHECK_OUTPUT_FENCE,
     LITERATURE_FENCE,
+    INSIGHT_FENCE,
 )
 
 #: Every delimiter, longest first, so a delimiter that contains another is

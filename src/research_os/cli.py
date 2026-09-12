@@ -30,6 +30,8 @@ from research_os.errors import (
 )
 from research_os.experiment.commands import add_experiment_parser
 from research_os.experiment.commands import dispatch as experiment_dispatch
+from research_os.insights.commands import add_insight_parser
+from research_os.insights.commands import dispatch as insight_dispatch
 from research_os.literature.commands import add_lit_parser
 from research_os.literature.commands import dispatch as lit_dispatch
 from research_os.models import Reviewable, Verdict
@@ -499,6 +501,7 @@ def _build_parser() -> argparse.ArgumentParser:
     add_lit_parser(subparsers)
     add_propose_parser(subparsers)
     add_experiment_parser(subparsers)
+    add_insight_parser(subparsers)
     return parser
 
 
@@ -539,6 +542,8 @@ def main() -> None:
             code = propose_dispatch(args)
         elif args.command == "experiment":
             code = experiment_dispatch(args)
+        elif args.command == "insight":
+            code = insight_dispatch(args)
         else:
             parser.print_help()
             return
