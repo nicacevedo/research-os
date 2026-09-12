@@ -5,6 +5,15 @@ It always names what was actually observed - the commands the controller ran and
 their exit codes, the model each role really used, how independent the review
 was - and it always ends with the exact next human action, because the run stops
 short of merging on purpose.
+
+Most of what it quotes was written by something other than Research OS: a
+planner's task title, an analyst's finding, a reviewer's summary, whatever a
+test suite printed. So every renderer here returns its text through
+:func:`~research_os.textsafe.terminal_safe`, which makes control characters
+visible instead of letting a terminal act on them. That is a property of the
+*view*: the archived model output under the run directory is untouched, and
+model-to-model handoffs use the stricter, separate boundary in
+:mod:`research_os.automation.promptdata`.
 """
 
 from __future__ import annotations
@@ -21,6 +30,7 @@ from research_os.automation.models import (
 )
 from research_os.automation.store import RunStore
 from research_os.automation.worktree import worktrees_root
+from research_os.textsafe import terminal_safe
 
 
 def _role_line(run: AutomationRun, role: str) -> str:
@@ -75,7 +85,7 @@ def render_plan(run: AutomationRun) -> str:
     for order in run.work_orders:
         lines.extend(_render_order_intent(run, order))
     lines.append("")
-    return "\n".join(lines) + "\n"
+    return terminal_safe("\n".join(lines) + "\n")
 
 
 def _render_order_intent(run: AutomationRun, order: WorkOrder) -> list[str]:
@@ -183,7 +193,7 @@ def render_status(run: AutomationRun, store: RunStore) -> str:
         )
     if run.failure_reason:
         lines.append(f"failure      {run.failure_reason}")
-    return "\n".join(lines) + "\n"
+    return terminal_safe("\n".join(lines) + "\n")
 
 
 def render_report(run: AutomationRun, store: RunStore) -> str:
@@ -290,7 +300,7 @@ def render_report(run: AutomationRun, store: RunStore) -> str:
     lines.extend(["", "=" * 72, "next human action", "=" * 72, ""])
     lines.extend(_next_action(run))
     lines.append("")
-    return "\n".join(lines) + "\n"
+    return terminal_safe("\n".join(lines) + "\n")
 
 
 def _render_analysis(order: WorkOrder, store: RunStore) -> list[str]:
@@ -470,7 +480,7 @@ def render_providers(
     )
     if resolved is None:
         lines.append("no provider is available, so no role could be assigned")
-        return "\n".join(lines) + "\n"
+        return terminal_safe("\n".join(lines) + "\n")
     lines.append("Role assignment")
     for role in ("planner", "analyst", "coder", "reviewer"):
         setting = resolved.roles.get(role)
@@ -494,7 +504,7 @@ def render_providers(
             "",
         ]
     )
-    return "\n".join(lines) + "\n"
+    return terminal_safe("\n".join(lines) + "\n")
 
 
 def _exit(item: object) -> str:

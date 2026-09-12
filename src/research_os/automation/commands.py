@@ -42,6 +42,7 @@ from research_os.errors import (
     ProviderUnavailableError,
 )
 from research_os.registry import list_projects
+from research_os.textsafe import terminal_safe
 
 RegistryFactory = Callable[[], dict[str, ProviderAdapter]]
 
@@ -184,14 +185,7 @@ def _status(args: argparse.Namespace) -> int:
     store = RunStore.open(args.run_id)
     run = store.load()
     if args.json:
-        print(
-            json.dumps(
-                run.model_dump(mode="json"),
-                ensure_ascii=False,
-                indent=2,
-                sort_keys=True,
-            )
-        )
+        print(_machine_json(run.model_dump(mode="json"), indent=2))
     else:
         print(render_status(run, store), end="")
     return EXIT_OK
@@ -209,7 +203,7 @@ def _events(args: argparse.Namespace) -> int:
     if args.limit and args.limit > 0:
         records = records[-args.limit :]
     for record in records:
-        print(json.dumps(record, ensure_ascii=False, sort_keys=True))
+        print(_machine_json(record))
     return EXIT_OK
 
 
@@ -218,7 +212,11 @@ def _runs(_args: argparse.Namespace) -> int:
         store = RunStore.open(run_id)
         run = store.load()
         marker = "DRY " if run.dry_run else ""
-        print(f"{run.state:16} {marker}{run_id}  {run.project_path}  {run.goal}")
+        print(
+            terminal_safe(
+                f"{run.state:16} {marker}{run_id}  {run.project_path}  {run.goal}"
+            )
+        )
     return EXIT_OK
 
 
@@ -226,7 +224,7 @@ def _cancel(args: argparse.Namespace) -> int:
     controller = _controller(args)
     store = RunStore.open(args.run_id)
     run = controller.cancel(store, reason=args.reason)
-    print(f"{run.run_id} is now {run.state}: {run.failure_reason}")
+    print(terminal_safe(f"{run.run_id} is now {run.state}: {run.failure_reason}"))
     return EXIT_OK
 
 
@@ -260,6 +258,24 @@ def _providers(args: argparse.Namespace) -> int:
         resolved = None
     print(render_providers(probes, config=config, resolved=resolved), end="")
     return EXIT_OK if resolved is not None else EXIT_ERROR
+
+
+def _machine_json(payload: object, *, indent: int | None = None) -> str:
+    """Return a JSON view that is both parseable and safe to print.
+
+    These two commands emit the record itself, for a script or for a person
+    piping it into one, so the answer here is not the display sanitizer used for
+    the human renderers: rewriting a control character inside a JSON string
+    would change the data a reader parses, and doing it after serialisation
+    would produce a ``\\x`` that is not a legal JSON escape at all.
+
+    ``ensure_ascii`` is the right tool instead. It escapes every non-ASCII
+    character, including DEL and the C1 range a terminal in an 8-bit mode reads
+    as control introducers, into ``\\uXXXX`` - so nothing in the output is a
+    control character, and ``json.loads`` still returns the original strings.
+    """
+
+    return json.dumps(payload, ensure_ascii=True, indent=indent, sort_keys=True)
 
 
 def resolve_project(value: str) -> Path:

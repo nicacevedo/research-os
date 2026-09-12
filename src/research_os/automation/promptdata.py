@@ -32,6 +32,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 from research_os.errors import PromptDataError
+from research_os.textsafe import CONTROL_CHARS
 
 #: The default cap on one rendered field.
 DEFAULT_FIELD_CHARS = 2_000
@@ -49,12 +50,14 @@ _KEPT_IN_BLOCKS: frozenset[str] = frozenset({"\n", "\t"})
 
 #: Every character that may not reach a prompt as itself.
 #:
-#: C0, DEL, and C1. A newline or a carriage return forges the line structure a
-#: fence is read by; a NUL truncates the value for anything that hands it to a C
-#: API; the rest move a terminal cursor or re-colour what a human is reading.
-CONTROL_CHARS: frozenset[str] = frozenset(
-    chr(code) for code in (*range(0x20), 0x7F, *range(0x80, 0xA0))
-)
+#: C0, DEL, and C1, defined once in :mod:`research_os.textsafe` and re-exported
+#: here for the callers that read it from this module. A newline or a carriage
+#: return forges the line structure a fence is read by; a NUL truncates the
+#: value for anything that hands it to a C API; the rest move a terminal cursor
+#: or re-colour what a human is reading. The prompt boundary and the display
+#: boundary disagree about what to *do* with such a character - this module
+#: makes it a space, the display makes it visible - but they must not disagree
+#: about which characters they are.
 
 
 @dataclass(frozen=True, slots=True)
