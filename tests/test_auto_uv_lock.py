@@ -278,6 +278,77 @@ def test_a_symlinked_lock_is_never_written_through(tmp_path: Path) -> None:
     assert real.read_text(encoding="utf-8") == "version = 1\n"
 
 
+def test_a_lock_swapped_for_an_outbound_symlink_is_not_restored_through(
+    tmp_path: Path,
+) -> None:
+    """The state at ``observe`` is a record, not a promise about ``settle``.
+
+    Between the two, the controller runs acceptance commands, and those execute
+    project code a write-enabled worker just wrote. A test that replaces
+    ``uv.lock`` with a link out of the worktree would, under a guard that
+    trusted its earlier observation, have the restore write the lock bytes
+    straight through it - a write past the isolation boundary that Git evidence
+    could never show, performed before the containment gate re-scans.
+    """
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = outside / "important.txt"
+    victim.write_text("not yours\n", encoding="utf-8")
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    target = worktree / UV_LOCK_FILENAME
+    target.write_text("version = 1\n", encoding="utf-8")
+
+    guard = UvLockGuard.observe(worktree)
+    assert guard.frozen is True
+
+    target.unlink()
+    target.symlink_to(victim)
+    outcome = guard.settle()
+
+    assert outcome.action == LOCK_RETAINED
+    assert "restored" in outcome.detail
+    assert victim.read_text(encoding="utf-8") == "not yours\n"
+
+
+def test_a_symlink_a_check_created_is_removed_without_touching_its_target(
+    tmp_path: Path,
+) -> None:
+    """Removing it is safe: ``unlink`` discards the link, never the target."""
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = outside / "important.txt"
+    victim.write_text("not yours\n", encoding="utf-8")
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+
+    guard = UvLockGuard.observe(worktree)
+    (worktree / UV_LOCK_FILENAME).symlink_to(victim)
+    outcome = guard.settle()
+
+    assert outcome.action == LOCK_REMOVED
+    assert not (worktree / UV_LOCK_FILENAME).exists()
+    assert victim.read_text(encoding="utf-8") == "not yours\n"
+
+
+def test_a_lock_path_that_is_not_a_file_is_never_claimed_as_frozen(
+    tmp_path: Path,
+) -> None:
+    """A directory named uv.lock is not a lock, so nothing may vouch for it."""
+
+    (tmp_path / UV_LOCK_FILENAME).mkdir()
+
+    guard = UvLockGuard.observe(tmp_path)
+    outcome = guard.settle()
+
+    assert guard.present_before is True
+    assert guard.frozen is False
+    assert outcome.action == LOCK_RETAINED
+    assert (tmp_path / UV_LOCK_FILENAME).is_dir()
+
+
 # -- real uv ------------------------------------------------------------------
 
 

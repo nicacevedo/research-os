@@ -306,8 +306,14 @@ is not independent.
   caused, recording a `uv_lock_settled` event so the run says plainly that it
   resolved dependencies rather than leaving an unexplained artifact behind.
   An inherited `UV_FROZEN` is overwritten or removed the same way
-  `UV_PROJECT_ENVIRONMENT` is. A `uv.lock` that is a symlink is reported and
-  left untouched rather than written through.
+  `UV_PROJECT_ENVIRONMENT` is. What the controller observed before the checks is
+  a record, never a promise about what is there afterwards: the acceptance
+  commands run project code, so every read and write the restore performs uses
+  `O_NOFOLLOW`, and `unlink` discards a link rather than its target. A `uv.lock`
+  that is, or becomes, a symlink is reported and left untouched rather than
+  written through — otherwise restoring it would be a write past the isolation
+  boundary, performed before the containment gate re-scans, that Git evidence
+  could never show.
 - **Symlinks may not leave the worktree.** Git-level isolation is not
   filesystem-level isolation: a symlink inside the worktree that points outside
   it would carry a write past the isolation boundary, and because the link
