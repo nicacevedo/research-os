@@ -258,6 +258,62 @@ class PromotionRefusedError(ProposalError):
     """
 
 
+class ExperimentError(ResearchOSError):
+    """Base class for experiment-execution failures.
+
+    An execution record is runtime state, never science, so none of these means
+    a corrupt capsule. What they mean is that something was refused, could not
+    be reached, or did not produce what it said it would.
+    """
+
+
+class ExperimentConfigError(ExperimentError):
+    """Raised when experiment configuration is missing, invalid, or silent.
+
+    Also raised for the ordinary case of a project with no declared commands.
+    That is not a malfunction: a command nobody declared cannot be run, and
+    saying so plainly is the whole point of declaring them.
+    """
+
+
+class ExperimentSpecError(ExperimentError):
+    """Raised when a command cannot be built from its declaration and values.
+
+    Refusal, never repair. A supplied value that does not fit its declared type
+    is rejected rather than quoted or escaped, because escaping would mean
+    guessing what the caller meant -- and the caller may be a model.
+    """
+
+
+class ExperimentAuthorizationError(ExperimentError):
+    """Raised when an execution is not authorised to spend what it would spend.
+
+    An experiment costs real time and sometimes real money. A missing explicit
+    authorisation, an exhausted submission budget, and a partition outside the
+    allowlist are all this, and each says which one it was.
+    """
+
+
+class ExperimentIngestError(ExperimentError):
+    """Raised when what an execution produced cannot be read or hashed."""
+
+
+class ExperimentStoreError(ExperimentError):
+    """Raised when the experiment run store cannot be read or written."""
+
+
+class ExperimentRunNotFoundError(ExperimentError):
+    """Raised when an experiment run id names no run directory."""
+
+
+class SchedulerUnavailableError(ExperimentError):
+    """Raised when a scheduler cannot be reached or refuses a submission.
+
+    Reported rather than worked around. A machine with no ``sbatch`` is not a
+    submit host, and pretending a job was queued would be worse than saying so.
+    """
+
+
 class Severity(StrEnum):
     """Finding severity for deterministic validation reports."""
 

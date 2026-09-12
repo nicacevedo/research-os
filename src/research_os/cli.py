@@ -28,6 +28,8 @@ from research_os.errors import (
     ResearchOSError,
     ReviewBlockedError,
 )
+from research_os.experiment.commands import add_experiment_parser
+from research_os.experiment.commands import dispatch as experiment_dispatch
 from research_os.literature.commands import add_lit_parser
 from research_os.literature.commands import dispatch as lit_dispatch
 from research_os.models import Reviewable, Verdict
@@ -496,6 +498,7 @@ def _build_parser() -> argparse.ArgumentParser:
     add_auto_parser(subparsers)
     add_lit_parser(subparsers)
     add_propose_parser(subparsers)
+    add_experiment_parser(subparsers)
     return parser
 
 
@@ -534,6 +537,8 @@ def main() -> None:
             code = lit_dispatch(args)
         elif args.command == "propose":
             code = propose_dispatch(args)
+        elif args.command == "experiment":
+            code = experiment_dispatch(args)
         else:
             parser.print_help()
             return
