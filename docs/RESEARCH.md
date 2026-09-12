@@ -18,7 +18,10 @@ researchctl research report RUN_ID [--events]       everything it did
 researchctl research list                           every run
 researchctl research cancel RUN_ID                  stop an unfinished run
 researchctl research cleanup RUN_ID                 release its worktrees
+researchctl research resume RUN_ID                  recover an interrupted run
 ```
+
+See [OPERATIONS.md](OPERATIONS.md) for `doctor`, `storage`, and recovery.
 
 ## The shape of a run
 
@@ -72,12 +75,19 @@ T-003  [experiment]  skipped
            It would have run: python3 fit.py --seed 7
 ```
 
-**A budget.** Model calls, write tasks, experiments, and cluster submissions
-have separate counters, because the resources are not interchangeable. A plan
-the run could never pay for is refused at planning time rather than discovered
-at the last task, and each spend is charged against the value on disk before
-anything happens — so a crashed run's file is an accurate account of what it
-actually spent.
+**A budget.** Model calls, write tasks, experiments, cluster submissions and
+wall clock have separate counters, because the resources are not
+interchangeable. A plan the run could never pay for is refused at planning time
+rather than discovered at the last task, and each spend is charged against the
+value on disk before anything happens — so a crashed run's file is an accurate
+account of what it actually spent. The wall-clock bound stops the run from
+starting another task rather than killing one mid-flight, because a task killed
+in flight is how a run ends up holding a worktree nobody knows about.
+
+**A crash.** If the process dies, the run's state becomes `INTERRUPTED` rather
+than a stale `EXECUTING`, and only `researchctl research resume` moves it — a
+deliberate act in which a person decides what happens to the task that was in
+flight.
 
 ## What a run cannot do
 

@@ -49,6 +49,15 @@ NEXT_STEPS: dict[ResearchState, str] = {
         "Answer the open question with 'researchctl research answer', then run "
         "'researchctl research run' again to continue."
     ),
+    ResearchState.EXECUTING: (
+        "This run says it is executing, which after a crash it is not. Recover "
+        "it with 'researchctl research resume RUN_ID'."
+    ),
+    ResearchState.INTERRUPTED: (
+        "This run was interrupted and has been recovered. Continue it with "
+        "'researchctl research run RUN_ID'; the task that was in flight is "
+        "marked above."
+    ),
     ResearchState.READY_FOR_HUMAN: (
         "Read each artifact below in the store that owns it. Nothing here has "
         "entered the capsule: proposals are suggestions, evidence packets are "

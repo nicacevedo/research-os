@@ -242,3 +242,55 @@ def test_cleanup_reports_when_there_is_nothing_to_remove(
     out = capsys.readouterr().out
     assert "Nothing to remove" in out
     assert "Nothing scientific was touched." in out
+
+
+def test_resume_recovers_an_interrupted_run_from_the_cli(
+    wired: FakeProvider, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    from research_os.research.models import TaskStatus
+
+    repo = init_repo(tmp_path / "project")
+    run_cli(monkeypatch, "research", "start", str(repo), "--goal", "Read the field.")
+    capsys.readouterr()
+    run_id = ResearchStore.list_run_ids()[-1]
+
+    # Leave it exactly as a killed process would.
+    store = ResearchStore.open(run_id)
+    run = store.load()
+    store.save(
+        run.model_copy(
+            update={
+                "state": ResearchState.EXECUTING,
+                "tasks": [
+                    item.model_copy(update={"status": TaskStatus.RUNNING})
+                    for item in run.tasks
+                ],
+            }
+        )
+    )
+
+    assert run_cli(monkeypatch, "research", "run", run_id) != 0
+    assert "resume" in capsys.readouterr().err
+
+    assert run_cli(monkeypatch, "research", "resume", run_id, "--retry") == 0
+    assert "researchctl research run" in capsys.readouterr().out
+    assert run_cli(monkeypatch, "research", "run", run_id) == 0
+    assert "READY_FOR_HUMAN" in capsys.readouterr().out
+
+
+def test_doctor_names_an_interrupted_research_run(
+    wired: FakeProvider, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """The one stuck state a researcher would otherwise never find out about."""
+
+    repo = init_repo(tmp_path / "project")
+    run_cli(monkeypatch, "research", "start", str(repo), "--goal", "Read the field.")
+    capsys.readouterr()
+    run_id = ResearchStore.list_run_ids()[-1]
+    store = ResearchStore.open(run_id)
+    store.save(store.load().model_copy(update={"state": ResearchState.EXECUTING}))
+
+    assert run_cli(monkeypatch, "doctor", "--no-storage") == 0
+    out = capsys.readouterr().out
+    assert run_id in out
+    assert "researchctl research resume" in out

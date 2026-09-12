@@ -81,7 +81,7 @@ def test_doctor_healthy_xdg_pass(
     assert code == 0
     assert "FAIL" not in captured.out
     for name, path in mapping.items():
-        assert f"PASS  {name:<10}  {path}" in captured.out
+        assert f"PASS  {name:26}  {path}" in captured.out
 
 
 def test_doctor_missing_required_directory_fail(

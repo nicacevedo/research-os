@@ -68,6 +68,29 @@ def add_research_parser(subparsers: argparse._SubParsersAction) -> None:
         help="Decline to continue. The run ends here rather than going on.",
     )
 
+    resume = actions.add_parser(
+        "resume",
+        help="Recover a run whose process stopped while it was working.",
+    )
+    resume.add_argument("run_id", metavar="RUN_ID")
+    resume.add_argument(
+        "--retry",
+        action="store_true",
+        help=(
+            "Re-run the task that was in flight instead of marking it failed. "
+            "It may already have spent something."
+        ),
+    )
+    resume.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "Allow --retry on an interrupted experiment. Check "
+            "'researchctl experiment runs' first: the previous attempt may "
+            "already have run or been submitted."
+        ),
+    )
+
     status = actions.add_parser("status", help="Show where one run is.")
     status.add_argument("run_id", metavar="RUN_ID")
 
@@ -135,6 +158,7 @@ def dispatch(args: argparse.Namespace) -> int:
     handlers = {
         "start": _start,
         "run": _run,
+        "resume": _resume,
         "answer": _answer,
         "status": _status,
         "report": _report,
@@ -213,6 +237,17 @@ def _run(args: argparse.Namespace) -> int:
     run = _controller(args).execute(store)
     print(render_run(run), end="")
     print(f"run directory   {store.directory}")
+    return EXIT_OK
+
+
+def _resume(args: argparse.Namespace) -> int:
+    store = ResearchStore.open(args.run_id)
+    run = _recording_controller().resume(
+        store, retry=bool(args.retry), force=bool(args.force)
+    )
+    print(render_run(run), end="")
+    if run.state is ResearchState.INTERRUPTED:
+        print(f"\nContinue it with:\n     researchctl research run {run.run_id}")
     return EXIT_OK
 
 

@@ -4,11 +4,10 @@ from __future__ import annotations
 
 import argparse
 import json
-import shutil
 import sys
 from collections.abc import Sequence
 
-from research_os import __version__
+from research_os import __version__, diagnostics
 from research_os.automation.commands import add_auto_parser
 from research_os.automation.commands import dispatch as auto_dispatch
 from research_os.capsule import (
@@ -37,7 +36,6 @@ from research_os.literature.commands import dispatch as lit_dispatch
 from research_os.models import Reviewable, Verdict
 from research_os.paper.commands import add_paper_parser
 from research_os.paper.commands import dispatch as paper_dispatch
-from research_os.paths import xdg_dir_issue, xdg_dirs
 from research_os.proposal.commands import add_propose_parser
 from research_os.proposal.commands import dispatch as propose_dispatch
 from research_os.registry import (
@@ -58,37 +56,32 @@ from research_os.review import (
 )
 
 
-def _doctor() -> int:
-    checks: list[tuple[str, bool, str]] = []
+def _doctor(args: argparse.Namespace) -> int:
+    """Report what this machine can do, and exit non-zero only if something broke.
 
-    py_ok = sys.version_info[:2] == (3, 12)
-    checks.append(
-        (
-            "python",
-            py_ok,
-            f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
-        )
-    )
+    An absent capability -- one provider, no cluster, no declared experiments --
+    is a WARN and exits zero. A researcher who wires ``doctor`` into a script
+    should be told about real breakage and not about the shape of their setup.
+    """
 
-    for command in ("git",):
-        path = shutil.which(command)
-        checks.append((command, path is not None, path or "not found"))
+    report = diagnostics.collect(include_storage=not args.no_storage)
+    if args.json:
+        print(json.dumps(report.payload(), ensure_ascii=True, indent=2, sort_keys=True))
+    else:
+        print(diagnostics.render(report, verbose=args.verbose), end="")
+    return EXIT_OK if report.ok else EXIT_ERROR
 
-    for name, path in xdg_dirs().items():
-        issue = xdg_dir_issue(path)
-        if issue is None:
-            checks.append((name, True, str(path)))
-        else:
-            checks.append((name, False, f"{path} ({issue})"))
 
-    failed = False
-
-    for name, ok, detail in checks:
-        status = "PASS" if ok else "FAIL"
-        print(f"{status:4}  {name:10}  {detail}")
-        failed = failed or not ok
-
-    return EXIT_ERROR if failed else EXIT_OK
+def _storage(args: argparse.Namespace) -> int:
+    if args.reclaim:
+        print(diagnostics.render_reclaimed(diagnostics.reclaim()), end="")
+        return EXIT_OK
+    report = diagnostics.Report(usage=list(diagnostics.storage_usage()))
+    if args.json:
+        print(json.dumps(report.payload(), ensure_ascii=True, indent=2, sort_keys=True))
+    else:
+        print(diagnostics.render(report, verbose=True), end="")
+    return EXIT_OK
 
 
 def _init_project(args: argparse.Namespace) -> int:
@@ -441,7 +434,40 @@ def _build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command")
 
     subparsers.add_parser("version", help="Show the Research OS version.")
-    subparsers.add_parser("doctor", help="Check the local Research OS environment.")
+
+    doctor_parser = subparsers.add_parser(
+        "doctor",
+        help="Check what this machine can actually do. Makes no network request.",
+    )
+    doctor_parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Show every check and every store, including the empty ones.",
+    )
+    doctor_parser.add_argument(
+        "--json", action="store_true", help="Emit the report as JSON."
+    )
+    doctor_parser.add_argument(
+        "--no-storage",
+        action="store_true",
+        help="Skip measuring runtime storage. Faster on a large state directory.",
+    )
+
+    storage_parser = subparsers.add_parser(
+        "storage",
+        help="Report what runtime state is using, and release what is reclaimable.",
+    )
+    storage_parser.add_argument(
+        "--reclaim",
+        action="store_true",
+        help=(
+            "Release the worktrees and check environments finished runs still "
+            "hold. Records, ledgers and branches are kept."
+        ),
+    )
+    storage_parser.add_argument(
+        "--json", action="store_true", help="Emit the measurement as JSON."
+    )
 
     init_parser = subparsers.add_parser(
         "init-project",
@@ -525,7 +551,9 @@ def main() -> None:
 
     try:
         if args.command == "doctor":
-            code = _doctor()
+            code = _doctor(args)
+        elif args.command == "storage":
+            code = _storage(args)
         elif args.command == "init-project":
             code = _init_project(args)
         elif args.command == "register-project":

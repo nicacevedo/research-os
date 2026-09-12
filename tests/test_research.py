@@ -208,6 +208,7 @@ def test_a_run_may_be_resumed_only_from_unambiguous_states() -> None:
     assert RESUMABLE_STATES == {
         ResearchState.PLAN_READY,
         ResearchState.WAITING_FOR_HUMAN,
+        ResearchState.INTERRUPTED,
     }
     for state in TERMINAL_STATES:
         assert allowed_transitions(state) == frozenset()
@@ -809,3 +810,147 @@ def test_a_cluster_submission_beyond_the_budget_is_refused_before_sbatch(
     assert store.load().state is ResearchState.FAILED
     events = [record["event"] for record in store.iter_events()]
     assert "experiment_executed" not in events
+
+
+# -- recovering an interrupted run -------------------------------------------
+
+
+def interrupt(store: ResearchStore, task_id: str = "T-001") -> ResearchRun:
+    """Leave the run exactly as a killed process would: mid-task, mid-state."""
+
+    run = store.load()
+    tasks = [
+        item.model_copy(update={"status": TaskStatus.RUNNING, "started_at": "now"})
+        if item.task_id == task_id
+        else item
+        for item in run.tasks
+    ]
+    return store.save(
+        run.model_copy(update={"state": ResearchState.EXECUTING, "tasks": tasks})
+    )
+
+
+def test_an_interrupted_run_cannot_simply_be_executed_again(
+    research_home: Path, tmp_path: Path
+) -> None:
+    controller, store, _run, _ = start(tmp_path)
+    interrupt(store)
+    with pytest.raises(ResearchStateError, match="resume"):
+        controller.execute(store)
+
+
+def test_resume_marks_the_in_flight_task_failed_by_default(
+    research_home: Path, tmp_path: Path
+) -> None:
+    """The conservative reading: nothing is repeated, because it may have spent."""
+
+    controller, store, _run, _ = start(
+        tmp_path,
+        plan=plan_payload(tasks=[task(), task(task_id="T-002", depends_on=["T-001"])]),
+    )
+    interrupt(store)
+    run = controller.resume(store)
+    assert run.state is ResearchState.INTERRUPTED
+    assert run.task("T-001").status is TaskStatus.FAILED
+    assert "may already have spent" in (run.task("T-001").failure_reason or "")
+    assert run.resumable
+
+
+def test_resume_with_retry_puts_the_task_back_in_the_queue(
+    research_home: Path, tmp_path: Path
+) -> None:
+    controller, store, _run, _ = start(tmp_path)
+    interrupt(store)
+    run = controller.resume(store, retry=True)
+    assert run.task("T-001").status is TaskStatus.PENDING
+    assert run.task("T-001").started_at is None
+    run = controller.execute(store)
+    assert run.state is ResearchState.READY_FOR_HUMAN
+    assert run.task("T-001").status is TaskStatus.DONE
+
+
+def test_a_resumed_run_continues_with_what_does_not_depend_on_the_failure(
+    research_home: Path, tmp_path: Path
+) -> None:
+    controller, store, _run, _ = start(
+        tmp_path,
+        plan=plan_payload(tasks=[task(), task(task_id="T-002", depends_on=["T-001"])]),
+    )
+    interrupt(store)
+    controller.resume(store)
+    with pytest.raises(ResearchPlanError, match="blocked"):
+        controller.execute(store)
+    run = store.load()
+    assert run.task("T-002").status is TaskStatus.BLOCKED
+    assert run.state is ResearchState.FAILED
+
+
+def test_retrying_an_interrupted_experiment_needs_force(
+    research_home: Path, tmp_path: Path
+) -> None:
+    """The one retry that can cost real money is the one that must be deliberate."""
+
+    controller, store, _run, _ = start(
+        tmp_path,
+        plan=plan_payload(tasks=[experiment_task()]),
+        experiments=experiment_config(),
+        execute_experiments=True,
+    )
+    interrupt(store)
+    with pytest.raises(ResearchStateError, match="spend the same compute twice"):
+        controller.resume(store, retry=True)
+    run = controller.resume(store, retry=True, force=True)
+    assert run.task("T-001").status is TaskStatus.PENDING
+    assert any(
+        record.get("event") == "task_recovered" and record.get("forced") is True
+        for record in store.iter_events()
+    )
+
+
+def test_resuming_a_run_interrupted_while_planning_fails_it(
+    research_home: Path, tmp_path: Path
+) -> None:
+    controller, store, run, _ = start(tmp_path)
+    store.save(run.model_copy(update={"state": ResearchState.PLANNING}))
+    run = controller.resume(store)
+    assert run.state is ResearchState.FAILED
+    assert "still planning" in (run.failure_reason or "")
+
+
+def test_resume_refuses_a_run_that_was_not_interrupted(
+    research_home: Path, tmp_path: Path
+) -> None:
+    controller, store, _run, _ = start(tmp_path)
+    with pytest.raises(ResearchStateError, match="not an interrupted run"):
+        controller.resume(store)
+
+
+def test_a_pass_that_runs_out_of_time_stops_before_starting_the_next_task(
+    research_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The bound is on the loop, not a timeout on the work.
+
+    Killing a task mid-flight is how a run ends up holding a worktree nobody
+    knows about. Declining to start the next one leaves every artifact complete
+    and the ledger honest about why it stopped.
+    """
+
+    controller, store, _run, _ = start(
+        tmp_path,
+        plan=plan_payload(tasks=[task(), task(task_id="T-002")]),
+        budget=ResearchBudget(max_wall_clock_seconds=60),
+    )
+
+    clock = iter(
+        ["2026-09-12T10:00:00Z", "2026-09-12T10:30:00Z"] + ["2026-09-12T10:30:00Z"] * 50
+    )
+    monkeypatch.setattr("research_os.research.controller.utc_now", lambda: next(clock))
+    with pytest.raises(BudgetExceededError, match="wall-clock budget"):
+        controller.execute(store)
+
+    run = store.load()
+    assert run.state is ResearchState.FAILED
+    assert run.task("T-001").status is TaskStatus.PENDING
+    assert any(
+        record.get("event") == "wall_clock_exhausted" for record in store.iter_events()
+    )

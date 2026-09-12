@@ -1869,7 +1869,7 @@ class AutomationController:
             )
         limit = run.budget.max_wall_clock_seconds
         if limit is not None:
-            elapsed = _elapsed_seconds(run.created_at, utc_now())
+            elapsed = elapsed_seconds(run.created_at, utc_now())
             if elapsed > limit:
                 raise BudgetExceededError(
                     f"wall-clock budget exhausted: {elapsed}s elapsed of {limit}s"
@@ -2200,7 +2200,7 @@ def _read_captured(stored: str | None) -> str:
         return ""
 
 
-def _elapsed_seconds(start: str, end: str) -> int:
+def elapsed_seconds(start: str, end: str) -> int:
     """Return whole seconds between two runtime timestamps.
 
     The runtime format has second resolution and is always UTC, so both sides

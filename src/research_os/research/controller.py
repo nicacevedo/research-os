@@ -31,7 +31,10 @@ from pathlib import Path
 
 from research_os.automation.config import AutomationConfig, ResolvedRoles, resolve_roles
 from research_os.automation.context import build_context, render_context
-from research_os.automation.controller import AutomationController
+from research_os.automation.controller import (
+    AutomationController,
+    elapsed_seconds,
+)
 from research_os.automation.gitutil import has_commits, head_commit, repository_root
 from research_os.automation.models import (
     Access,
@@ -82,6 +85,7 @@ from research_os.paper.packet import build_source_packet
 from research_os.proposal.context import build_science_context, render_science_context
 from research_os.proposal.controller import ProposalController
 from research_os.research.models import (
+    INTERRUPTIBLE_STATES,
     SATISFIED_STATUSES,
     HumanCheckpoint,
     ResearchBudget,
@@ -290,10 +294,17 @@ class ResearchController:
         run = store.load()
         if run.terminal:
             raise ResearchStateError(f"{run.run_id} is already {run.state}")
+        if run.state in INTERRUPTIBLE_STATES:
+            raise ResearchStateError(
+                f"{run.run_id} is {run.state}, which means a process stopped "
+                "while it was working. Recover it with 'researchctl research "
+                f"resume {run.run_id}' -- that makes you decide what happens to "
+                "the task that was in flight."
+            )
         if not run.resumable:
             raise ResearchStateError(
-                f"{run.run_id} is {run.state}; only a planned run or one waiting "
-                "for a human can be executed"
+                f"{run.run_id} is {run.state}; only a planned run, one waiting "
+                "for a human, or a recovered one can be executed"
             )
         pending = run.pending_checkpoints
         if pending:
@@ -302,11 +313,13 @@ class ResearchController:
                 f"{pending[0].question} Answer it with 'researchctl research answer'."
             )
         run = self._transition(store, run, ResearchState.EXECUTING)
+        started = utc_now()
         try:
             for planned in list(run.tasks):
                 task = run.task(planned.task_id)
                 if task.terminal:
                     continue
+                self._assert_time_remains(store, run, started, task.task_id)
                 run = self._dispatch(store, run, task.task_id)
                 if run.state is ResearchState.WAITING_FOR_HUMAN:
                     return run
@@ -808,6 +821,93 @@ class ResearchController:
         )
         return self._transition(store, run, ResearchState.CANCELLED)
 
+    # -- recovery --------------------------------------------------------
+
+    def resume(
+        self, store: ResearchStore, *, retry: bool = False, force: bool = False
+    ) -> ResearchRun:
+        """Recover a run whose process stopped while it was working.
+
+        A crashed run's file still says ``EXECUTING`` and nothing will ever move
+        it. This is the only thing that can, and it deliberately makes a person
+        choose what happens to the task that was in flight, because the
+        controller cannot tell from the outside whether that task spent
+        anything. A worktree may exist, a cluster job may have been submitted, a
+        provider may have been invoked and charged.
+
+        The default is to mark the interrupted task failed and continue with
+        whatever does not depend on it -- the conservative reading, in which
+        nothing is repeated. ``retry`` re-runs it instead, and is refused for an
+        experiment without ``force``, because re-running one is exactly the
+        mistake that costs real money.
+        """
+
+        run = store.load()
+        if run.state not in INTERRUPTIBLE_STATES:
+            raise ResearchStateError(
+                f"{run.run_id} is {run.state}, which is not an interrupted run. "
+                "Resume recovers a run whose process stopped while it was "
+                "planning or executing."
+            )
+        if run.state is ResearchState.PLANNING:
+            return self._fail(
+                store,
+                run,
+                "the process stopped while this run was still planning. Planning "
+                "is a single model call and produced nothing to salvage; start a "
+                "new run.",
+            )
+
+        in_flight = [item for item in run.tasks if item.status is TaskStatus.RUNNING]
+        for task in in_flight:
+            if retry and task.kind is TaskKind.EXPERIMENT and not force:
+                raise ResearchStateError(
+                    f"{task.task_id} is an experiment that was interrupted. It may "
+                    "already have run or been submitted, so retrying it could "
+                    "spend the same compute twice. Check "
+                    "'researchctl experiment runs' first, then pass --force if "
+                    "you are sure, or resume without --retry to mark it failed."
+                )
+            if retry:
+                run = self._update(
+                    store,
+                    run,
+                    task.task_id,
+                    status=TaskStatus.PENDING,
+                    started_at=None,
+                    finished_at=None,
+                    failure_reason=None,
+                    detail="retried after an interruption",
+                )
+            else:
+                run = self._update(
+                    store,
+                    run,
+                    task.task_id,
+                    status=TaskStatus.FAILED,
+                    finished_at=utc_now(),
+                    failure_reason=(
+                        "the process stopped while this task was running; it was "
+                        "not retried, because it may already have spent something"
+                    ),
+                )
+            store.append_event(
+                "task_recovered",
+                task_id=task.task_id,
+                kind=str(task.kind),
+                decision="retry" if retry else "fail",
+                forced=bool(retry and force),
+            )
+        run = self._transition(
+            store,
+            run,
+            ResearchState.INTERRUPTED,
+            in_flight=[item.task_id for item in in_flight],
+            decision="retry" if retry else "fail",
+        )
+        store.append_event("run_resumable", tasks_in_flight=len(in_flight))
+        return run
+
     # -- finishing -------------------------------------------------------
 
     def _finish(self, store: ResearchStore, run: ResearchRun) -> ResearchRun:
@@ -926,6 +1026,36 @@ class ResearchController:
             model_calls=model_calls,
         )
         return run
+
+    @staticmethod
+    def _assert_time_remains(
+        store: ResearchStore, run: ResearchRun, started: str, task_id: str
+    ) -> None:
+        """Refuse to start another task once this pass has run out of time.
+
+        A bound on the loop, not a timeout on the work. Killing a task mid-flight
+        is how a run ends up holding a worktree nobody knows about or a cluster
+        job nobody is watching; declining to start the next one leaves every
+        artifact complete and the record honest about why it stopped.
+        """
+
+        limit = run.budget.max_wall_clock_seconds
+        if limit is None:
+            return
+        elapsed = elapsed_seconds(started, utc_now())
+        if elapsed <= limit:
+            return
+        store.append_event(
+            "wall_clock_exhausted",
+            task_id=task_id,
+            elapsed_seconds=elapsed,
+            limit_seconds=limit,
+        )
+        raise BudgetExceededError(
+            f"this pass has been running for {elapsed}s and its wall-clock "
+            f"budget is {limit}s, so {task_id} was not started. Everything that "
+            "did run is complete and recorded."
+        )
 
     @staticmethod
     def _assert_calls_remain(run: ResearchRun, needed: int) -> None:

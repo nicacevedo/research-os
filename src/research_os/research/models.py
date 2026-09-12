@@ -77,6 +77,17 @@ class ResearchState(StrEnum):
     PLAN_READY = "PLAN_READY"
     EXECUTING = "EXECUTING"
     WAITING_FOR_HUMAN = "WAITING_FOR_HUMAN"
+    INTERRUPTED = "INTERRUPTED"
+    """The process stopped while this run was executing.
+
+    A distinct state rather than a stale ``EXECUTING``, because the two mean
+    different things to whoever finds the run: ``EXECUTING`` says something is
+    happening, and after a crash nothing is. Recording the interruption is also
+    what makes ``researchctl research resume`` a deliberate act -- a person
+    decides what to do about the task that was in flight, rather than the
+    controller guessing.
+    """
+
     READY_FOR_HUMAN = "READY_FOR_HUMAN"
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
@@ -88,12 +99,25 @@ TERMINAL_STATES: frozenset[ResearchState] = frozenset(
 
 #: States a stopped run may be resumed from.
 #:
-#: Deliberately only two, and both unambiguous: a plan that has not started, and
-#: a run paused at a checkpoint whose answer a person has now given. A FAILED or
-#: CANCELLED run is never resurrected -- what "continue" would mean there depends
-#: on why it stopped, and guessing is how a run silently repeats a costly step.
+#: Three, and each unambiguous: a plan that has not started, a run paused at a
+#: checkpoint whose answer a person has now given, and a run whose interruption
+#: a person has already decided what to do about. A FAILED or CANCELLED run is
+#: never resurrected -- what "continue" would mean there depends on why it
+#: stopped, and guessing is how a run silently repeats a costly step.
 RESUMABLE_STATES: frozenset[ResearchState] = frozenset(
-    {ResearchState.PLAN_READY, ResearchState.WAITING_FOR_HUMAN}
+    {
+        ResearchState.PLAN_READY,
+        ResearchState.WAITING_FOR_HUMAN,
+        ResearchState.INTERRUPTED,
+    }
+)
+
+#: States that mean a process stopped without finishing what it started.
+#:
+#: Only ``researchctl research resume`` moves a run out of one of these, and it
+#: makes a person say what should happen to the task that was in flight.
+INTERRUPTIBLE_STATES: frozenset[ResearchState] = frozenset(
+    {ResearchState.PLANNING, ResearchState.EXECUTING}
 )
 
 _FORWARD: dict[ResearchState, frozenset[ResearchState]] = {
@@ -101,9 +125,14 @@ _FORWARD: dict[ResearchState, frozenset[ResearchState]] = {
     ResearchState.PLANNING: frozenset({ResearchState.PLAN_READY}),
     ResearchState.PLAN_READY: frozenset({ResearchState.EXECUTING}),
     ResearchState.EXECUTING: frozenset(
-        {ResearchState.WAITING_FOR_HUMAN, ResearchState.READY_FOR_HUMAN}
+        {
+            ResearchState.WAITING_FOR_HUMAN,
+            ResearchState.INTERRUPTED,
+            ResearchState.READY_FOR_HUMAN,
+        }
     ),
     ResearchState.WAITING_FOR_HUMAN: frozenset({ResearchState.EXECUTING}),
+    ResearchState.INTERRUPTED: frozenset({ResearchState.EXECUTING}),
     ResearchState.READY_FOR_HUMAN: frozenset(),
     ResearchState.FAILED: frozenset(),
     ResearchState.CANCELLED: frozenset(),
@@ -149,6 +178,13 @@ class ResearchBudget(BaseModel):
     max_experiments: int = Field(default=2, ge=0, le=20)
     max_cluster_submissions: int = Field(default=2, ge=0, le=20)
     max_wall_clock_seconds: int | None = Field(default=7200, ge=60)
+    """How long one execution pass may keep starting new tasks.
+
+    Checked before each task rather than enforced as a timeout, because killing
+    a task mid-flight is how a run ends up holding a worktree nobody knows
+    about or a cluster job nobody is watching. The bound is on the loop: past
+    the limit, the run stops starting work and hands what it has to a person.
+    """
     max_repair_attempts: int = Field(default=1, ge=0, le=1)
     """How many bounded repairs one work item may make.
 
