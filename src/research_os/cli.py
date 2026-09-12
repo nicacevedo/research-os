@@ -46,6 +46,8 @@ from research_os.registry import (
     list_projects,
     register_project,
 )
+from research_os.research.commands import add_research_parser
+from research_os.research.commands import dispatch as research_dispatch
 from research_os.review import (
     EvidenceEntry,
     ExperimentEntry,
@@ -499,6 +501,7 @@ def _build_parser() -> argparse.ArgumentParser:
     review_parser.add_argument("object_id", metavar="CLAIM-ID")
     review_parser.add_argument("path", nargs="?", default=".")
 
+    add_research_parser(subparsers)
     add_auto_parser(subparsers)
     add_lit_parser(subparsers)
     add_propose_parser(subparsers)
@@ -537,6 +540,8 @@ def main() -> None:
             code = _digest(args)
         elif args.command == "review":
             code = _review(args)
+        elif args.command == "research":
+            code = research_dispatch(args)
         elif args.command == "auto":
             code = auto_dispatch(args)
         elif args.command == "lit":

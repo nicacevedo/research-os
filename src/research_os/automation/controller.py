@@ -72,6 +72,7 @@ from research_os.automation.planner import (
     MODEL_CALLS_PER_ANALYSIS_TASK,
     MODEL_CALLS_PER_CODING_TASK,
     PLAN_SCHEMA,
+    PlanDocument,
     build_planner_prompt,
     parse_plan,
     plan_to_work_orders,
@@ -256,8 +257,17 @@ class AutomationController:
         dry_run: bool = False,
         skip_planner: bool = False,
         budget: Budget | None = None,
+        plan: PlanDocument | None = None,
     ) -> tuple[RunStore, AutomationRun]:
-        """Preflight, build context, and plan. Never invokes a write worker."""
+        """Preflight, build context, and plan. Never invokes a write worker.
+
+        ``plan`` supplies a plan that was produced elsewhere -- by a higher-level
+        research run that has already decided what the coding work is. It is
+        validated by exactly the same rules a planner's output is, and it skips
+        only the model call, never a check. That is what lets the research
+        orchestrator reuse this controller rather than reimplement dispatch,
+        scope enforcement, checking, review, and the bounded repair.
+        """
 
         goal = goal.strip()
         if not goal:
@@ -310,7 +320,7 @@ class AutomationController:
             run = self._archive_context(store, run, packet)
             if skip_planner:
                 return store, run
-            run = self._plan(store, run, packet, resolved)
+            run = self._plan(store, run, packet, resolved, supplied=plan)
         except AutomationError as exc:
             run = self._fail(store, run, str(exc))
             raise
@@ -432,8 +442,24 @@ class AutomationController:
         run: AutomationRun,
         packet: ContextPacket,
         resolved: ResolvedRoles,
+        supplied: PlanDocument | None = None,
     ) -> AutomationRun:
         run = self._transition(store, run, RunState.PLANNING)
+        if supplied is not None:
+            # A plan decided upstream still passes every local gate. Skipping
+            # the model call is a saving; skipping validation would be a hole.
+            store.append_event(
+                "plan_supplied",
+                tasks=[item.id for item in supplied.tasks],
+                detail="the plan came from a higher-level run, not from a planner call",
+            )
+            plan = supplied
+            validate_plan(
+                plan,
+                budget=run.budget,
+                allowed_programs=self.config.allowed_check_programs,
+            )
+            return self._accept_plan(store, run, plan, resolved)
         planner = resolved.roles["planner"]
         prompt = build_planner_prompt(
             goal=run.goal,
@@ -462,6 +488,17 @@ class AutomationController:
             budget=run.budget,
             allowed_programs=self.config.allowed_check_programs,
         )
+        return self._accept_plan(store, run, plan, resolved)
+
+    def _accept_plan(
+        self,
+        store: RunStore,
+        run: AutomationRun,
+        plan: PlanDocument,
+        resolved: ResolvedRoles,
+    ) -> AutomationRun:
+        """Turn a validated plan into work orders. One path, however it arrived."""
+
         store.write_json("plan/plan.json", plan.model_dump(mode="json"))
         orders = plan_to_work_orders(
             plan,

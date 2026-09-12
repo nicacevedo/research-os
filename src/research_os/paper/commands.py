@@ -13,7 +13,6 @@ import json
 from pathlib import Path
 
 from research_os.automation.config import load_config
-from research_os.automation.providers import default_registry
 from research_os.automation.worktree import release_worktree
 from research_os.errors import EXIT_ERROR, EXIT_OK, PaperError
 from research_os.paper.controller import PaperController
@@ -108,7 +107,9 @@ def dispatch(args: argparse.Namespace) -> int:
 
 
 def _sources(args: argparse.Namespace) -> int:
-    from research_os.automation.commands import resolve_project
+    from research_os.automation.commands import (
+        resolve_project,
+    )
 
     packet = build_source_packet(
         resolve_project(args.project),
@@ -130,7 +131,10 @@ def _sources(args: argparse.Namespace) -> int:
 
 
 def _write(args: argparse.Namespace) -> int:
-    from research_os.automation.commands import resolve_project
+    from research_os.automation.commands import (
+        provider_registry,
+        resolve_project,
+    )
 
     project = resolve_project(args.project)
     packet = build_source_packet(
@@ -140,7 +144,7 @@ def _write(args: argparse.Namespace) -> int:
         limitations=args.limitation,
     )
     controller = PaperController(
-        providers=default_registry(),
+        providers=provider_registry(),
         config=load_config(Path(args.config) if args.config else None),
         allow_repair=not args.no_repair,
     )

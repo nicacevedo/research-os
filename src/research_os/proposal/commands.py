@@ -106,14 +106,16 @@ def dispatch(args: argparse.Namespace) -> int:
 
 
 def _start(args: argparse.Namespace) -> int:
-    from research_os.automation.commands import resolve_project
+    from research_os.automation.commands import (
+        provider_registry,
+        resolve_project,
+    )
     from research_os.automation.config import load_config
-    from research_os.automation.providers import default_registry
     from research_os.literature.config import load_config as load_literature_config
     from research_os.proposal.controller import ProposalController
 
     controller = ProposalController(
-        providers=default_registry(),
+        providers=provider_registry(),
         config=load_config(Path(args.config) if args.config else None),
         literature_config=load_literature_config(),
     )

@@ -379,6 +379,38 @@ class DraftNotFoundError(PaperError):
     """Raised when a draft id names no draft directory."""
 
 
+class ResearchError(ResearchOSError):
+    """Base class for unified research-orchestration failures.
+
+    A research run is the layer above every other controller: it decides what
+    runs, in what order, against which budget, and when to stop for a person. It
+    owns no worker and writes nothing scientific, so none of these means the
+    capsule is wrong -- they mean a run could not be planned, could not be
+    dispatched, or was asked to do something it is not allowed to do.
+    """
+
+
+class ResearchPlanError(ResearchError):
+    """Raised when a research plan is absent, malformed, or not executable.
+
+    Includes the case that matters most: a plan naming an experiment command the
+    researcher never declared. That is refused at planning time rather than at
+    the moment of spending, so the failure costs nothing.
+    """
+
+
+class ResearchStateError(ResearchError):
+    """Raised when a research run is asked for a transition it cannot make."""
+
+
+class ResearchStoreError(ResearchError):
+    """Raised when a research run directory cannot be read or written."""
+
+
+class ResearchRunNotFoundError(ResearchError):
+    """Raised when a run id names no research run directory."""
+
+
 class Severity(StrEnum):
     """Finding severity for deterministic validation reports."""
 
