@@ -44,6 +44,32 @@ Research OS must never automatically:
 
 Those operations require explicit human authorization. See `MACHINE_AUDIT.md`.
 
+## Untrusted text at the terminal
+
+Model output and external retrieved text are data, and they reach a human
+through a terminal that reads some byte sequences as commands. `ESC` opens an
+ANSI control sequence that can clear the screen, move the cursor back over a
+line already printed, recolour output, or retitle the window; `0x9B` does the
+same thing to a terminal in an 8-bit mode. A finding or summary carrying one
+could make a rendered report say something other than what the run recorded.
+
+`research_os.textsafe.terminal_safe` is the display boundary. Every rendered
+report, status, plan, and provider view passes through it, and every control
+character that is not a newline or a tab is rewritten as a visible `\xNN`
+rather than sent to the terminal. It neutralises without censoring: the human
+still reads the text that was written.
+
+Two things it deliberately is not:
+
+- It is not the model-to-model boundary. Text entering another model's prompt
+  goes through `research_os.automation.promptdata`, which is stricter and also
+  neutralises data-block delimiters. Both modules take their definition of
+  "control character" from `textsafe` so the two boundaries cannot drift apart.
+- It is not applied to stored artifacts. The run archive keeps the bytes the
+  provider returned, with their digests. The machine-readable views
+  (`auto status --json`, `auto events`) escape rather than rewrite, so they stay
+  parseable and still return the original strings from `json.loads`.
+
 ## Browser and provider policy
 
 Browser subscription interfaces must not be scraped or unofficially automated.

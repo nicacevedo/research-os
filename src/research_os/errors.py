@@ -91,6 +91,110 @@ class ReviewBlockedError(ResearchOSError):
         self.findings = findings
 
 
+class AutomationError(ResearchOSError):
+    """Base class for automation control-plane failures.
+
+    Runtime automation is not scientific state, so these never indicate a
+    corrupt capsule. They are raised, reported, and recorded in the run ledger.
+    """
+
+
+class PreflightError(AutomationError):
+    """Raised when a project is not in a state an automation run may start from."""
+
+
+class GitError(AutomationError):
+    """Raised when a deterministic Git inspection or worktree command fails."""
+
+
+class RunStoreError(AutomationError):
+    """Raised when the runtime run store cannot be read or written."""
+
+
+class RunNotFoundError(AutomationError):
+    """Raised when a run id names no run directory."""
+
+
+class RunStateError(AutomationError):
+    """Raised on an undeclared run-state transition."""
+
+
+class BudgetExceededError(AutomationError):
+    """Raised before an invocation that would exceed a declared run budget."""
+
+
+class ProviderUnavailableError(AutomationError):
+    """Raised when a configured provider is not usable on this machine."""
+
+
+class ProviderInvocationError(AutomationError):
+    """Raised when a provider ran but produced no usable result."""
+
+
+class PlanValidationError(AutomationError):
+    """Raised when planner output is not a valid, in-policy work plan."""
+
+
+class CommandPolicyError(AutomationError):
+    """Raised when a planner-originated acceptance command is not authorised.
+
+    The controller executes acceptance commands itself, so which command shapes
+    a plan may name is policy. Raised before the argument vector reaches
+    ``subprocess.run``, never after.
+    """
+
+
+class WorktreeError(AutomationError):
+    """Raised when an isolated automation worktree cannot be created or removed."""
+
+
+class WorktreeIsolationError(WorktreeError):
+    """Raised when a write-enabled worker would run outside its own worktree.
+
+    An enforced invariant rather than a prompt instruction: the controller
+    checks the resolved working directory before every write invocation.
+    """
+
+
+class SymlinkScopeError(WorktreeIsolationError):
+    """Raised when a symlink in the worktree resolves outside it.
+
+    A writer told to change an in-scope path writes through whatever that path
+    is. If the path is a symlink out of the worktree, the write lands outside
+    the isolation boundary and Git never sees it, so the run is refused before
+    the writer is invoked.
+    """
+
+
+class AnalystOutputError(AutomationError):
+    """Raised when an analysis worker's structured findings are not usable.
+
+    Analyst output is data the controller parses, never instruction it follows,
+    so a report that does not validate is a failed work order rather than
+    something to interpret generously.
+    """
+
+
+class SnapshotMutationError(AutomationError):
+    """Raised when a snapshot-read worker changed the checkout it was reading.
+
+    The analysis worker is given read-only file tools and a pinned snapshot, so
+    a changed HEAD or a dirty tree means an enforcement boundary did not hold.
+    The run fails and the violation is recorded; nothing is quietly restored.
+    """
+
+
+class PromptDataError(AutomationError):
+    """Raised when model-originated text would forge a prompt data boundary.
+
+    The controller renders every model-originated string through one prompt-safe
+    serializer, so this is a programming error rather than a hostile input: it
+    means a field reached a data block without passing that boundary. It fails
+    closed, because a prompt whose fence is ambiguous has already lost the
+    distinction between data and instruction.
+    """
+
+
 class Severity(StrEnum):
     """Finding severity for deterministic validation reports."""
 

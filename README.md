@@ -14,7 +14,8 @@ its own `.research/` capsule.
 - No agent approves its own scientific work
 - Local deterministic computation before any later LLM reasoning
 
-See `DESIGN_INVARIANTS.md` and `ARCHITECTURE.md`.
+See `DESIGN_INVARIANTS.md` and `ARCHITECTURE.md`. The automation control plane
+is described in `docs/AUTOMATION_MVP.md`.
 
 ## Status
 
@@ -60,6 +61,15 @@ uv run researchctl projects
 uv run researchctl status [path]
 uv run researchctl digest <OBJECT-ID> [path]
 uv run researchctl review <CLAIM-ID> [path]
+uv run researchctl auto providers
+uv run researchctl auto start PROJECT --goal "..." [--dry-run]
+uv run researchctl auto run RUN_ID
+uv run researchctl auto status RUN_ID
+uv run researchctl auto report RUN_ID
+uv run researchctl auto events RUN_ID
+uv run researchctl auto runs
+uv run researchctl auto cancel RUN_ID
+uv run researchctl auto cleanup RUN_ID
 ```
 
 `version` prints `0.1.0`.
@@ -114,6 +124,20 @@ and stays a human act. There is no `researchctl set-status`. To re-review an
 accepted Claim, set it back to `evidence_linked` first — R0 acceptance is
 existential, so a new verdict cannot override an approval that already satisfies
 the gate.
+
+`auto` is the deterministic automation control plane: it turns a goal into a
+bounded plan, dispatches a coding agent into an isolated Git worktree, runs the
+acceptance commands itself, has the diff reviewed by a separate read-only model,
+and stops at `READY_FOR_HUMAN`. It never merges, never pushes, and never records
+a scientific Review or accepts a Claim. Runtime state lives under
+`~/.local/state/research-os/runs/` and can be deleted without affecting any
+project. See `docs/AUTOMATION_MVP.md`.
+
+`auto` is for repositories you trust. Its acceptance checks run the project's
+own code, including code a worker has just written, as your user. Worktree
+isolation keeps a worker out of your canonical checkout; it is not an OS
+sandbox, and containers are not yet provided. Do not point `auto` at an
+untrusted or freshly cloned repository.
 
 Exit codes: `0` success, `1` project/validation/runtime failure (including a
 path that is not a Research OS project), `2` usage/argument error.

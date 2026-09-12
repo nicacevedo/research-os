@@ -28,3 +28,25 @@ def data_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     path.mkdir()
     monkeypatch.setenv("RESEARCH_OS_DATA_HOME", str(path))
     return path
+
+
+@pytest.fixture
+def automation_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Redirect every Research OS directory into ``tmp_path``.
+
+    Automation runs write runtime state, create worktrees, and read the project
+    registry, so a test that does not relocate all four directories would touch
+    the researcher's real machine.
+    """
+
+    root = tmp_path / "xdg"
+    mapping = {
+        "RESEARCH_OS_CONFIG_HOME": root / "config",
+        "RESEARCH_OS_DATA_HOME": root / "data",
+        "RESEARCH_OS_CACHE_HOME": root / "cache",
+        "RESEARCH_OS_STATE_HOME": root / "state",
+    }
+    for name, path in mapping.items():
+        path.mkdir(parents=True)
+        monkeypatch.setenv(name, str(path))
+    return mapping["RESEARCH_OS_STATE_HOME"]
