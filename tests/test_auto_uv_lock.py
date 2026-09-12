@@ -22,6 +22,7 @@ way. Only the model providers are fake.
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -330,6 +331,35 @@ def test_a_symlink_a_check_created_is_removed_without_touching_its_target(
 
     assert outcome.action == LOCK_REMOVED
     assert not (worktree / UV_LOCK_FILENAME).exists()
+    assert victim.read_text(encoding="utf-8") == "not yours\n"
+
+
+def test_a_lock_hard_linked_to_an_outside_file_is_not_written_through(
+    tmp_path: Path,
+) -> None:
+    """A hard link is an ordinary regular file, so ``O_NOFOLLOW`` does not see it.
+
+    It is the other way a name inside the worktree can reach content outside it,
+    and unlike a symlink it survives every check that asks about the path.
+    """
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = outside / "important.txt"
+    victim.write_text("not yours\n", encoding="utf-8")
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    target = worktree / UV_LOCK_FILENAME
+    target.write_text("version = 1\n", encoding="utf-8")
+
+    guard = UvLockGuard.observe(worktree)
+    target.unlink()
+    os.link(victim, target)
+
+    outcome = guard.settle()
+
+    assert outcome.action == LOCK_RETAINED
+    assert "hard link" in outcome.detail
     assert victim.read_text(encoding="utf-8") == "not yours\n"
 
 

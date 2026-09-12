@@ -264,20 +264,35 @@ def _read_without_following(target: Path) -> bytes | None:
 
 
 def _write_without_following(target: Path, content: bytes) -> str | None:
-    """Write ``content`` to ``target``, refusing to write through a symlink.
+    """Write ``content`` to ``target``, refusing to write to another file's inode.
 
-    Returns ``None`` on success, or the reason it did not happen. A symlink at
-    the path is refused by the kernel rather than by a check this code performs,
-    so nothing that changes between the decision and the write can defeat it.
+    Returns ``None`` on success, or the reason it did not happen.
+
+    ``O_NOFOLLOW`` refuses a symlink in the kernel rather than in a check this
+    code performs, so nothing that changes between the decision and the open can
+    defeat it. That leaves one other way a path inside the worktree can name
+    content outside it: a hard link, which is a perfectly ordinary regular file
+    as far as ``O_NOFOLLOW`` is concerned. So the link count is read from the
+    descriptor that is about to be written - the same open file, not the path
+    again - and a lock with more than one name is declined rather than
+    truncated. A researcher who genuinely hard-linked their lock file loses a
+    restore they did not need; anything else loses an escape.
     """
 
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
+    flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW
     try:
         descriptor = os.open(target, flags, 0o644)
     except OSError as exc:
         return str(exc)
     try:
         with os.fdopen(descriptor, "wb") as handle:
+            links = os.fstat(handle.fileno()).st_nlink
+            if links > 1:
+                return (
+                    f"uv.lock has {links} hard links, so writing it would change "
+                    "a file that is also named somewhere else"
+                )
+            handle.truncate(0)
             handle.write(content)
     except OSError as exc:
         return str(exc)
