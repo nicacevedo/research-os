@@ -35,6 +35,23 @@ class ScriptedResponse:
     body: bytes = b"{}"
     headers: dict[str, str] = field(default_factory=dict)
     raises: Exception | None = None
+    transport_error: str = ""
+    """A request that never completed: a timeout, a reset, a DNS failure.
+
+    Distinct from ``raises`` because the client treats the two differently and
+    has to: a transport failure is retried, a settled refusal is not. Scripting
+    them through one field would make the retry tests unable to tell which
+    behaviour they were actually observing.
+    """
+
+    transport_failures: int | None = None
+    """How many leading attempts fail before this response is served.
+
+    Counted down across calls, which is what makes "recovers after one transient
+    error" expressible as a scripted fact rather than as two separate clients.
+    ``None`` with a ``transport_error`` set means every attempt fails, which is
+    the host that never recovers.
+    """
 
 
 @dataclass
@@ -57,11 +74,22 @@ class ScriptedClient(HttpClient):
             self.waited.append(seconds)
 
     def _perform(self, url: str, headers: dict[str, str]) -> HttpResponse:
+        from research_os.literature.http import _TransportFailure
+
         self.requests.append((url, dict(headers)))
         for response in self.responses:
             if response.match in url:
                 if response.raises is not None:
                     raise response.raises
+                host = url.split("/")[2] if "//" in url else url
+                if response.transport_failures is None:
+                    if response.transport_error:
+                        raise _TransportFailure(response.transport_error, host=host)
+                elif response.transport_failures > 0:
+                    response.transport_failures -= 1
+                    raise _TransportFailure(
+                        response.transport_error or "connection reset", host=host
+                    )
                 return HttpResponse(
                     url=url,
                     status=response.status,

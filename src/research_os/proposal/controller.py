@@ -17,7 +17,9 @@ proposal, one assessment. A literature pass adds one more.
 
 from __future__ import annotations
 
+import json
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -37,8 +39,12 @@ from research_os.automation.providers import (
     ProviderAdapter,
     probe_registry,
 )
+from research_os.automation.structured import extract_json_object
 from research_os.errors import (
     AutomationError,
+    ProposalBudgetError,
+    ProposalError,
+    ProposalGroundingError,
     ProposalValidationError,
     ProviderInvocationError,
     ProviderUnavailableError,
@@ -67,7 +73,10 @@ from research_os.proposal.models import (
 )
 from research_os.proposal.planner import (
     PROPOSAL_SCHEMA,
+    GroundingViolation,
+    build_grounding_correction_prompt,
     build_proposal_prompt,
+    grounding_violations,
     parse_proposal,
     validate_proposal,
 )
@@ -82,9 +91,38 @@ LITERATURE_PACKET_WORKS = 12
 
 #: The most model calls one proposal may ever spend.
 #:
-#: Three: literature, proposal, assessment. A proposal that needed more than
-#: that would be a run, and a run is what the automation controller is for.
-MAX_MODEL_CALLS = 3
+#: Four: literature, proposal, one bounded grounding correction, assessment. A
+#: proposal that needed more than that would be a run, and a run is what the
+#: automation controller is for.
+MAX_MODEL_CALLS = 4
+
+#: How many times a refused proposal may be sent back for grounding correction.
+#:
+#: One, and it is a constant rather than a parameter so that no configuration
+#: can turn it into a loop. The first real pilot produced a proposal citing a
+#: literature key that did not exist, and the validator refused it -- correctly,
+#: and that refusal is the property being preserved here, not relaxed. What was
+#: missing was the ability to fix one wrong reference without a human restarting
+#: the whole run. A second attempt would be something else: a model being asked
+#: repeatedly until it happens to produce something that passes, which is how a
+#: gate stops meaning anything.
+MAX_GROUNDING_CORRECTIONS = 1
+
+
+@dataclass(frozen=True, slots=True)
+class GroundingCorrection:
+    """What the one bounded grounding correction attempt did.
+
+    Recorded whether it succeeded or not. A correction that failed is the more
+    interesting record of the two: it says the controller spent a model call and
+    still refused to put the proposal in front of a human.
+    """
+
+    refused: tuple[str, ...]
+    attempted: bool
+    corrected: bool
+    still_refused: tuple[str, ...] = ()
+    reason: str = ""
 
 
 @dataclass
@@ -96,6 +134,7 @@ class ProposalOutcome:
     assessment: ProposalAssessment | None = None
     literature_keys: tuple[str, ...] = ()
     invocations: list[ModelInvocation] = field(default_factory=list)
+    grounding_correction: GroundingCorrection | None = None
 
     @property
     def model_calls(self) -> int:
@@ -119,6 +158,43 @@ class ProposalController:
         with_literature: bool = False,
         retrieve: bool = False,
         assess: bool = True,
+        max_model_calls: int | None = None,
+    ) -> ProposalOutcome:
+        """Produce one proposal, and make every failure say what it cost.
+
+        The accounting wrapper is separate from the work because a failed
+        proposal spends real model calls and used to report none. A caller with
+        a budget charged only on success, so a run whose planner reliably cited
+        a nonexistent key could spend three calls a time, be retried, and spend
+        three more against a ledger that never moved. Found by an independent
+        review of this release.
+        """
+
+        spent: list[ModelInvocation] = []
+        try:
+            return self._propose(
+                project_path=project_path,
+                goal=goal,
+                with_literature=with_literature,
+                retrieve=retrieve,
+                assess=assess,
+                max_model_calls=max_model_calls,
+                invocations=spent,
+            )
+        except (ProposalError, ProviderInvocationError) as failure:
+            failure.model_calls = len(spent)
+            raise
+
+    def _propose(
+        self,
+        *,
+        project_path: Path,
+        goal: str,
+        with_literature: bool,
+        retrieve: bool,
+        assess: bool,
+        max_model_calls: int | None,
+        invocations: list[ModelInvocation],
     ) -> ProposalOutcome:
         """Produce one proposal for ``goal`` against ``project_path``.
 
@@ -126,7 +202,18 @@ class ProposalController:
         index; ``retrieve`` additionally asks the providers first. Retrieval is
         opt-in because it reaches the network, and a researcher running this
         against a project on a train should get a proposal rather than an error.
+
+        ``max_model_calls`` is the ceiling a caller with a budget of its own
+        imposes on this run. It exists for the bounded grounding correction: the
+        correction is an ordinary model call, so whether one can be afforded is
+        the caller's question, not this controller's. ``None`` means only this
+        controller's own :data:`MAX_MODEL_CALLS` applies.
         """
+
+        if max_model_calls is not None:
+            max_model_calls = min(max_model_calls, MAX_MODEL_CALLS)
+        else:
+            max_model_calls = MAX_MODEL_CALLS
 
         goal = goal.strip()
         if not goal:
@@ -143,7 +230,6 @@ class ProposalController:
             project_path=str(root), goal=goal, created_at=created_at
         )
 
-        invocations: list[ModelInvocation] = []
         pending: list[tuple[str, str]] = []
         literature_data: str | None = None
         literature_keys: tuple[str, ...] = ()
@@ -153,6 +239,7 @@ class ProposalController:
                 resolved=resolved,
                 retrieve=retrieve,
                 invocations=invocations,
+                max_model_calls=max_model_calls,
             )
             pending.extend(entries)
 
@@ -165,6 +252,7 @@ class ProposalController:
         prompt = build_proposal_prompt(
             goal=goal, context=context, literature_data=literature_data
         )
+        self._assert_affordable(invocations, max_model_calls, "the proposal worker")
         invocation, result = self._invoke(
             role=Role.PLANNER,
             setting=setting,
@@ -178,20 +266,57 @@ class ProposalController:
             raise ProviderInvocationError(
                 f"the proposal worker failed: {invocation.error or 'unknown error'}"
             )
-        proposal = parse_proposal(
-            structured=result.structured,
-            text=result.text,
-            proposal_id=proposal_id,
-            project_path=str(root),
-            project_id=context.project_id,
-            base_commit=base_commit,
-            goal=goal,
-            grounding=grounding,
-            provider=setting.provider,
-            model=invocation.model or setting.model,
-            invocation_id=invocation.invocation_id,
-        )
-        validate_proposal(proposal)
+        payload = result.structured
+        if payload is None:
+            payload = extract_json_object(result.text)
+
+        def _parse(candidate: dict | None, source: ModelInvocation) -> ResearchProposal:
+            return parse_proposal(
+                structured=candidate,
+                text=result.text if candidate is payload else None,
+                proposal_id=proposal_id,
+                project_path=str(root),
+                project_id=context.project_id,
+                base_commit=base_commit,
+                goal=goal,
+                grounding=grounding,
+                provider=setting.provider,
+                model=source.model or setting.model,
+                invocation_id=source.invocation_id,
+            )
+
+        correction: GroundingCorrection | None = None
+        correction_prompt = ""
+        correction_text = ""
+        try:
+            proposal = _parse(payload, invocation)
+            validate_proposal(proposal)
+        except ProposalValidationError as first:
+            # The trigger is a fact about the payload, not the wording of the
+            # error: ``grounding_violations`` re-derives which citations were
+            # unsupplied. Anything else -- a malformed shape, a non-sequential
+            # id, an experiment that discriminates nothing -- has no correction
+            # path and is re-raised exactly as before.
+            violations = (
+                grounding_violations(payload, grounding)
+                if isinstance(payload, dict)
+                else ()
+            )
+            if not violations:
+                raise
+            proposal, correction, correction_prompt, correction_text = (
+                self._correct_grounding(
+                    first=first,
+                    violations=violations,
+                    payload=payload,
+                    goal=goal,
+                    grounding=grounding,
+                    setting=setting,
+                    parse=_parse,
+                    invocations=invocations,
+                    max_model_calls=max_model_calls,
+                )
+            )
 
         store = ProposalStore.create(proposal)
         store.append_event(
@@ -209,6 +334,31 @@ class ProposalController:
         store.write_text(
             f"model_outputs/{invocation.invocation_id}.txt", result.text or ""
         )
+        if correction is not None:
+            # The refused payload, written as itself rather than left to
+            # ``result.text``. A provider answering through a structured-output
+            # schema returns no text at all, so relying on the text file would
+            # have preserved the correction and lost the thing it corrected --
+            # which is the one artefact a reader needs to judge whether the
+            # correction was honest.
+            store.write_text(
+                f"model_outputs/{invocation.invocation_id}.refused.json",
+                json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False),
+            )
+            store.append_event(
+                "proposal_grounding_refused",
+                invocation_id=invocation.invocation_id,
+                unsupplied=list(correction.refused),
+                refused_output=f"model_outputs/{invocation.invocation_id}.refused.json",
+            )
+            corrected_id = invocations[-1].invocation_id
+            store.write_text(f"prompts/{corrected_id}.txt", correction_prompt)
+            store.write_text(f"model_outputs/{corrected_id}.txt", correction_text)
+            store.append_event(
+                "proposal_grounding_corrected",
+                invocation_id=corrected_id,
+                attempts=MAX_GROUNDING_CORRECTIONS,
+            )
         store.append_event(
             "proposal_validated",
             items=len(proposal.items),
@@ -227,6 +377,7 @@ class ProposalController:
                 context_text=render_science_context(context),
                 resolved=resolved,
                 invocations=invocations,
+                max_model_calls=max_model_calls,
             )
         return ProposalOutcome(
             store=store,
@@ -234,7 +385,101 @@ class ProposalController:
             assessment=assessment,
             literature_keys=literature_keys,
             invocations=invocations,
+            grounding_correction=correction,
         )
+
+    def _correct_grounding(
+        self,
+        *,
+        first: ProposalValidationError,
+        violations: tuple[GroundingViolation, ...],
+        payload: dict,
+        goal: str,
+        grounding: ProposalGrounding,
+        setting: RoleSetting,
+        parse: Callable[[dict | None, ModelInvocation], ResearchProposal],
+        invocations: list[ModelInvocation],
+        max_model_calls: int,
+    ) -> tuple[ResearchProposal, GroundingCorrection, str, str]:
+        """Spend one model call to make a refused proposal cite only what it has.
+
+        The bound is the design. One attempt, the same evidence packet, the same
+        goal, no new authority of any kind -- the correction worker is given a
+        strictly smaller task than the one that already failed, and if it fails
+        too the run ends. What it may *not* do is as important as what it may:
+        it cannot widen the evidence universe, because ``grounding`` is the same
+        object the first attempt was held to and is re-applied to its output by
+        the same validator.
+        """
+
+        refused = tuple(item.render() for item in violations)
+        unsupplied = sorted({item.cited for item in violations})
+
+        # Budget first, and before the prompt is even built. A correction is an
+        # ordinary model call and is charged like one; a controller that spent a
+        # call it had not checked for would be deciding its own budget.
+        if len(invocations) >= max_model_calls:
+            raise ProposalGroundingError(
+                f"{first}. One grounding correction was available but this run "
+                f"has spent its {max_model_calls} model call(s), so the refused "
+                "proposal stands. Unsupplied identifier(s): " + ", ".join(unsupplied)
+            ) from first
+
+        prompt = build_grounding_correction_prompt(
+            goal=goal,
+            payload=payload,
+            violations=violations,
+            grounding=grounding,
+        )
+        invocation_id = f"INV-{len(invocations) + 1:04d}"
+        invocation, result = self._invoke(
+            role=Role.PLANNER,
+            setting=setting,
+            prompt=prompt,
+            timeout_seconds=PROPOSAL_TIMEOUT_SECONDS,
+            json_schema=PROPOSAL_SCHEMA,
+            invocation_id=invocation_id,
+        )
+        invocations.append(invocation)
+        if not result.ok:
+            raise ProposalGroundingError(
+                f"{first}. The one grounding correction failed to run: "
+                f"{invocation.error or 'unknown error'}"
+            ) from first
+
+        corrected_payload = result.structured
+        if corrected_payload is None:
+            corrected_payload = extract_json_object(result.text)
+        again = (
+            grounding_violations(corrected_payload, grounding)
+            if isinstance(corrected_payload, dict)
+            else ()
+        )
+        if again:
+            # The exact failure this bound exists for: a worker told an
+            # identifier does not exist invented another one. There is no second
+            # attempt, because a gate that retries until it passes is not a gate.
+            raise ProposalGroundingError(
+                f"{first}. The one available grounding correction was used and "
+                "still cited identifiers this run did not have: "
+                + ", ".join(sorted({item.cited for item in again}))
+                + ". No further correction is attempted."
+            ) from first
+        try:
+            proposal = parse(corrected_payload, invocation)
+            validate_proposal(proposal)
+        except ProposalValidationError as second:
+            raise ProposalGroundingError(
+                f"{first}. The one available grounding correction was used and "
+                f"its output is still not a valid proposal: {second}"
+            ) from second
+
+        correction = GroundingCorrection(
+            refused=refused,
+            attempted=True,
+            corrected=True,
+        )
+        return proposal, correction, prompt, result.text or ""
 
     # -- phases ----------------------------------------------------------
 
@@ -245,6 +490,7 @@ class ProposalController:
         resolved: ResolvedRoles,
         retrieve: bool,
         invocations: list[ModelInvocation],
+        max_model_calls: int,
     ) -> tuple[str | None, tuple[str, ...], list[tuple[str, str]]]:
         """Retrieve, rank, and read literature for the goal. Read-only throughout.
 
@@ -264,6 +510,7 @@ class ProposalController:
         packet = build_packet(goal, results, max_works=LITERATURE_PACKET_WORKS)
 
         setting = self._setting(resolved, "literature", Role.LITERATURE)
+        self._assert_affordable(invocations, max_model_calls, "the literature analyst")
         prompt = build_literature_prompt(goal=goal, packet=packet)
         invocation_id = f"INV-{len(invocations) + 1:04d}"
         invocation, result = self._invoke(
@@ -306,8 +553,10 @@ class ProposalController:
         context_text: str,
         resolved: ResolvedRoles,
         invocations: list[ModelInvocation],
+        max_model_calls: int,
     ) -> ProposalAssessment:
         setting = self._setting(resolved, "reviewer", Role.REVIEWER)
+        self._assert_affordable(invocations, max_model_calls, "the assessor")
         prompt = build_assessment_prompt(proposal, context_text=context_text)
         invocation_id = f"INV-{len(invocations) + 1:04d}"
         invocation, result = self._invoke(
@@ -346,6 +595,27 @@ class ProposalController:
         return assessment
 
     # -- primitives ------------------------------------------------------
+
+    @staticmethod
+    def _assert_affordable(
+        invocations: list[ModelInvocation], ceiling: int, what: str
+    ) -> None:
+        """Refuse a model call this run cannot pay for, before it is made.
+
+        Checked at every spend, not only at the bounded grounding correction --
+        which is where it was first needed and where, for one release, it was
+        the only place it existed. A ceiling enforced at one of four call sites
+        is not a ceiling; it is a parameter whose name promises something the
+        code does not do, and the next caller to trust it is the one who finds
+        out. Found by an independent reviewer and reproduced: a run asked for a
+        ceiling of one made two calls.
+        """
+
+        if len(invocations) >= ceiling:
+            raise ProposalBudgetError(
+                f"this proposal run may spend {ceiling} model call(s) and has "
+                f"already spent {len(invocations)}; {what} would exceed it"
+            )
 
     def _invoke(
         self,

@@ -1,0 +1,104 @@
+# Hermetic CI: no provider credentials, no model calls, no network access to
+# anything but the package index.
+#
+# Everything here must be runnable by a contributor with a clone and uv. If a
+# job ever needs a secret, the change that made it need one is the bug.
+#
+# uv is installed with its own official installer rather than through a
+# third-party setup action, so the only Action this workflow depends on is
+# GitHub's own checkout. One less unpinned third party in the release path.
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+    tags-ignore: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Nothing here may reach a model provider. Set empty explicitly so a test that
+  # tried would fail loudly rather than inherit a runner's ambient configuration.
+  RESEARCH_OS_OPENALEX_API_KEY: ""
+
+jobs:
+  gates:
+    name: ${{ matrix.gate }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - gate: lint
+          - gate: smoke
+          - gate: tests
+          - gate: guarantees
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: install the project
+        run: uv sync --all-groups --frozen
+
+      - name: git identity
+        # Several tests create real commits in real temporary repositories.
+        run: |
+          git config --global user.email "ci@example.invalid"
+          git config --global user.name "ci"
+          git config --global init.defaultBranch main
+
+      - name: ruff check
+        if: matrix.gate == 'lint'
+        run: uv run ruff check .
+
+      - name: ruff format --check
+        if: matrix.gate == 'lint'
+        run: uv run ruff format --check .
+
+      - name: the package imports and the console script runs
+        if: matrix.gate == 'smoke'
+        run: |
+          uv run python -c "import research_os; print(research_os.__version__)"
+          uv run researchctl --help
+          uv run researchctl version
+
+      - name: doctor runs without a provider
+        if: matrix.gate == 'smoke'
+        # It reports what is missing; it must not fail because something is.
+        run: uv run researchctl doctor
+
+      - name: the declared version matches the importable one
+        if: matrix.gate == 'smoke'
+        run: uv run pytest -q tests/test_packaging.py
+
+      - name: the hermetic suite
+        if: matrix.gate == 'tests'
+        run: uv run pytest -q
+
+      - name: the boundaries that must not move
+        if: matrix.gate == 'guarantees'
+        # Run on their own as well as inside the full suite, so a failure here
+        # names the property that broke instead of being one line in 2351.
+        run: |
+          uv run pytest -q \
+            tests/test_security_regressions.py \
+            tests/test_auto_promptdata.py \
+            tests/test_auto_command_policy.py \
+            tests/test_validate.py \
+            tests/test_review.py \
+            tests/test_runlock.py \
+            tests/test_crash_recovery.py \
+            tests/test_proposal_grounding_correction.py \
+            tests/test_lit_transport.py

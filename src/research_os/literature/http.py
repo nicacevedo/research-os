@@ -32,6 +32,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from typing import IO
 
 from research_os import __version__
@@ -54,6 +56,22 @@ MAX_RETRY_AFTER_SECONDS = 60
 
 #: Statuses worth trying again. Everything else is the provider's answer.
 RETRYABLE_STATUSES: frozenset[int] = frozenset({429, 500, 502, 503, 504})
+
+
+class _TransportFailure(Exception):
+    """The request did not complete: a timeout, a reset, a DNS failure.
+
+    Internal, and separate from :class:`SourceUnavailableError` on purpose. Both
+    end up unavailable if they persist, but only this one is worth trying again:
+    a URL that is not HTTPS will not become HTTPS on the second attempt, and
+    offline mode will not become online. Retrying those would turn a settled
+    refusal into a delay.
+    """
+
+    def __init__(self, detail: str, *, host: str) -> None:
+        super().__init__(detail)
+        self.detail = detail
+        self.host = host
 
 
 def user_agent(contact_email: str | None) -> str:
@@ -143,7 +161,25 @@ class HttpClient:
             if credential_host and parsed.hostname != credential_host:
                 request_headers.pop("Authorization", None)
             self._wait_for(parsed.hostname or "")
-            response = self._perform(current, request_headers)
+            try:
+                response = self._perform(current, request_headers)
+            except _TransportFailure as failure:
+                # A request that never completed is retried on the same terms as
+                # one that came back 503, and for the same reason: both are the
+                # network being briefly unwell rather than the provider giving an
+                # answer. The first live run lost its whole arXiv leg to a single
+                # timeout that no retry ever followed -- and the cost of that is
+                # not just a slower review, it is a literature record that says
+                # arXiv was unavailable when one more attempt would have reached
+                # it.
+                if attempt >= MAX_RETRIES:
+                    raise SourceUnavailableError(
+                        f"cannot reach {failure.host}: {failure.detail} "
+                        f"(after {attempt + 1} attempt(s))"
+                    ) from failure
+                attempt += 1
+                self._sleep(min(float(2**attempt), MAX_RETRY_AFTER_SECONDS))
+                continue
             if response.status in RETRYABLE_STATUSES and attempt < MAX_RETRIES:
                 attempt += 1
                 self._sleep(self._retry_delay(response, attempt))
@@ -181,9 +217,28 @@ class HttpClient:
             time.sleep(seconds)
 
     def _retry_delay(self, response: HttpResponse, attempt: int) -> float:
-        raw = response.header("retry-after")
-        if raw and raw.strip().isdigit():
-            return min(float(raw.strip()), MAX_RETRY_AFTER_SECONDS)
+        """How long to wait before retrying, honouring ``Retry-After``.
+
+        RFC 9110 allows that header in two forms, and a provider is free to send
+        either. Reading only the seconds form meant a date-form ``Retry-After``
+        silently became a two-second backoff -- which is how a client that
+        believes it is being polite gets itself blocked.
+        """
+
+        raw = (response.header("retry-after") or "").strip()
+        # ``isascii`` as well as ``isdigit``: the latter is True for characters
+        # ``float`` refuses, such as the superscript two, so a provider sending
+        # ``Retry-After: ²`` turned a header parse into an unhandled
+        # ValueError escaping a request that had already succeeded in reaching
+        # the provider. Found by an independent reviewer.
+        if raw.isascii() and raw.isdigit():
+            return min(float(raw), MAX_RETRY_AFTER_SECONDS)
+        if raw:
+            moment = parsedate_to_datetime_or_none(raw)
+            if moment is not None:
+                seconds = (moment - datetime.now(UTC)).total_seconds()
+                # A date already in the past means "you may retry now".
+                return min(max(seconds, 0.0), MAX_RETRY_AFTER_SECONDS)
         return min(float(2**attempt), MAX_RETRY_AFTER_SECONDS)
 
     def _perform(self, url: str, headers: dict[str, str]) -> HttpResponse:
@@ -221,11 +276,14 @@ class HttpClient:
                 body=body,
             )
         except urllib.error.URLError as exc:
-            raise SourceUnavailableError(
-                f"cannot reach {urllib.parse.urlparse(url).hostname}: {exc.reason}"
+            raise _TransportFailure(
+                str(exc.reason), host=urllib.parse.urlparse(url).hostname or url
             ) from exc
         except (TimeoutError, OSError) as exc:
-            raise SourceUnavailableError(f"request to {url} failed: {exc}") from exc
+            raise _TransportFailure(
+                str(exc) or exc.__class__.__name__,
+                host=urllib.parse.urlparse(url).hostname or url,
+            ) from exc
 
 
 def read_bounded(stream: IO[bytes], max_bytes: int) -> tuple[bytes, bool]:
@@ -260,3 +318,18 @@ def encode_query(parameters: dict[str, str | int | None]) -> str:
         if value is not None
     }
     return urllib.parse.urlencode(usable, quote_via=urllib.parse.quote)
+
+
+def parsedate_to_datetime_or_none(value: str) -> datetime | None:
+    """Parse an HTTP-date, returning ``None`` rather than raising on nonsense.
+
+    A ``Retry-After`` header is provider-controlled text. A malformed one is a
+    provider bug, not a reason to abandon a request that already succeeded in
+    reaching the provider.
+    """
+
+    try:
+        moment = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)

@@ -44,16 +44,29 @@ def experiments_root() -> Path:
 
 
 def make_experiment_run_id(
-    *, project_path: str, task_name: str, created_at: str
+    *, project_path: str, task_name: str, created_at: str, attempt: str = ""
 ) -> str:
     """Return the run id determined by these inputs.
 
     Deterministic like every other id here: the same project, task, and second
     produce the same id, so a duplicate is a visible collision rather than two
     directories holding one execution.
+
+    ``attempt`` distinguishes executions that are deliberately *not* the same
+    work despite sharing all of that. Automation run ids gained the same
+    discriminator for the same reason, and experiments needed it once their
+    record started being written before the worktree: a run that fails during
+    preparation now leaves a directory, so retrying it in the same second asked
+    for an id that already existed and was refused. Retrying promptly after a
+    failure is the ordinary thing to do, so it must not be the one thing that
+    cannot work.
     """
 
-    material = f"experiment-run-v1\n{project_path}\n{task_name}\n{created_at}"
+    material = (
+        f"experiment-run-v1\n{project_path}\n{task_name}\n{created_at}\n{attempt}"
+        if attempt
+        else f"experiment-run-v1\n{project_path}\n{task_name}\n{created_at}"
+    )
     digest = hashlib.sha256(material.encode("utf-8")).hexdigest()[:8]
     stamp = created_at.replace("-", "").replace(":", "")
     return f"XRUN-{stamp}-{digest}"

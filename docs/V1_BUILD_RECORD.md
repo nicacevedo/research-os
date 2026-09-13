@@ -732,3 +732,300 @@ fail -- distinguishes a detector from a decoration.
   a future threaded caller sees it beforehand.
 - **Review independence is degraded.** Only one provider family is installed.
   Every run says so before it starts.
+
+---
+
+# Part III — Operational hardening for v1.0.0
+
+The repository became public between Part II and this. That changed what the
+work was: v1 was already built and tagged, so what remained was to screen what
+had been published, close the two crash windows Part II deferred with stated
+residual risk, and find out by *running* the system whether it is useful rather
+than only safe.
+
+The last of those produced most of this section. Three defects below were found
+by pilots and none by review.
+
+## 15. The public-history audit
+
+No scanner was installed — no `gitleaks`, no `trufflehog`, no
+`detect-secrets` — so the scan was written: every unique blob reachable from
+every ref, decompressed and matched against credential patterns for the
+providers this project could plausibly touch, plus a Shannon-entropy sweep for
+credential-shaped strings nobody thought to pattern-match.
+
+484 blobs, 484 scanned, **zero credible secrets**. The entropy sweep's 97
+candidates were all long Python identifiers (`allowed_check_programs`,
+`min_interval_seconds`). The single `password`-shaped hit was
+`api_key="secret-token"` in `tests/test_lit_http.py`, a fixture.
+
+The privacy sweep found three things worth naming and none worth rewriting
+history for:
+
+- `ni.acevedo.villena@gmail.com` in `pyproject.toml`. Deliberate package author
+  metadata, and normal for a published package. Recorded so the choice is a
+  choice.
+- `.cursor/plans/r0_kernel_plan_cd53bab0.plan.md`, deleted before publication
+  and still reachable in three blobs. It contains `/home/nicacevedo/...` and the
+  repository's own public remote URL. Neither is a disclosure; the path is now
+  gitignored. Rewriting public history for a cosmetic path would cost every
+  existing clone and buy nothing.
+- No IP addresses, no institutional endpoints, no manuscripts, no datasets, no
+  provider transcripts.
+
+Largest blob in the entire history: 88 KB. Whole `.git`: 6 MB. Nothing binary,
+nothing licensed, nothing generated was ever committed.
+
+**The repository has no licence**, and none was invented. A public repository
+without one grants no rights to anyone, which is a decision the author has to
+make and an automated change must not. The README now says so plainly, and
+`tests/test_packaging.py` asserts only that the metadata and the tree cannot
+*disagree* about the answer.
+
+One finding was not a secret and mattered anyway: the repository's **default
+branch, `main`, was still the initial bootstrap commit** — twelve files and an
+empty `README.md`. Every visitor to the public page had been reading that. It is
+an ancestor of the release, so fast-forwarding it discards nothing.
+
+## 16. The two crash windows
+
+Both were reported at the end of Part II as deferred with stated residual risk.
+Both have the same invariant: *before an irreversible side effect can become
+orphanable, the thing that owns it must already exist on disk.*
+
+**Outer/inner run dispatch.** A research run learned its inner automation run's
+id from `start()`'s return value. A crash inside `start` — after the run
+directory existed — left a directory whose id lived only in the dead process,
+and the id is a digest over a timestamp nobody recorded, so it could not even be
+recomputed. The parent now reserves the identity, writes it to its own ledger,
+and passes it in. `reserved_dispatches` reports every reservation that never
+finished and says whether the directory is actually present, so a reader never
+infers a crash point.
+
+That also closed a budget leak nobody was looking for: delegated spend was
+reconciled only from runs that reported *starting*, so a run killed inside
+`start` spent model calls nothing counted.
+
+**Experiment worktree and store registration.** `create_worktree` registers a
+worktree in the researcher's own repository and locks it, and that happened
+before `ExperimentStore.create`. The record is now written first, in a new
+`PREPARING` state, with the worktree path derived rather than observed.
+
+Writing the path down before creating it exposed two defects that were invisible
+while it was only ever read back:
+
+- `_worktree_run_id` documented itself as returning "a stable id" and read the
+  clock for the timestamp half. Two calls a second apart disagreed. A defensive
+  equality check in `run()` caught it on the first test run.
+- An experiment retried inside the same second collided on its run id, because
+  experiment ids had no attempt discriminator — the one automation ids gained,
+  in Part I, for exactly this reason. Before the reordering the first attempt
+  never wrote a record, so the collision was unreachable; writing the record
+  first made retrying-after-failure the one thing that could not work.
+
+**The lock.** Worktree locks and run locks share a directory and have opposite
+lifecycles. Part I spent three wrong fixes learning that unlinking a held
+`flock`'s *name* lets the next arrival lock a different inode at the same path.
+Every lock removal added here therefore derives its target from the worktree
+path and re-checks the derived filename, so no recovery path can reach a run
+lock even if handed one. Proven live: a `storage --reclaim` released three
+worktrees while all 36 run-lock inodes stayed byte-identical.
+
+`experiment cleanup` also used to return early when the worktree was absent,
+leaving the lock a crash between locking and creating had left — which made that
+path permanently unusable by a run whose owner had died.
+
+`tests/test_crash_recovery.py` injects a failure at each boundary rather than
+manufacturing the final state, because the question is not whether an orphan can
+be cleaned up once found. One of those tests found a bug in *itself* first:
+`monkeypatch.undo()` reverts the fixture's environment relocation too, so the
+assertion after it was reading the researcher's real state directory.
+
+## 17. The bounded grounding correction
+
+The Part II pilot produced a proposal citing `L-002`, a literature key that did
+not exist, and the grounding validator refused it. That refusal is correct and
+is preserved. What was missing was the ability to fix one wrong reference
+without a human restarting the run.
+
+One attempt. Same evidence packet, same goal, no new authority. A second
+invented identifier fails closed.
+
+The design decision worth recording is the **trigger**. It is computed from the
+payload — `grounding_violations` re-derives which citations were unsupplied —
+never from the exception's message. A classifier built on error text is one
+rewording away from treating some *other* refusal as correctable, and the whole
+value of the bound is that it applies to exactly one failure mode.
+
+Provenance needed one correction of its own: the refused payload is written out
+as itself, because a provider answering through a structured-output schema
+returns no text at all, so relying on the text file would have preserved the
+correction and lost the thing it corrected.
+
+**It fired in production during Pilot B**, on a proposal citing `PR-002` and
+`PR-003` as capsule objects. One correction was spent; the corrected output was
+still invalid, for a different reason; the run failed closed with no second
+attempt. Exactly case B of the regression suite, unrehearsed.
+
+## 18. Literature transport
+
+The Part II pilot reached Crossref, timed out on arXiv, and got a 429 from
+OpenAlex. Two of those are the network being the network. The third cost the
+entire arXiv leg, because a request that never *completed* was reported
+unavailable without a single retry — while a 503 was retried. There is no
+principle behind that distinction.
+
+A transport failure now retries on the same bounded terms. A settled refusal —
+not HTTPS, offline mode — still is not retried, and that distinction is now in
+the type system rather than in a comment.
+
+`Retry-After` is also honoured in its HTTP-date form. Reading only the seconds
+form meant a date-form header fell through to a two-second backoff: a client
+that believed it was being polite retrying far sooner than it had been asked to.
+
+No HTTP response cache was added. The literature store already is the cache, and
+a second layer in front of it would be a new place for the two to disagree.
+
+## 19. What the pilots found
+
+Three defects, none of which review had found.
+
+**Pilot B, first attempt.** A read-only run against a real project died on its
+first planner call with `error_max_structured_output_retries` — the provider's
+own structured-output machinery giving up — and was abandoned with thirteen of
+fourteen model calls unspent. The bounded re-ask that already existed covered a
+plan that *arrived and was refused*, not one that never arrived. The same single
+re-ask now covers both, with the same prompt, because nothing was rejected and
+so there is nothing to correct.
+
+**Pilot C, first attempt.** The plan named a declared experiment command and
+omitted its required `seed`. The validator checked that the command *name* was
+declared and stopped there — its own docstring already made the argument for
+finishing the check. The run spent three model calls and stopped a human before
+failing on something knowable the instant the plan was parsed. Refused at
+planning time now, where the bounded correction can repair it.
+
+**Pilot C, second and third attempts — not a system defect.** The synthetic
+repository was `src`-layout, and the planner chose a bare `pytest` rather than
+`uv run pytest`. A bare acceptance command runs in the inherited environment by
+design, so the project's own package was not importable and its tests could not
+collect. The controller behaved correctly throughout: checks failed, one bounded
+repair ran, the repair fixed the import and introduced a lint error, and the run
+failed closed rather than handing over code that fails the project's own gates.
+
+That is worth recording as an operational note rather than a fix: **for a
+`src`-layout Python project, an acceptance command must be `uv run pytest`, not
+`pytest`.** The fixture was rebuilt flat-layout rather than the prompt tuned,
+because tuning a prompt until a stochastic model passes is not evidence.
+
+## 20. Mutation proofs
+
+Twelve protections were disabled one at a time and the suite re-run. All twelve
+were detected; none was missed.
+
+Removing the child-run reservation, writing the experiment record after the
+worktree, letting an invented identifier through validation, allowing a second
+grounding correction, skipping the correction's budget check, letting lock
+release take a caller-supplied path, making reclaim blind to a lock with no
+worktree, making the derived worktree id read the clock again, stopping
+transport retries, ignoring a date-form `Retry-After`, turning an unreachable
+source into an empty `OK` result, and letting the two declared versions drift.
+
+Three more were run against the pilot-driven fixes: removing the provider retry,
+unbounding it, and skipping its budget check. All three detected.
+
+## 21. Residual risks after v1.0.0
+
+- **No licence.** Human decision. Nothing is granted until it is made.
+- **A `src`-layout project needs `uv run pytest`.** A plan naming a bare
+  `pytest` will fail to import the project under test. The failure is loud and
+  fails closed; it is a planning trap, not a hole.
+- **The planner inserts human checkpoints readily.** Two of four pilots stopped
+  at one. That is the designed behaviour and it is correct — one of them was a
+  genuine scientific decision — but a run intended to complete unattended has to
+  say so in its goal.
+- **Review independence is still degraded.** Only `claude` is installed. Every
+  run says `DEGRADED_SAME_PROVIDER_FAMILY` before it starts.
+- **Worktree isolation is not an OS sandbox**, and project checks execute
+  project code with the user's permissions. Unchanged, and now stated on the
+  first screen of the README rather than only in `SECURITY.md`.
+- **`_HELD` is process-global, not thread-safe.** Unreachable today.
+
+## 22. The independent delta review, and what it found
+
+One read-only review of `research-os-v1..HEAD`, no write authority, fresh
+context, strongest local model. Verdict: **PASS WITH BOUNDED REPAIR**, three
+concrete defects.
+
+The first run of that review had to be abandoned: given permission to run the
+suite, it spent its budget re-running fourteen minutes of tests instead of
+reading the diff. Re-scoped to six files with an explicit ban on the full suite,
+it returned in under six minutes. Its last words before being stopped were
+"now let me test the budget-cap boundary I suspect is unenforced" — which was
+correct, and is the fourth item below.
+
+**F1 — a live experiment preparation could be reclaimed out from under itself.**
+The fix for one race opened another. `PREPARING` is deliberately not in
+`ACTIVE_STATES`, which is what lets recovery see a crashed preparation; it also
+made a preparation *in progress* look idle, so a concurrent
+`storage --reclaim` could delete the worktree a running process was in the
+middle of creating, and release its lock.
+
+Refusing to reclaim `PREPARING` unconditionally would have put the orphan the
+state exists to expose straight back out of reach, so the answer had to
+distinguish a live preparation from a dead one. The kernel already answers
+exactly that question: a `flock` is released when its holder dies. The
+preparation now holds this run's lock across the whole window, and both
+`diagnostics` and `experiment cleanup` ask `runlock.is_held` before touching it
+— asked twice, because a preparation can begin between reclaim selecting a run
+and reclaim deleting it. No staleness heuristic, no timeout, no note to misread.
+
+The first regression written for this did not discriminate: it inspected
+reclaim's view *before* `create_worktree` ran, so there was nothing on disk to
+offer and the assertion passed however the idle rule was written. Mutating the
+rule proved it. The test now looks after the worktree exists and while the
+record still says `PREPARING`, and catches all three mutations — including the
+over-correction that never reclaims.
+
+**F2 — a failed proposal task charged the run nothing.** The charge sat after
+the call that raised. A planner that reliably cites a nonexistent key could
+spend the literature call, the proposal call and the bounded correction, fail,
+be retried, and spend three more against a ledger that had not moved — a
+model-controlled path to unbounded real spend under a budget that only counted
+successes. Proposal errors now carry what they cost and the research controller
+charges it before re-raising. The automation dispatch path already reconciled
+its uncharged inner spend; this one was the gap beside it.
+
+**F3 — a `Retry-After` header could crash the request that received it.**
+`str.isdigit()` is True for characters `float` refuses: `Retry-After: ²` passed
+the check and raised `ValueError` out of a request that had already reached the
+provider, as a type no caller catches. The date-form branch added in this
+release was written total; the seconds-form branch beside it was not.
+
+**F4 — informational, accepted as-is.** A payload with both a grounding
+violation and an unrelated structural defect still enters the correction, whose
+prompt lists only the grounding errors. Cost is exactly one budget-checked,
+non-recursive call, and the second failure is reported honestly.
+
+**The budget ceiling, found by the abandoned first reviewer and reproduced.**
+`max_model_calls` was checked in one place — the bounded correction, where it
+was first needed — and nowhere else. A run asked for a ceiling of one made two.
+A ceiling enforced at one of four call sites is not a ceiling; it is a parameter
+whose name promises something the code does not do. It is now checked before
+every spend, and `MINIMUM_CALLS[PROPOSAL]` rose from 2 to 3 to match what a
+proposal with literature actually costs, so the entry gate and the ceiling agree.
+
+**What the review could not break**, recorded because it is the more useful
+half: no argument to `release_worktree_lock` can name a run lock (sha256 hex
+cannot contain `r`, `u`, `n` or `-`), and the real fix was removing the old
+`unlink(record.lock_path)` — a field persisted outside the repository that could
+previously have directed an arbitrary unlink. Exactly one grounding correction,
+with `ProposalGroundingError` subclassing `ProposalValidationError` checked
+specifically for whether it could re-arm the handler; it cannot. Planner
+invocations bounded at two by exhaustion of all four orderings. The refused
+proposal cannot forge a fence: `json.dumps` escapes newlines before
+`prompt_safe_block` scrubs delimiters before `render_data_block` refuses an
+ambiguous fence outright. Reserved run ids re-validated against `RUN_ID_RE`
+before any path is built. Transport retries and 5xx retries share one counter,
+so they cannot be alternated to exceed the bound. Settled refusals raise outside
+the retry `try` and are never retried.

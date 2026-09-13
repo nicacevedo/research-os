@@ -56,6 +56,7 @@ from research_os.automation.providers import (
     ProviderAdapter,
     probe_registry,
 )
+from research_os.automation.store import make_run_id
 from research_os.errors import (
     AutomationError,
     BudgetExceededError,
@@ -64,6 +65,7 @@ from research_os.errors import (
     LiteratureError,
     PaperError,
     ProposalError,
+    ProposalGroundingError,
     ProviderInvocationError,
     ProviderUnavailableError,
     ResearchError,
@@ -126,7 +128,12 @@ MAX_DELEGATED_MODEL_CALLS = 100
 MINIMUM_CALLS: dict[TaskKind, int] = {
     TaskKind.LITERATURE: 0,
     TaskKind.ANALYSIS: 1,
-    TaskKind.PROPOSAL: 2,
+    # Literature, the proposal itself, and the assessment. It was 2, which was
+    # the no-literature cost, so a proposal task could be admitted with less
+    # budget than it would actually spend -- harmless while the proposal
+    # controller silently overspent, wrong the moment that controller started
+    # refusing calls it could not pay for.
+    TaskKind.PROPOSAL: 3,
     TaskKind.CODE: 2,
     TaskKind.EXPERIMENT: 0,
     TaskKind.PAPER: 2,
@@ -146,6 +153,25 @@ WORKER_ERRORS = (
     ProposalError,
     ResearchError,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class ReservedDispatch:
+    """One inner automation run a research run named but never accounted for.
+
+    Written by ``ResearchController.reserved_dispatches``. ``present`` says
+    whether the reserved directory is on disk: False means the crash landed
+    before the inner run could exist and there is nothing to recover, True means
+    it exists and this research run is its owner of record.
+    """
+
+    run_id: str
+    task_id: str
+    automation_run_id: str
+    reserved_at: str
+    present: bool
+    state: str
+
 
 #: What every task handler looks like from the dispatcher's side.
 Handler = Callable[["ResearchStore", "ResearchRun", str], "ResearchRun"]
@@ -243,6 +269,10 @@ class ResearchController:
             setting=resolved.roles["planner"],
             prompt=prompt,
             declared=frozenset(declared),
+            required={
+                name: frozenset(item.name for item in spec.parameters if item.required)
+                for name, spec in declared.items()
+            },
         )
         tasks = to_tasks(plan)
         self._assert_budget_could_finish(run, tasks)
@@ -267,6 +297,7 @@ class ResearchController:
         setting: RoleSetting,
         prompt: str,
         declared: frozenset[str],
+        required: dict[str, frozenset[str]] | None = None,
     ) -> tuple[ResearchRun, ResearchPlan]:
         """Get one validated plan, allowing at most one bounded re-ask.
 
@@ -279,6 +310,20 @@ class ResearchController:
 
         One re-ask, charged against the same allowance everything else uses. A
         second failure ends the run.
+
+        The same single re-ask now also covers a provider that failed to answer
+        at all, which a live pilot showed was not covered. A run against a real
+        project died on its first planner call with
+        ``error_max_structured_output_retries`` -- the provider's own structured
+        output machinery giving up -- and the run was abandoned with thirteen of
+        its fourteen model calls unspent. A transport or schema failure is not a
+        statement about the plan; nothing was rejected, because nothing arrived.
+        Re-asking is therefore the *same* question, not a correction: there is
+        nothing to correct.
+
+        Still one extra attempt in total, because the loop is two iterations
+        wide however it is spent. A provider that fails twice is a provider that
+        is not working, and the honest answer to that is a failed run.
         """
 
         attempt = prompt
@@ -293,16 +338,31 @@ class ResearchController:
                 json_schema=PLAN_SCHEMA,
             )
             if not result.ok:
-                raise ProviderInvocationError(
-                    f"the research planner failed: "
-                    f"{invocation.error or 'unknown error'}"
+                detail = invocation.error or "unknown error"
+                store.append_event(
+                    "plan_provider_failed",
+                    invocation_id=invocation.invocation_id,
+                    detail=detail,
+                    retried=not correction,
                 )
+                if correction or run.remaining_model_calls < 1:
+                    raise ProviderInvocationError(
+                        f"the research planner failed: {detail}"
+                    )
+                # Deliberately the same prompt. The question was never answered,
+                # so asking a different one would be answering a question the
+                # researcher did not pose.
+                store.append_event("plan_retry_started", reason=detail)
+                continue
             try:
                 plan = parse_research_plan(
                     structured=result.structured, text=result.text
                 )
                 validate_research_plan(
-                    plan, budget=run.budget, declared_experiments=declared
+                    plan,
+                    budget=run.budget,
+                    declared_experiments=declared,
+                    required_parameters=required,
                 )
             except ResearchPlanError as exc:
                 store.append_event(
@@ -597,9 +657,30 @@ class ResearchController:
         # that counting the "started" events written on success means a dispatch
         # that fails inside ``start`` -- after the run directory exists -- burns
         # no number, so a prompt retry asks for the same id and collides again.
+        #
+        # The same event now also carries the id the inner run *will* have, and
+        # that is what makes the dispatch crash-consistent. Creating an inner run
+        # directory is irreversible; learning its id from ``start``'s return value
+        # means a crash anywhere inside ``start`` leaves a directory this run
+        # cannot name, cannot resume past, and cannot clean up -- an orphan
+        # nothing points at. Reserving the identity first inverts that: the
+        # ledger names the child before the child can exist, so every crash point
+        # from here on leaves either no directory or a directory this run can
+        # find. See ``reserved_dispatches``.
         attempt = self._delegated_attempts(store, task_id) + 1
+        dispatched_at = utc_now()
+        reserved_run_id = make_run_id(
+            project_path=run.project_path,
+            goal=task.goal,
+            created_at=dispatched_at,
+            attempt=f"{task_id}#{attempt}",
+        )
         store.append_event(
-            "automation_dispatch_attempted", task_id=task_id, attempt=attempt
+            "automation_dispatch_attempted",
+            task_id=task_id,
+            attempt=attempt,
+            automation_run_id=reserved_run_id,
+            reserved_at=dispatched_at,
         )
         inner_store, inner = controller.start(
             project_path=Path(run.project_path),
@@ -607,6 +688,7 @@ class ResearchController:
             budget=budget,
             plan=plan,
             attempt=f"{task_id}#{attempt}",
+            reserved_run_id=reserved_run_id,
         )
         store.append_event(
             "automation_run_started",
@@ -657,20 +739,62 @@ class ResearchController:
             literature_config=self.literature_config,
             literature_store=self.literature_store,
         )
-        outcome = controller.propose(
-            project_path=Path(run.project_path),
-            goal=task.goal,
-            with_literature=with_literature,
-            retrieve=False,
-        )
+        try:
+            outcome = controller.propose(
+                project_path=Path(run.project_path),
+                goal=task.goal,
+                with_literature=with_literature,
+                retrieve=False,
+                # This run's own remaining budget, so the proposal controller can
+                # tell whether it can afford the one bounded grounding
+                # correction. Deciding that here rather than there keeps the
+                # budget owned by the layer that has one.
+                max_model_calls=run.remaining_model_calls,
+            )
+        except (ProposalError, ProviderInvocationError) as failure:
+            # Charged before re-raising, because the calls were made. A failed
+            # proposal used to cost this run nothing on paper: the charge sat
+            # after the call that raised, so a planner that reliably cited a
+            # nonexistent key could spend the literature call, the proposal call
+            # and the bounded correction, fail, be retried, and spend three more
+            # against a ledger that had not moved. The automation dispatch path
+            # already reconciled its uncharged inner spend; this one did not.
+            run = self._charge(store, run, getattr(failure, "model_calls", 0))
+            if isinstance(failure, ProposalGroundingError):
+                # "The model cited something that does not exist and the one
+                # correction did not fix it" is the single most useful thing a
+                # researcher can be told about a failed proposal, and the
+                # proposal store has nothing in it to say so: a proposal that
+                # never validated was never created.
+                store.append_event(
+                    "proposal_grounding_failed",
+                    task_id=task_id,
+                    detail=str(failure),
+                )
+            store.append_event(
+                "proposal_failed",
+                task_id=task_id,
+                model_calls=getattr(failure, "model_calls", 0),
+                error=type(failure).__name__,
+            )
+            raise
         run = self._charge(store, run, outcome.model_calls)
         verdict = str(outcome.assessment.verdict) if outcome.assessment else None
+        correction = outcome.grounding_correction
+        if correction is not None:
+            store.append_event(
+                "proposal_grounding_corrected",
+                task_id=task_id,
+                proposal_id=outcome.proposal.proposal_id,
+                unsupplied=list(correction.refused),
+            )
         store.append_event(
             "proposal_produced",
             task_id=task_id,
             proposal_id=outcome.proposal.proposal_id,
             items=len(outcome.proposal.items),
             verdict=verdict,
+            grounding_corrections=1 if correction is not None else 0,
         )
         suffix = f"; assessment {verdict}" if verdict else ""
         return self._finish_task(
@@ -1015,7 +1139,82 @@ class ResearchController:
         )
 
     @staticmethod
-    def _delegated_total(store: ResearchStore, task_id: str) -> int:
+    def delegated_run_ids(
+        store: ResearchStore, task_id: str | None = None
+    ) -> tuple[str, ...]:
+        """Return every inner automation run id this run is known to have named.
+
+        Read from the reservation event as well as the started event, and that
+        difference is the point. A dispatch that died inside ``start`` wrote a
+        reservation and no start, so a reader that trusts only ``started`` is
+        blind to exactly the run that most needs finding. Order is ledger order
+        and ids are deduplicated, because the two events name the same run.
+        """
+
+        seen: dict[str, None] = {}
+        for record in store.iter_events():
+            if record.get("event") not in {
+                "automation_dispatch_attempted",
+                "automation_run_started",
+            }:
+                continue
+            if task_id is not None and record.get("task_id") != task_id:
+                continue
+            inner_id = str(record.get("automation_run_id", ""))
+            if inner_id:
+                seen[inner_id] = None
+        return tuple(seen)
+
+    @classmethod
+    def reserved_dispatches(cls, store: ResearchStore) -> tuple[ReservedDispatch, ...]:
+        """Return every inner run this run reserved but never reported finishing.
+
+        The deterministic answer to "what did this run start that nobody can
+        see". A reservation is written before the inner run directory can exist
+        and a finish is written after it is accounted for, so a reservation with
+        no finish is precisely the crash window: the inner run either was never
+        created, or exists and is this run's to account for and to clean up.
+
+        ``present`` distinguishes those two without guessing -- it is whether the
+        directory is actually on disk -- so a caller never has to infer a crash
+        point from a missing file.
+        """
+
+        from research_os.automation.store import RunStore, runs_root
+
+        finished = {
+            str(record.get("automation_run_id", ""))
+            for record in store.iter_events()
+            if record.get("event") == "automation_run_finished"
+        }
+        found: list[ReservedDispatch] = []
+        for record in store.iter_events():
+            if record.get("event") != "automation_dispatch_attempted":
+                continue
+            inner_id = str(record.get("automation_run_id", ""))
+            if not inner_id or inner_id in finished:
+                continue
+            directory = runs_root() / inner_id
+            state = ""
+            if directory.is_dir():
+                try:
+                    state = str(RunStore.open(inner_id).load().state)
+                except Exception:  # noqa: BLE001 - a state we cannot read is ""
+                    state = ""
+            found.append(
+                ReservedDispatch(
+                    run_id=store.run_id,
+                    task_id=str(record.get("task_id", "")),
+                    automation_run_id=inner_id,
+                    reserved_at=str(record.get("reserved_at", "")),
+                    present=directory.is_dir(),
+                    state=state,
+                )
+            )
+        return tuple(found)
+
+    @classmethod
+    def _delegated_total(cls, store: ResearchStore, task_id: str) -> int:
         """Return this task's cumulative delegated model-call spend.
 
         Summed over every automation run the task ever started, read from those
@@ -1023,18 +1222,17 @@ class ResearchController:
         definition, used by both the event that records a charge and the
         reconciliation that reads it back -- because when those two disagreed
         about what the number meant, the difference was charged twice.
+
+        Counted over reserved ids, not only started ones. A run killed inside
+        ``start`` can still have spent model calls, and charging only what
+        reported itself is the same mistake as a budget that counts successes.
         """
 
         from research_os.automation.store import RunStore
         from research_os.errors import AutomationError
 
         total = 0
-        for record in store.iter_events():
-            if record.get("event") != "automation_run_started":
-                continue
-            if record.get("task_id") != task_id:
-                continue
-            inner_id = str(record.get("automation_run_id", ""))
+        for inner_id in cls.delegated_run_ids(store, task_id):
             try:
                 total += RunStore.open(inner_id).load().model_calls_used
             except (AutomationError, OSError):

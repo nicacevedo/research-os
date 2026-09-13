@@ -50,6 +50,17 @@ class ExecutionState(StrEnum):
     would make a lost job look finished.
     """
 
+    PREPARING = "preparing"
+    """Recorded, but its isolated worktree does not exist yet.
+
+    The two-phase window that makes worktree creation crash-consistent. Creating
+    a Git worktree is an irreversible side effect in the *project* repository;
+    writing the record first means a process killed between the two leaves a
+    worktree whose owner is on disk and findable, instead of a directory and a
+    registration nothing in the store has ever heard of. A run seen in this state
+    is always a crash: the controller either moves it to PREPARED or fails it.
+    """
+
     PREPARED = "prepared"
     SUBMITTED = "submitted"
     PENDING = "pending"

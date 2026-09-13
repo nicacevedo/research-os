@@ -1,10 +1,57 @@
 # Research OS
 
-Local-first kernel for reproducible, evidence-grounded scientific research.
+**Provenance-gated scientific automation for reproducible research.**
+
+Research OS lets language models do bounded, auditable work on a research
+project while the project's scientific truth stays in Git, in human-readable
+files, under human authority. A model can read a repository, retrieve and
+analyse literature, propose hypotheses and experiments, write code in an
+isolated worktree, and run a declared experiment. A model cannot decide that
+any of it is true.
+
+What that means concretely:
+
+- **Scientific truth is version-controlled, not inferred.** Claims, questions,
+  evidence and reviews are Git-tracked YAML and Markdown under a project's
+  `.research/` capsule. There is no database holding the real answer.
+- **Every claim carries its provenance.** Evidence is identified by content
+  digest and traced to the run, command and inputs that produced it. A proposal
+  that cites something the run did not actually have is refused, not trimmed.
+- **Human scientific acceptance is explicit.** No automated path can record a
+  human Review, mark a Claim accepted, or promote a draft into the record.
+  Automation stops at `READY_FOR_HUMAN`.
+- **Writes are isolated.** A write-enabled worker never touches the
+  researcher's checkout; it gets its own Git worktree, and the controller
+  checks that before every invocation.
+- **Budgets and permissions belong to the controller.** Model calls, write
+  tasks, experiments and wall clock are counted before they are spent, and a
+  model cannot change its own permissions, paths, commands or budgets.
+- **Model output is untrusted data.** Anything a model or a retrieved paper
+  wrote is fenced as data before it reaches another prompt, and it cannot alter
+  controller-authored instructions.
 
 This repository is the **central Research OS kernel**. It is not an individual
 science project. Scientific work lives in separate Git repositories, each with
 its own `.research/` capsule.
+
+## What this is not
+
+Read this before pointing it at anything you care about.
+
+- **It is not an OS sandbox.** Worktree isolation is a *Git* boundary, not a
+  containment boundary. Research OS is designed for repositories you already
+  trust.
+- **Project code runs with your Unix permissions.** Acceptance checks and
+  declared experiments execute the project's own code -- including code a model
+  just wrote -- as you. A malicious or compromised project repository can do
+  anything your user account can do.
+- **It is not fully autonomous science.** It automates the bounded parts and
+  refuses the scientific decision. A run that reaches `READY_FOR_HUMAN` is
+  asking you to read it.
+- **It is Linux-first.** Developed and tested on Linux with Python 3.12. It
+  relies on `fcntl.flock` and POSIX filesystem semantics.
+
+See [SECURITY.md](SECURITY.md) for the full trust boundary.
 
 ## Architecture principles
 
@@ -58,10 +105,17 @@ RESEARCH_OS_STATE_HOME
 Requires Python 3.12 and [uv](https://docs.astral.sh/uv/).
 
 ```bash
-git clone git@github.com:nicacevedo/research-os.git
+git clone https://github.com/nicacevedo/research-os.git
 cd research-os
 uv sync
+uv run researchctl doctor
 ```
+
+`doctor` reports what this machine can actually do: which agent provider CLIs
+are installed and authenticated, whether the state directories are writable, and
+which literature sources are reachable. Research OS runs without any model
+provider -- the deterministic kernel, the capsule, validation and the test suite
+all work offline -- but a research run needs at least one authenticated provider.
 
 ## Current commands
 
@@ -223,9 +277,25 @@ automatically, by any command.
 
 ```bash
 uv sync --all-groups
-uv run pytest
+uv run pytest -q
 uv run ruff check .
 uv run ruff format --check .
 ```
 
-All three must pass before stopping.
+All three must pass before stopping. The suite is hermetic: it makes no network
+requests, spends no model calls, and needs no provider credentials, so an
+external contributor can run the whole thing after `uv sync`.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the full development loop and
+[CHANGELOG.md](CHANGELOG.md) for what each release contains.
+
+## Status
+
+Research OS **v1.0.0** is the first stable operational release. See
+[CHANGELOG.md](CHANGELOG.md).
+
+## License
+
+**No license has been chosen yet.** Until one is added, default copyright
+applies and no use, modification or redistribution rights are granted, despite
+the repository being publicly readable. If you want to use this, open an issue.

@@ -1,6 +1,6 @@
 [project]
 name = "research-os"
-version = "0.1.0"
+version = "1.0.0"
 description = "Local-first orchestration for reproducible, evidence-grounded scientific research."
 readme = "README.md"
 authors = [

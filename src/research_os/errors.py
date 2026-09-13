@@ -236,7 +236,16 @@ class ProposalError(ResearchOSError):
     A proposal is runtime state, not science, so none of these ever indicates a
     corrupt capsule. The one that touches a capsule -- promotion -- raises
     ``CapsuleError`` for filesystem problems and these for everything it refuses.
+
+    ``model_calls`` is how many calls the run had already spent when it failed.
+    A failed proposal spends real budget -- an independent reviewer measured a
+    deterministic path to three uncharged calls, because a model that always
+    cites a fake key reaches it every time -- and a budget that only counts
+    successes is not a budget. The caller charges this, so the number has to
+    survive the raise.
     """
+
+    model_calls: int = 0
 
 
 class ProposalValidationError(ProposalError):
@@ -246,6 +255,26 @@ class ProposalValidationError(ProposalError):
     does not validate is a failed task rather than something to interpret
     generously -- and a proposal citing something this run never had is refused
     outright rather than trimmed.
+    """
+
+
+class ProposalBudgetError(ProposalError):
+    """Raised when a proposal run would spend a model call it cannot pay for.
+
+    Checked before the call, never after. A budget discovered at the end is a
+    receipt, not a budget.
+    """
+
+
+class ProposalGroundingError(ProposalValidationError):
+    """Raised when a proposal cites identifiers its run was never given.
+
+    A distinct type because it is the one proposal failure that has a bounded
+    automatic answer: the same worker, the same evidence, one chance to cite only
+    what it actually has. Every other validation failure stays exactly as
+    fail-closed as it was. Raising this *after* that one attempt means the
+    attempt was made and refused again, which is a final answer, not a retryable
+    one.
     """
 
 

@@ -50,6 +50,7 @@ from research_os.automation.gitutil import (
     porcelain_status,
 )
 from research_os.automation.models import (
+    RUN_ID_RE,
     TIMESTAMP_FORMAT,
     AcceptanceCommand,
     Access,
@@ -261,6 +262,7 @@ class AutomationController:
         budget: Budget | None = None,
         plan: PlanDocument | None = None,
         attempt: str = "",
+        reserved_run_id: str = "",
     ) -> tuple[RunStore, AutomationRun]:
         """Preflight, build context, and plan. Never invokes a write worker.
 
@@ -276,11 +278,28 @@ class AutomationController:
         only the model call, never a check. That is what lets the research
         orchestrator reuse this controller rather than reimplement dispatch,
         scope enforcement, checking, review, and the bounded repair.
+
+        ``reserved_run_id`` lets a parent run decide this run's identity *before*
+        calling, and is what closes the dispatch crash window. Creating the run
+        directory is irreversible, so a parent that learns the id only from the
+        return value has an interval -- the whole of this method -- in which a
+        crash leaves a directory nothing points at. A parent that reserves the id
+        first, writes it to its own ledger, and then calls with it can always
+        name what it started. The id is used verbatim: it is an identifier, not a
+        derivation this method needs to re-check.
         """
 
         goal = goal.strip()
         if not goal:
             raise PreflightError("a run goal must contain at least one character")
+        # Checked before anything is resolved or probed. A malformed identity is
+        # a caller defect, and reporting it as one beats reporting whatever the
+        # first unrelated failure downstream happens to be.
+        if reserved_run_id and RUN_ID_RE.fullmatch(reserved_run_id) is None:
+            raise PreflightError(
+                f"reserved run id {reserved_run_id!r} is not a run id; a parent "
+                "must reserve an identity this store can actually create"
+            )
 
         preflight = self._preflight(project_path)
         resolved = self._resolve_roles()
@@ -288,7 +307,8 @@ class AutomationController:
 
         created_at = utc_now()
         run = AutomationRun(
-            run_id=make_run_id(
+            run_id=reserved_run_id
+            or make_run_id(
                 project_path=str(preflight.root),
                 goal=goal,
                 created_at=created_at,
