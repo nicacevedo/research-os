@@ -54,8 +54,16 @@ def assert_contained_symlinks(worktree: Path) -> None:
     """Raise ``SymlinkScopeError`` if any symlink escapes ``worktree``.
 
     Called before a write-enabled worker is invoked and again when the
-    controller collects evidence, so neither a symlink that shipped in the base
-    commit nor one the worker created can carry a write out of the worktree.
+    controller collects evidence, so a symlink that shipped in the base commit
+    and one the worker left behind are both caught.
+
+    What this does not catch, stated plainly because an independent reviewer
+    had to point it out: a link created, written through, and deleted *during*
+    the invocation is gone by the time the second scan runs. Closing that would
+    need filesystem mediation this system does not have. The real bound on a
+    write worker is its tool set -- file tools only, no command tool, enforced
+    in :class:`~research_os.automation.providers.InvocationRequest` -- and the
+    trusted-repository boundary documented in the README.
     """
 
     escaping = outbound_symlinks(worktree)

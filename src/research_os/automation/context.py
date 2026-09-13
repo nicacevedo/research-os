@@ -25,7 +25,12 @@ from research_os.automation.gitutil import (
     repository_root,
 )
 from research_os.automation.models import utc_now
-from research_os.automation.promptdata import prompt_safe, prompt_safe_block
+from research_os.automation.promptdata import (
+    REPOSITORY_FENCE,
+    prompt_safe,
+    prompt_safe_block,
+    render_data_block,
+)
 from research_os.capsule import validate_project
 from research_os.digests import subject_digest
 from research_os.models import Reviewable
@@ -304,16 +309,25 @@ def render_context(packet: ContextPacket) -> str:
         if packet.tracked_files_truncated:
             lines.append(f"[file list truncated at {MAX_TRACKED_FILES}]")
     for supplied in packet.files:
+        # A real fence, assembled and re-read by the prompt-data boundary.
+        #
+        # A bare ``` was not enough. For a reviewer this content comes out of the
+        # implementer's own worktree, so a worker could write a file that closed
+        # the markdown fence and forged a section the prompt attributes to the
+        # controller. Every delimiter this system knows about is inert inside a
+        # rendered block; ``` was inert inside nothing, because nothing assembled
+        # it here.
         lines.extend(
             [
                 "",
                 f"## File: {prompt_safe(supplied.path)}",
                 f"[{supplied.bytes} bytes, sha256 {prompt_safe(supplied.sha256)}]",
-                "```",
-                prompt_safe_block(
-                    supplied.content, limit=MAX_RENDERED_FILE_CHARS
-                ).rstrip("\n"),
-                "```",
+                render_data_block(
+                    REPOSITORY_FENCE,
+                    prompt_safe_block(
+                        supplied.content, limit=MAX_RENDERED_FILE_CHARS
+                    ).split("\n"),
+                ),
             ]
         )
     if packet.notes:

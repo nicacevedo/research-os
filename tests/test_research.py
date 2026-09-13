@@ -1281,3 +1281,48 @@ def test_a_second_placeholder_plan_ends_the_run(
     run = ResearchStore.open(ResearchStore.list_run_ids()[-1]).load()
     assert run.state is ResearchState.FAILED
     assert len(provider.requests_for(Role.PLANNER)) == 2
+
+
+def test_retrying_an_interrupted_task_charges_what_it_already_spent(
+    research_home: Path, tmp_path: Path
+) -> None:
+    """Found by an independent reviewer: a killed run loses its own spend.
+
+    Delegated model calls are charged in a ``finally`` that a killed process
+    never reaches. Without reconciliation a kill-and-retry loop spends real
+    money against a budget that never notices, and ``run.json`` under-reports
+    what the run cost.
+    """
+
+    controller, store, _run, _ = start(
+        tmp_path, plan=plan_payload(tasks=[analysis_task()])
+    )
+    run = controller.execute(store)
+    inner_id = run.task("T-001").artifact_id or ""
+    spent = run.model_calls_used
+    assert spent > 1
+
+    # Rewind to exactly what a killed process leaves: the task mid-flight and
+    # the delegated spend never charged.
+    store.save(
+        run.model_copy(
+            update={
+                "state": ResearchState.EXECUTING,
+                "model_calls_used": 1,
+                "tasks": [
+                    item.model_copy(
+                        update={"status": TaskStatus.RUNNING, "model_calls": 0}
+                    )
+                    for item in run.tasks
+                ],
+            }
+        )
+    )
+    recovered = controller.resume(store, retry=True)
+
+    assert recovered.model_calls_used == spent, "the interrupted spend was lost"
+    assert any(
+        record.get("event") == "delegated_spend_reconciled"
+        for record in store.iter_events()
+    )
+    assert inner_id

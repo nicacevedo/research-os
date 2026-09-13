@@ -708,10 +708,13 @@ class ResearchController:
                 ),
             )
         self._assert_compute_remains(run, task_id, command.executor)
+        # No worktree argument: the experiment controller creates an isolated
+        # one. Passing the researcher's checkout here is what an independent
+        # reviewer found, and it put an experiment's cwd inside canonical
+        # science.
         experiment_store, record, packet = controller.run(
             project_path=Path(run.project_path),
             task_name=task.experiment_task,
-            worktree=Path(run.project_path),
             parameters=dict(task.experiment_parameters),
             project_id=run.project_id,
             execute=True,
@@ -940,6 +943,12 @@ class ResearchController:
                     "you are sure, or resume without --retry to mark it failed."
                 )
             if retry:
+                # Charge whatever the interrupted attempt already spent before
+                # queueing another. A killed process never reached the `finally`
+                # that accounts for a delegated run, so without this a
+                # kill-and-retry loop spends real money against a budget that
+                # does not notice. The ledger knows which runs were started.
+                run = self._reconcile_delegated_spend(store, run, task.task_id)
                 run = self._update(
                     store,
                     run,
@@ -978,6 +987,44 @@ class ResearchController:
         )
         store.append_event("run_resumable", tasks_in_flight=len(in_flight))
         return run
+
+    def _reconcile_delegated_spend(
+        self, store: ResearchStore, run: ResearchRun, task_id: str
+    ) -> ResearchRun:
+        """Charge model calls an interrupted delegated run made but never reported.
+
+        ``_delegate_to_automation`` charges in a ``finally``, which a killed
+        process never runs. The event ledger recorded the automation run id when
+        it started, so the spend is recoverable from disk: read each one, and
+        charge the difference between what it used and what this run was told
+        about.
+        """
+
+        from research_os.automation.store import RunStore
+        from research_os.errors import AutomationError
+
+        already = run.task(task_id).model_calls
+        spent = 0
+        for record in store.iter_events():
+            if record.get("event") != "automation_run_started":
+                continue
+            if record.get("task_id") != task_id:
+                continue
+            inner_id = str(record.get("automation_run_id", ""))
+            try:
+                spent += RunStore.open(inner_id).load().model_calls_used
+            except (AutomationError, OSError):
+                continue
+        owed = spent - already
+        if owed <= 0:
+            return store.load()
+        store.append_event(
+            "delegated_spend_reconciled",
+            task_id=task_id,
+            model_calls=owed,
+            previously_recorded=already,
+        )
+        return self._charge(store, run, owed)
 
     # -- finishing -------------------------------------------------------
 

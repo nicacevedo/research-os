@@ -26,7 +26,12 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from research_os.automation.promptdata import prompt_safe, prompt_safe_block
+from research_os.automation.promptdata import (
+    LITERATURE_FENCE,
+    prompt_safe,
+    prompt_safe_block,
+    render_data_block,
+)
 from research_os.capsule import validate_project
 from research_os.digests import subject_digest
 from research_os.errors import PaperPacketError
@@ -311,11 +316,19 @@ def _literature_entries(
 def render_source_packet(packet: SourcePacket) -> str:
     """Render the packet as the text a writer receives.
 
-    Not fenced as untrusted data, because it is not: every entry here was
-    assembled by the controller from this project's own accepted science and
-    from literature that already passed the citation check. What it is instead
-    is *exhaustive*: the writer is told, in the same breath, that this is
+    The project's own accepted science is not fenced, because it is not
+    untrusted: every claim, evidence and experiment entry was assembled by the
+    controller from files a human wrote and approved. What that part is instead
+    is *exhaustive* -- the writer is told, in the same breath, that this is
     everything it may use.
+
+    Literature is different and is fenced. An independent reviewer caught the
+    original justification here, which said the citation check made it trusted:
+    that check only proves the key is in the local index, and the title,
+    authors, venue and retraction note are whatever a publisher's API returned.
+    Every field does go through ``prompt_safe``, so none of it can open a line
+    of its own -- but "cannot escape" is not the same claim as "is trusted", and
+    the writer is the one worker here with a worktree.
     """
 
     lines = [
@@ -427,11 +440,12 @@ def render_source_packet(packet: SourcePacket) -> str:
     lines.extend(["", "## Literature you may cite"])
     if not packet.literature:
         lines.append("(none - do not cite anything)")
+    literature_lines: list[str] = []
     for item in packet.literature:
         authors = ", ".join(item.authors[:4]) or "no authors recorded"
         if len(item.authors) > 4:
             authors += f" +{len(item.authors) - 4}"
-        lines.extend(
+        literature_lines.extend(
             [
                 "",
                 f"- cite as: [{item.citation_key}]",
@@ -445,7 +459,7 @@ def render_source_packet(packet: SourcePacket) -> str:
             ]
         )
         if item.is_retracted:
-            lines.append(
+            literature_lines.append(
                 "  RETRACTED: "
                 + prompt_safe(
                     item.retraction_note or "this work was withdrawn",
@@ -453,6 +467,8 @@ def render_source_packet(packet: SourcePacket) -> str:
                 )
                 + " - do not cite it as established without saying so"
             )
+    if literature_lines:
+        lines.append(render_data_block(LITERATURE_FENCE, literature_lines))
 
     lines.extend(["", "## Unresolved limitations"])
     if not packet.limitations:

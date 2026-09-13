@@ -136,6 +136,21 @@ class Access(StrEnum):
 READ_ONLY_TOOLS: frozenset[str] = frozenset({"Read", "Glob", "Grep"})
 
 
+#: The only tools an isolated-write worker may ever be given.
+#:
+#: File tools, and nothing that runs a command. An independent reviewer found
+#: this position had no allowlist at all while the other two did, so a
+#: configuration file naming ``Bash`` would have been honoured -- and a worker
+#: with ``Bash`` is not confined by worktree isolation in any meaningful sense,
+#: since it can reach any path the user can.
+#:
+#: The controller runs acceptance commands itself, deliberately, through a
+#: closed grammar. A write worker never needs to run one, so it never gets to.
+WRITE_TOOLS: frozenset[str] = frozenset(
+    {"Read", "Glob", "Grep", "Write", "Edit", "MultiEdit", "NotebookEdit"}
+)
+
+
 class RiskClass(StrEnum):
     """How much authority a work order needs."""
 

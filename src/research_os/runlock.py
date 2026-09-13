@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -109,19 +110,48 @@ def _acquire(target: Path, *, run_id: str, action: str) -> None:
                 f"{owner.get('created_at', 'at an unknown time')}). Wait for it "
                 "to finish, or stop that process, before changing this run."
             ) from None
-        # The owner is gone. Taking the lock over is the only way the run is
-        # ever usable again, and saying nothing about it would hide a crash.
-        target.unlink(missing_ok=True)
-        try:
-            handle = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        except OSError as exc:
-            raise RunLockedError(
-                f"cannot take over the stale lock on {run_id}: {exc}"
-            ) from exc
+        handle = _take_over(target, run_id=run_id)
     except OSError as exc:
         raise RunLockedError(f"cannot lock {run_id}: {exc}") from exc
     with os.fdopen(handle, "w", encoding="utf-8") as stream:
         stream.write(payload + "\n")
+
+
+def _take_over(target: Path, *, run_id: str) -> int:
+    """Claim a lock whose owner is gone, without racing another claimant.
+
+    An independent reviewer found the obvious version wrong: unlink the stale
+    file, then create it exclusively. Two processes both unlink, both create,
+    and the second unlink removes the first's *fresh* lock -- so both believe
+    they hold it, which is precisely the silent double-writer this module
+    exists to prevent.
+
+    Creating a uniquely-named file and hard-linking it into place fixes it.
+    ``os.link`` fails if the destination exists, so exactly one claimant wins
+    however many are trying, and the loser re-reads and is refused normally.
+    """
+
+    unique = target.with_name(f"{target.name}.{os.getpid()}.{time.time_ns()}")
+    try:
+        handle = os.open(unique, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except OSError as exc:
+        raise RunLockedError(
+            f"cannot take over the stale lock on {run_id}: {exc}"
+        ) from exc
+    try:
+        # Remove the corpse, then claim the name atomically. Another claimant
+        # that got there first makes os.link fail, and nobody's live lock is
+        # ever unlinked because only a dead owner's name is removed here.
+        target.unlink(missing_ok=True)
+        os.link(unique, target)
+    except OSError as exc:
+        os.close(handle)
+        raise RunLockedError(
+            f"another process took over the stale lock on {run_id} first: {exc}"
+        ) from exc
+    finally:
+        unique.unlink(missing_ok=True)
+    return handle
 
 
 def _read(target: Path) -> dict[str, Any]:

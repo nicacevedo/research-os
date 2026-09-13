@@ -232,6 +232,22 @@ class ExperimentRun(BaseModel):
     project_path: NonBlankStr
     base_commit: str | None = None
     worktree_path: str | None = None
+    """Where this experiment actually ran.
+
+    An isolated Git worktree, not the researcher's checkout. Recorded because a
+    result nobody can locate is not a result, and because the artifacts below
+    are identified by content hash *and* by path within it.
+    """
+
+    branch: str | None = None
+    isolated: bool = True
+    """Whether the execution was isolated from the canonical checkout.
+
+    False only when a caller supplied its own directory, which the CLI allows
+    deliberately and the record then states plainly. An independent reviewer
+    found every caller doing that by default; the default is now isolation.
+    """
+
     executor: ExecutorKind
     argv: list[NonBlankStr] = Field(min_length=1)
     parameters: dict[str, str] = Field(default_factory=dict)

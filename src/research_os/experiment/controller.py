@@ -15,10 +15,13 @@ and more certain than the next:
    authorisation by default, and a run has a bounded number of local executions
    and cluster submissions. A literature question and a cluster job must not be
    able to look the same from the outside.
-3. **Is the checkout sound?** An experiment runs in an isolated worktree, and a
-   worktree containing a symlink that leaves it is refused before a process
-   starts -- otherwise a write to a declared output path could land outside it
-   and Git would show nothing.
+3. **Is the checkout sound?** An experiment runs in an isolated worktree that
+   this controller creates, never the researcher's checkout, and a worktree
+   containing a symlink that leaves it is refused before a process starts --
+   otherwise a write to a declared output path could land outside it and Git
+   would show nothing. A caller may override the directory; the run then
+   records ``isolated=False``, which is the only way an experiment touches
+   canonical science.
 
 What comes out is a candidate packet. It is never Evidence, never accepted, and
 never a verdict about a hypothesis.
@@ -26,12 +29,14 @@ never a verdict about a hypothesis.
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from research_os.automation.filescope import assert_contained_symlinks
 from research_os.automation.gitutil import has_commits, head_commit, repository_root
-from research_os.automation.models import utc_now
+from research_os.automation.models import WorktreeRecord, utc_now
+from research_os.automation.worktree import create_worktree
 from research_os.errors import (
     ExperimentAuthorizationError,
     ExperimentConfigError,
@@ -66,6 +71,20 @@ from research_os.experiment.store import ExperimentStore, make_experiment_run_id
 #: question about an experiment that cost something.
 AUTHORIZED_EXPLICIT = "explicit --execute"
 AUTHORIZED_CONFIGURED = "configured: require_explicit_execute is false"
+
+
+def _worktree_run_id(experiment_run_id: str) -> str:
+    """Return a run id shaped the way the shared worktree helpers require.
+
+    They are shared with the automation control plane, which validates the
+    shape. An experiment run is not an automation run, so this derives a stable
+    id from it rather than pretending one exists; the real home of the record is
+    the experiment run directory.
+    """
+
+    digest = hashlib.sha256(experiment_run_id.encode("utf-8")).hexdigest()[:8]
+    stamp = utc_now().replace("-", "").replace(":", "")
+    return f"RUN-{stamp}-{digest}"
 
 
 @dataclass
@@ -212,7 +231,7 @@ class ExperimentController:
         *,
         project_path: Path,
         task_name: str,
-        worktree: Path,
+        worktree: Path | None = None,
         parameters: dict[str, object] | None = None,
         project_id: str | None = None,
         execute: bool = False,
@@ -224,6 +243,18 @@ class ExperimentController:
         candidate evidence packet. A submitted cluster job returns no packet
         yet: it has not finished, and a packet for a job that is still queued
         would describe results that do not exist.
+
+        ``worktree`` defaults to a fresh isolated worktree at the project's
+        current commit, which is what every other write-capable task in this
+        system gets. It did not always: an independent reviewer found every
+        caller passing the researcher's own checkout, so an experiment ran with
+        its cwd inside canonical science and the containment scan below covered
+        the whole repository -- which also meant any project with a ``.venv``
+        was refused outright, its interpreter symlinks pointing out of the tree.
+
+        A caller may still supply a directory. That is a deliberate act, it is
+        recorded as ``isolated=False`` on the run, and it is the only way an
+        experiment touches the checkout.
         """
 
         root = repository_root(project_path)
@@ -244,15 +275,36 @@ class ExperimentController:
         )
 
         created_at = utc_now()
+        run_id = make_experiment_run_id(
+            project_path=str(root), task_name=task_name, created_at=created_at
+        )
+        supplied = worktree is not None
+        record: WorktreeRecord | None = None
+        if worktree is None:
+            record = create_worktree(
+                run_id=_worktree_run_id(run_id),
+                task_id="T-001",
+                repository=root,
+                base_commit=head_commit(root) if has_commits(root) else "",
+            )
+            worktree = Path(record.path)
+            # Resolved against the checkout a moment ago; resolve it again now
+            # that the command knows where it will actually run.
+            command = self.resolve(
+                project_id=project_id,
+                task_name=task_name,
+                parameters=parameters,
+                worktree=worktree,
+            )
         run = ExperimentRun(
-            run_id=make_experiment_run_id(
-                project_path=str(root), task_name=task_name, created_at=created_at
-            ),
+            run_id=run_id,
             task_name=task_name,
             project_id=project_id,
             project_path=str(root),
             base_commit=head_commit(root) if has_commits(root) else None,
             worktree_path=str(worktree),
+            branch=record.branch if record is not None else None,
+            isolated=not supplied,
             executor=command.executor,
             argv=list(command.argv),
             parameters=dict(command.parameters),
@@ -266,6 +318,9 @@ class ExperimentController:
         store.append_event(
             "experiment_prepared",
             task_name=task_name,
+            worktree=str(worktree),
+            isolated=not supplied,
+            branch=record.branch if record is not None else None,
             executor=str(command.executor),
             argv=list(command.argv),
             parameters=dict(command.parameters),
@@ -276,7 +331,12 @@ class ExperimentController:
 
         # Git-level isolation is not filesystem isolation. A declared output
         # path that is a symlink out of the worktree would put a result outside
-        # the checkout, and Git would report a clean run.
+        # it, and Git would report a clean run.
+        #
+        # This scans the directory the experiment will actually run in. When
+        # that is a fresh worktree it holds tracked files only, so an ordinary
+        # project's ``.venv`` -- whose interpreter symlinks point at the system
+        # Python -- is simply not there to refuse.
         assert_contained_symlinks(worktree)
 
         if command.executor is ExecutorKind.LOCAL:

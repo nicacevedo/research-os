@@ -70,7 +70,11 @@ def add_experiment_parser(subparsers: argparse._SubParsersAction) -> None:
     )
     run.add_argument(
         "--worktree",
-        help="Where to run. Defaults to the project itself.",
+        help=(
+            "Run in this directory instead of a fresh isolated worktree. "
+            "Deliberate: it is the only way an experiment touches your "
+            "checkout, and the run records that it was not isolated."
+        ),
     )
     run.add_argument("--partition", help="Slurm partition. Must be in your allowlist.")
     run.add_argument(
@@ -141,7 +145,9 @@ def _scheduler(args: argparse.Namespace) -> int:
 def _run(args: argparse.Namespace) -> int:
     config = _config(args)
     project_id, project_path = _project(args.project)
-    worktree = Path(args.worktree).expanduser() if args.worktree else project_path
+    # None means an isolated worktree, which is the default and the only safe
+    # one. --worktree is a deliberate override and is recorded as such.
+    worktree = Path(args.worktree).expanduser() if args.worktree else None
     controller = ExperimentController(config=config)
     parameters = _parameters(args.param)
 
@@ -152,8 +158,9 @@ def _run(args: argparse.Namespace) -> int:
             parameters=parameters,
             worktree=worktree,
         )
+        where = str(worktree) if worktree else "a fresh isolated worktree"
         print()
-        print(f"Would run, in {worktree}:")
+        print(f"Would run, in {where}:")
         print(f"    {command.display}")
         print()
         print(f"executor        {command.executor}")

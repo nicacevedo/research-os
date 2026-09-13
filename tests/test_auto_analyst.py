@@ -1072,3 +1072,34 @@ def test_a_run_configured_for_no_repairs_gets_no_correction(
     with pytest.raises(AnalystOutputError):
         ctx.controller.execute(ctx.store)
     assert len(ctx.provider.requests_for(Role.ANALYST)) == 1
+
+
+def test_the_correction_carries_the_identifier_the_worker_must_fix(
+    automation_home: Path, tmp_path: Path
+) -> None:
+    """A correction prompt that truncates away the thing to correct is useless.
+
+    Found by an independent reviewer: the reason was rendered at the 128-char
+    label limit, so the real message was cut at "...refers to findings that" and
+    the one identifier the analyst needed never arrived.
+    """
+
+    provider = scripted_research()
+    dangling = dict(DANGLING_EVIDENCE)
+    dangling["evidence"] = [
+        {
+            "finding_id": "F-999",
+            "file_ref": "adder.py",
+            "detail": "cites a finding this report never made",
+        }
+    ]
+    provider.responses[str(Role.ANALYST)] = [
+        ScriptedResponse(structured=dangling),
+        ScriptedResponse(structured=analysis_payload()),
+    ]
+    ctx = start_research_run(tmp_path, provider=provider)
+    ctx.controller.execute(ctx.store)
+
+    retry = ctx.provider.requests_for(Role.ANALYST)[1].prompt
+    assert "F-999" in retry, "the identifier to fix was truncated away"
+    assert "were not reported" in retry

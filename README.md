@@ -169,10 +169,14 @@ a scientific Review or accepts a Claim. Runtime state lives under
 project. See `docs/AUTOMATION_MVP.md`.
 
 `auto` is for repositories you trust. Its acceptance checks run the project's
-own code, including code a worker has just written, as your user. Worktree
-isolation keeps a worker out of your canonical checkout; it is not an OS
-sandbox, and containers are not yet provided. Do not point `auto` at an
-untrusted or freshly cloned repository.
+own code, including code a worker has just written, as your user, and a
+declared experiment runs whatever command you declared. Every write-capable
+task -- code, paper and experiment alike -- works in an isolated Git worktree
+rather than your canonical checkout, and a write worker is given file tools
+only, never a command tool. That is Git isolation, not an OS sandbox: the
+process can still reach any path your user can, and containers are not
+provided. Do not point `auto` or `experiment` at an untrusted or freshly cloned
+repository.
 
 `research` is the whole architecture behind a few verbs. It plans a research
 goal into a bounded DAG of typed tasks — literature, analysis, proposal, code,

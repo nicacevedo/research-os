@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 
+from research_os.automation.filescope import outbound_symlinks
 from research_os.errors import (
     ExperimentAuthorizationError,
     ExperimentConfigError,
@@ -609,3 +610,101 @@ def test_configuration_is_read_from_outside_every_worktree(
 
     assert loaded.command(PROJECT_ID, "noop").argv == ["python3", "-c", "pass"]
     assert loaded.source == target
+
+
+# -- isolation, which every earlier test in this file opted out of ------------
+
+
+def test_an_experiment_runs_in_an_isolated_worktree_by_default(
+    research_home: Path, tmp_path: Path
+) -> None:
+    """Found by an independent reviewer: every caller passed the checkout.
+
+    Each test above supplies ``worktree=project``, so the isolation property was
+    never exercised by any of them. This one supplies nothing, which is what the
+    CLI and the research controller now do.
+    """
+
+    project = git_project(tmp_path / "widget", script=SUCCESS_SCRIPT)
+    before = {
+        item.relative_to(project).as_posix(): item.read_bytes()
+        for item in sorted(project.rglob("*"))
+        if item.is_file() and ".git" not in item.relative_to(project).parts
+    }
+
+    controller = ExperimentController(config=config())
+    store, run, packet = controller.run(
+        project_path=project,
+        task_name="fit-model",
+        parameters={"seed": 7},
+        project_id=PROJECT_ID,
+        execute=True,
+    )
+
+    assert run.state is ExecutionState.COMPLETED
+    assert packet is not None and packet.usable
+    assert run.isolated is True
+    assert run.branch
+
+    worktree = Path(run.worktree_path or "")
+    assert worktree.is_dir()
+    assert project.resolve() not in worktree.resolve().parents
+    assert worktree != project
+
+    # The result was written in the worktree, and the checkout is untouched.
+    assert (worktree / "results" / "fit.json").is_file()
+    assert not (project / "results").exists()
+    after = {
+        item.relative_to(project).as_posix(): item.read_bytes()
+        for item in sorted(project.rglob("*"))
+        if item.is_file() and ".git" not in item.relative_to(project).parts
+    }
+    assert after == before
+    assert store.load().artifacts
+
+
+def test_a_project_with_a_virtualenv_is_not_refused(
+    research_home: Path, tmp_path: Path
+) -> None:
+    """The functional half of the same defect, and the one a user hits first.
+
+    An interpreter symlink in ``.venv/bin`` points out of the repository. When
+    the containment scan covered the whole checkout, every ordinary Python
+    project was refused -- after the run record had already been written.
+    """
+
+    project = git_project(tmp_path / "widget", script=SUCCESS_SCRIPT)
+    venv = project / ".venv" / "bin"
+    venv.mkdir(parents=True)
+    (venv / "python").symlink_to("/usr/bin/python3")
+    assert outbound_symlinks(project), "the fixture must reproduce the condition"
+
+    controller = ExperimentController(config=config())
+    _store, run, packet = controller.run(
+        project_path=project,
+        task_name="fit-model",
+        parameters={"seed": 7},
+        project_id=PROJECT_ID,
+        execute=True,
+    )
+    assert run.state is ExecutionState.COMPLETED
+    assert packet is not None and packet.usable
+
+
+def test_supplying_a_worktree_is_recorded_as_not_isolated(
+    research_home: Path, tmp_path: Path
+) -> None:
+    """The override stays available, and the record says it was used."""
+
+    project = git_project(tmp_path / "widget", script=SUCCESS_SCRIPT)
+    controller = ExperimentController(config=config())
+    _store, run, _packet = controller.run(
+        project_path=project,
+        task_name="fit-model",
+        worktree=project,
+        parameters={"seed": 7},
+        project_id=PROJECT_ID,
+        execute=True,
+    )
+    assert run.isolated is False
+    assert run.worktree_path == str(project)

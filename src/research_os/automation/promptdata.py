@@ -116,6 +116,31 @@ INSIGHT_FENCE = DataFence(
     end="----- END TRANSFERRED INSIGHTS (ANOTHER PROJECT'S FINDINGS) -----",
 )
 
+#: Repository file content quoted into a worker's prompt.
+#:
+#: Added after an independent reviewer showed the gap. File bodies were rendered
+#: inside a bare markdown ``` fence, and for the *reviewer* those bodies come out
+#: of the implementer's own worktree -- so a worker could write a file that
+#: closed the fence and forged a section attributed to the controller. The
+#: delimiters this module knows about were all inert inside that body; ``` was
+#: not one of them, because it was never assembled here.
+REPOSITORY_FENCE = DataFence(
+    begin="----- BEGIN REPOSITORY FILE (UNTRUSTED FILE CONTENT) -----",
+    end="----- END REPOSITORY FILE (UNTRUSTED FILE CONTENT) -----",
+)
+
+#: One write-enabled worker's diff, quoted for the reviewer that judges it.
+DIFF_FENCE = DataFence(
+    begin="----- BEGIN WORKER DIFF (UNTRUSTED WORKER OUTPUT) -----",
+    end="----- END WORKER DIFF (UNTRUSTED WORKER OUTPUT) -----",
+)
+
+#: What a write-enabled worker said it did. A claim, never evidence.
+WORKER_REPORT_FENCE = DataFence(
+    begin="----- BEGIN WORKER REPORT (UNVERIFIED WORKER CLAIM) -----",
+    end="----- END WORKER REPORT (UNVERIFIED WORKER CLAIM) -----",
+)
+
 #: Every fence the controller generates.
 #:
 #: One tuple, because :data:`ALL_DELIMITERS` is derived from it and that is what
@@ -128,6 +153,9 @@ FENCES: tuple[DataFence, ...] = (
     CHECK_OUTPUT_FENCE,
     LITERATURE_FENCE,
     INSIGHT_FENCE,
+    REPOSITORY_FENCE,
+    DIFF_FENCE,
+    WORKER_REPORT_FENCE,
 )
 
 #: Every delimiter, longest first, so a delimiter that contains another is

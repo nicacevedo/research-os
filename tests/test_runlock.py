@@ -210,3 +210,48 @@ def test_a_cancel_succeeds_once_the_run_is_no_longer_held(
     )
     assert result.returncode == 0, result.stderr
     assert store.load().state is ResearchState.CANCELLED
+
+
+def test_only_one_of_many_claimants_takes_over_a_stale_lock(
+    automation_home: Path,
+) -> None:
+    """Found by an independent reviewer: the obvious takeover is racy.
+
+    Unlink-then-create lets two processes both unlink and both create, with the
+    second unlink removing the first's *fresh* lock -- two live holders, which
+    is the silent double-writer this module exists to prevent. Real processes,
+    started together, all racing one stale lock.
+    """
+
+    target = lock_path(RUN_ID)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        json.dumps({"run_id": RUN_ID, "action": "research run", "pid": 2**31 - 1}),
+        encoding="utf-8",
+    )
+
+    claimant = (
+        "import os, sys, time\n"
+        "from research_os.runlock import run_lock\n"
+        "from research_os.errors import RunLockedError\n"
+        "try:\n"
+        "    with run_lock(sys.argv[1], action='claim'):\n"
+        "        print('HELD', os.getpid(), flush=True)\n"
+        "        time.sleep(1.5)\n"
+        "except RunLockedError:\n"
+        "    print('REFUSED', flush=True)\n"
+    )
+    processes = [
+        subprocess.Popen(
+            [sys.executable, "-c", claimant, RUN_ID],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=dict(os.environ),
+        )
+        for _ in range(6)
+    ]
+    outputs = [process.communicate(timeout=60)[0] for process in processes]
+
+    held = [item for item in outputs if "HELD" in item]
+    assert len(held) == 1, f"{len(held)} processes believed they held the lock"
