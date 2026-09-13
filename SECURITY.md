@@ -1,5 +1,69 @@
 # Research OS security
 
+## Reporting a vulnerability
+
+Report security issues privately, not as a public issue: use GitHub's **Report a
+vulnerability** button under this repository's Security tab, which opens a
+private advisory. Please include what an attacker would gain, the smallest
+reproduction you have, and the commit you saw it on. There is no bounty and no
+guaranteed response time; this is a research tool maintained by one person.
+
+Do not include real credentials, private scientific data, or unpublished
+manuscript content in a report.
+
+## The trust boundary
+
+Research OS is designed for **repositories you already trust**, running on a
+machine you control, as your own user. That assumption is load-bearing, and
+everything below follows from it.
+
+**Worktree isolation is a Git boundary, not an OS sandbox.** A write-enabled
+worker gets its own Git worktree so it cannot modify the researcher's canonical
+checkout, and the controller verifies that immediately before every write
+invocation. That protects the scientific record from an ordinary mistake. It
+does not confine a process: the worktree is an ordinary directory on the same
+filesystem, with the same user, the same network, and the same environment.
+
+**Project code executes with your Unix permissions.** Two paths run code this
+repository did not write:
+
+- *Acceptance checks.* After a write-enabled worker changes a project, the
+  controller runs that project's declared check commands -- `pytest`, `ruff` --
+  against the code the worker just wrote. `pytest` executes the project's
+  `conftest.py` and its test modules. If a model wrote them, a model chose what
+  runs.
+- *Declared experiments.* An experiment runs a command the researcher declared
+  in `~/.config/research-os/experiments.yaml`, selected by name, with typed
+  parameters substituted whole-token. It executes the project's program.
+
+Both are argument vectors, never shell strings: nothing here interpolates into a
+shell, and the acceptance-command grammar authorises whole argv vectors rather
+than a program name. That stops a *plan* from naming an arbitrary command. It
+does not stop a program the researcher already trusts from doing what programs
+do.
+
+The practical consequence: **do not point Research OS at a repository you would
+not run `pytest` in.** Cloning an untrusted project and starting a run on it is
+equivalent to executing that project's code.
+
+**What is enforced rather than requested.** These are structural, not prompt
+instructions:
+
+- A model cannot change its own permissions, allowed paths, executable commands,
+  model-call budgets, experiment budgets, run state, canonical Git branches, or
+  scientific approval state.
+- No automated path records a human Review, sets `reviewer_kind` to human, or
+  marks a Claim accepted. The acceptance gate lives in `validate.py`.
+- Model-originated and externally retrieved text is fenced as data by
+  `research_os.automation.promptdata` before it reaches another prompt, and
+  cannot forge a fence delimiter or alter controller-authored instructions.
+- Every command is an argv list. There is no `shell=True`, no `os.system`, no
+  `eval`, and no `exec` anywhere in the source.
+
+**What is not claimed.** No containment against a hostile project, no protection
+against a compromised provider CLI, no multi-user isolation, and no defence
+against someone with write access to your own state directory.
+
 ## Secrets
 
 Secrets must never enter Git.

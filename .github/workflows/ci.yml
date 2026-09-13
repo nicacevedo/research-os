@@ -1,0 +1,108 @@
+# Hermetic CI: no provider credentials, no model calls, no network.
+#
+# Everything here must be runnable by a contributor with a clone and uv. If a
+# job ever needs a secret, the change that made it need one is the bug.
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+    tags-ignore: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Nothing here may reach a provider. Set explicitly so a test that tried to
+  # would fail loudly rather than picking up a runner's ambient configuration.
+  RESEARCH_OS_OPENALEX_API_KEY: ""
+
+jobs:
+  lint:
+    name: Ruff
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+      - run: uv sync --all-groups --frozen
+      - name: ruff check
+        run: uv run ruff check .
+      - name: ruff format --check
+        run: uv run ruff format --check .
+
+  smoke:
+    name: Package and CLI smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+      - run: uv sync --all-groups --frozen
+      - name: the package imports
+        run: uv run python -c "import research_os; print(research_os.__version__)"
+      - name: the console script runs
+        run: |
+          uv run researchctl --help
+          uv run researchctl version
+      - name: doctor runs without a provider
+        # It reports what is missing; it must not fail because something is.
+        run: uv run researchctl doctor || true
+      - name: the declared version matches the importable one
+        run: uv run pytest -q tests/test_packaging.py
+
+  tests:
+    name: Hermetic test suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+      - run: uv sync --all-groups --frozen
+      - name: git identity for the worktree tests
+        # Several tests create real commits in real temporary repositories.
+        run: |
+          git config --global user.email "ci@example.invalid"
+          git config --global user.name "ci"
+          git config --global init.defaultBranch main
+      - name: pytest
+        run: uv run pytest -q
+
+  guarantees:
+    name: Security and scientific-integrity regressions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+      - run: uv sync --all-groups --frozen
+      - name: git identity
+        run: |
+          git config --global user.email "ci@example.invalid"
+          git config --global user.name "ci"
+          git config --global init.defaultBranch main
+      - name: the boundaries that must not move
+        # Run on their own as well as inside the full suite, so a failure here
+        # names the property that broke instead of being one line in 2200.
+        run: |
+          uv run pytest -q \
+            tests/test_security_regressions.py \
+            tests/test_auto_promptdata.py \
+            tests/test_auto_command_policy.py \
+            tests/test_validate.py \
+            tests/test_review.py \
+            tests/test_runlock.py \
+            tests/test_crash_recovery.py \
+            tests/test_proposal_grounding_correction.py \
+            tests/test_lit_transport.py
