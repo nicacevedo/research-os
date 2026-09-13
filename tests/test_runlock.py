@@ -373,3 +373,132 @@ def test_contending_processes_never_both_enter_the_critical_section(
     assert violations == 0, (
         f"{violations} of {acquisitions} acquisitions had two holders at once"
     )
+
+
+# -- the release gates: identity, waiters, and cleanup ------------------------
+
+#: Open the lock path, announce it, wait, then try to take the lock.
+#:
+#: The two steps are separated on purpose. A process that opened the path before
+#: the holder released is the exact shape that broke the previous
+#: implementation: its descriptor referred to an inode that unlinking had
+#: orphaned, so its ``flock`` succeeded on a file nobody else could reach while
+#: the next arrival locked a fresh inode at the same path.
+WAITER = """
+import fcntl, os, sys, time
+path = sys.argv[1]
+handle = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+print("OPENED", os.fstat(handle).st_ino, flush=True)
+sys.stdin.readline()
+try:
+    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError:
+    print("REFUSED", flush=True)
+else:
+    print("ACQUIRED", os.fstat(handle).st_ino, flush=True)
+    time.sleep(0.3)
+"""
+
+
+def test_the_lock_path_keeps_one_identity_across_acquire_and_release(
+    automation_home: Path,
+) -> None:
+    """Normal release must not unlink or recreate the lock file.
+
+    The correctness of this lock rests entirely on every contender referring to
+    the same inode. Three previous implementations broke precisely by replacing
+    the file, so identity is asserted directly rather than inferred.
+    """
+
+    with run_lock(RUN_ID, action="first"):
+        first = lock_path(RUN_ID).stat().st_ino
+    assert lock_path(RUN_ID).is_file(), "release removed the lock file"
+    after_release = lock_path(RUN_ID).stat().st_ino
+    with run_lock(RUN_ID, action="second"):
+        second = lock_path(RUN_ID).stat().st_ino
+    assert first == after_release == second, (
+        "the lock pathname changed identity across an ordinary acquire/release"
+    )
+
+
+def test_a_process_that_opened_before_release_cannot_hold_alongside_the_next(
+    automation_home: Path,
+) -> None:
+    """The deterministic detector for the bug that escaped every earlier test.
+
+    Sequence: A holds; B opens the path while A still holds it; A releases; C
+    acquires normally. B then attempts its lock. Against the released
+    implementation B must be refused, because C holds the very inode B opened.
+
+    Against the previous implementation -- which unlinked on release -- B held an
+    orphaned inode and C created a fresh one, so both reported success.
+    """
+
+    target = lock_path(RUN_ID)
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    waiter = subprocess.Popen(
+        [sys.executable, "-c", WAITER, str(target)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=dict(os.environ),
+    )
+    try:
+        assert waiter.stdout is not None and waiter.stdin is not None
+        with run_lock(RUN_ID, action="holder A"):
+            opened = waiter.stdout.readline().split()
+            assert opened[0] == "OPENED", opened
+            waiter_inode = int(opened[1])
+        # A has released. C now takes it the ordinary way and keeps it.
+        with run_lock(RUN_ID, action="holder C"):
+            held_inode = lock_path(RUN_ID).stat().st_ino
+            waiter.stdin.write("go\n")
+            waiter.stdin.flush()
+            verdict = waiter.stdout.readline().split()
+
+        assert verdict[0] == "REFUSED", (
+            f"a process that opened before release acquired alongside the next "
+            f"holder: {verdict}"
+        )
+        assert waiter_inode == held_inode, (
+            "the waiter and the holder were looking at different inodes, which "
+            "is the condition that made two simultaneous holders possible"
+        )
+    finally:
+        waiter.kill()
+        waiter.wait(timeout=30)
+
+
+def test_run_cleanup_cannot_proceed_while_another_process_holds_the_run(
+    research_home: Path, tmp_path: Path
+) -> None:
+    """Cleanup removes a worktree and its worktree lock. It must synchronise.
+
+    ``auto cleanup`` takes the same run lock an executing run holds, so a
+    cleanup arriving mid-run is refused rather than pulling the checkout out
+    from under a live worker.
+    """
+
+    from research_os.automation.store import RunStore
+    from tests.automation_helpers import init_repo as init_code_repo
+    from tests.test_auto_controller import scripted, start_run
+
+    started = start_run(tmp_path / "codeproj", provider=scripted())
+    del init_code_repo
+    run_id = started.run.run_id
+
+    with run_lock(run_id, action="auto run"):
+        result = subprocess.run(
+            [sys.executable, "-m", "research_os.cli", "auto", "cleanup", run_id],
+            capture_output=True,
+            check=False,
+            text=True,
+            env=dict(os.environ),
+            cwd=str(tmp_path),
+        )
+    assert result.returncode != 0, result.stdout
+    assert "another process" in result.stderr
+    # And the run record is still there to be cleaned up later.
+    assert RunStore.open(run_id).load().run_id == run_id
