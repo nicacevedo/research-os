@@ -26,6 +26,7 @@ from pydantic import ValidationError
 from research_os.automation.promptdata import (
     CHECK_OUTPUT_FENCE,
     DIFF_FENCE,
+    TASK_FENCE,
     prompt_safe,
     prompt_safe_block,
     render_data_block,
@@ -132,7 +133,7 @@ this project's science; you are not doing science, and nothing you write becomes
 part of the project's scientific record.
 
 WHAT YOU WERE ASKED TO DO
-{prompt_safe_block(instruction, limit=MAX_INSTRUCTION_CHARS)}
+{render_data_block(TASK_FENCE, prompt_safe_block(instruction, limit=MAX_INSTRUCTION_CHARS).split(chr(10)))}
 
 YOU MAY CHANGE ONLY THESE PATHS
 {allowed}
@@ -295,7 +296,7 @@ This is the only repair this run allows. After you stop, the controller re-runs
 every deterministic check. If anything still fails, the task fails.
 
 WHAT YOU WERE ASKED TO DO
-{prompt_safe_block(instruction, limit=MAX_INSTRUCTION_CHARS)}
+{render_data_block(TASK_FENCE, prompt_safe_block(instruction, limit=MAX_INSTRUCTION_CHARS).split(chr(10)))}
 
 WHAT THE DETERMINISTIC CHECKS FOUND
 

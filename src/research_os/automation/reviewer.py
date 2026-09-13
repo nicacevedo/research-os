@@ -25,6 +25,7 @@ from research_os.automation.models import (
 from research_os.automation.promptdata import (
     DIFF_FENCE,
     REVIEW_FENCE,
+    TASK_FENCE,
     WORKER_REPORT_FENCE,
     prompt_safe,
     prompt_safe_block,
@@ -140,10 +141,10 @@ itself.
 TASK {order.task_id}: {prompt_safe(order.title, limit=MAX_LABEL_CHARS)}
 
 GOAL
-{prompt_safe_block(order.goal, limit=MAX_REPORT_CHARS)}
+{render_data_block(TASK_FENCE, prompt_safe_block(order.goal, limit=MAX_REPORT_CHARS).split(chr(10)))}
 
 COMPLETION CONDITION
-{prompt_safe_block(order.completion_condition, limit=MAX_REPORT_CHARS)}
+{render_data_block(TASK_FENCE, prompt_safe_block(order.completion_condition, limit=MAX_REPORT_CHARS).split(chr(10)))}
 
 BASE COMMIT
 {order.base_commit}

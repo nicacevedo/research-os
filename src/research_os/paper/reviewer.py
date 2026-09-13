@@ -28,6 +28,8 @@ from pydantic import ValidationError
 from research_os.automation.promptdata import (
     DIFF_FENCE,
     REVIEW_FENCE,
+    TASK_FENCE,
+    WORKER_REPORT_FENCE,
     prompt_safe,
     prompt_safe_block,
     render_data_block,
@@ -103,14 +105,30 @@ def build_writing_review_prompt(
         )
         or "- (every deterministic check passed)"
     )
-    declared = "\n".join(
-        f"  {label}: {', '.join(values) or '(none)'}"
-        for label, values in (
-            ("claims", manifest.claim_ids),
-            ("evidence", manifest.evidence_ids),
-            ("experiments", manifest.experiment_ids),
-            ("citations", manifest.citation_keys),
-        )
+    # Every one of these is a string the write-enabled writer chose, so each is
+    # rendered inert and the whole list is assembled by the prompt-data
+    # boundary. A final release review found them interpolated raw -- no
+    # sanitiser, no fence -- and demonstrated a writer forging this prompt's own
+    # "DETERMINISTIC CHECKS THE CONTROLLER RAN" section inside a claim id.
+    #
+    # The manifest model now refuses an id that is not id-shaped, which is the
+    # root cause. This is the second layer: it holds even for a field that
+    # acquires a looser validator later.
+    declared = render_data_block(
+        WORKER_REPORT_FENCE,
+        [
+            f"  {label}: "
+            + (
+                ", ".join(prompt_safe(item, limit=MAX_LABEL_CHARS) for item in values)
+                or "(none)"
+            )
+            for label, values in (
+                ("claims", manifest.claim_ids),
+                ("evidence", manifest.evidence_ids),
+                ("experiments", manifest.experiment_ids),
+                ("citations", manifest.citation_keys),
+            )
+        ],
     )
     caveats = (
         "\n".join(
@@ -132,7 +150,7 @@ part only reading can settle.
 SECTION: {section}
 
 WHAT THE WRITER WAS ASKED TO DO
-{prompt_safe_block(instruction, limit=6_000)}
+{render_data_block(TASK_FENCE, prompt_safe_block(instruction, limit=6_000).split(chr(10)))}
 
 DETERMINISTIC CHECKS THE CONTROLLER RAN
 {checks}

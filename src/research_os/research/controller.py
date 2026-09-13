@@ -589,11 +589,15 @@ class ResearchController:
             max_work_orders=1,
             max_repair_attempts=run.budget.max_repair_attempts,
         )
+        # A retried task dispatches a genuinely different run with the same
+        # project, goal and -- if the retry is prompt -- the same second. The
+        # attempt number is what keeps their ids apart.
         inner_store, inner = controller.start(
             project_path=Path(run.project_path),
             goal=task.goal,
             budget=budget,
             plan=plan,
+            attempt=f"{task_id}#{self._delegated_attempts(store, task_id) + 1}",
         )
         store.append_event(
             "automation_run_started",
@@ -613,7 +617,7 @@ class ResearchController:
                 automation_run_id=inner.run_id,
                 state=str(inner_store.load().state),
                 model_calls=spent,
-                charged_total=spent,
+                charged_total=self._delegated_total(store, task_id),
             )
         detail = f"automation run {inner.run_id} finished {inner.state}"
         order = inner.work_orders[0] if inner.work_orders else None
@@ -990,6 +994,44 @@ class ResearchController:
         store.append_event("run_resumable", tasks_in_flight=len(in_flight))
         return run
 
+    @staticmethod
+    def _delegated_attempts(store: ResearchStore, task_id: str) -> int:
+        """Return how many delegated runs this task has already started."""
+
+        return sum(
+            1
+            for record in store.iter_events()
+            if record.get("event") == "automation_run_started"
+            and record.get("task_id") == task_id
+        )
+
+    @staticmethod
+    def _delegated_total(store: ResearchStore, task_id: str) -> int:
+        """Return this task's cumulative delegated model-call spend.
+
+        Summed over every automation run the task ever started, read from those
+        runs' own records rather than from anything this run believes. One
+        definition, used by both the event that records a charge and the
+        reconciliation that reads it back -- because when those two disagreed
+        about what the number meant, the difference was charged twice.
+        """
+
+        from research_os.automation.store import RunStore
+        from research_os.errors import AutomationError
+
+        total = 0
+        for record in store.iter_events():
+            if record.get("event") != "automation_run_started":
+                continue
+            if record.get("task_id") != task_id:
+                continue
+            inner_id = str(record.get("automation_run_id", ""))
+            try:
+                total += RunStore.open(inner_id).load().model_calls_used
+            except (AutomationError, OSError):
+                continue
+        return total
+
     def _reconcile_delegated_spend(
         self, store: ResearchStore, run: ResearchRun, task_id: str
     ) -> ResearchRun:
@@ -1002,33 +1044,19 @@ class ResearchController:
         about.
         """
 
-        from research_os.automation.store import RunStore
-        from research_os.errors import AutomationError
+        spent = self._delegated_total(store, task_id)
 
-        # What this task has actually spent: the sum over every delegated run
-        # it ever started, read from those runs' own records.
-        spent = 0
-        inner_ids: list[str] = []
-        for record in store.iter_events():
-            if record.get("event") != "automation_run_started":
-                continue
-            if record.get("task_id") != task_id:
-                continue
-            inner_ids.append(str(record.get("automation_run_id", "")))
-        for inner_id in inner_ids:
-            try:
-                spent += RunStore.open(inner_id).load().model_calls_used
-            except (AutomationError, OSError):
-                continue
-
-        # What this run has already been charged for it. Every event that
-        # records a charge writes the running total under one key, so this is a
-        # maximum over one quantity rather than over a mixture.
+        # What this run has already been charged for this task. Every event that
+        # records a charge writes the *same* quantity under ``charged_total`` --
+        # the task's cumulative delegated spend -- so this is a maximum over one
+        # quantity rather than over a mixture.
         #
-        # It was a mixture, and a third independent review caught it: the
-        # finished event carried an inner run's total and the reconcile event
-        # carried a delta, so a second interruption compared a total against a
-        # delta and charged the difference twice.
+        # It has been a mixture twice. The third review found the finished event
+        # carrying a total and the reconcile event a delta; the fix moved both to
+        # a "total", but the finished event's total was one *inner run's*, not the
+        # task's, so a task with two delegated runs still compared incomparable
+        # numbers and over-charged. Both now go through ``_delegated_total``,
+        # which is the only definition of the quantity.
         charged = max(
             (
                 int(record.get("charged_total", 0))

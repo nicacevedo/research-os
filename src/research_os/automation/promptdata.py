@@ -149,6 +149,20 @@ WORKER_REPORT_FENCE = DataFence(
     end="----- END WORKER REPORT (UNVERIFIED WORKER CLAIM) -----",
 )
 
+#: A task's own description -- its goal, completion condition or instruction.
+#:
+#: These read like the controller talking, and for a delegated task they are not:
+#: a research plan's task goals are written by the research planner, and reach
+#: the analyst, coder, writer and both reviewers. ``prompt_safe_block`` makes
+#: every delimiter inert but deliberately keeps newlines, because a goal with
+#: paragraphs should keep them -- which is exactly what lets an unfenced one
+#: open a line and forge a heading. Five instances of that were found across
+#: four reviews before this fence existed.
+TASK_FENCE = DataFence(
+    begin="----- BEGIN TASK TEXT (AS SUPPLIED TO THE CONTROLLER) -----",
+    end="----- END TASK TEXT (AS SUPPLIED TO THE CONTROLLER) -----",
+)
+
 #: Every fence the controller generates.
 #:
 #: One tuple, because :data:`ALL_DELIMITERS` is derived from it and that is what
@@ -164,6 +178,7 @@ FENCES: tuple[DataFence, ...] = (
     REPOSITORY_FENCE,
     DIFF_FENCE,
     WORKER_REPORT_FENCE,
+    TASK_FENCE,
 )
 
 #: Every delimiter, longest first, so a delimiter that contains another is

@@ -24,7 +24,12 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from research_os.automation.promptdata import prompt_safe, prompt_safe_block
+from research_os.automation.promptdata import (
+    TASK_FENCE,
+    prompt_safe,
+    prompt_safe_block,
+    render_data_block,
+)
 from research_os.automation.structured import extract_json_object
 from research_os.errors import ResearchPlanError
 from research_os.models import NonBlankStr
@@ -157,7 +162,7 @@ dispatches each kind to a worker it already has; it cannot dispatch anything
 else, and a plan naming an unknown kind is refused before anything runs.
 
 THE RESEARCHER'S GOAL
-{prompt_safe_block(goal, limit=MAX_GOAL_CHARS)}
+{render_data_block(TASK_FENCE, prompt_safe_block(goal, limit=MAX_GOAL_CHARS).split(chr(10)))}
 
 TASK KINDS
 
@@ -311,25 +316,92 @@ PLACEHOLDERS: frozenset[str] = frozenset(
 )
 
 
-def _is_placeholder(value: str) -> bool:
-    """Return whether every token in ``value`` is a placeholder.
+#: Structural words that carry no subject matter on their own.
+#:
+#: These are not placeholders. "goal", "task" and "query" appear in perfectly
+#: good titles. What they cannot do is *rescue* a field that is otherwise a
+#: placeholder, and that is the only thing this set is used for.
+#:
+#: Added after the release pilot. The guard below refused a field whose every
+#: token was a placeholder, so a planner returning "test" was caught -- and one
+#: returning "Test task", "Test goal." and "test query" was not, because "task",
+#: "goal" and "query" are real words. The run then searched three providers for
+#: "test query" against a real project and reported success.
+FILLER: frozenset[str] = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "basic",
+        "case",
+        "check",
+        "data",
+        "dummy",
+        "field",
+        "for",
+        "generic",
+        "goal",
+        "here",
+        "input",
+        "item",
+        "minimal",
+        "of",
+        "output",
+        "plan",
+        "query",
+        "run",
+        "sample",
+        "simple",
+        "step",
+        "stuff",
+        "task",
+        "the",
+        "thing",
+        "things",
+        "this",
+        "to",
+        "value",
+        "values",
+    }
+)
 
-    A token counts either as written or with surrounding punctuation removed, so
-    both "TBD." and a bare "..." are caught. Stripping alone would reduce "..."
-    to nothing and let it through, which is the one that actually turned up.
+
+def _tokens(value: str) -> list[str]:
+    """Return lowered tokens, each also tried with punctuation stripped."""
+
+    found: list[str] = []
+    for token in value.split():
+        lowered = token.lower()
+        stripped = lowered.strip(".,;:!?\"'()[]")
+        found.append(stripped if stripped and stripped not in lowered[:0] else lowered)
+    return [item for item in found if item]
+
+
+def _is_placeholder(value: str) -> bool:
+    """Return whether ``value`` says nothing but "this is a placeholder".
+
+    True when at least one token is a placeholder and no token carries any
+    subject matter -- so "test", "TBD.", a bare "...", and "Test task" are all
+    refused, while "Read the field", "Testing the estimator" and any title with
+    a real noun in it are not.
+
+    Both halves matter. Requiring a placeholder token keeps the rule from
+    grading ordinary terse prose; requiring every *other* token to be structural
+    filler is what closes the gap the release pilot found.
     """
 
-    tokens = value.split()
+    tokens = _tokens(value)
     if not tokens:
         return False
+    seen_placeholder = False
     for token in tokens:
-        lowered = token.lower()
-        if lowered in PLACEHOLDERS:
+        if token in PLACEHOLDERS:
+            seen_placeholder = True
             continue
-        if lowered.strip(".,;:!?\"'()[]") in PLACEHOLDERS:
+        if token in FILLER:
             continue
         return False
-    return True
+    return seen_placeholder
 
 
 def _assert_not_a_placeholder(value: str, *, what: str, where: str) -> None:

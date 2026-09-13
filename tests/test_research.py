@@ -1477,3 +1477,147 @@ def test_a_second_interruption_after_a_completed_attempt_is_not_double_charged(
 
     assert first == truth, "reconciliation invented spend that never happened"
     assert second == truth, "the completed attempt was charged twice"
+
+
+def test_a_plan_dressed_up_in_real_words_is_still_refused(
+    research_home: Path, tmp_path: Path
+) -> None:
+    """The exact plan the release pilot produced against a real project.
+
+    The first placeholder guard refused a field whose every token was a
+    placeholder, so "test" was caught. This was not: "Test task", "Test goal."
+    and "test query" all contain a real word, and the run went on to search
+    three literature providers for "test query" and report success.
+
+    The rule now refuses a field that contains a placeholder and nothing but
+    structural filler besides -- which is what these are -- while leaving any
+    field with actual subject matter alone.
+    """
+
+    pilot_plan = {
+        "summary": "Test minimal plan to isolate schema validation issue.",
+        "tasks": [
+            {
+                "id": "T-001",
+                "kind": "literature",
+                "title": "Test task",
+                "goal": "Test goal.",
+                "query": "test query",
+            }
+        ],
+    }
+    with pytest.raises(ResearchPlanError, match="placeholder"):
+        start(tmp_path, plan=pilot_plan)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "Test task",
+        "Test goal.",
+        "test query",
+        "example data",
+        "TODO: the plan",
+        "placeholder step",
+    ],
+)
+def test_placeholder_dressed_in_filler_is_refused(value: str) -> None:
+    from research_os.research.planner import _is_placeholder
+
+    assert _is_placeholder(value), f"{value!r} slipped through"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "Read the field",
+        "Read it",
+        "Testing the estimator",
+        "Prior art on curvature-approximation adequacy",
+        "Find out whether anyone has settled this.",
+        "widget deformation under load",
+        "Assess the query planner's fallback behaviour",
+        "Implement the goal-seeking solver",
+    ],
+)
+def test_real_prose_containing_a_structural_word_is_not_refused(value: str) -> None:
+    """The guard must not start grading writing.
+
+    Several of these contain "query", "goal" or "the" -- words the filter treats
+    as structural -- and every one of them is a legitimate thing to write.
+    """
+
+    from research_os.research.planner import _is_placeholder
+
+    assert not _is_placeholder(value), f"{value!r} was wrongly refused"
+
+
+def test_two_delegated_runs_on_one_task_are_not_double_charged(
+    research_home: Path, tmp_path: Path
+) -> None:
+    """A task with *two* delegated runs, which is where the units diverged.
+
+    A final release review showed the previous test could not see this defect:
+    with one delegated run, "this inner run's total" and "this task's cumulative
+    total" are the same number, so writing one where the other was meant is
+    invisible. With two they differ, and the reconciliation charged the
+    difference again.
+
+    The sequence is the reviewer's: execute, interrupt, resume --retry (a second
+    delegated run), execute, interrupt, resume.
+    """
+
+    from research_os.automation.store import RunStore
+
+    controller, store, _run, _ = start(
+        tmp_path, plan=plan_payload(tasks=[analysis_task()])
+    )
+    controller.execute(store)
+
+    def interrupt() -> None:
+        current = store.load()
+        store.save(
+            current.model_copy(
+                update={
+                    "state": ResearchState.EXECUTING,
+                    "tasks": [
+                        item.model_copy(update={"status": TaskStatus.RUNNING})
+                        for item in current.tasks
+                    ],
+                }
+            )
+        )
+
+    # First interruption, retried -- this dispatches a *second* delegated run.
+    interrupt()
+    controller.resume(store, retry=True)
+    controller.execute(store)
+
+    # Second interruption, on the default path.
+    interrupt()
+    recovered = controller.resume(store, retry=False)
+
+    # The truth: the planner's call plus every delegated run's own record.
+    delegated = sum(
+        RunStore.open(str(record["automation_run_id"])).load().model_calls_used
+        for record in store.iter_events()
+        if record.get("event") == "automation_run_started"
+    )
+    started = sum(
+        1
+        for record in store.iter_events()
+        if record.get("event") == "automation_run_started"
+    )
+    assert started >= 2, "the fixture must produce more than one delegated run"
+    assert recovered.model_calls_used == 1 + delegated, (
+        f"charged {recovered.model_calls_used}, true total {1 + delegated} "
+        f"across {started} delegated runs"
+    )
+
+    # And every charge event agrees on what the number means.
+    totals = [
+        int(record["charged_total"])
+        for record in store.iter_events()
+        if record.get("charged_total") is not None
+    ]
+    assert totals == sorted(totals), f"charged_total went backwards: {totals}"

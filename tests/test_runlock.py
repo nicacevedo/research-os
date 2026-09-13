@@ -333,26 +333,31 @@ print(f"{violations} {acquisitions}", flush=True)
 def test_contending_processes_never_both_enter_the_critical_section(
     automation_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The only test here that can actually observe the failure mode.
+    """Contention with a witness inside the critical section.
 
-    An independent reviewer measured what the previous version of this file
-    could not: give each racer one attempt and a winner that holds for 400ms,
-    and no process is ever mid-acquire while another releases -- which is the
-    only window there is. Looping acquire/release with a witness file inside the
-    critical section finds it in roughly one acquisition in fifty.
+    Looping acquire/release is what a single-acquisition test cannot do: give
+    each racer one attempt and a winner that holds for 400ms, and no process is
+    ever mid-acquire while another releases, which is the only window there is.
 
-    It found two real bugs this way. First an ``os.link`` takeover that unlinked
-    a live lock; then a release that unlinked the lock file *before* dropping
-    the flock, leaving one process holding an unreachable inode while the next
-    created a fresh one at the same path. Both produced two simultaneous
-    holders; this test produced 8% violations against the second.
+    Two corrections to what this docstring used to claim, both from a release
+    review that mutation-tested this file. It is *not* the only test here that
+    can observe the failure, and it is not the one to rely on: at the few
+    hundred acquisitions it reaches in-suite it caught the unlink-on-release bug
+    in none of eight trials. The deterministic detector is
+    ``test_a_process_that_opened_before_release_cannot_hold_alongside_the_next``,
+    which catches it every time.
+
+    This test earns its place as a broad net -- under mutation it fails against
+    a shared lock and against the stale-takeover bug -- and as the in-suite echo
+    of the release probe, which runs the same shape at thousands of acquisitions
+    and is where the 8% measurement actually came from.
     """
 
     witness = tmp_path / "witness"
     monkeypatch.setenv("RUNLOCK_WITNESS", str(witness))
     workers = [
         subprocess.Popen(
-            [sys.executable, "-c", STRESS, RUN_ID, "400"],
+            [sys.executable, "-c", STRESS, RUN_ID, "700"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -369,7 +374,9 @@ def test_contending_processes_never_both_enter_the_critical_section(
         first, second = line.split()
         violations += int(first)
         acquisitions += int(second)
-    assert acquisitions > 50, f"too few acquisitions to mean anything: {acquisitions}"
+    # A floor well clear of what the loop actually reaches, so a loaded
+    # machine produces a real failure rather than a flake.
+    assert acquisitions > 120, f"too few acquisitions to mean anything: {acquisitions}"
     assert violations == 0, (
         f"{violations} of {acquisitions} acquisitions had two holders at once"
     )

@@ -23,6 +23,7 @@ from pydantic import ValidationError
 from research_os.automation.models import AnalystReport, WorkOrder
 from research_os.automation.promptdata import (
     ANALYST_FENCE,
+    TASK_FENCE,
     prompt_safe,
     prompt_safe_block,
     render_data_block,
@@ -142,10 +143,10 @@ install anything, so do not plan to: report what you established by reading.
 TASK {order.task_id}: {prompt_safe(order.title, limit=MAX_LABEL_CHARS)}
 
 GOAL
-{prompt_safe_block(order.goal, limit=MAX_FREE_TEXT_CHARS)}
+{render_data_block(TASK_FENCE, prompt_safe_block(order.goal, limit=MAX_FREE_TEXT_CHARS).split(chr(10)))}
 
 COMPLETION CONDITION
-{prompt_safe_block(order.completion_condition, limit=MAX_FREE_TEXT_CHARS)}
+{render_data_block(TASK_FENCE, prompt_safe_block(order.completion_condition, limit=MAX_FREE_TEXT_CHARS).split(chr(10)))}
 
 SNAPSHOT COMMIT
 {order.base_commit}

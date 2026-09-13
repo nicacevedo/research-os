@@ -233,6 +233,16 @@ class SourcePacket(BaseModel):
 NUMBER_RE = re.compile(r"(?<![A-Za-z0-9_.-])\d+(?:\.\d+)?(?![A-Za-z0-9_.])")
 
 
+#: The shape of a capsule object id a writer may name in its manifest.
+#:
+#: Deliberately the shape and nothing more: whether the id exists is settled by
+#: the capsule, not by a regex.
+OBJECT_ID_RE = re.compile(r"^[A-Z][A-Z0-9_]{1,15}-[0-9]{1,6}$")
+
+#: The shape of a citation key, which is one bare token in the prose too.
+CITATION_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+
+
 class SourceManifest(BaseModel):
     """What a writer says it used. Provenance, not prose.
 
@@ -254,6 +264,44 @@ class SourceManifest(BaseModel):
     unresolved_caveats: list[NonBlankStr] = Field(default_factory=list)
     written_paths: list[str] = Field(default_factory=list)
     generated_at: str = Field(default_factory=utc_now)
+
+    @field_validator("claim_ids", "evidence_ids", "experiment_ids")
+    @classmethod
+    def _object_ids_are_object_ids(cls, value: list[str]) -> list[str]:
+        """Refuse anything that is not shaped like a capsule object id.
+
+        These are model-originated and were the one part of a manifest with no
+        validator at all -- ``written_paths`` two lines below has had one since
+        it was written, and ``draft_id`` has a regex. A final release review
+        showed the consequence: a writer could return a "claim id" containing
+        newlines and a forged section, and the writing reviewer's prompt
+        interpolated it verbatim.
+
+        Shape only. Whether the id names anything real is a question for
+        ``_check_manifest``, which answers it against the capsule.
+        """
+
+        for item in value:
+            if OBJECT_ID_RE.fullmatch(item) is None:
+                raise ValueError(
+                    f"{item!r} is not a capsule object id. A manifest records "
+                    "which objects a draft used; an id is a short token like "
+                    "CLAIM-0001, never free text."
+                )
+        return value
+
+    @field_validator("citation_keys")
+    @classmethod
+    def _citation_keys_are_tokens(cls, value: list[str]) -> list[str]:
+        """A citation key is one bare token, as it is in the prose that cites it."""
+
+        for item in value:
+            if CITATION_KEY_RE.fullmatch(item) is None:
+                raise ValueError(
+                    f"{item!r} is not a citation key. A key is a single token "
+                    "such as smith2019widgets, never free text."
+                )
+        return value
 
     @field_validator("written_paths")
     @classmethod

@@ -360,7 +360,7 @@ class PaperController:
         resolved: ResolvedRoles,
         invocations: list[ModelInvocation],
     ) -> WritingReview:
-        setting = resolved.roles["reviewer"]
+        setting = self._reviewer_setting(resolved)
         diff = ""
         if draft.diff_path:
             diff = store.path(*draft.diff_path.split("/")).read_text(encoding="utf-8")
@@ -536,6 +536,33 @@ class PaperController:
 
     def _resolve_roles(self) -> ResolvedRoles:
         return resolve_roles(self.config, probe_registry(self.providers))
+
+    @staticmethod
+    def _reviewer_setting(resolved: ResolvedRoles) -> RoleSetting:
+        """Return the review role, refusing anything that is not context-only.
+
+        Every other controller asserts this position before invoking; this one
+        took the configured role on trust, so a configuration declaring the
+        reviewer write-enabled would have been honoured -- it passes both tool
+        allowlists, and ``Access`` derives ``ISOLATED_WRITE`` from
+        ``read_only: false``. It could not have reached ``.research/``, but a
+        reviewer with file tools in the draft's own record directory is not the
+        context-only position the architecture documents.
+        """
+
+        setting = resolved.roles.get("reviewer")
+        if setting is None:
+            raise AutomationError(
+                "this configuration declares no reviewer role; a draft is not "
+                "put in front of a researcher unreviewed"
+            )
+        if setting.access is not Access.CONTEXT_ONLY:
+            raise AutomationError(
+                f"the reviewer role declares {setting.access}; a writing "
+                "reviewer is context-only and is given no tools, so it cannot "
+                "act on what it is judging"
+            )
+        return setting
 
     @staticmethod
     def _writer_setting(resolved: ResolvedRoles) -> RoleSetting:

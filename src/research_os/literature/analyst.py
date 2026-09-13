@@ -33,6 +33,7 @@ from pydantic import ValidationError
 
 from research_os.automation.promptdata import (
     ANALYST_FENCE,
+    TASK_FENCE,
     prompt_safe,
     prompt_safe_block,
     render_data_block,
@@ -170,7 +171,7 @@ automation controller. You have no tools: no Read, no Write, no Edit, no Bash,
 and no network. Everything you may use is in this prompt.
 
 RESEARCH GOAL
-{prompt_safe_block(goal, limit=MAX_SUMMARY_CHARS)}
+{render_data_block(TASK_FENCE, prompt_safe_block(goal, limit=MAX_SUMMARY_CHARS).split(chr(10)))}
 
 WHAT THE BLOCK BELOW IS
 

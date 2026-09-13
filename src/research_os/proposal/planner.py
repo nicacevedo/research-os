@@ -26,7 +26,12 @@ from typing import Any
 from pydantic import ValidationError
 
 from research_os.automation.models import utc_now
-from research_os.automation.promptdata import prompt_safe, prompt_safe_block
+from research_os.automation.promptdata import (
+    TASK_FENCE,
+    prompt_safe,
+    prompt_safe_block,
+    render_data_block,
+)
 from research_os.automation.structured import extract_json_object
 from research_os.errors import ProposalValidationError
 from research_os.proposal.context import ScienceContext, render_science_context
@@ -228,7 +233,7 @@ human may promote any part of it -- and even then it becomes a *draft*, never an
 accepted Claim and never a Review.
 
 RESEARCHER'S GOAL
-{prompt_safe_block(goal, limit=MAX_GOAL_CHARS)}
+{render_data_block(TASK_FENCE, prompt_safe_block(goal, limit=MAX_GOAL_CHARS).split(chr(10)))}
 
 WHAT YOU MAY CITE
 

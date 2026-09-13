@@ -23,6 +23,7 @@ from research_os.automation.models import AcceptanceCommand, CommandResult, Work
 from research_os.automation.promptdata import (
     CHECK_OUTPUT_FENCE,
     DIFF_FENCE,
+    TASK_FENCE,
     prompt_safe,
     prompt_safe_block,
     render_data_block,
@@ -90,10 +91,10 @@ TASK {order.task_id}: {prompt_safe(order.title, limit=MAX_LABEL_CHARS)}
 {_dependency_section(order, dependency_data)}
 
 GOAL
-{prompt_safe_block(order.goal, limit=MAX_FREE_TEXT_CHARS)}
+{render_data_block(TASK_FENCE, prompt_safe_block(order.goal, limit=MAX_FREE_TEXT_CHARS).split(chr(10)))}
 
 COMPLETION CONDITION
-{prompt_safe_block(order.completion_condition, limit=MAX_FREE_TEXT_CHARS)}
+{render_data_block(TASK_FENCE, prompt_safe_block(order.completion_condition, limit=MAX_FREE_TEXT_CHARS).split(chr(10)))}
 
 YOU MAY CHANGE ONLY THESE PATHS
 {allowed}
@@ -217,10 +218,10 @@ fails; there is no third attempt, so do not leave anything half-finished.
 TASK {order.task_id}: {prompt_safe(order.title, limit=MAX_LABEL_CHARS)}
 
 GOAL
-{prompt_safe_block(order.goal, limit=MAX_FREE_TEXT_CHARS)}
+{render_data_block(TASK_FENCE, prompt_safe_block(order.goal, limit=MAX_FREE_TEXT_CHARS).split(chr(10)))}
 
 COMPLETION CONDITION
-{prompt_safe_block(order.completion_condition, limit=MAX_FREE_TEXT_CHARS)}
+{render_data_block(TASK_FENCE, prompt_safe_block(order.completion_condition, limit=MAX_FREE_TEXT_CHARS).split(chr(10)))}
 
 WHY YOU WERE CALLED BACK
 {reason}

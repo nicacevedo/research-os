@@ -260,8 +260,15 @@ class AutomationController:
         skip_planner: bool = False,
         budget: Budget | None = None,
         plan: PlanDocument | None = None,
+        attempt: str = "",
     ) -> tuple[RunStore, AutomationRun]:
         """Preflight, build context, and plan. Never invokes a write worker.
+
+        ``attempt`` distinguishes a deliberate second dispatch of the same work
+        from an accidental duplicate. A research task retried after an
+        interruption starts a genuinely different run with the same project,
+        goal and often the same second; without it the run id collided and the
+        store refused to create the directory.
 
         ``plan`` supplies a plan that was produced elsewhere -- by a higher-level
         research run that has already decided what the coding work is. It is
@@ -285,6 +292,7 @@ class AutomationController:
                 project_path=str(preflight.root),
                 goal=goal,
                 created_at=created_at,
+                attempt=attempt,
             ),
             project_path=str(preflight.root),
             goal=goal,
