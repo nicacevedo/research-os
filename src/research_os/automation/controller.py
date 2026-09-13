@@ -24,6 +24,7 @@ from pydantic import ValidationError
 from research_os.automation.analyst import (
     ANALYST_SCHEMA,
     build_analyst_prompt,
+    build_correction_prompt,
     parse_analyst_report,
     render_analyst_data,
     snapshot_evidence,
@@ -72,6 +73,7 @@ from research_os.automation.planner import (
     MODEL_CALLS_PER_ANALYSIS_TASK,
     MODEL_CALLS_PER_CODING_TASK,
     PLAN_SCHEMA,
+    PlanDocument,
     build_planner_prompt,
     parse_plan,
     plan_to_work_orders,
@@ -106,6 +108,7 @@ from research_os.errors import (
     SnapshotMutationError,
     SymlinkScopeError,
 )
+from research_os.runlock import run_lock
 
 PLANNER_TIMEOUT_SECONDS = 600
 REVIEWER_TIMEOUT_SECONDS = 600
@@ -256,8 +259,24 @@ class AutomationController:
         dry_run: bool = False,
         skip_planner: bool = False,
         budget: Budget | None = None,
+        plan: PlanDocument | None = None,
+        attempt: str = "",
     ) -> tuple[RunStore, AutomationRun]:
-        """Preflight, build context, and plan. Never invokes a write worker."""
+        """Preflight, build context, and plan. Never invokes a write worker.
+
+        ``attempt`` distinguishes a deliberate second dispatch of the same work
+        from an accidental duplicate. A research task retried after an
+        interruption starts a genuinely different run with the same project,
+        goal and often the same second; without it the run id collided and the
+        store refused to create the directory.
+
+        ``plan`` supplies a plan that was produced elsewhere -- by a higher-level
+        research run that has already decided what the coding work is. It is
+        validated by exactly the same rules a planner's output is, and it skips
+        only the model call, never a check. That is what lets the research
+        orchestrator reuse this controller rather than reimplement dispatch,
+        scope enforcement, checking, review, and the bounded repair.
+        """
 
         goal = goal.strip()
         if not goal:
@@ -273,6 +292,7 @@ class AutomationController:
                 project_path=str(preflight.root),
                 goal=goal,
                 created_at=created_at,
+                attempt=attempt,
             ),
             project_path=str(preflight.root),
             goal=goal,
@@ -310,7 +330,7 @@ class AutomationController:
             run = self._archive_context(store, run, packet)
             if skip_planner:
                 return store, run
-            run = self._plan(store, run, packet, resolved)
+            run = self._plan(store, run, packet, resolved, supplied=plan)
         except AutomationError as exc:
             run = self._fail(store, run, str(exc))
             raise
@@ -321,6 +341,10 @@ class AutomationController:
     def execute(self, store: RunStore) -> AutomationRun:
         """Dispatch the plan, check it deterministically, and have it reviewed."""
 
+        with run_lock(store.run_id, action="auto run"):
+            return self._execute(store)
+
+    def _execute(self, store: RunStore) -> AutomationRun:
         run = store.load()
         if run.dry_run:
             raise AutomationError(
@@ -365,6 +389,17 @@ class AutomationController:
         return run
 
     def cancel(self, store: RunStore, *, reason: str) -> AutomationRun:
+        """Stop a run that is not terminal.
+
+        Takes the same lock an executing process holds, so a cancel either
+        happens or is refused. It must never be accepted and then silently
+        overwritten by a run that carried on regardless.
+        """
+
+        with run_lock(store.run_id, action="auto cancel"):
+            return self._cancel(store, reason=reason)
+
+    def _cancel(self, store: RunStore, *, reason: str) -> AutomationRun:
         run = store.load()
         if run.terminal:
             raise AutomationError(f"{run.run_id} is already {run.state}")
@@ -375,6 +410,10 @@ class AutomationController:
     def cleanup(self, store: RunStore) -> tuple[AutomationRun, tuple[str, ...]]:
         """Remove this run's worktrees. Branches and run records are kept."""
 
+        with run_lock(store.run_id, action="auto cleanup"):
+            return self._cleanup(store)
+
+    def _cleanup(self, store: RunStore) -> tuple[AutomationRun, tuple[str, ...]]:
         run = store.load()
         removed: list[str] = []
         records = []
@@ -432,8 +471,24 @@ class AutomationController:
         run: AutomationRun,
         packet: ContextPacket,
         resolved: ResolvedRoles,
+        supplied: PlanDocument | None = None,
     ) -> AutomationRun:
         run = self._transition(store, run, RunState.PLANNING)
+        if supplied is not None:
+            # A plan decided upstream still passes every local gate. Skipping
+            # the model call is a saving; skipping validation would be a hole.
+            store.append_event(
+                "plan_supplied",
+                tasks=[item.id for item in supplied.tasks],
+                detail="the plan came from a higher-level run, not from a planner call",
+            )
+            plan = supplied
+            validate_plan(
+                plan,
+                budget=run.budget,
+                allowed_programs=self.config.allowed_check_programs,
+            )
+            return self._accept_plan(store, run, plan, resolved)
         planner = resolved.roles["planner"]
         prompt = build_planner_prompt(
             goal=run.goal,
@@ -462,6 +517,17 @@ class AutomationController:
             budget=run.budget,
             allowed_programs=self.config.allowed_check_programs,
         )
+        return self._accept_plan(store, run, plan, resolved)
+
+    def _accept_plan(
+        self,
+        store: RunStore,
+        run: AutomationRun,
+        plan: PlanDocument,
+        resolved: ResolvedRoles,
+    ) -> AutomationRun:
+        """Turn a validated plan into work orders. One path, however it arrived."""
+
         store.write_json("plan/plan.json", plan.model_dump(mode="json"))
         orders = plan_to_work_orders(
             plan,
@@ -534,6 +600,117 @@ class AutomationController:
             detail=detail,
         )
         raise AutomationError(f"{task_id} is blocked by {', '.join(blocked)}")
+
+    def _analyst_report(
+        self,
+        store: RunStore,
+        run: AutomationRun,
+        task_id: str,
+        *,
+        setting: RoleSetting,
+        snapshot: Path,
+        context_text: str,
+        invocation: ModelInvocation,
+        result: InvocationResult,
+        snapshot_commit: str,
+        timeout_seconds: int,
+    ) -> tuple[AutomationRun, AnalystReport, ModelInvocation]:
+        """Validate the analyst's report, allowing at most one bounded re-ask.
+
+        The re-ask exists because of a failure seen against a live provider: a
+        report that cited a finding id it had not reported. That is mechanical,
+        the worker is the only thing that can fix it, and losing an entire
+        research run to it is a worse answer than spending one more read-only
+        call.
+
+        It is not leniency. The second report is validated by exactly the same
+        rules as the first, and a second failure ends the work order. The
+        attempt is charged against the same bounded-repair allowance the coder
+        has, so a run configured for no repairs gets none here either.
+        """
+
+        def parse(current: InvocationResult, current_invocation: ModelInvocation):
+            return parse_analyst_report(
+                structured=current.structured,
+                text=current.text,
+                task_id=task_id,
+                provider=setting.provider,
+                model=current_invocation.model or setting.model,
+                invocation_id=current_invocation.invocation_id,
+                snapshot_commit=snapshot_commit,
+            )
+
+        try:
+            return run, parse(result, invocation), invocation
+        except AnalystOutputError as first:
+            # Bound here and used below: Python unbinds the name at the end of
+            # the except clause, and the message is the whole input to the
+            # correction.
+            reason = str(first)
+            store.append_event(
+                "analyst_output_rejected",
+                task_id=task_id,
+                invocation_id=invocation.invocation_id,
+                detail=reason,
+            )
+            order = run.order(task_id)
+            if run.budget.max_repair_attempts < 1 or order.repair_attempts >= 1:
+                raise
+            refusal = repair_budget_refusal(run)
+            if refusal is not None:
+                store.append_event(
+                    "analyst_correction_declined", task_id=task_id, detail=refusal
+                )
+                raise
+
+        run = self._update_order(
+            store,
+            run,
+            task_id,
+            repair_attempts=run.order(task_id).repair_attempts + 1,
+        )
+        store.append_event(
+            "analyst_correction_started",
+            task_id=task_id,
+            previous_invocation_id=invocation.invocation_id,
+        )
+        run, retry_invocation, retry_result = self._invoke(
+            store,
+            run,
+            role=Role.ANALYST,
+            setting=setting,
+            prompt=build_correction_prompt(
+                run.order(task_id),
+                context_text=context_text,
+                previous_output=result.text or "",
+                reason=reason,
+            ),
+            cwd=snapshot,
+            timeout_seconds=timeout_seconds,
+            json_schema=ANALYST_SCHEMA,
+            task_id=task_id,
+        )
+        run = self._update_order(
+            store,
+            run,
+            task_id,
+            invocation_ids=[
+                *run.order(task_id).invocation_ids,
+                retry_invocation.invocation_id,
+            ],
+        )
+        if not retry_result.ok:
+            raise AnalystOutputError(
+                f"the analyst's one correction failed to run: "
+                f"{retry_invocation.error or 'unknown error'}"
+            )
+        report = parse(retry_result, retry_invocation)
+        store.append_event(
+            "analyst_correction_accepted",
+            task_id=task_id,
+            invocation_id=retry_invocation.invocation_id,
+        )
+        return run, report, retry_invocation
 
     def _execute_analysis_order(
         self,
@@ -678,22 +855,19 @@ class AutomationController:
             )
 
         try:
-            report = parse_analyst_report(
-                structured=result.structured,
-                text=result.text,
-                task_id=task_id,
-                provider=setting.provider,
-                model=invocation.model or setting.model,
-                invocation_id=invocation.invocation_id,
+            run, report, invocation = self._analyst_report(
+                store,
+                run,
+                task_id,
+                setting=setting,
+                snapshot=snapshot,
+                context_text=render_context(packet),
+                invocation=invocation,
+                result=result,
                 snapshot_commit=after["head"],
+                timeout_seconds=order.timeout_seconds,
             )
         except AnalystOutputError as exc:
-            store.append_event(
-                "analyst_output_rejected",
-                task_id=task_id,
-                invocation_id=invocation.invocation_id,
-                detail=str(exc),
-            )
             self._update_order(
                 store,
                 run,
@@ -1832,7 +2006,7 @@ class AutomationController:
             )
         limit = run.budget.max_wall_clock_seconds
         if limit is not None:
-            elapsed = _elapsed_seconds(run.created_at, utc_now())
+            elapsed = elapsed_seconds(run.created_at, utc_now())
             if elapsed > limit:
                 raise BudgetExceededError(
                     f"wall-clock budget exhausted: {elapsed}s elapsed of {limit}s"
@@ -2163,7 +2337,7 @@ def _read_captured(stored: str | None) -> str:
         return ""
 
 
-def _elapsed_seconds(start: str, end: str) -> int:
+def elapsed_seconds(start: str, end: str) -> int:
     """Return whole seconds between two runtime timestamps.
 
     The runtime format has second resolution and is always UTC, so both sides

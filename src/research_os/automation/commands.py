@@ -305,10 +305,21 @@ def set_registry_factory(factory: RegistryFactory | None) -> None:
         _REGISTRY_FACTORY.append(factory)
 
 
-def _registry() -> dict[str, ProviderAdapter]:
+def provider_registry() -> dict[str, ProviderAdapter]:
+    """Return the provider registry every command group should use.
+
+    One accessor rather than each group calling ``default_registry`` itself, so
+    the test seam above covers the whole CLI instead of the part that happened to
+    be written first.
+    """
+
     if _REGISTRY_FACTORY:
         return _REGISTRY_FACTORY[0]()
     return default_registry()
+
+
+def _registry() -> dict[str, ProviderAdapter]:
+    return provider_registry()
 
 
 def _controller(args: argparse.Namespace) -> AutomationController:

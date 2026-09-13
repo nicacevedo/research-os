@@ -30,9 +30,23 @@ from research_os.automation.models import (
     WorkOrder,
     safe_relative_path,
 )
+from research_os.automation.promptdata import (
+    TASK_FENCE,
+    prompt_safe_block,
+    render_data_block,
+)
 from research_os.automation.structured import extract_json_object
 from research_os.errors import CommandPolicyError, PlanValidationError
 from research_os.models import NonBlankStr
+
+#: How much of a goal reaches the planner.
+#:
+#: The goal normally comes from the researcher's own command line, so this is
+#: not a trust boundary today. It is rendered like every other goal in this
+#: system because the one caller that could supply a model-written goal -- a
+#: research task delegating here -- always supplies a plan too, and that
+#: invariant is one refactor away from being the only thing holding it.
+MAX_GOAL_CHARS = 6_000
 
 PLAN_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -195,7 +209,7 @@ research plan is therefore two tasks:
     T-002  coder     implement the smallest correction, depends_on T-001
 
 USER GOAL
-{goal}
+{render_data_block(TASK_FENCE, prompt_safe_block(goal, limit=MAX_GOAL_CHARS).split(chr(10)))}
 
 REPOSITORY
 {project_path}

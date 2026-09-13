@@ -111,6 +111,14 @@ class RunStoreError(AutomationError):
     """Raised when the runtime run store cannot be read or written."""
 
 
+class RunLockedError(AutomationError):
+    """Raised when another process is already changing this run.
+
+    Refusing is the whole point: two processes writing one run record means the
+    loser's decision disappears under the winner's next write, silently.
+    """
+
+
 class RunNotFoundError(AutomationError):
     """Raised when a run id names no run directory."""
 
@@ -193,6 +201,222 @@ class PromptDataError(AutomationError):
     closed, because a prompt whose fence is ambiguous has already lost the
     distinction between data and instruction.
     """
+
+
+class LiteratureError(ResearchOSError):
+    """Base class for literature-subsystem failures.
+
+    The literature index is shared, rebuildable infrastructure, not scientific
+    truth, so none of these ever indicates a corrupt capsule. They are reported
+    and, where a run is involved, recorded in its ledger.
+    """
+
+
+class LiteratureStoreError(LiteratureError):
+    """Raised when the shared scholarly store cannot be opened, read, or written."""
+
+
+class SourceUnavailableError(LiteratureError):
+    """Raised when a literature provider cannot be used on this machine.
+
+    A missing credential, an unreachable host, and an exhausted rate budget are
+    all this: the provider is not usable right now. It is a reportable state
+    rather than a crash, so the rest of a retrieval can continue and say plainly
+    which source was skipped.
+    """
+
+
+class ExtractionError(LiteratureError):
+    """Raised when local text extraction from a stored file cannot be completed."""
+
+
+class ProposalError(ResearchOSError):
+    """Base class for scientific-proposal failures.
+
+    A proposal is runtime state, not science, so none of these ever indicates a
+    corrupt capsule. The one that touches a capsule -- promotion -- raises
+    ``CapsuleError`` for filesystem problems and these for everything it refuses.
+    """
+
+
+class ProposalValidationError(ProposalError):
+    """Raised when proposal output is not a usable, grounded proposal.
+
+    Fail-closed. A proposal is what a researcher decides from, so output that
+    does not validate is a failed task rather than something to interpret
+    generously -- and a proposal citing something this run never had is refused
+    outright rather than trimmed.
+    """
+
+
+class ProposalStoreError(ProposalError):
+    """Raised when the proposal store cannot be read or written."""
+
+
+class ProposalNotFoundError(ProposalError):
+    """Raised when a proposal id names no proposal directory."""
+
+
+class PromotionRefusedError(ProposalError):
+    """Raised when a promotion would cross a boundary only a human may cross.
+
+    Never raised because a proposal was poor. It is raised when something other
+    than an interactive human asked for scientific state to be written, or when
+    the promotion would produce something stronger than a draft.
+    """
+
+
+class ExperimentError(ResearchOSError):
+    """Base class for experiment-execution failures.
+
+    An execution record is runtime state, never science, so none of these means
+    a corrupt capsule. What they mean is that something was refused, could not
+    be reached, or did not produce what it said it would.
+    """
+
+
+class ExperimentConfigError(ExperimentError):
+    """Raised when experiment configuration is missing, invalid, or silent.
+
+    Also raised for the ordinary case of a project with no declared commands.
+    That is not a malfunction: a command nobody declared cannot be run, and
+    saying so plainly is the whole point of declaring them.
+    """
+
+
+class ExperimentSpecError(ExperimentError):
+    """Raised when a command cannot be built from its declaration and values.
+
+    Refusal, never repair. A supplied value that does not fit its declared type
+    is rejected rather than quoted or escaped, because escaping would mean
+    guessing what the caller meant -- and the caller may be a model.
+    """
+
+
+class ExperimentAuthorizationError(ExperimentError):
+    """Raised when an execution is not authorised to spend what it would spend.
+
+    An experiment costs real time and sometimes real money. A missing explicit
+    authorisation, an exhausted submission budget, and a partition outside the
+    allowlist are all this, and each says which one it was.
+    """
+
+
+class ExperimentIngestError(ExperimentError):
+    """Raised when what an execution produced cannot be read or hashed."""
+
+
+class ExperimentStoreError(ExperimentError):
+    """Raised when the experiment run store cannot be read or written."""
+
+
+class ExperimentRunNotFoundError(ExperimentError):
+    """Raised when an experiment run id names no run directory."""
+
+
+class SchedulerUnavailableError(ExperimentError):
+    """Raised when a scheduler cannot be reached or refuses a submission.
+
+    Reported rather than worked around. A machine with no ``sbatch`` is not a
+    submit host, and pretending a job was queued would be worse than saying so.
+    """
+
+
+class InsightError(ResearchOSError):
+    """Base class for cross-project insight failures.
+
+    An insight is durable shared knowledge but never scientific truth: it holds
+    nobody's Claim and rests on nobody's Evidence. These failures are therefore
+    operational, and none of them indicates a corrupt capsule.
+    """
+
+
+class InsightStoreError(InsightError):
+    """Raised when the insight corpus cannot be read or written."""
+
+
+class InsightNotFoundError(InsightError):
+    """Raised when an insight or nomination id names nothing."""
+
+
+class InsightPromotionRefusedError(InsightError):
+    """Raised when something other than a human tried to promote an insight.
+
+    Promotion is the only operation that puts knowledge where another project's
+    workers will read it. An agent may nominate; the crossing is a human act.
+    """
+
+
+class PaperError(ResearchOSError):
+    """Base class for manuscript-writing failures.
+
+    A draft is prose about science, never science. None of these means a corrupt
+    capsule, and none of them means anything was accepted: a writing task ends
+    with a diff on a branch that a human reads.
+    """
+
+
+class PaperPacketError(PaperError):
+    """Raised when the sources a writing task would use cannot be assembled.
+
+    Most often because a Claim was asked for that is not accepted, or whose
+    human approval no longer binds its current evidence. That is a refusal
+    rather than a malfunction: a manuscript may only state what the project has
+    actually accepted, as it stands now.
+    """
+
+
+class PaperManifestError(PaperError):
+    """Raised when a writer produced no usable record of what it wrote from.
+
+    Fail-closed. Without a manifest the prose cannot be checked against
+    anything, so prose with no provenance record is an incomplete task rather
+    than a task with a missing extra.
+    """
+
+
+class PaperWritingError(PaperError):
+    """Raised when a writing task is refused or its writer left its scope."""
+
+
+class PaperStoreError(PaperError):
+    """Raised when the draft store cannot be read or written."""
+
+
+class DraftNotFoundError(PaperError):
+    """Raised when a draft id names no draft directory."""
+
+
+class ResearchError(ResearchOSError):
+    """Base class for unified research-orchestration failures.
+
+    A research run is the layer above every other controller: it decides what
+    runs, in what order, against which budget, and when to stop for a person. It
+    owns no worker and writes nothing scientific, so none of these means the
+    capsule is wrong -- they mean a run could not be planned, could not be
+    dispatched, or was asked to do something it is not allowed to do.
+    """
+
+
+class ResearchPlanError(ResearchError):
+    """Raised when a research plan is absent, malformed, or not executable.
+
+    Includes the case that matters most: a plan naming an experiment command the
+    researcher never declared. That is refused at planning time rather than at
+    the moment of spending, so the failure costs nothing.
+    """
+
+
+class ResearchStateError(ResearchError):
+    """Raised when a research run is asked for a transition it cannot make."""
+
+
+class ResearchStoreError(ResearchError):
+    """Raised when a research run directory cannot be read or written."""
+
+
+class ResearchRunNotFoundError(ResearchError):
+    """Raised when a run id names no research run directory."""
 
 
 class Severity(StrEnum):

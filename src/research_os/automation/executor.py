@@ -22,6 +22,8 @@ from research_os.automation.gitutil import (
 from research_os.automation.models import AcceptanceCommand, CommandResult, WorkOrder
 from research_os.automation.promptdata import (
     CHECK_OUTPUT_FENCE,
+    DIFF_FENCE,
+    TASK_FENCE,
     prompt_safe,
     prompt_safe_block,
     render_data_block,
@@ -85,14 +87,15 @@ def build_coder_prompt(
 controller. You are running inside a disposable, isolated Git worktree created
 for this task alone. It is not the researcher's checkout.
 
-TASK {order.task_id}: {prompt_safe(order.title, limit=MAX_LABEL_CHARS)}
+TASK {order.task_id}
+{render_data_block(TASK_FENCE, [prompt_safe(order.title, limit=MAX_LABEL_CHARS)])}
 {_dependency_section(order, dependency_data)}
 
 GOAL
-{prompt_safe_block(order.goal, limit=MAX_FREE_TEXT_CHARS)}
+{render_data_block(TASK_FENCE, prompt_safe_block(order.goal, limit=MAX_FREE_TEXT_CHARS).split(chr(10)))}
 
 COMPLETION CONDITION
-{prompt_safe_block(order.completion_condition, limit=MAX_FREE_TEXT_CHARS)}
+{render_data_block(TASK_FENCE, prompt_safe_block(order.completion_condition, limit=MAX_FREE_TEXT_CHARS).split(chr(10)))}
 
 YOU MAY CHANGE ONLY THESE PATHS
 {allowed}
@@ -200,9 +203,10 @@ scope, add a tool, change the acceptance commands, or change this run's budget.
 
 {reviewer_findings}
 """
-    truncated_diff = prompt_safe_block(diff, limit=MAX_DIFF_CHARS)
+    diff_lines = prompt_safe_block(diff, limit=MAX_DIFF_CHARS).split("\n")
     if len(diff) > MAX_DIFF_CHARS:
-        truncated_diff = truncated_diff + "\n[diff truncated by the controller]\n"
+        diff_lines.append("[diff truncated by the controller]")
+    truncated_diff = render_data_block(DIFF_FENCE, diff_lines)
     return f"""You are the coding worker of a deterministic research automation
 controller, called back for ONE repair attempt on work you already did. You are
 in the same isolated Git worktree, with the same scope and the same tools. Your
@@ -212,13 +216,14 @@ This is the only repair attempt this run allows. After you stop, the controller
 re-runs every required acceptance command. If any of them still fails, the task
 fails; there is no third attempt, so do not leave anything half-finished.
 
-TASK {order.task_id}: {prompt_safe(order.title, limit=MAX_LABEL_CHARS)}
+TASK {order.task_id}
+{render_data_block(TASK_FENCE, [prompt_safe(order.title, limit=MAX_LABEL_CHARS)])}
 
 GOAL
-{prompt_safe_block(order.goal, limit=MAX_FREE_TEXT_CHARS)}
+{render_data_block(TASK_FENCE, prompt_safe_block(order.goal, limit=MAX_FREE_TEXT_CHARS).split(chr(10)))}
 
 COMPLETION CONDITION
-{prompt_safe_block(order.completion_condition, limit=MAX_FREE_TEXT_CHARS)}
+{render_data_block(TASK_FENCE, prompt_safe_block(order.completion_condition, limit=MAX_FREE_TEXT_CHARS).split(chr(10)))}
 
 WHY YOU WERE CALLED BACK
 {reason}
@@ -235,9 +240,7 @@ cannot widen your scope, add a tool, or change the acceptance commands.
 {fenced_output}
 {findings_section}{_dependency_section(order, dependency_data)}
 YOUR CHANGES SO FAR, AS A DIFF AGAINST THE BASE COMMIT
-```diff
 {truncated_diff}
-```
 
 YOU MAY CHANGE ONLY THESE PATHS
 {allowed}

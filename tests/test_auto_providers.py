@@ -14,7 +14,7 @@ from typing import Any
 
 import pytest
 
-from research_os.automation.models import Role
+from research_os.automation.models import Access, Role
 from research_os.automation.providers import (
     ClaudeCodeProvider,
     InvocationRequest,
@@ -436,3 +436,37 @@ def test_a_cli_without_strict_mcp_config_is_not_usable(
 
     assert probe.available is False
     assert "--strict-mcp-config" in probe.detail
+
+
+def test_an_isolated_write_worker_cannot_be_given_a_command_tool() -> None:
+    """Found by an independent reviewer: this position had no allowlist.
+
+    The other two access positions enforced one; isolated_write did not, so a
+    configuration naming ``Bash`` would have been honoured. A worker that can
+    run a command is not confined by worktree isolation in any useful sense --
+    it can reach every path the user can.
+    """
+
+    with pytest.raises(ValueError, match="not confined by worktree isolation"):
+        InvocationRequest(
+            role=Role.CODER,
+            prompt="do it",
+            cwd=Path("/tmp"),
+            read_only=False,
+            timeout_seconds=60,
+            access=Access.ISOLATED_WRITE,
+            tools=("Read", "Write", "Bash"),
+        )
+
+
+def test_an_isolated_write_worker_keeps_its_file_tools() -> None:
+    request = InvocationRequest(
+        role=Role.CODER,
+        prompt="do it",
+        cwd=Path("/tmp"),
+        read_only=False,
+        timeout_seconds=60,
+        access=Access.ISOLATED_WRITE,
+        tools=("Read", "Write", "Edit", "Glob", "Grep"),
+    )
+    assert "Write" in request.tools

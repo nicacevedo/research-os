@@ -86,15 +86,32 @@ repositories) under an authorized milestone.
 
 ## API budgets
 
-Paid API use requires explicit budgets (invariant 12). R0 has no API clients.
-Later releases that add providers must expose and respect configurable limits
-before any paid call.
+Paid API use requires explicit budgets (invariant 12).
+
+v1 has API clients: three scholarly HTTP sources (OpenAlex, Crossref, arXiv)
+and the agent provider CLIs. Every model call is counted against a budget
+checked *before* the spend -- separately for model calls, write tasks,
+experiments, cluster submissions and wall clock -- and a plan the run could
+never pay for is refused at planning time. The scholarly sources are
+credential-free and rate-limited by policy rather than by budget; where a key
+is optional it is read from the environment and never stored.
 
 ## Agent execution constraints
 
 - Finite stop conditions; stop after the approved milestone
 - No continuously thinking agents in R0
-- No execution adapters, containers, Slurm, or MCP in R0
+- No containers and no MCP. v1 has execution adapters and a Slurm abstraction:
+  an experiment runs only a command the researcher declared in
+  `~/.config/research-os/experiments.yaml`, outside every worktree, selected by
+  name with typed parameters substituted whole-token. Execution needs explicit
+  authorisation, runs in an isolated worktree, and is bounded by per-run
+  counters for local runs and cluster submissions.
 - Do not touch real scientific project repositories unless explicitly instructed
 - Do not expose secrets in chat, logs, or commits
+- The interactive-terminal gate on `review` and `propose promote` is
+  `sys.stdin.isatty()`. It is a usability and safety guard, not authentication:
+  anything that allocates a PTY satisfies it. The binding rule that an agent
+  must not record a human Review lives in `AGENTS.md`, and the structural
+  guarantee is the acceptance gate in `validate.py`, which no automated path
+  writes.
 - Do not push or merge unless explicitly instructed

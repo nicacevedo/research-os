@@ -76,15 +76,25 @@ def locks_root() -> Path:
     return state_home() / LOCKS_DIRNAME
 
 
-def make_run_id(*, project_path: str, goal: str, created_at: str) -> str:
+def make_run_id(
+    *, project_path: str, goal: str, created_at: str, attempt: str = ""
+) -> str:
     """Return the run id determined by these inputs.
 
-    Deterministic rather than random: the same project, goal, and second yield
-    the same id, so a duplicate is a visible collision instead of a second
-    directory holding the same work.
+    Deterministic rather than random: the same project, goal, second and attempt
+    yield the same id, so starting the same run twice by accident is a visible
+    collision rather than a second directory holding the same work.
+
+    ``attempt`` distinguishes runs that are deliberately *not* the same work
+    despite sharing everything else. A research task that is interrupted and
+    retried dispatches a second delegated run for the same project, goal and --
+    if the retry is prompt -- the same second; without this it inherited the
+    first run's id and the store refused to create it, so a legitimate
+    ``research resume --retry`` failed. Found in a release review and then
+    reproduced by the regression test for a different defect entirely.
     """
 
-    material = f"run-id-v1\n{project_path}\n{goal}\n{created_at}"
+    material = f"run-id-v1\n{project_path}\n{goal}\n{created_at}\n{attempt}"
     digest = hashlib.sha256(material.encode("utf-8")).hexdigest()[:8]
     stamp = created_at.replace("-", "").replace(":", "")
     return f"RUN-{stamp}-{digest}"

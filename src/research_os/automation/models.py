@@ -94,10 +94,11 @@ def assert_transition(current: RunState, target: RunState) -> None:
 
 
 class Role(StrEnum):
-    """The bounded worker roles this MVP dispatches."""
+    """The bounded worker roles the controller dispatches."""
 
     PLANNER = "planner"
     ANALYST = "analyst"
+    LITERATURE = "literature"
     CODER = "coder"
     REVIEWER = "reviewer"
 
@@ -133,6 +134,21 @@ class Access(StrEnum):
 #: no ``Bash``, so the analysis worker has nothing to act with, which is a
 #: stronger guarantee than instructing it not to act.
 READ_ONLY_TOOLS: frozenset[str] = frozenset({"Read", "Glob", "Grep"})
+
+
+#: The only tools an isolated-write worker may ever be given.
+#:
+#: File tools, and nothing that runs a command. An independent reviewer found
+#: this position had no allowlist at all while the other two did, so a
+#: configuration file naming ``Bash`` would have been honoured -- and a worker
+#: with ``Bash`` is not confined by worktree isolation in any meaningful sense,
+#: since it can reach any path the user can.
+#:
+#: The controller runs acceptance commands itself, deliberately, through a
+#: closed grammar. A write worker never needs to run one, so it never gets to.
+WRITE_TOOLS: frozenset[str] = frozenset(
+    {"Read", "Glob", "Grep", "Write", "Edit", "MultiEdit", "NotebookEdit"}
+)
 
 
 class RiskClass(StrEnum):
@@ -748,8 +764,16 @@ class RoleSetting(BaseModel):
         Each position is enforced by what the worker is handed, not by what it
         is asked to do, so a role that declares two contradictory things is a
         configuration error rather than a preference the invocation layer may
-        quietly correct. The invocation layer independently re-applies the same
-        rule.
+        quietly correct.
+
+        The invocation layer independently re-applies the same rule, in
+        :class:`~research_os.automation.providers.InvocationRequest`. Two layers,
+        deliberately: this one fails a bad configuration when it is loaded, at
+        no cost, and that one fails it again at the moment of use, so a request
+        assembled in code rather than read from a file is bound by the same
+        rule. An independent reviewer found the isolated-write case enforced
+        only in the second, which meant a config naming ``Bash`` loaded cleanly
+        and failed later, after a worktree already existed.
         """
 
         if self.access is Access.CONTEXT_ONLY:
@@ -791,6 +815,15 @@ class RoleSetting(BaseModel):
             raise ValueError(
                 "an isolated_write role must not be read_only; write work runs "
                 "in its own disposable worktree"
+            )
+        forbidden = [item for item in self.tools if item not in WRITE_TOOLS]
+        if forbidden:
+            raise ValueError(
+                "an isolated_write role may only declare the file tools "
+                f"{', '.join(sorted(WRITE_TOOLS))}, but this one declares "
+                f"{', '.join(forbidden)}; a worker that can run a command is "
+                "not confined by worktree isolation, and the controller runs "
+                "acceptance commands itself through a closed grammar"
             )
         return self
 

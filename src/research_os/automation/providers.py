@@ -23,6 +23,7 @@ from typing import Any, Protocol
 
 from research_os.automation.models import (
     READ_ONLY_TOOLS,
+    WRITE_TOOLS,
     Access,
     ProviderProbe,
     Role,
@@ -101,6 +102,15 @@ class InvocationRequest:
             return
         if self.read_only:
             raise ValueError("an isolated_write invocation must not be read-only")
+        forbidden = [item for item in self.tools if item not in WRITE_TOOLS]
+        if forbidden:
+            raise ValueError(
+                "an isolated_write invocation may only carry the file tools "
+                f"{', '.join(sorted(WRITE_TOOLS))}, but this one carries "
+                f"{', '.join(forbidden)}. A worker that can run a command is "
+                "not confined by worktree isolation: the controller runs "
+                "acceptance commands itself, through a closed grammar."
+            )
 
 
 @dataclass(frozen=True, slots=True)
