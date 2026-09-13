@@ -657,8 +657,71 @@ def _reclaimable() -> tuple[int, int, str]:
             holding.add(run_id)
         _, runtime = _measure(runs_root() / run_id / RUNTIME_DIRNAME)
         environments += runtime
+
+    for run_id, target in _finished_experiment_worktrees():
+        _, size = _measure(target)
+        worktrees += size
+        holding.add(run_id)
+
     note = f"{len(holding)} finished run(s) still hold a worktree" if holding else ""
     return worktrees, environments, note
+
+
+def _terminal_experiment_states() -> frozenset:
+    """The experiment states after which a worktree is no longer in use."""
+
+    from research_os.experiment.models import TERMINAL_STATES
+
+    return TERMINAL_STATES
+
+
+def _experiment_controller():
+    from research_os.experiment.controller import ExperimentController
+
+    return ExperimentController()
+
+
+def _experiment_run_ids() -> tuple[str, ...]:
+    from research_os.errors import ResearchOSError
+    from research_os.experiment.store import ExperimentStore
+
+    try:
+        return ExperimentStore.list_run_ids()
+    except ResearchOSError:
+        return ()
+
+
+def _experiment_run(run_id: str):
+    from research_os.errors import ResearchOSError
+    from research_os.experiment.store import ExperimentStore
+
+    try:
+        return ExperimentStore.open(run_id).load()
+    except ResearchOSError:
+        return None
+
+
+def _finished_experiment_worktrees() -> list[tuple[str, Path]]:
+    """Return (run id, worktree) for every finished, isolated experiment run.
+
+    Making experiments isolated gave them worktrees of their own, and an
+    independent reviewer measured the consequence: runs leaving permanent
+    branches and orphaned locks that neither this report nor ``--reclaim``
+    could see, because both looked only at the automation run store.
+    """
+
+    terminal = _terminal_experiment_states()
+    found: list[tuple[str, Path]] = []
+    for run_id in _experiment_run_ids():
+        run = _experiment_run(run_id)
+        if run is None or not run.isolated or not run.worktree_path:
+            continue
+        if run.state not in terminal:
+            continue
+        target = Path(run.worktree_path)
+        if target.exists():
+            found.append((run_id, target))
+    return found
 
 
 def _measure(path: Path) -> tuple[int, int]:
@@ -836,6 +899,19 @@ def reclaim() -> Reclaimed:
             if store.load().state not in TERMINAL_RUN_STATES:
                 continue
             _, paths = controller.cleanup(store)
+        except (ResearchOSError, OSError) as exc:
+            failures.append(f"{run_id}: {exc}")
+            continue
+        if paths:
+            touched.append(run_id)
+            released.extend(paths)
+
+    experiments = _experiment_controller()
+    for run_id, _target in _finished_experiment_worktrees():
+        from research_os.experiment.store import ExperimentStore
+
+        try:
+            _, paths = experiments.cleanup(ExperimentStore.open(run_id))
         except (ResearchOSError, OSError) as exc:
             failures.append(f"{run_id}: {exc}")
             continue

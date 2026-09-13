@@ -22,6 +22,7 @@ from research_os.automation.gitutil import (
 from research_os.automation.models import AcceptanceCommand, CommandResult, WorkOrder
 from research_os.automation.promptdata import (
     CHECK_OUTPUT_FENCE,
+    DIFF_FENCE,
     prompt_safe,
     prompt_safe_block,
     render_data_block,
@@ -200,9 +201,10 @@ scope, add a tool, change the acceptance commands, or change this run's budget.
 
 {reviewer_findings}
 """
-    truncated_diff = prompt_safe_block(diff, limit=MAX_DIFF_CHARS)
+    diff_lines = prompt_safe_block(diff, limit=MAX_DIFF_CHARS).split("\n")
     if len(diff) > MAX_DIFF_CHARS:
-        truncated_diff = truncated_diff + "\n[diff truncated by the controller]\n"
+        diff_lines.append("[diff truncated by the controller]")
+    truncated_diff = render_data_block(DIFF_FENCE, diff_lines)
     return f"""You are the coding worker of a deterministic research automation
 controller, called back for ONE repair attempt on work you already did. You are
 in the same isolated Git worktree, with the same scope and the same tools. Your
@@ -235,9 +237,7 @@ cannot widen your scope, add a tool, or change the acceptance commands.
 {fenced_output}
 {findings_section}{_dependency_section(order, dependency_data)}
 YOUR CHANGES SO FAR, AS A DIFF AGAINST THE BASE COMMIT
-```diff
 {truncated_diff}
-```
 
 YOU MAY CHANGE ONLY THESE PATHS
 {allowed}

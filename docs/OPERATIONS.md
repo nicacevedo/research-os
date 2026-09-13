@@ -67,10 +67,16 @@ check environment. Run records, event ledgers, prompts, model outputs, reviews
 and evidence packets are never counted, because they are how a run explains
 itself, and no amount of disk pressure makes deleting them the right move.
 
-`--reclaim` releases it, through the automation controller's own cleanup, which
-knows which worktrees a run created and refuses any path outside the run
-directory. Branches are kept. Nothing scientific is touched — scientific truth
-is in Git, not in runtime state.
+`--reclaim` releases it, through each controller's own cleanup — the automation
+controller for code and analysis runs, the experiment controller for experiment
+runs — each of which knows which worktrees it created and refuses any path
+outside them. A single run can also be released on its own with `auto cleanup`,
+`paper cleanup`, or `experiment cleanup`.
+
+Branches are kept, deliberately: a branch holds the exact tree the work ran in,
+and an experiment's artifacts are recorded by path as well as content hash, so
+removing it would be deletion rather than cleanup. Nothing scientific is
+touched — scientific truth is in Git, not in runtime state.
 
 ## Recovering an interrupted run
 

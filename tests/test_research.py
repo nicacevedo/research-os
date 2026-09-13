@@ -22,6 +22,11 @@ from typing import Any
 import pytest
 
 from research_os.automation.models import Role
+from research_os.automation.planner import (
+    PlanDocument,
+    PlannedRole,
+)
+from research_os.automation.planner import PlannedTask as AutomationPlannedTask
 from research_os.errors import (
     BudgetExceededError,
     ProviderInvocationError,
@@ -1283,46 +1288,151 @@ def test_a_second_placeholder_plan_ends_the_run(
     assert len(provider.requests_for(Role.PLANNER)) == 2
 
 
-def test_retrying_an_interrupted_task_charges_what_it_already_spent(
+def test_an_interrupted_delegated_task_is_charged_on_both_resume_paths(
     research_home: Path, tmp_path: Path
 ) -> None:
-    """Found by an independent reviewer: a killed run loses its own spend.
+    """Found by an independent reviewer, twice over.
 
     Delegated model calls are charged in a ``finally`` that a killed process
-    never reaches. Without reconciliation a kill-and-retry loop spends real
-    money against a budget that never notices, and ``run.json`` under-reports
-    what the run cost.
+    never reaches. The first fix reconciled only on ``--retry``; resume without
+    it is the documented default, and the run goes on executing its remaining
+    tasks either way, so the leak survived on the path most people take.
+
+    The fixture is the state a kill actually leaves: an
+    ``automation_run_started`` event naming a delegated run that really spent,
+    no ``automation_run_finished`` event, and the task still RUNNING.
     """
 
-    controller, store, _run, _ = start(
+    from research_os.automation.controller import AutomationController
+    from tests.research_helpers import fake_config
+
+    for retry in (False, True):
+        case = tmp_path / f"case-{retry}"
+        controller, store, _run, repo = start(
+            case, plan=plan_payload(tasks=[analysis_task(), task(task_id="T-002")])
+        )
+
+        # A real delegated run that really spent model calls, dispatched the way
+        # the research controller dispatches one.
+        inner_controller = AutomationController(
+            providers=controller.providers, config=fake_config()
+        )
+        inner_store, inner = inner_controller.start(
+            project_path=repo,
+            goal="Understand the adder.",
+            plan=PlanDocument(
+                summary="analyse it",
+                tasks=[
+                    AutomationPlannedTask(
+                        id="T-001",
+                        title="Understand the adder",
+                        goal="Explain what adder.py does.",
+                        role=PlannedRole.ANALYST,
+                        read_only=True,
+                        read_paths=["adder.py"],
+                        completion_condition="findings about adder.py",
+                    )
+                ],
+            ),
+        )
+        inner = inner_controller.execute(inner_store)
+        inner_spend = inner.model_calls_used
+        assert inner_spend >= 1
+
+        # The ledger records the dispatch and nothing after it.
+        store.append_event(
+            "automation_run_started",
+            task_id="T-001",
+            automation_run_id=inner.run_id,
+            directory=str(inner_store.directory),
+            writes=False,
+        )
+        store.save(
+            store.load().model_copy(
+                update={
+                    "state": ResearchState.EXECUTING,
+                    "tasks": [
+                        item.model_copy(update={"status": TaskStatus.RUNNING})
+                        if item.task_id == "T-001"
+                        else item
+                        for item in store.load().tasks
+                    ],
+                }
+            )
+        )
+        before = store.load().model_calls_used
+        recovered = controller.resume(store, retry=retry)
+
+        assert recovered.model_calls_used == before + inner_spend, (
+            f"resume(retry={retry}) lost the interrupted spend"
+        )
+        assert any(
+            record.get("event") == "delegated_spend_reconciled"
+            for record in store.iter_events()
+        )
+
+
+def test_reconciling_twice_does_not_charge_the_same_attempt_again(
+    research_home: Path, tmp_path: Path
+) -> None:
+    """A second interruption must not re-charge the first attempt.
+
+    The task record reports zero calls for something that never finished, so
+    reconciliation reads what it has already been told from the ledger instead.
+    """
+
+    from research_os.automation.controller import AutomationController
+    from tests.research_helpers import fake_config
+
+    controller, store, _run, repo = start(
         tmp_path, plan=plan_payload(tasks=[analysis_task()])
     )
-    run = controller.execute(store)
-    inner_id = run.task("T-001").artifact_id or ""
-    spent = run.model_calls_used
-    assert spent > 1
+    inner_controller = AutomationController(
+        providers=controller.providers, config=fake_config()
+    )
+    inner_store, inner = inner_controller.start(
+        project_path=repo,
+        goal="Understand the adder.",
+        plan=PlanDocument(
+            summary="analyse it",
+            tasks=[
+                AutomationPlannedTask(
+                    id="T-001",
+                    title="Understand the adder",
+                    goal="Explain what adder.py does.",
+                    role=PlannedRole.ANALYST,
+                    read_only=True,
+                    read_paths=["adder.py"],
+                    completion_condition="findings about adder.py",
+                )
+            ],
+        ),
+    )
+    inner = inner_controller.execute(inner_store)
+    store.append_event(
+        "automation_run_started",
+        task_id="T-001",
+        automation_run_id=inner.run_id,
+        directory=str(inner_store.directory),
+        writes=False,
+    )
 
-    # Rewind to exactly what a killed process leaves: the task mid-flight and
-    # the delegated spend never charged.
-    store.save(
-        run.model_copy(
+    def interrupted():
+        current = store.load()
+        return current.model_copy(
             update={
                 "state": ResearchState.EXECUTING,
-                "model_calls_used": 1,
                 "tasks": [
                     item.model_copy(
                         update={"status": TaskStatus.RUNNING, "model_calls": 0}
                     )
-                    for item in run.tasks
+                    for item in current.tasks
                 ],
             }
         )
-    )
-    recovered = controller.resume(store, retry=True)
 
-    assert recovered.model_calls_used == spent, "the interrupted spend was lost"
-    assert any(
-        record.get("event") == "delegated_spend_reconciled"
-        for record in store.iter_events()
-    )
-    assert inner_id
+    store.save(interrupted())
+    once = controller.resume(store, retry=True).model_calls_used
+    store.save(interrupted())
+    twice = controller.resume(store, retry=True).model_calls_used
+    assert twice == once, "the first attempt was charged a second time"

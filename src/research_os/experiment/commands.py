@@ -97,6 +97,12 @@ def add_experiment_parser(subparsers: argparse._SubParsersAction) -> None:
 
     actions.add_parser("runs", help="List experiment runs.")
 
+    cleanup = actions.add_parser(
+        "cleanup",
+        help="Release one run's isolated worktree. The branch and record are kept.",
+    )
+    cleanup.add_argument("run_id", metavar="RUN_ID")
+
     events = actions.add_parser("events", help="Print one run's event ledger.")
     events.add_argument("run_id", metavar="RUN_ID")
 
@@ -120,6 +126,7 @@ def dispatch(args: argparse.Namespace) -> int:
         "poll": _poll,
         "cancel": _cancel,
         "runs": _runs,
+        "cleanup": _cleanup,
         "events": _events,
         "example-config": _example_config,
     }
@@ -212,6 +219,29 @@ def _runs(_args: argparse.Namespace) -> int:
         ExperimentStore.open(item).load() for item in ExperimentStore.list_run_ids()
     ]
     print(render_run_list(runs), end="")
+    return EXIT_OK
+
+
+def _cleanup(args: argparse.Namespace) -> int:
+    """Release the worktree, keep the branch.
+
+    The branch holds the tree the experiment ran in, and the artifacts are
+    recorded by path as well as content hash, so removing it would be deletion
+    rather than cleanup.
+    """
+
+    store = ExperimentStore.open(args.run_id)
+    controller = ExperimentController(config=_config(args))
+    run, removed = controller.cleanup(store)
+    if not removed:
+        print(f"{run.run_id}: no isolated worktree to remove")
+        return EXIT_OK
+    for path in removed:
+        print(f"Removed {path}")
+    print(
+        f"\nThe branch {run.branch} and the run record are kept. "
+        "Nothing scientific was touched."
+    )
     return EXIT_OK
 
 

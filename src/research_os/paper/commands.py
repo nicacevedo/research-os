@@ -207,6 +207,7 @@ def _cleanup(args: argparse.Namespace) -> int:
     """
 
     from research_os.automation.models import WorktreeRecord
+    from research_os.automation.worktree import lock_path as worktree_lock_path
 
     store = DraftStore.open(args.draft_id)
     draft = store.load()
@@ -219,7 +220,10 @@ def _cleanup(args: argparse.Namespace) -> int:
             path=draft.worktree_path,
             branch=draft.branch or "unknown",
             base_commit=draft.base_commit or "0" * 40,
-            lock_path=str(Path(draft.worktree_path).with_suffix(".lock")),
+            # The real lock, from the helper that creates it. Deriving it by
+            # changing the worktree's suffix pointed at a path that never
+            # existed, so every cleanup left its lock file behind.
+            lock_path=str(worktree_lock_path(Path(draft.worktree_path))),
             created_at=draft.created_at,
         ),
         repository=Path(draft.project_path),

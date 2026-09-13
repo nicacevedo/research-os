@@ -934,6 +934,13 @@ class ResearchController:
 
         in_flight = [item for item in run.tasks if item.status is TaskStatus.RUNNING]
         for task in in_flight:
+            # Charge what the interrupted attempt already spent, whichever way
+            # this resume goes. A killed process never reached the `finally`
+            # that accounts for a delegated run, and the run carries on
+            # executing its remaining tasks either way -- so doing this only on
+            # --retry, as it was at first, left the default path spending
+            # against a budget that had lost count.
+            run = self._reconcile_delegated_spend(store, run, task.task_id)
             if retry and task.kind is TaskKind.EXPERIMENT and not force:
                 raise ResearchStateError(
                     f"{task.task_id} is an experiment that was interrupted. It may "
@@ -943,12 +950,6 @@ class ResearchController:
                     "you are sure, or resume without --retry to mark it failed."
                 )
             if retry:
-                # Charge whatever the interrupted attempt already spent before
-                # queueing another. A killed process never reached the `finally`
-                # that accounts for a delegated run, so without this a
-                # kill-and-retry loop spends real money against a budget that
-                # does not notice. The ledger knows which runs were started.
-                run = self._reconcile_delegated_spend(store, run, task.task_id)
                 run = self._update(
                     store,
                     run,
@@ -1003,7 +1004,20 @@ class ResearchController:
         from research_os.automation.store import RunStore
         from research_os.errors import AutomationError
 
-        already = run.task(task_id).model_calls
+        # What this run has already been told about, taken from the ledger
+        # rather than from the task record: a task that never finished reports
+        # zero, so a second interruption would otherwise charge the first
+        # attempt all over again.
+        already = max(
+            (
+                int(record.get("model_calls", 0))
+                for record in store.iter_events()
+                if record.get("task_id") == task_id
+                and record.get("event")
+                in {"automation_run_finished", "delegated_spend_reconciled"}
+            ),
+            default=run.task(task_id).model_calls,
+        )
         spent = 0
         for record in store.iter_events():
             if record.get("event") != "automation_run_started":

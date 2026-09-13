@@ -6,8 +6,9 @@ before every write invocation, and an exclusive on-disk lock makes a second
 concurrent worker in the same checkout a hard failure rather than a race.
 
 Worktrees are created under the Research OS state home, never inside the
-researcher's repository, and are removed only by the explicit cleanup command,
-so a failed run leaves its evidence in place.
+researcher's repository, and are removed only by an explicit cleanup command --
+``auto cleanup``, ``paper cleanup``, ``experiment cleanup``, or
+``storage --reclaim`` -- so a failed run leaves its evidence in place.
 """
 
 from __future__ import annotations

@@ -1,10 +1,18 @@
 """The one boundary where model-originated text becomes prompt data.
 
-Every string a provider produced and a later provider prompt embeds passes
-through this module and nowhere else. That is the whole point of it: the
-controller's claim is not that each call site remembers to strip a delimiter,
-it is that there is a single serializer, so a field that forgets to use it is a
-visible omission rather than a silent escape.
+Every string a provider produced and a later provider prompt embeds should pass
+through this module. That is the point of it: the controller's claim is not that
+each call site remembers to strip a delimiter, it is that there is a single
+serializer to use.
+
+It is worth being exact about what that does and does not guarantee, because an
+independent reviewer found the difference twice. What this module guarantees is
+that anything rendered *through it* is inert. What it cannot guarantee is that
+every call site uses it: a prompt that quotes worker text in a markdown fence of
+its own has not been made safe by anything here, and both times that happened it
+was a reviewer's prompt. ``tests/test_security_regressions.py`` therefore asserts
+the absence of that construct across the whole package, which is the only check
+that catches the next one.
 
 Two things are guaranteed here.
 

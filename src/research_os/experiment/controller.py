@@ -36,7 +36,7 @@ from pathlib import Path
 from research_os.automation.filescope import assert_contained_symlinks
 from research_os.automation.gitutil import has_commits, head_commit, repository_root
 from research_os.automation.models import WorktreeRecord, utc_now
-from research_os.automation.worktree import create_worktree
+from research_os.automation.worktree import create_worktree, release_worktree
 from research_os.errors import (
     ExperimentAuthorizationError,
     ExperimentConfigError,
@@ -519,6 +519,44 @@ class ExperimentController:
             blocking=packet.blocking_notes,
         )
         return packet
+
+    def cleanup(self, store: ExperimentStore) -> tuple[ExperimentRun, tuple[str, ...]]:
+        """Release this run's worktree. The branch and the record are kept.
+
+        Added because making experiments isolated created something to clean up
+        and nothing to clean it up with: an independent reviewer measured three
+        runs leaving three permanent branches and three orphaned locks that
+        neither ``doctor`` nor ``storage --reclaim`` could see.
+
+        The branch is kept deliberately. It holds the exact tree the experiment
+        ran in, and the artifacts are recorded by path *and* content hash, so a
+        researcher who has not yet taken what they need can still get it.
+        """
+
+        from research_os.automation.models import WorktreeRecord
+        from research_os.automation.worktree import lock_path as worktree_lock_path
+
+        run = store.load()
+        if not run.isolated or not run.worktree_path:
+            return run, ()
+        target = Path(run.worktree_path)
+        if not target.exists():
+            return run, ()
+        release_worktree(
+            WorktreeRecord(
+                task_id="T-001",
+                path=run.worktree_path,
+                branch=run.branch or "unknown",
+                base_commit=run.base_commit or "0" * 40,
+                lock_path=str(worktree_lock_path(target)),
+                created_at=run.created_at,
+            ),
+            repository=Path(run.project_path),
+        )
+        store.append_event(
+            "worktree_removed", path=run.worktree_path, branch=run.branch
+        )
+        return run, (run.worktree_path,)
 
     def cancel(self, store: ExperimentStore) -> ExperimentRun:
         run = store.load()

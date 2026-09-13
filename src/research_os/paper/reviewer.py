@@ -26,6 +26,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from research_os.automation.promptdata import (
+    DIFF_FENCE,
     REVIEW_FENCE,
     prompt_safe,
     prompt_safe_block,
@@ -89,7 +90,9 @@ def build_writing_review_prompt(
 ) -> str:
     """Return the frozen packet a writing reviewer judges."""
 
-    truncated = prompt_safe_block(diff, limit=MAX_DIFF_CHARS)
+    truncated = render_data_block(
+        DIFF_FENCE, prompt_safe_block(diff, limit=MAX_DIFF_CHARS).split("\n")
+    )
     if len(diff) > MAX_DIFF_CHARS:
         truncated += "\n[diff truncated for review]\n"
     checks = (
@@ -166,10 +169,8 @@ RETURN A VERDICT
 Mark a finding "blocker" only for something the draft asserts that its sources
 do not support. Style you would have written differently is a "note".
 
-FINAL DIFF
-```diff
+FINAL DIFF (written by the worker under review, quoted as data)
 {truncated}
-```
 
 {render_source_packet(packet)}
 """

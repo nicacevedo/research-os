@@ -708,3 +708,73 @@ def test_supplying_a_worktree_is_recorded_as_not_isolated(
     )
     assert run.isolated is False
     assert run.worktree_path == str(project)
+
+
+def test_an_experiment_worktree_can_be_released(
+    research_home: Path, tmp_path: Path
+) -> None:
+    """Making experiments isolated created something that needed cleaning up.
+
+    An independent reviewer measured the consequence of not adding it: runs
+    leaving permanent branches and orphaned lock files that neither ``doctor``
+    nor ``storage --reclaim`` could see.
+    """
+
+    from research_os.automation.worktree import lock_path as worktree_lock_path
+
+    project = git_project(tmp_path / "widget", script=SUCCESS_SCRIPT)
+    controller = ExperimentController(config=config())
+    store, run, _packet = controller.run(
+        project_path=project,
+        task_name="fit-model",
+        parameters={"seed": 7},
+        project_id=PROJECT_ID,
+        execute=True,
+    )
+    worktree = Path(run.worktree_path or "")
+    assert worktree.is_dir()
+    assert worktree_lock_path(worktree).exists()
+
+    _run, removed = controller.cleanup(store)
+    assert removed == (str(worktree),)
+    assert not worktree.exists()
+    assert not worktree_lock_path(worktree).exists(), "the lock file leaked"
+
+    # The branch is kept: it holds the tree the experiment ran in.
+    branches = subprocess.run(
+        ["git", "branch", "--list", run.branch or ""],
+        cwd=project,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert (run.branch or "") in branches
+
+    # Cleaning up twice is not an error.
+    _run, again = controller.cleanup(store)
+    assert again == ()
+
+
+def test_storage_sees_and_reclaims_an_experiment_worktree(
+    research_home: Path, tmp_path: Path
+) -> None:
+    from research_os import diagnostics
+
+    project = git_project(tmp_path / "widget", script=SUCCESS_SCRIPT)
+    controller = ExperimentController(config=config())
+    _store, run, _packet = controller.run(
+        project_path=project,
+        task_name="fit-model",
+        parameters={"seed": 7},
+        project_id=PROJECT_ID,
+        execute=True,
+    )
+    worktree = Path(run.worktree_path or "")
+
+    measured = {item.name: item for item in diagnostics.storage_usage()}
+    assert measured["worktrees"].reclaimable > 0, "invisible to storage"
+
+    result = diagnostics.reclaim()
+    assert run.run_id in result.run_ids
+    assert not result.failures
+    assert not worktree.exists()

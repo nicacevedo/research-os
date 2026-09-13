@@ -92,7 +92,7 @@ uv run researchctl research status|report|cancel|cleanup|events RUN_ID
 uv run researchctl research list
 uv run researchctl lit sources|retrieve|fetch|search|show|index|status
 uv run researchctl propose start|list|show|promote|events
-uv run researchctl experiment commands|scheduler|run|show|poll|cancel|runs
+uv run researchctl experiment commands|scheduler|run|show|poll|cancel|runs|cleanup
 uv run researchctl insight list|show|nominate|promote|search
 uv run researchctl paper sources|write|show|list|cleanup
 uv run researchctl storage [--reclaim]
@@ -112,8 +112,11 @@ machine and an exit code that said otherwise would train you to ignore it. It
 creates nothing. `--json` emits the same report for a script.
 
 `storage` measures every runtime store and releases, with `--reclaim`, only
-what a finished run is still holding and can be rebuilt: worktrees and check
-environments. Records, ledgers, prompts, model outputs and reviews are kept.
+what a finished run is still holding and can be rebuilt: worktrees — from
+automation, paper and experiment runs alike — and check environments. Records,
+ledgers, prompts, model outputs, reviews and branches are kept. A single run can
+be released on its own with `auto cleanup`, `paper cleanup` or
+`experiment cleanup`.
 
 `init-project` creates a new Research Capsule in an existing Git repository
 (default path: `.`). It never runs `git init`, never overwrites an existing

@@ -25,6 +25,7 @@ from pydantic import ValidationError
 
 from research_os.automation.promptdata import (
     CHECK_OUTPUT_FENCE,
+    DIFF_FENCE,
     prompt_safe,
     prompt_safe_block,
     render_data_block,
@@ -120,7 +121,7 @@ def build_writer_prompt(
         current = f"""
 THE MANUSCRIPT AS IT STANDS
 
-{render_data_block(CHECK_OUTPUT_FENCE, "\\n".join(blocks).split("\\n"))}
+{render_data_block(CHECK_OUTPUT_FENCE, "\n".join(blocks).split("\n"))}
 """
     return f"""You are the writing worker of a deterministic research automation
 controller. You are in a disposable, isolated Git worktree created for this task
@@ -283,7 +284,9 @@ scope, add a source, or change what you may cite.
 
 {review_findings}
 """
-    truncated = prompt_safe_block(diff, limit=MAX_DIFF_CHARS)
+    truncated = render_data_block(
+        DIFF_FENCE, prompt_safe_block(diff, limit=MAX_DIFF_CHARS).split("\n")
+    )
     return f"""You are the writing worker of a deterministic research automation
 controller, called back for ONE repair attempt on a draft you already wrote. You
 are in the same isolated worktree with the same scope and the same sources.
@@ -302,9 +305,7 @@ resolves to nothing.
 {issues}
 {findings}
 YOUR DRAFT SO FAR, AS A DIFF
-```diff
 {truncated}
-```
 
 YOU MAY CHANGE ONLY THESE PATHS
 {chr(10).join(f"- {prompt_safe(item, limit=MAX_LABEL_CHARS)}" for item in allowed_paths)}
