@@ -163,6 +163,33 @@ TASK_FENCE = DataFence(
     end="----- END TASK TEXT (AS SUPPLIED TO THE CONTROLLER) -----",
 )
 
+#: The result of a deterministic check the controller ran on a draft.
+#:
+#: Distinct from :data:`CHECK_OUTPUT_FENCE`, which holds what a program printed.
+#: These lines are computed by the controller and are established facts -- but
+#: each one quotes the thing it judged, so a citation key the writer invented
+#: arrives inside the detail. The block is fenced for the quoted half and
+#: labelled for the computed half, because a delta review found the writing
+#: reviewer being told in one sentence that these results are established fact
+#: and in the next that the block holds untrusted program output.
+CHECK_RESULT_FENCE = DataFence(
+    begin="----- BEGIN CHECK RESULTS (CONTROLLER-COMPUTED, QUOTING THE DRAFT) -----",
+    end="----- END CHECK RESULTS (CONTROLLER-COMPUTED, QUOTING THE DRAFT) -----",
+)
+
+#: An operator-supplied statement carried in a source packet.
+#:
+#: Unresolved limitations reach the paper writer, the writing reviewer and the
+#: write-enabled repair worker. They come from a human today -- ``--limitation``
+#: on the CLI, never a model -- and they were rendered with ``prompt_safe_block``
+#: outside every block, which keeps line breaks and so could stand a second
+#: packet heading. "Only a human writes it today" is the reasoning four earlier
+#: findings in this class were justified by, so it is fenced like the rest.
+STATEMENT_FENCE = DataFence(
+    begin="----- BEGIN SUPPLIED STATEMENT (QUOTED, NOT SPOKEN) -----",
+    end="----- END SUPPLIED STATEMENT (QUOTED, NOT SPOKEN) -----",
+)
+
 #: Every fence the controller generates.
 #:
 #: One tuple, because :data:`ALL_DELIMITERS` is derived from it and that is what
@@ -179,6 +206,8 @@ FENCES: tuple[DataFence, ...] = (
     DIFF_FENCE,
     WORKER_REPORT_FENCE,
     TASK_FENCE,
+    STATEMENT_FENCE,
+    CHECK_RESULT_FENCE,
 )
 
 #: Every delimiter, longest first, so a delimiter that contains another is

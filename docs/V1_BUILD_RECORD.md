@@ -349,6 +349,15 @@ by the test suite catching them immediately. A representative selection:
 - **The symlink scan cannot catch a link created and deleted within one
   invocation.** The real bound on a write worker is its tool set: file tools
   only, no command tool, enforced at config load and again at invocation.
+- **The pre-dispatch event does not record the inner run id.** It cannot: the
+  id is derived inside `AutomationController.start`, after the event is written.
+  So a `start` that creates the run directory and then fails leaves an inner
+  store that `researchctl research cleanup` -- which walks `automation_run_started`
+  -- will not reach. Recording it would mean the research controller deriving the
+  id itself, duplicating `make_run_id`'s inputs outside the function that owns
+  them, which is how the run-lock went wrong three times. Residual risk: leaked
+  disk in a run directory after a dispatch that died mid-start, visible to
+  `researchctl storage` and removable by hand.
 - **Review independence is degraded.** Only `claude` is installed, so the
   reviewer is a different model of the same family. Every run says so before it
   starts, not after.
@@ -491,7 +500,7 @@ run the two quantities coincide.
 
 | Exercise | Result |
 | --- | --- |
-| Full suite | **2,047 passed** in 147s |
+| Full suite | **2,202 passed** |
 | Ruff check / format / `git diff --check` | clean |
 | R0 scientific regression | **411 passed**; digests and models byte-unchanged |
 | Synthetic end-to-end, real CLI | **22/22** |
@@ -560,6 +569,18 @@ its disposition. Nothing is omitted because later code changed.
 | D1-2 | `TASK_FENCE` rewrite falsified the automation reviewer's own paragraph | FIXED | prose corrected at `automation/reviewer.py` |
 | A1 | Seventh instance: `unresolved_caveats` sanitised but unfenced | FIXED | as D1-1 |
 | — | Fifth unfenced channel: all task text | FIXED | `test_every_reviewer_prompt_renders_worker_text_through_the_boundary` |
+| F1 | `unresolved_caveats` outside every data block (same as A1, found twice) | FIXED | `test_no_worker_authored_text_reaches_a_prompt_outside_a_data_block` |
+| F2 | `packet.limitations` rendered multi-line outside a fence | FIXED | as F1 |
+| F3 | `severity` / `check` bypassed `prompt_safe` inside the new fence | FIXED | fail-closed either way; closed for symmetry |
+| F4 | `_hostile_grounding` docstring overclaimed at its second call site | FIXED | docstring corrected |
+| F5 | Framing paragraph still false: the worker report is marked neither kind | FIXED | `test_the_automation_reviewer_prompt_holds_only_the_two_kinds_it_declares` |
+| F6 | `CHECK_OUTPUT_FENCE` mislabelled at both new uses | FIXED | `CHECK_RESULT_FENCE`; manuscript moved to `REPOSITORY_FENCE` |
+| F7 | `automation_dispatch_attempted` had no test anywhere | FIXED | `test_a_dispatch_is_numbered_before_it_is_attempted` |
+| F8 | Two fixtures documented a state the controller can no longer produce | FIXED | docstring corrected |
+| F10 | The stated reason for the FILLER trim was untested | FIXED | added to `test_real_prose_containing_a_structural_word_is_not_refused` |
+| F11 | `paper/writer.py::build_repair_prompt` had no test at all | FIXED | covered by F1's pair builder; mutation-tested |
+| F12 | This ledger omitted the findings its own commit repaired | FIXED | these rows |
+| F9 | New event records `attempt` but not the inner run id | **DEFERRED** | stated below |
 
 ### The property that ended the series
 
@@ -601,6 +622,45 @@ field carrying the defect. The first version varied only the caveat list, so the
 manifest-id mutant went unseen; the fix was to drive every worker-authored field
 of the manifest, bypassing the validators on purpose so that the test stays a
 test of the prompt boundary rather than a second test of the validators.
+
+### Five reviews, and what finally ended it
+
+The second delta review returned no BLOCKER and four REPAIR-BEFORE-RELEASE
+items. One of them, F1, was the same defect the property test had already found
+and fixed an hour earlier and under a different name -- two independent methods
+converging on the same line, which is the first time in this build that
+happened.
+
+The other three are worth separating, because they are not the same kind of
+problem:
+
+- **F5 was the third prose-only repair of one paragraph.** The automation
+  reviewer's framing paragraph described its own blocks, and twice a review
+  found the description untrue of the prompt: first because task text had moved
+  into blocks the paragraph said carried no controller authority, then because
+  the paragraph named a marker word -- UNTRUSTED -- that the implementer's
+  report does not carry, and named a kind of block (captured command output)
+  that this prompt does not have at all. Both earlier repairs were wording, and
+  wording cannot be rerun. The third repair ships with a detector:
+  `test_the_automation_reviewer_prompt_holds_only_the_two_kinds_it_declares`
+  enumerates the fences the rendered prompt actually contains and fails if it
+  holds a kind the paragraph does not describe.
+
+- **F7 and F11 were repairs with no detector.** Deleting the line that writes
+  `automation_dispatch_attempted` left every attempt numbered 1 and the whole
+  suite green; `paper/writer.py::build_repair_prompt` appeared in no test at
+  all, so half of the previous round's BLOCKER repair -- the half whose reader
+  is write-enabled -- could be reverted unnoticed. Both are now mutation-proven:
+  removing the event fails
+  `test_a_dispatch_is_numbered_before_it_is_attempted`, and unfencing the
+  repair prompt's check list fails the pair-builder property.
+
+That is the pattern the whole build record keeps recording. Four tests in this
+project have passed by not exercising what they named -- the lock racer, the
+`HOSTILE_FIELDS` cross-product, `issues=[]`, and the first version of the pair
+builder. The correction is not more tests; it is asserting the property rather
+than the instance, and then mutating the implementation to prove the assertion
+can fail.
 
 ### Deferred, with stated residual risk
 

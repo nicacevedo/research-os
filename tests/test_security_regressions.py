@@ -784,7 +784,16 @@ def _outside_blocks(prompt: str) -> str:
     return "\n".join(kept)
 
 
-def _empty_packet():
+def _empty_packet(limitations: list[str] | None = None):
+    """A source packet, optionally carrying the one field a human fills.
+
+    ``limitations`` is the packet's only free-text field, and it is rendered
+    into the writer's prompt, the writing reviewer's and the write-enabled
+    repair worker's. It reached all three outside every data block until a
+    delta review demonstrated a multi-line limitation standing a second packet
+    heading, so the pair builder drives it like any other untrusted channel.
+    """
+
     from research_os.paper.models import SourcePacket
 
     return SourcePacket(
@@ -795,9 +804,75 @@ def _empty_packet():
         evidence=[],
         experiments=[],
         literature=[],
-        limitations=[],
+        limitations=list(limitations or []),
         excluded_claims={},
     )
+
+
+def test_the_automation_reviewer_prompt_holds_only_the_two_kinds_it_declares() -> None:
+    """Three repairs of that framing paragraph have been prose only.
+
+    Twice a review failed this prompt for stating a rule about its own blocks
+    that the blocks did not satisfy: first because task text moved into data
+    blocks the paragraph said carried no controller authority, then because the
+    paragraph named a marker word the implementer's report does not carry. Both
+    repairs were wording, and wording cannot be rerun.
+
+    This asserts what the wording claims, against the rendered prompt: the
+    blocks it contains are worker output or they are the task's own text, and
+    both kinds are actually present. A prompt that gains a third kind fails
+    here rather than in a fifth review.
+    """
+
+    from research_os.automation.models import CommandResult, RiskClass, Role
+    from research_os.automation.promptdata import (
+        CHECK_OUTPUT_FENCE,
+        DIFF_FENCE,
+        FENCES,
+        REPOSITORY_FENCE,
+        TASK_FENCE,
+        WORKER_REPORT_FENCE,
+    )
+    from research_os.automation.reviewer import build_reviewer_prompt
+    from tests.test_auto_models import make_order
+
+    worker_output = {
+        DIFF_FENCE,
+        WORKER_REPORT_FENCE,
+        CHECK_OUTPUT_FENCE,
+        REPOSITORY_FENCE,
+    }
+    task_text = {TASK_FENCE}
+
+    prompt = build_reviewer_prompt(
+        make_order(role=Role.CODER, risk_class=RiskClass.WRITE_ISOLATED),
+        diff="+ a line",
+        check_results=[
+            CommandResult(
+                argv=["pytest", "-q"],
+                cwd="/tmp/worktree",
+                required=True,
+                exit_code=0,
+                timed_out=False,
+                timeout_seconds=60,
+                started_at="2026-09-13T10:15:00Z",
+                ended_at="2026-09-13T10:15:01Z",
+                duration_ms=1000,
+            )
+        ],
+        worker_report="I changed adder.py.",
+        context_text="(context)",
+    )
+
+    present = {fence for fence in FENCES if fence.begin in prompt}
+    assert present, "the reviewer prompt renders no data block at all"
+    unclassified = present - worker_output - task_text
+    assert not unclassified, (
+        "the prompt carries a kind of block its framing paragraph does not "
+        f"describe: {sorted(fence.begin for fence in unclassified)}"
+    )
+    assert present & worker_output, "the paragraph promises worker output"
+    assert present & task_text, "the paragraph promises the task's own text"
 
 
 def _worker_prompt_pairs() -> list[tuple[str, str, str]]:
@@ -899,7 +974,7 @@ def _worker_prompt_pairs() -> list[tuple[str, str, str]]:
         return build_writing_review_prompt(
             section=SectionKind.RESULTS,
             instruction=text,
-            packet=_empty_packet(),
+            packet=_empty_packet([text]),
             manifest=manifest,
             grounding=_hostile_grounding(manifest.draft_id, text),
             diff=text,
@@ -913,7 +988,7 @@ def _worker_prompt_pairs() -> list[tuple[str, str, str]]:
         return build_paper_repair(
             section=SectionKind.RESULTS,
             instruction=text,
-            packet=_empty_packet(),
+            packet=_empty_packet([text]),
             allowed_paths=["paper/manuscript.md"],
             grounding=_hostile_grounding("DRAFT-20260913T000000Z-0a1b2c3d", text),
             review_findings=None,
@@ -1018,6 +1093,14 @@ def _hostile_grounding(draft_id: str, hostile: str):
     one field carrying the defect was the one never exercised. A check's detail
     quotes what the writer wrote -- an invented citation key, taken out of the
     prose by a regex that accepts arbitrary text between the braces.
+
+    Where it does the work: the two callers differ. In
+    ``test_a_writer_cannot_forge_a_controller_section_in_its_reviewers_prompt``
+    and in ``_worker_prompt_pairs`` it fails against the pre-fix rendering. In
+    ``_reviewer_prompts_with_hostile_input`` it does not change any assertion
+    outcome, because ``detail`` was already whitespace-folded before the fix and
+    that consumer counts only standalone lines -- a later delta review said so,
+    and this docstring said otherwise until it did.
     """
 
     from research_os.paper.models import GroundingIssue, GroundingReport

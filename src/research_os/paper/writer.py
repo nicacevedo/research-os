@@ -24,8 +24,9 @@ from typing import Any
 from pydantic import ValidationError
 
 from research_os.automation.promptdata import (
-    CHECK_OUTPUT_FENCE,
+    CHECK_RESULT_FENCE,
     DIFF_FENCE,
+    REPOSITORY_FENCE,
     TASK_FENCE,
     prompt_safe,
     prompt_safe_block,
@@ -130,7 +131,7 @@ def build_writer_prompt(
         current = f"""
 THE MANUSCRIPT AS IT STANDS
 
-{render_data_block(CHECK_OUTPUT_FENCE, "\n".join(blocks).split("\n"))}
+{render_data_block(REPOSITORY_FENCE, "\n".join(blocks).split("\n"))}
 """
     return f"""You are the writing worker of a deterministic research automation
 controller. You are in a disposable, isolated Git worktree created for this task
@@ -275,10 +276,11 @@ def build_repair_prompt(
     """
 
     issues = render_data_block(
-        CHECK_OUTPUT_FENCE,
+        CHECK_RESULT_FENCE,
         (
             "\n".join(
-                f"- [{item.severity}] {item.check}: "
+                f"- [{prompt_safe(item.severity, limit=MAX_LABEL_CHARS)}] "
+                + f"{prompt_safe(item.check, limit=MAX_LABEL_CHARS)}: "
                 + prompt_safe(item.message, limit=MAX_CHECK_MESSAGE_CHARS)
                 + (
                     f"\n    {prompt_safe(item.detail, limit=MAX_CHECK_MESSAGE_CHARS)}"

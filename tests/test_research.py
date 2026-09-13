@@ -1298,9 +1298,17 @@ def test_an_interrupted_delegated_task_is_charged_on_both_resume_paths(
     it is the documented default, and the run goes on executing its remaining
     tasks either way, so the leak survived on the path most people take.
 
-    The fixture is the state a kill actually leaves: an
+    The fixture is the part of that state reconciliation reads: an
     ``automation_run_started`` event naming a delegated run that really spent,
     no ``automation_run_finished`` event, and the task still RUNNING.
+
+    It is deliberately *not* the whole of what a kill leaves. A real dispatch
+    now writes ``automation_dispatch_attempted`` first, and a delta review
+    pointed out that a fixture claiming to be the real state while omitting
+    that event would quietly mask an attempt-accounting regression. The event
+    is irrelevant to reconciliation, which reads only the started/finished
+    pair; it is covered directly by
+    ``test_a_dispatch_is_numbered_before_it_is_attempted``.
     """
 
     from research_os.automation.controller import AutomationController
@@ -1538,6 +1546,11 @@ def test_placeholder_dressed_in_filler_is_refused(value: str) -> None:
         "widget deformation under load",
         "Assess the query planner's fallback behaviour",
         "Implement the goal-seeking solver",
+        # The two the FILLER set was trimmed for. The trim's stated reason was
+        # that these were being refused; without them here, putting "case" or
+        # "values" back would re-break both silently.
+        "Test the minimal case",
+        "Test the output values",
     ],
 )
 def test_real_prose_containing_a_structural_word_is_not_refused(value: str) -> None:
@@ -1550,6 +1563,95 @@ def test_real_prose_containing_a_structural_word_is_not_refused(value: str) -> N
     from research_os.research.planner import _is_placeholder
 
     assert not _is_placeholder(value), f"{value!r} was wrongly refused"
+
+
+def test_a_dispatch_is_numbered_before_it_is_attempted(
+    research_home: Path, tmp_path: Path
+) -> None:
+    """The attempt number is written before the dispatch, not after it.
+
+    A delta review found the third consecutive repair in this area shipping
+    with no detector: ``automation_dispatch_attempted`` appeared nowhere in the
+    suite, so deleting the line that writes it left every attempt numbered 1
+    and the whole suite still green. This is the detector.
+    """
+
+    controller, store, _run, _ = start(
+        tmp_path, plan=plan_payload(tasks=[analysis_task()])
+    )
+    controller.execute(store)
+
+    dispatch = [
+        record
+        for record in store.iter_events()
+        if record.get("event")
+        in ("automation_dispatch_attempted", "automation_run_started")
+    ]
+    assert dispatch, "the task dispatched no delegated run at all"
+    assert dispatch[0]["event"] == "automation_dispatch_attempted", (
+        "the attempt number must be recorded before the dispatch that uses it, "
+        f"but the first dispatch event was {dispatch[0]['event']!r}"
+    )
+    assert dispatch[0]["attempt"] == 1
+
+
+def test_a_dispatch_that_dies_after_its_directory_exists_burns_its_number(
+    research_home: Path, tmp_path: Path
+) -> None:
+    """The failure the pre-dispatch event exists to prevent, reproduced.
+
+    ``AutomationController.start`` creates the run directory and then does more
+    work -- context, planning -- any of which can fail. When it does, the
+    research controller never writes ``automation_run_started``. Counting
+    *those* to number the next attempt therefore hands the retry the number the
+    dead dispatch already used, and ``RunStore.create`` refuses the directory it
+    just found. Only a retry inside the same UTC second collides, which is
+    exactly what a prompt ``resume --retry`` is.
+
+    Asserted against the event stream such a failure leaves rather than by
+    killing a real dispatch, so the collision is deterministic rather than a
+    race the test has to win.
+    """
+
+    from research_os.automation.store import make_run_id
+    from research_os.research.controller import ResearchController
+
+    controller, store, run, _ = start(
+        tmp_path, plan=plan_payload(tasks=[analysis_task()])
+    )
+    del controller
+
+    # What a dispatch that died inside ``start`` leaves behind: it was numbered,
+    # and it never started.
+    store.append_event("automation_dispatch_attempted", task_id="T-001", attempt=1)
+
+    started = sum(
+        1
+        for record in store.iter_events()
+        if record.get("event") == "automation_run_started"
+    )
+    assert started == 0, "the fixture must leave no started event"
+    assert ResearchController._delegated_attempts(store, "T-001") == 1, (
+        "the dead dispatch must still count against the task"
+    )
+
+    # Both dispatches share everything a run id is derived from, including the
+    # second -- the only case in which the ids can collide at all.
+    same = {
+        "project_path": run.project_path,
+        "goal": "Make add return a sum.",
+        "created_at": "2026-09-13T10:15:00Z",
+    }
+    dead = make_run_id(**same, attempt="T-001#1")
+    retry = make_run_id(
+        **same,
+        attempt=f"T-001#{ResearchController._delegated_attempts(store, 'T-001') + 1}",
+    )
+    assert retry != dead, "the retry reused the dead dispatch's run id"
+
+    # And the counter this replaced -- one over the *started* events -- hands
+    # back the dead dispatch's own id.
+    assert make_run_id(**same, attempt=f"T-001#{started + 1}") == dead
 
 
 def test_two_delegated_runs_on_one_task_are_not_double_charged(

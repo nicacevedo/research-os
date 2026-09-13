@@ -28,6 +28,7 @@ from pathlib import Path
 
 from research_os.automation.promptdata import (
     LITERATURE_FENCE,
+    STATEMENT_FENCE,
     prompt_safe,
     prompt_safe_block,
     render_data_block,
@@ -471,12 +472,22 @@ def render_source_packet(packet: SourcePacket) -> str:
         lines.append(render_data_block(LITERATURE_FENCE, literature_lines))
 
     lines.extend(["", "## Unresolved limitations"])
+    # The one newline-preserving render in this package that used to sit outside
+    # a data block. A limitation comes from a human today -- ``--limitation`` on
+    # the CLI, never a model -- but ``prompt_safe_block`` keeps line breaks, so a
+    # multi-line limitation could stand a second "SOURCES YOU MAY USE" heading
+    # in a packet that reaches the writer, the writing reviewer and the repair
+    # worker. "Human-only today" is the reasoning four earlier findings in this
+    # class were justified by, so it is fenced like everything else.
     if not packet.limitations:
         lines.append("(none were supplied)")
-    lines.extend(
-        f"- {prompt_safe_block(item, limit=MAX_STATEMENT_CHARS)}"
-        for item in packet.limitations
-    )
+    else:
+        limitation_lines: list[str] = []
+        for item in packet.limitations:
+            body = prompt_safe_block(item, limit=MAX_STATEMENT_CHARS).split("\n")
+            limitation_lines.append(f"- {body[0]}")
+            limitation_lines.extend(f"  {line}" for line in body[1:])
+        lines.append(render_data_block(STATEMENT_FENCE, limitation_lines))
 
     if packet.excluded_claims:
         lines.extend(["", "## Claims that were asked for and withheld"])
