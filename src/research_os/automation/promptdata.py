@@ -190,6 +190,18 @@ STATEMENT_FENCE = DataFence(
     end="----- END SUPPLIED STATEMENT (QUOTED, NOT SPOKEN) -----",
 )
 
+#: A proposal the grounding validator refused, quoted back for correction.
+#:
+#: The strongest reason this fence exists rather than reusing another: the block
+#: it renders is a whole *rejected* proposal, and the correction worker's task is
+#: to edit it. A worker asked to edit text is being invited to read that text as
+#: instructions, so the delimiter says outright what the block is and what its
+#: status is -- refused output, not a brief.
+REJECTED_PROPOSAL_FENCE = DataFence(
+    begin="----- BEGIN REFUSED PROPOSAL (UNTRUSTED MODEL OUTPUT) -----",
+    end="----- END REFUSED PROPOSAL (UNTRUSTED MODEL OUTPUT) -----",
+)
+
 #: Every fence the controller generates.
 #:
 #: One tuple, because :data:`ALL_DELIMITERS` is derived from it and that is what
@@ -208,6 +220,7 @@ FENCES: tuple[DataFence, ...] = (
     TASK_FENCE,
     STATEMENT_FENCE,
     CHECK_RESULT_FENCE,
+    REJECTED_PROPOSAL_FENCE,
 )
 
 #: Every delimiter, longest first, so a delimiter that contains another is

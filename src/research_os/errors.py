@@ -249,6 +249,18 @@ class ProposalValidationError(ProposalError):
     """
 
 
+class ProposalGroundingError(ProposalValidationError):
+    """Raised when a proposal cites identifiers its run was never given.
+
+    A distinct type because it is the one proposal failure that has a bounded
+    automatic answer: the same worker, the same evidence, one chance to cite only
+    what it actually has. Every other validation failure stays exactly as
+    fail-closed as it was. Raising this *after* that one attempt means the
+    attempt was made and refused again, which is a final answer, not a retryable
+    one.
+    """
+
+
 class ProposalStoreError(ProposalError):
     """Raised when the proposal store cannot be read or written."""
 
