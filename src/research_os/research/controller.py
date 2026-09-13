@@ -128,7 +128,12 @@ MAX_DELEGATED_MODEL_CALLS = 100
 MINIMUM_CALLS: dict[TaskKind, int] = {
     TaskKind.LITERATURE: 0,
     TaskKind.ANALYSIS: 1,
-    TaskKind.PROPOSAL: 2,
+    # Literature, the proposal itself, and the assessment. It was 2, which was
+    # the no-literature cost, so a proposal task could be admitted with less
+    # budget than it would actually spend -- harmless while the proposal
+    # controller silently overspent, wrong the moment that controller started
+    # refusing calls it could not pay for.
+    TaskKind.PROPOSAL: 3,
     TaskKind.CODE: 2,
     TaskKind.EXPERIMENT: 0,
     TaskKind.PAPER: 2,
@@ -746,16 +751,31 @@ class ResearchController:
                 # budget owned by the layer that has one.
                 max_model_calls=run.remaining_model_calls,
             )
-        except ProposalGroundingError as refused:
-            # Ledgered even though the task is about to fail, because "the model
-            # cited something that does not exist and the correction did not fix
-            # it" is the single most useful thing a researcher can be told about
-            # a failed proposal, and the proposal store has nothing in it to say
-            # so: a proposal that never validated was never created.
+        except (ProposalError, ProviderInvocationError) as failure:
+            # Charged before re-raising, because the calls were made. A failed
+            # proposal used to cost this run nothing on paper: the charge sat
+            # after the call that raised, so a planner that reliably cited a
+            # nonexistent key could spend the literature call, the proposal call
+            # and the bounded correction, fail, be retried, and spend three more
+            # against a ledger that had not moved. The automation dispatch path
+            # already reconciled its uncharged inner spend; this one did not.
+            run = self._charge(store, run, getattr(failure, "model_calls", 0))
+            if isinstance(failure, ProposalGroundingError):
+                # "The model cited something that does not exist and the one
+                # correction did not fix it" is the single most useful thing a
+                # researcher can be told about a failed proposal, and the
+                # proposal store has nothing in it to say so: a proposal that
+                # never validated was never created.
+                store.append_event(
+                    "proposal_grounding_failed",
+                    task_id=task_id,
+                    detail=str(failure),
+                )
             store.append_event(
-                "proposal_grounding_failed",
+                "proposal_failed",
                 task_id=task_id,
-                detail=str(refused),
+                model_calls=getattr(failure, "model_calls", 0),
+                error=type(failure).__name__,
             )
             raise
         run = self._charge(store, run, outcome.model_calls)

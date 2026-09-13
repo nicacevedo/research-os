@@ -226,7 +226,12 @@ class HttpClient:
         """
 
         raw = (response.header("retry-after") or "").strip()
-        if raw.isdigit():
+        # ``isascii`` as well as ``isdigit``: the latter is True for characters
+        # ``float`` refuses, such as the superscript two, so a provider sending
+        # ``Retry-After: ²`` turned a header parse into an unhandled
+        # ValueError escaping a request that had already succeeded in reaching
+        # the provider. Found by an independent reviewer.
+        if raw.isascii() and raw.isdigit():
             return min(float(raw), MAX_RETRY_AFTER_SECONDS)
         if raw:
             moment = parsedate_to_datetime_or_none(raw)

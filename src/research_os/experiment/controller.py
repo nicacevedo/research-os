@@ -36,7 +36,7 @@ from pathlib import Path
 
 from research_os.automation.filescope import assert_contained_symlinks
 from research_os.automation.gitutil import has_commits, head_commit, repository_root
-from research_os.automation.models import utc_now
+from research_os.automation.models import WorktreeRecord, utc_now
 from research_os.automation.worktree import (
     branch_name,
     create_worktree,
@@ -76,6 +76,7 @@ from research_os.experiment.store import (
     experiments_root,
     make_experiment_run_id,
 )
+from research_os.runlock import run_lock
 
 #: How an execution was authorised, recorded on every run.
 #:
@@ -389,39 +390,25 @@ class ExperimentController:
                 worktree=str(worktree),
                 branch=branch,
             )
-            try:
-                record = create_worktree(
-                    run_id=_worktree_run_id(run_id),
-                    task_id="T-001",
-                    repository=root,
-                    base_commit=head_commit(root) if has_commits(root) else "",
+            # Held across the whole PREPARING window, and that is what makes the
+            # window safe to be visible in.
+            #
+            # Writing the record before the worktree is what lets recovery find
+            # a crash here. It also makes a run that is being prepared *right
+            # now* visible to recovery, in a state that is deliberately not
+            # ACTIVE -- so a concurrent ``storage --reclaim`` could see a live
+            # preparation, call it idle, and delete the worktree out from under
+            # it. An independent review found that: the fix for one race opened
+            # another.
+            #
+            # The kernel settles it. A flock is released when its holder dies,
+            # so "this lock is held" means a living process is preparing this
+            # run and "it is free" means nobody is. No staleness heuristic, no
+            # timeout, no note to misread.
+            with run_lock(run_id, action="experiment prepare"):
+                run, _record = self._prepare_worktree(
+                    store, run, run_id=run_id, root=root, worktree=worktree
                 )
-            except Exception as exc:
-                # The record outlives the failure on purpose. A PREPARING run
-                # whose worktree never appeared is the honest description of
-                # what happened, and it is what stops a phantom active
-                # experiment from existing at all.
-                run = run.model_copy(
-                    update={
-                        "state": ExecutionState.FAILED,
-                        "failure_reason": f"worktree creation failed: {exc}",
-                        "ended_at": utc_now(),
-                    }
-                )
-                store.save(run)
-                store.append_event(
-                    "experiment_preparation_failed",
-                    worktree=str(worktree),
-                    detail=str(exc),
-                )
-                raise
-            if record.path != str(worktree):  # pragma: no cover - defensive
-                raise ExperimentError(
-                    f"worktree was created at {record.path}, not at the reserved "
-                    f"path {worktree} this run already recorded"
-                )
-            run = run.model_copy(update={"state": ExecutionState.PREPARED})
-            store.save(run)
         store.append_event(
             "experiment_prepared",
             task_name=task_name,
@@ -627,6 +614,57 @@ class ExperimentController:
         )
         return packet
 
+    def _prepare_worktree(
+        self,
+        store: ExperimentStore,
+        run: ExperimentRun,
+        *,
+        run_id: str,
+        root: Path,
+        worktree: Path,
+    ) -> tuple[ExperimentRun, WorktreeRecord]:
+        """Create the isolated worktree this PREPARING run already recorded.
+
+        Called with this run's lock held, so nothing else may reclaim what it is
+        building. The record moves to PREPARED only once the worktree really
+        exists at the path the record already names.
+        """
+
+        try:
+            record = create_worktree(
+                run_id=_worktree_run_id(run_id),
+                task_id="T-001",
+                repository=root,
+                base_commit=head_commit(root) if has_commits(root) else "",
+            )
+        except Exception as exc:
+            # The record outlives the failure on purpose. A PREPARING run whose
+            # worktree never appeared is the honest description of what
+            # happened, and it is what stops a phantom active experiment from
+            # existing at all.
+            run = run.model_copy(
+                update={
+                    "state": ExecutionState.FAILED,
+                    "failure_reason": f"worktree creation failed: {exc}",
+                    "ended_at": utc_now(),
+                }
+            )
+            store.save(run)
+            store.append_event(
+                "experiment_preparation_failed",
+                worktree=str(worktree),
+                detail=str(exc),
+            )
+            raise
+        if record.path != str(worktree):  # pragma: no cover - defensive
+            raise ExperimentError(
+                f"worktree was created at {record.path}, not at the reserved "
+                f"path {worktree} this run already recorded"
+            )
+        run = run.model_copy(update={"state": ExecutionState.PREPARED})
+        store.save(run)
+        return run, record
+
     def cleanup(self, store: ExperimentStore) -> tuple[ExperimentRun, tuple[str, ...]]:
         """Release this run's worktree. The branch and the record are kept.
 
@@ -644,10 +682,21 @@ class ExperimentController:
         from research_os.automation.worktree import lock_path as worktree_lock_path
         from research_os.automation.worktree import release_worktree_lock
         from research_os.experiment.models import ACTIVE_STATES
+        from research_os.runlock import is_held
 
         run = store.load()
         if not run.isolated or not run.worktree_path:
             return run, ()
+        if run.state is ExecutionState.PREPARING and is_held(run.run_id):
+            # Being prepared right now by a living process. The second half of
+            # the same guard as in ``diagnostics``: reclaim asks before it
+            # selects a run, and this asks again before it deletes one, because
+            # a preparation can begin between those two moments.
+            raise ExperimentStoreError(
+                f"{run.run_id} is being prepared by another process; its "
+                "worktree is being created right now. Wait for it to finish, "
+                "or stop that process, before releasing its directory."
+            )
         if run.state in ACTIVE_STATES:
             # A submitted cluster job's working directory *is* this worktree.
             # Removing it under a running job was possible until a third

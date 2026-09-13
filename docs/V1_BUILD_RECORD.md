@@ -950,3 +950,82 @@ unbounding it, and skipping its budget check. All three detected.
   project code with the user's permissions. Unchanged, and now stated on the
   first screen of the README rather than only in `SECURITY.md`.
 - **`_HELD` is process-global, not thread-safe.** Unreachable today.
+
+## 22. The independent delta review, and what it found
+
+One read-only review of `research-os-v1..HEAD`, no write authority, fresh
+context, strongest local model. Verdict: **PASS WITH BOUNDED REPAIR**, three
+concrete defects.
+
+The first run of that review had to be abandoned: given permission to run the
+suite, it spent its budget re-running fourteen minutes of tests instead of
+reading the diff. Re-scoped to six files with an explicit ban on the full suite,
+it returned in under six minutes. Its last words before being stopped were
+"now let me test the budget-cap boundary I suspect is unenforced" — which was
+correct, and is the fourth item below.
+
+**F1 — a live experiment preparation could be reclaimed out from under itself.**
+The fix for one race opened another. `PREPARING` is deliberately not in
+`ACTIVE_STATES`, which is what lets recovery see a crashed preparation; it also
+made a preparation *in progress* look idle, so a concurrent
+`storage --reclaim` could delete the worktree a running process was in the
+middle of creating, and release its lock.
+
+Refusing to reclaim `PREPARING` unconditionally would have put the orphan the
+state exists to expose straight back out of reach, so the answer had to
+distinguish a live preparation from a dead one. The kernel already answers
+exactly that question: a `flock` is released when its holder dies. The
+preparation now holds this run's lock across the whole window, and both
+`diagnostics` and `experiment cleanup` ask `runlock.is_held` before touching it
+— asked twice, because a preparation can begin between reclaim selecting a run
+and reclaim deleting it. No staleness heuristic, no timeout, no note to misread.
+
+The first regression written for this did not discriminate: it inspected
+reclaim's view *before* `create_worktree` ran, so there was nothing on disk to
+offer and the assertion passed however the idle rule was written. Mutating the
+rule proved it. The test now looks after the worktree exists and while the
+record still says `PREPARING`, and catches all three mutations — including the
+over-correction that never reclaims.
+
+**F2 — a failed proposal task charged the run nothing.** The charge sat after
+the call that raised. A planner that reliably cites a nonexistent key could
+spend the literature call, the proposal call and the bounded correction, fail,
+be retried, and spend three more against a ledger that had not moved — a
+model-controlled path to unbounded real spend under a budget that only counted
+successes. Proposal errors now carry what they cost and the research controller
+charges it before re-raising. The automation dispatch path already reconciled
+its uncharged inner spend; this one was the gap beside it.
+
+**F3 — a `Retry-After` header could crash the request that received it.**
+`str.isdigit()` is True for characters `float` refuses: `Retry-After: ²` passed
+the check and raised `ValueError` out of a request that had already reached the
+provider, as a type no caller catches. The date-form branch added in this
+release was written total; the seconds-form branch beside it was not.
+
+**F4 — informational, accepted as-is.** A payload with both a grounding
+violation and an unrelated structural defect still enters the correction, whose
+prompt lists only the grounding errors. Cost is exactly one budget-checked,
+non-recursive call, and the second failure is reported honestly.
+
+**The budget ceiling, found by the abandoned first reviewer and reproduced.**
+`max_model_calls` was checked in one place — the bounded correction, where it
+was first needed — and nowhere else. A run asked for a ceiling of one made two.
+A ceiling enforced at one of four call sites is not a ceiling; it is a parameter
+whose name promises something the code does not do. It is now checked before
+every spend, and `MINIMUM_CALLS[PROPOSAL]` rose from 2 to 3 to match what a
+proposal with literature actually costs, so the entry gate and the ceiling agree.
+
+**What the review could not break**, recorded because it is the more useful
+half: no argument to `release_worktree_lock` can name a run lock (sha256 hex
+cannot contain `r`, `u`, `n` or `-`), and the real fix was removing the old
+`unlink(record.lock_path)` — a field persisted outside the repository that could
+previously have directed an arbitrary unlink. Exactly one grounding correction,
+with `ProposalGroundingError` subclassing `ProposalValidationError` checked
+specifically for whether it could re-arm the handler; it cannot. Planner
+invocations bounded at two by exhaustion of all four orderings. The refused
+proposal cannot forge a fence: `json.dumps` escapes newlines before
+`prompt_safe_block` scrubs delimiters before `render_data_block` refuses an
+ambiguous fence outright. Reserved run ids re-validated against `RUN_ID_RE`
+before any path is built. Transport retries and 5xx retries share one counter,
+so they cannot be alternated to exceed the bound. Settled refusals raise outside
+the retry `try` and are never retried.

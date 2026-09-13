@@ -178,6 +178,49 @@ def _release(handle: int, target: Path) -> None:
             pass
 
 
+def is_held(run_id: str) -> bool:
+    """Whether some live process currently holds the lock for ``run_id``.
+
+    Asks the kernel rather than reading the note in the file. A ``flock`` is
+    released when its holder dies for any reason, so "could not acquire" means
+    there is a living owner and "could acquire" means there is not. That is the
+    whole reason this module uses ``flock``, and it is the only staleness
+    question this codebase is allowed to answer -- the one the kernel answers.
+
+    Acquired and released immediately, and the answer is a fact about that
+    instant, not a reservation. It is therefore only ever safe to use in one
+    direction: to decide to *leave something alone*. A caller must never read a
+    False as permission to take anything, because between the answer and the
+    action another process may have arrived. Recovery uses it exactly that way
+    -- to refuse to reclaim a run that is being prepared right now -- and being
+    wrong in the conservative direction costs one more reclaim pass.
+    """
+
+    target = lock_path(run_id)
+    if str(target) in _HELD:
+        return True
+    if not target.exists():
+        return False
+    try:
+        handle = os.open(target, os.O_RDWR)
+    except OSError:
+        # Unreadable is not provably free, and the safe answer to "may I delete
+        # what this guards" is no.
+        return True
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return True
+    else:
+        fcntl.flock(handle, fcntl.LOCK_UN)
+        return False
+    finally:
+        try:
+            os.close(handle)
+        except OSError:
+            pass
+
+
 def _read(target: Path) -> dict[str, Any]:
     try:
         data = json.loads(target.read_text(encoding="utf-8"))

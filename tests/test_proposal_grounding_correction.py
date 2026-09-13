@@ -493,3 +493,169 @@ def test_a_malformed_proposal_gets_no_correction_at_all(
     assert not isinstance(refused.value, ProposalGroundingError)
     planner_calls = [call for call in provider.calls if call.role is Role.PLANNER]
     assert len(planner_calls) == 1, "a structural failure must not spend a model call"
+
+
+# -- the ceiling is a ceiling, not a suggestion --------------------------------
+
+
+def test_the_model_call_ceiling_is_enforced_at_every_spend(
+    research_home: Path, tmp_path: Path
+) -> None:
+    """Found by an independent reviewer, and it was right.
+
+    ``max_model_calls`` was checked in exactly one place -- the bounded
+    grounding correction, which is where it was first needed -- and nowhere
+    else. A run asked for a ceiling of one made two calls, because the proposal
+    worker and the assessor never consulted it. A ceiling enforced at one of
+    four call sites is not a ceiling; it is a parameter whose name promises
+    something the code does not do.
+    """
+
+    from research_os.errors import ProposalBudgetError
+
+    project = init_capsule_project(tmp_path / "project")
+    provider = scripted([proposal_payload(items=[item()])])
+    controller = make_controller(
+        {"fake": provider}, literature_store=seeded_literature()
+    )
+
+    with pytest.raises(ProposalBudgetError, match="the assessor would exceed it"):
+        controller.propose(
+            project_path=project,
+            goal="widget deformation load",
+            with_literature=False,
+            max_model_calls=1,
+        )
+
+    planner = [call for call in provider.calls if call.role is Role.PLANNER]
+    reviewer = [call for call in provider.calls if call.role is Role.REVIEWER]
+    assert len(planner) == 1, "the one call it could pay for was made"
+    assert len(reviewer) == 0, "the one it could not was refused before the spend"
+
+
+def test_a_ceiling_of_zero_refuses_the_proposal_worker_itself(
+    research_home: Path, tmp_path: Path
+) -> None:
+    from research_os.errors import ProposalBudgetError
+
+    project = init_capsule_project(tmp_path / "project")
+    provider = scripted([proposal_payload(items=[item()])])
+    controller = make_controller(
+        {"fake": provider}, literature_store=seeded_literature()
+    )
+
+    with pytest.raises(ProposalBudgetError, match="the proposal worker"):
+        controller.propose(
+            project_path=project,
+            goal="widget deformation load",
+            with_literature=False,
+            max_model_calls=0,
+        )
+
+    assert provider.calls == [], "nothing was spent at all"
+
+
+def test_the_literature_analyst_is_also_subject_to_the_ceiling(
+    research_home: Path, tmp_path: Path
+) -> None:
+    from research_os.errors import ProposalBudgetError
+
+    project = init_capsule_project(tmp_path / "project")
+    provider = scripted([proposal_payload(items=[item()])])
+    controller = make_controller(
+        {"fake": provider}, literature_store=seeded_literature()
+    )
+
+    with pytest.raises(ProposalBudgetError, match="the literature analyst"):
+        controller.propose(
+            project_path=project,
+            goal="widget deformation load",
+            with_literature=True,
+            max_model_calls=0,
+        )
+
+    assert provider.calls == []
+
+
+def test_the_default_ceiling_still_pays_for_the_whole_pipeline(
+    research_home: Path, tmp_path: Path
+) -> None:
+    """The other half: making the ceiling real must not make it bite by default.
+
+    Literature, proposal, one grounding correction and the assessment is four,
+    which is exactly ``MAX_MODEL_CALLS``. If enforcing the ceiling had made the
+    ordinary corrected run unaffordable, the fix would have broken the feature
+    it was protecting.
+    """
+
+    project = init_capsule_project(tmp_path / "project")
+    provider = scripted(
+        [
+            proposal_payload(items=[item(grounded_in_literature=[INVENTED_KEY])]),
+            proposal_payload(items=[item(grounded_in_literature=[SUPPLIED_KEY])]),
+        ]
+    )
+    controller = make_controller(
+        {"fake": provider}, literature_store=seeded_literature()
+    )
+
+    outcome = run(controller, project)
+
+    assert outcome.grounding_correction is not None
+    assert outcome.assessment is not None, "the assessment was still affordable"
+    assert outcome.model_calls == 4
+
+
+# -- a failed proposal costs what it spent -------------------------------------
+
+
+def test_a_failed_proposal_reports_the_calls_it_spent(
+    research_home: Path, tmp_path: Path
+) -> None:
+    """A budget that only counts successes is not a budget.
+
+    The charge sat after the call that raised, so a planner that reliably cited
+    a nonexistent key could spend the literature call, the proposal call and
+    the bounded correction, fail, be retried, and spend three more against a
+    ledger that had not moved. Found by an independent review.
+    """
+
+    project = init_capsule_project(tmp_path / "project")
+    provider = scripted(
+        [
+            proposal_payload(items=[item(grounded_in_literature=[INVENTED_KEY])]),
+            proposal_payload(items=[item(grounded_in_literature=["L-003"])]),
+        ]
+    )
+    controller = make_controller(
+        {"fake": provider}, literature_store=seeded_literature()
+    )
+
+    with pytest.raises(ProposalGroundingError) as refused:
+        run(controller, project)
+
+    # Literature, the proposal, and the one correction.
+    assert refused.value.model_calls == 3
+    assert refused.value.model_calls == len(provider.calls)
+
+
+def test_a_proposal_that_could_not_afford_its_first_call_reports_zero(
+    research_home: Path, tmp_path: Path
+) -> None:
+    from research_os.errors import ProposalBudgetError
+
+    project = init_capsule_project(tmp_path / "project")
+    provider = scripted([proposal_payload(items=[item()])])
+    controller = make_controller(
+        {"fake": provider}, literature_store=seeded_literature()
+    )
+
+    with pytest.raises(ProposalBudgetError) as refused:
+        controller.propose(
+            project_path=project,
+            goal="widget deformation load",
+            with_literature=False,
+            max_model_calls=0,
+        )
+
+    assert refused.value.model_calls == 0

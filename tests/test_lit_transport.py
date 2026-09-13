@@ -399,3 +399,26 @@ def test_an_adapter_recovers_from_one_transient_failure() -> None:
 
     assert result.status is SourceStatus.OK
     assert len(transport.requests) == 2
+
+
+def test_a_non_ascii_digit_retry_after_does_not_crash_the_request() -> None:
+    """``str.isdigit()`` is True for characters ``float`` refuses.
+
+    ``Retry-After: ²`` — superscript two — passed the digit check and then
+    raised ValueError out of a request that had already reached the provider,
+    escaping as something no caller catches. Found by an independent review.
+    """
+
+    transport = client(
+        responses=[
+            ScriptedResponse(
+                match="example", status=429, headers={"retry-after": "²"}, body=b""
+            )
+        ],
+    )
+
+    response = transport.get("https://example.invalid/x")
+
+    assert response.status == 429, "the provider's answer still came back"
+    assert backoffs(transport.waited), "it fell back to exponential backoff"
+    assert max(transport.waited) <= MAX_RETRY_AFTER_SECONDS

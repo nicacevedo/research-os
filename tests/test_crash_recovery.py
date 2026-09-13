@@ -605,3 +605,146 @@ def test_the_derived_worktree_id_is_a_pure_function_of_the_run_id() -> None:
 
     assert RUN_ID_RE.fullmatch(first), "the shared helpers validate this shape"
     assert _worktree_run_id("XRUN-20260913T193649Z-ffffffff") != first
+
+
+# -- what the independent delta review found ----------------------------------
+
+
+def test_a_live_preparation_is_not_reclaimed_out_from_under_itself(
+    research_home: Path, tmp_path: Path
+) -> None:
+    """The race the crash-consistency fix opened, and the reason for the lock.
+
+    Writing the record before the worktree is what lets recovery find a crash.
+    It also makes a run that is being prepared *right now* visible to recovery,
+    in a state that is deliberately not ACTIVE. For one release that meant a
+    concurrent ``storage --reclaim`` could call a live preparation idle and
+    delete the worktree out from under it. Found by an independent review.
+    """
+
+    controller, project = _prepared(tmp_path)
+    seen: list[Path] = []
+
+    def prepare_then_look(**kwargs: object):
+        # The worktree is created first and the record is *still* PREPARING,
+        # because ``_prepare_worktree`` has not returned. That ordering is the
+        # whole test: looking before the directory exists would pass whatever
+        # the idle rule said, since there would be nothing on disk to offer.
+        record = real_create(**kwargs)
+        target = Path(record.path)
+        seen.append(target)
+        assert target.is_dir(), "the worktree really is on disk now"
+        assert (
+            ExperimentStore.open(ExperimentStore.list_run_ids()[0]).load().state
+            is ExecutionState.PREPARING
+        ), "and the record still says PREPARING"
+
+        found = diagnostics._finished_experiment_worktrees()
+        assert found == [], f"a live preparation was offered to reclaim: {found}"
+        released = diagnostics.reclaim()
+        assert released.paths == (), f"reclaim deleted a live preparation: {released}"
+        assert target.is_dir(), "the live preparation's worktree survived reclaim"
+        return record
+
+    real_create = worktree_module.create_worktree
+    with pytest.MonkeyPatch.context() as injected:
+        injected.setattr(
+            "research_os.experiment.controller.create_worktree", prepare_then_look
+        )
+        _store, run, _packet = controller.run(
+            project_path=project,
+            task_name="fit-model",
+            parameters={"seed": 7},
+            project_id=PROJECT_ID,
+            execute=True,
+        )
+
+    assert seen, "the injection point was reached"
+    assert run.state is ExecutionState.COMPLETED
+    # And the lock is not held any more, so the finished run *is* reclaimable.
+    assert not run_lock_is_held(run.run_id)
+
+
+def run_lock_is_held(run_id: str) -> bool:
+    from research_os.runlock import is_held
+
+    return is_held(run_id)
+
+
+def test_a_preparation_whose_process_died_is_still_reclaimable(
+    research_home: Path, tmp_path: Path
+) -> None:
+    """The other half. Refusing to reclaim PREPARING unconditionally would put
+    the orphan the state exists to expose right back out of reach."""
+
+    from research_os.experiment.models import ExperimentRun
+
+    controller, project = _prepared(tmp_path)
+    with pytest.MonkeyPatch.context() as injected:
+        injected.setattr(
+            "research_os.experiment.controller.create_worktree",
+            lambda **_: (_ for _ in ()).throw(Killed("killed while preparing")),
+        )
+        with pytest.raises(Killed):
+            controller.run(
+                project_path=project,
+                task_name="fit-model",
+                parameters={"seed": 7},
+                project_id=PROJECT_ID,
+                execute=True,
+            )
+
+    run_id = ExperimentStore.list_run_ids()[0]
+    store = ExperimentStore.open(run_id)
+    run = store.load()
+    # Force the SIGKILL shape: the record stays PREPARING because no except ran.
+    store.save(
+        ExperimentRun.model_validate(
+            {
+                **run.model_dump(mode="json"),
+                "state": "preparing",
+                "failure_reason": None,
+            }
+        )
+    )
+    target = Path(run.worktree_path or "")
+    target.mkdir(parents=True, exist_ok=True)
+
+    assert not run_lock_is_held(run_id), "the dead process holds nothing"
+    found = diagnostics._finished_experiment_worktrees()
+    assert [item[0] for item in found] == [run_id], "a dead preparation is reclaimable"
+
+
+def test_cleanup_refuses_a_preparation_another_process_is_doing(
+    research_home: Path, tmp_path: Path
+) -> None:
+    """Asked again at the moment of deletion, because a preparation can begin
+    between reclaim selecting a run and reclaim deleting it."""
+
+    from research_os.errors import ExperimentStoreError
+    from research_os.experiment.models import ExperimentRun
+    from research_os.runlock import run_lock
+
+    controller, project = _prepared(tmp_path)
+    _store, run, _packet = controller.run(
+        project_path=project,
+        task_name="fit-model",
+        parameters={"seed": 7},
+        project_id=PROJECT_ID,
+        execute=True,
+    )
+    store = ExperimentStore.open(run.run_id)
+    store.save(
+        ExperimentRun.model_validate(
+            {**run.model_dump(mode="json"), "state": "preparing"}
+        )
+    )
+
+    with run_lock(run.run_id, action="experiment prepare"):
+        with pytest.raises(ExperimentStoreError, match="being prepared"):
+            controller.cleanup(ExperimentStore.open(run.run_id))
+        assert Path(run.worktree_path or "").is_dir(), "nothing was released"
+
+    # Lock gone, so the same call now proceeds.
+    _run, released = controller.cleanup(ExperimentStore.open(run.run_id))
+    assert released

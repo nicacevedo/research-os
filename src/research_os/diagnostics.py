@@ -668,7 +668,7 @@ def _reclaimable() -> tuple[int, int, str]:
     return worktrees, environments, note
 
 
-def _experiment_worktree_is_idle(state: object) -> bool:
+def _experiment_worktree_is_idle(state: object, run_id: str = "") -> bool:
     """Return whether an experiment in ``state`` is still using its worktree.
 
     Asking the question the other way round, which is the correction a third
@@ -684,8 +684,20 @@ def _experiment_worktree_is_idle(state: object) -> bool:
     checkout rather than an orphan nobody can find.
     """
 
-    from research_os.experiment.models import ACTIVE_STATES
+    from research_os.experiment.models import ACTIVE_STATES, ExecutionState
+    from research_os.runlock import is_held
 
+    if state is ExecutionState.PREPARING and run_id:
+        # PREPARING is the one state that is neither active nor finished: it
+        # means a process is building this run's worktree right now, or died
+        # while doing so. Treating it as idle unconditionally -- which it was,
+        # for one release -- let a concurrent reclaim delete a live
+        # preparation's worktree out from under it, which an independent review
+        # found. Treating it as busy unconditionally would put the orphan that
+        # the PREPARING state exists to expose right back out of reach.
+        #
+        # The kernel distinguishes them. A flock dies with its holder.
+        return not is_held(run_id)
     return state not in ACTIVE_STATES
 
 
@@ -731,7 +743,7 @@ def _finished_experiment_worktrees() -> list[tuple[str, Path]]:
         run = _experiment_run(run_id)
         if run is None or not run.isolated or not run.worktree_path:
             continue
-        if not _experiment_worktree_is_idle(run.state):
+        if not _experiment_worktree_is_idle(run.state, run_id):
             continue
         target = Path(run.worktree_path)
         # The lock counts as something to release even with no directory beside

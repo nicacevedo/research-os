@@ -42,6 +42,8 @@ from research_os.automation.providers import (
 from research_os.automation.structured import extract_json_object
 from research_os.errors import (
     AutomationError,
+    ProposalBudgetError,
+    ProposalError,
     ProposalGroundingError,
     ProposalValidationError,
     ProviderInvocationError,
@@ -158,6 +160,42 @@ class ProposalController:
         assess: bool = True,
         max_model_calls: int | None = None,
     ) -> ProposalOutcome:
+        """Produce one proposal, and make every failure say what it cost.
+
+        The accounting wrapper is separate from the work because a failed
+        proposal spends real model calls and used to report none. A caller with
+        a budget charged only on success, so a run whose planner reliably cited
+        a nonexistent key could spend three calls a time, be retried, and spend
+        three more against a ledger that never moved. Found by an independent
+        review of this release.
+        """
+
+        spent: list[ModelInvocation] = []
+        try:
+            return self._propose(
+                project_path=project_path,
+                goal=goal,
+                with_literature=with_literature,
+                retrieve=retrieve,
+                assess=assess,
+                max_model_calls=max_model_calls,
+                invocations=spent,
+            )
+        except (ProposalError, ProviderInvocationError) as failure:
+            failure.model_calls = len(spent)
+            raise
+
+    def _propose(
+        self,
+        *,
+        project_path: Path,
+        goal: str,
+        with_literature: bool,
+        retrieve: bool,
+        assess: bool,
+        max_model_calls: int | None,
+        invocations: list[ModelInvocation],
+    ) -> ProposalOutcome:
         """Produce one proposal for ``goal`` against ``project_path``.
 
         ``with_literature`` adds a read-only literature pass over the local
@@ -192,7 +230,6 @@ class ProposalController:
             project_path=str(root), goal=goal, created_at=created_at
         )
 
-        invocations: list[ModelInvocation] = []
         pending: list[tuple[str, str]] = []
         literature_data: str | None = None
         literature_keys: tuple[str, ...] = ()
@@ -202,6 +239,7 @@ class ProposalController:
                 resolved=resolved,
                 retrieve=retrieve,
                 invocations=invocations,
+                max_model_calls=max_model_calls,
             )
             pending.extend(entries)
 
@@ -214,6 +252,7 @@ class ProposalController:
         prompt = build_proposal_prompt(
             goal=goal, context=context, literature_data=literature_data
         )
+        self._assert_affordable(invocations, max_model_calls, "the proposal worker")
         invocation, result = self._invoke(
             role=Role.PLANNER,
             setting=setting,
@@ -338,6 +377,7 @@ class ProposalController:
                 context_text=render_science_context(context),
                 resolved=resolved,
                 invocations=invocations,
+                max_model_calls=max_model_calls,
             )
         return ProposalOutcome(
             store=store,
@@ -359,7 +399,7 @@ class ProposalController:
         setting: RoleSetting,
         parse: Callable[[dict | None, ModelInvocation], ResearchProposal],
         invocations: list[ModelInvocation],
-        max_model_calls: int | None,
+        max_model_calls: int,
     ) -> tuple[ResearchProposal, GroundingCorrection, str, str]:
         """Spend one model call to make a refused proposal cite only what it has.
 
@@ -378,7 +418,7 @@ class ProposalController:
         # Budget first, and before the prompt is even built. A correction is an
         # ordinary model call and is charged like one; a controller that spent a
         # call it had not checked for would be deciding its own budget.
-        if max_model_calls is not None and len(invocations) >= max_model_calls:
+        if len(invocations) >= max_model_calls:
             raise ProposalGroundingError(
                 f"{first}. One grounding correction was available but this run "
                 f"has spent its {max_model_calls} model call(s), so the refused "
@@ -450,6 +490,7 @@ class ProposalController:
         resolved: ResolvedRoles,
         retrieve: bool,
         invocations: list[ModelInvocation],
+        max_model_calls: int,
     ) -> tuple[str | None, tuple[str, ...], list[tuple[str, str]]]:
         """Retrieve, rank, and read literature for the goal. Read-only throughout.
 
@@ -469,6 +510,7 @@ class ProposalController:
         packet = build_packet(goal, results, max_works=LITERATURE_PACKET_WORKS)
 
         setting = self._setting(resolved, "literature", Role.LITERATURE)
+        self._assert_affordable(invocations, max_model_calls, "the literature analyst")
         prompt = build_literature_prompt(goal=goal, packet=packet)
         invocation_id = f"INV-{len(invocations) + 1:04d}"
         invocation, result = self._invoke(
@@ -511,8 +553,10 @@ class ProposalController:
         context_text: str,
         resolved: ResolvedRoles,
         invocations: list[ModelInvocation],
+        max_model_calls: int,
     ) -> ProposalAssessment:
         setting = self._setting(resolved, "reviewer", Role.REVIEWER)
+        self._assert_affordable(invocations, max_model_calls, "the assessor")
         prompt = build_assessment_prompt(proposal, context_text=context_text)
         invocation_id = f"INV-{len(invocations) + 1:04d}"
         invocation, result = self._invoke(
@@ -551,6 +595,27 @@ class ProposalController:
         return assessment
 
     # -- primitives ------------------------------------------------------
+
+    @staticmethod
+    def _assert_affordable(
+        invocations: list[ModelInvocation], ceiling: int, what: str
+    ) -> None:
+        """Refuse a model call this run cannot pay for, before it is made.
+
+        Checked at every spend, not only at the bounded grounding correction --
+        which is where it was first needed and where, for one release, it was
+        the only place it existed. A ceiling enforced at one of four call sites
+        is not a ceiling; it is a parameter whose name promises something the
+        code does not do, and the next caller to trust it is the one who finds
+        out. Found by an independent reviewer and reproduced: a run asked for a
+        ceiling of one made two calls.
+        """
+
+        if len(invocations) >= ceiling:
+            raise ProposalBudgetError(
+                f"this proposal run may spend {ceiling} model call(s) and has "
+                f"already spent {len(invocations)}; {what} would exceed it"
+            )
 
     def _invoke(
         self,

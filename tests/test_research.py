@@ -1973,3 +1973,44 @@ def test_a_planner_failure_with_no_budget_left_is_not_retried(
 
     planner_calls = [call for call in provider.calls if call.role is Role.PLANNER]
     assert len(planner_calls) == 1, "a retry it cannot pay for must not be attempted"
+
+
+def test_a_failed_proposal_task_charges_the_run_for_what_it_spent(
+    research_home: Path, tmp_path: Path
+) -> None:
+    """Otherwise a retry spends the same calls again against an unmoved ledger."""
+
+    from research_os.errors import ProposalError
+    from tests.proposal_helpers import assessment_payload, item, proposal_payload
+    from tests.research_helpers import proposal_task
+
+    provider = scripted(plan=plan_payload(tasks=[proposal_task()]))
+    provider.responses["planner"] = [
+        ScriptedResponse(structured=plan_payload(tasks=[proposal_task()])),
+        # A proposal citing a capsule object this project does not hold. The
+        # correction is spent, invents nothing better, and the task fails.
+        ScriptedResponse(
+            structured=proposal_payload(items=[item(addresses=["C-9999"])])
+        ),
+        ScriptedResponse(
+            structured=proposal_payload(items=[item(addresses=["C-8888"])])
+        ),
+    ]
+    provider.responses["reviewer"] = [ScriptedResponse(structured=assessment_payload())]
+    controller, store, _run, _repo = start(tmp_path, provider=provider)
+    before = store.load().model_calls_used
+
+    with pytest.raises((ProposalError, ProviderInvocationError)):
+        controller.execute(store)
+
+    after = store.load().model_calls_used
+    events = [record.get("event") for record in store.iter_events()]
+    assert "proposal_failed" in events
+    failed = next(
+        record
+        for record in store.iter_events()
+        if record.get("event") == "proposal_failed"
+    )
+    assert after - before == failed["model_calls"], (
+        "the run was charged exactly what the failed proposal spent"
+    )
