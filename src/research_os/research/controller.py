@@ -592,12 +592,21 @@ class ResearchController:
         # A retried task dispatches a genuinely different run with the same
         # project, goal and -- if the retry is prompt -- the same second. The
         # attempt number is what keeps their ids apart.
+        #
+        # Recorded *before* the dispatch, not after. A delta review pointed out
+        # that counting the "started" events written on success means a dispatch
+        # that fails inside ``start`` -- after the run directory exists -- burns
+        # no number, so a prompt retry asks for the same id and collides again.
+        attempt = self._delegated_attempts(store, task_id) + 1
+        store.append_event(
+            "automation_dispatch_attempted", task_id=task_id, attempt=attempt
+        )
         inner_store, inner = controller.start(
             project_path=Path(run.project_path),
             goal=task.goal,
             budget=budget,
             plan=plan,
-            attempt=f"{task_id}#{self._delegated_attempts(store, task_id) + 1}",
+            attempt=f"{task_id}#{attempt}",
         )
         store.append_event(
             "automation_run_started",
@@ -1001,7 +1010,7 @@ class ResearchController:
         return sum(
             1
             for record in store.iter_events()
-            if record.get("event") == "automation_run_started"
+            if record.get("event") == "automation_dispatch_attempted"
             and record.get("task_id") == task_id
         )
 

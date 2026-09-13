@@ -380,3 +380,196 @@ The honest summary is that this codebase is in good shape *because* it was
 reviewed by something with no stake in it shipping, four times, and that the
 value of each round did not decline: round 3 found a defect at 1.8% incidence
 that rounds 1 and 2 had both nominally closed.
+
+---
+
+# Part II — Release audit
+
+Added during the release-closure pass. Part I above is the implementation
+history and is unchanged; nothing in it has been rewritten to look cleaner in
+hindsight.
+
+## 10. Review 4 and the delta review
+
+Review 4 was interrupted by a provider session limit and produced no report, so
+a fresh final release-gate review was run against `af913a4`.
+
+**Verdict: FAIL**, on one blocker and one repair-before-release item. It also
+mutation-tested the concurrency work and could not break it.
+
+### What it could not break
+
+- **The lock.** 8 processes, 2,400 acquisitions, an `O_EXCL` witness *and* a
+  read-modify-write counter inside the critical section: 0 violations, 0 lost
+  updates. Its control — the same harness against a `_release` that unlinks
+  before unlocking — produced 1,633 violations (68%) and 767/2400 on the
+  counter. Reentrancy traced; the documented thread-unsafety confirmed
+  unreachable (no `threading`, `asyncio` or `concurrent.futures` anywhere in
+  `src/`).
+- **Lock deletion paths.** A complete inventory of every deletion in `src/`:
+  nothing can reach `run-*.lock`, nothing removes `locks_root()`, and no code
+  iterates the locks directory at all.
+- **Cleanup interaction.** `auto cleanup`, `research cleanup` and
+  `storage --reclaim` all route through the run-locked cleanup; `experiment
+  cleanup` is a separate id namespace guarded on `ACTIVE_STATES`.
+- **The new lock tests, under mutation.** Injected via `sitecustomize` so spawned
+  children were mutated too: `LOCK_SH` failed 7/14, the stale-takeover bug 7/14,
+  unlink-on-release 3/14.
+- **Scientific integrity**, traced rather than read from docstrings: two writers
+  under `.research/`, both TTY-gated; `reviewer_kind: "human"` in exactly one
+  place; nothing writes `ACCEPTED`; `scope_violations` refuses `.research/`
+  before consulting any allow-list, and the paper layer reuses that same
+  function.
+
+### BLOCKER — a fourth unfenced channel, and then a fifth
+
+`paper/reviewer.py` interpolated the paper writer's manifest id lists with no
+sanitiser and **no delimiter at all** — so there was nothing to escape from; the
+writer simply emitted newlines and forged this prompt's own `DETERMINISTIC
+CHECKS THE CONTROLLER RAN` section, in the gate that stops a writing worker
+approving its own draft.
+
+Fixed in two layers: `SourceManifest` now refuses an id that is not id-shaped
+(the root cause — `written_paths` has had a validator since it was written), and
+the prompt renders what survives through `render_data_block`.
+
+The class-wide test meant to catch this could not: it searched for markdown
+fences, and this interpolation had none. Replacing it with a property test —
+*the controller's own section headings appear at most once as standalone lines
+outside every data block* — found a **fifth instance immediately**: `WHAT THE
+WRITER WAS ASKED TO DO` renders the instruction multi-line and unfenced, and
+that instruction is a research task's goal, written by the research planner.
+
+An audit found the same shape at **fifteen sites across nine files**: every
+goal, completion condition and instruction reaching an analyst, coder, writer,
+planner or either reviewer. `prompt_safe_block` makes delimiters inert and
+deliberately keeps newlines — which is exactly what lets an unfenced one open a
+line and forge a heading. `TASK_FENCE` was added and applied to all fifteen.
+
+That is the lesson of four rounds in one sentence: each previous round fixed the
+instance it was shown, and the class survived to be found again.
+
+### REPAIR — `charged_total`, wrong for the second time
+
+The third review found the ledger mixing a total with a delta. The fix moved
+both to "a total" — but the finished event's total was one *inner run's*, not
+the task's, so a task with two delegated runs still compared incomparable
+numbers and over-charged. Both now go through `_delegated_total`, the single
+definition. The previous regression test could not see it: with one delegated
+run the two quantities coincide.
+
+### Smaller items from the same review
+
+- A same-second run-id collision made a prompt `resume --retry` fail. Found
+  again by this pass's own new test, so fixed with an `attempt` discriminator
+  rather than deferred.
+- The writing reviewer's access position was never asserted, where every other
+  controller asserts it. `_reviewer_setting` now refuses anything but
+  `CONTEXT_ONLY`.
+- The automation planner's lone raw `{goal}`, fenced with the rest.
+- A false claim in the stress test's own docstring: it did **not** catch the
+  unlink bug in eight trials — the deterministic waiter test catches it every
+  time, and the 8% figure came from the release probe. Corrected, and its
+  acquisition floor raised from 50 to 120, clear of what it actually reaches.
+
+## 11. Concurrency release gate
+
+| Property | Result |
+| --- | --- |
+| Primitive | `fcntl.flock(LOCK_EX\|LOCK_NB)` on a stable path |
+| Lock file unlinked on release? | **No** — never, by design; that is the correctness argument |
+| Deletion paths reaching it | none (full inventory, twice, by two parties) |
+| Mutual exclusion | deterministic test + stress |
+| Waiter across release | deterministic; the detector for the bug that escaped three rounds |
+| Path/inode identity | asserted directly across acquire/release/re-acquire |
+| Process death | `SIGKILL` a holder; kernel releases; next caller acquires |
+| Cleanup interaction | `auto cleanup` refused mid-run via the same lock |
+| Release probe | 24,000 acquisitions over 5 repetitions, ~800k contended attempts, **0 violations** |
+| Detector proof | shipped → `REFUSED`, shared inode; broken → `ACQUIRED`, different inode |
+
+## 12. Validation results
+
+| Exercise | Result |
+| --- | --- |
+| Full suite | **2,047 passed** in 147s |
+| Ruff check / format / `git diff --check` | clean |
+| R0 scientific regression | **411 passed**; digests and models byte-unchanged |
+| Synthetic end-to-end, real CLI | **22/22** |
+| Real-provider bounded smoke | **PASS** — the one bounded repair fired and re-reviewed |
+| Real-project read-only pilot | **PASS** — project byte-identical |
+
+The real-provider run is worth recording precisely: planner `sonnet`, analyst
+`sonnet`, coder `opus`, reviewer `claude-sonnet-5`, independence
+`DEGRADED_SAME_PROVIDER_FAMILY`. The reviewer returned `PASS_WITH_REPAIR`, the
+single bounded repair ran, checks passed again (`pytest` exit 0,
+`git diff --check` exit 0), and `changed_paths` equalled `allowed_paths`
+exactly. The canonical checkout stayed at its initial commit with
+`raise NotImplementedError` intact; the implementation exists only on the
+branch.
+
+## 13. The read-only pilot, and one more degenerate plan
+
+The first pilot run against the real project produced a plan whose fields were
+`"Test task"`, `"Test goal."` and `"test query"` — and the placeholder guard let
+it through, because it required *every* token to be a placeholder and "task",
+"goal" and "query" are ordinary words. The run then searched three providers for
+"test query" and reported success.
+
+The guard now refuses a field that contains a placeholder token and nothing but
+structural filler besides. Deliberately still narrow: "Read the field",
+"Testing the estimator", "Assess the query planner's fallback behaviour" and
+"Implement the goal-seeking solver" all pass.
+
+The re-run produced a genuinely substantive plan — a literature query on
+diagonal-Hessian approximations for rank-one covariance penalties tied to
+EVI-0007 and EVI-0008, an analysis reading the real gate artifacts behind
+EVI-0008/EVI-0009 and the manuscript lines `STATE.md` flags as stale, and a
+checkpoint asking which gap to fund next — and stopped at that checkpoint.
+
+Both runs left the project byte-identical: HEAD `8733ad75`, zero modified files,
+capsule SHA `d6687d55ce9b084c` before and after.
+
+## 14. Final finding ledger
+
+Every substantive finding raised across four reviews and the release audit, with
+its disposition. Nothing is omitted because later code changed.
+
+| # | Finding | Disposition | Regression |
+| --- | --- | --- | --- |
+| S1 | Experiments ran in the canonical checkout; `.venv` projects refused outright | FIXED | `test_an_experiment_runs_in_an_isolated_worktree_by_default`, `test_a_project_with_a_virtualenv_is_not_refused` |
+| S2 | Worker could forge a controller section in the automation reviewer's prompt | FIXED | `test_a_worker_cannot_forge_a_controller_section_in_the_reviewer_prompt` |
+| S3 | Run-lock race (three wrong fixes) | FIXED | `test_a_process_that_opened_before_release_cannot_hold_alongside_the_next` + 13 more |
+| S4 | Killed run lost its delegated spend | FIXED | `test_an_interrupted_delegated_task_is_charged_on_both_resume_paths` |
+| S5 | Analyst correction truncated the identifier to repair | FIXED | `test_the_correction_carries_the_identifier_the_worker_must_fix` |
+| S6 | Literature unfenced to the paper writer | FIXED | `tests/test_paper.py` |
+| S7 | `ISOLATED_WRITE` had no tool allowlist | FIXED | `test_an_isolated_write_worker_cannot_be_given_a_command_tool` |
+| N1 | Experiment worktrees orphaned and invisible | FIXED | `test_a_worktree_left_by_a_run_that_never_started_is_reclaimable` |
+| N2 | Same forged-section defect in the paper reviewer | FIXED | `test_no_prompt_builder_wraps_untrusted_text_in_a_markdown_fence` |
+| N3 | Same construct, self-injection sites | FIXED | as above |
+| N4 | `paper cleanup` leaked its lock file | FIXED | `test_paper_cleanup_releases_the_worktree_and_its_lock` |
+| N5 | Reconciliation double-charged | FIXED (twice) | `test_two_delegated_runs_on_one_task_are_not_double_charged` |
+| N6 | Alleged literal `\n` in the paper writer | **FALSE_POSITIVE — VERIFIED** | byte-identical output re-confirmed this pass |
+| R4-1 | Manifest ids interpolated raw into the writing reviewer | FIXED | `test_a_writer_cannot_forge_a_controller_section_in_its_reviewers_prompt` |
+| R4-2 | `charged_total` unit mixture | FIXED | as N5 |
+| R4-3 | Same-second run-id collision on retry | FIXED | `test_two_delegated_runs_on_one_task_are_not_double_charged` |
+| R4-4 | Writing reviewer's access position unasserted | FIXED | `_reviewer_setting` |
+| R4-5 | Stress-test docstring made a false claim | FIXED | docstring corrected, floor raised |
+| P1 | Degenerate plan of bare placeholders | FIXED | `test_a_plan_made_of_placeholders_is_refused` |
+| P2 | Degenerate plan dressed in real words | FIXED | `test_a_plan_dressed_up_in_real_words_is_still_refused` |
+| — | Fifth unfenced channel: all task text | FIXED | `test_every_reviewer_prompt_renders_worker_text_through_the_boundary` |
+
+### Deferred, with stated residual risk
+
+- **Experiment worktree created before its store record.** A crash in that
+  window orphans a worktree, lock and branch with no record, invisible to
+  `experiment cleanup` and `reclaim`. Reordering means writing the record twice;
+  deferred rather than done at release time. Residual risk: leaked disk after a
+  crash in a millisecond window, recoverable by hand.
+- **`_is_interactive` is `sys.stdin.isatty()`.** Anything that allocates a PTY
+  satisfies it. It is a usability and safety guard, not authentication — the
+  binding rule that agents must not record human Reviews lives in `AGENTS.md`.
+  Now stated in `SECURITY.md`.
+- **`_HELD` is process-global, not thread-safe.** Unreachable today; recorded so
+  a future threaded caller sees it beforehand.
+- **Review independence is degraded.** Only one provider family is installed.
+  Every run says so before it starts.

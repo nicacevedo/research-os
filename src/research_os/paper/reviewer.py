@@ -26,6 +26,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from research_os.automation.promptdata import (
+    CHECK_OUTPUT_FENCE,
     DIFF_FENCE,
     REVIEW_FENCE,
     TASK_FENCE,
@@ -49,6 +50,9 @@ from research_os.paper.packet import render_source_packet
 
 MAX_DIFF_CHARS = 80_000
 MAX_LABEL_CHARS = 300
+
+#: How much of one deterministic check's message and detail is quoted.
+MAX_CHECK_MESSAGE_CHARS = 2_000
 MAX_STATEMENT_CHARS = 3_000
 
 REVIEW_SCHEMA: dict[str, Any] = {
@@ -97,13 +101,29 @@ def build_writing_review_prompt(
     )
     if len(diff) > MAX_DIFF_CHARS:
         truncated += "\n[diff truncated for review]\n"
-    checks = (
-        "\n".join(
-            f"- [{item.severity}] {item.check}: {item.message}"
-            + (f"\n    {prompt_safe(item.detail, limit=2_000)}" if item.detail else "")
-            for item in grounding.issues
-        )
-        or "- (every deterministic check passed)"
+    # Fenced, and for a reason that is not obvious from the variable name: a
+    # check's *message* is the controller's own wording, but its *detail* often
+    # quotes what the writer put in the prose -- a citation key it invented, an
+    # identifier resolving to nothing. A delta review demonstrated a writer
+    # emitting `\cite{...}` whose contents became a forged "RETURN A VERDICT"
+    # instruction, sitting inside the section this prompt calls established
+    # fact. Only the section's *heading* is the controller speaking; its
+    # contents are influenced by the thing under review.
+    checks = render_data_block(
+        CHECK_OUTPUT_FENCE,
+        (
+            "\n".join(
+                f"- [{item.severity}] {item.check}: "
+                + prompt_safe(item.message, limit=MAX_CHECK_MESSAGE_CHARS)
+                + (
+                    f"\n    {prompt_safe(item.detail, limit=MAX_CHECK_MESSAGE_CHARS)}"
+                    if item.detail
+                    else ""
+                )
+                for item in grounding.issues
+            )
+            or "- (every deterministic check passed)"
+        ).split("\n"),
     )
     # Every one of these is a string the write-enabled writer chose, so each is
     # rendered inert and the whole list is assembled by the prompt-data

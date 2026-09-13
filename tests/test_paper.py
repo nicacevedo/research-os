@@ -796,3 +796,51 @@ def test_paper_cleanup_releases_the_worktree_and_its_lock(
 
     # Cleaning up twice is not an error.
     assert _cleanup(args) == EXIT_OK
+
+
+def test_a_write_enabled_reviewer_is_refused(
+    automation_home: Path, tmp_path: Path
+) -> None:
+    """The writing reviewer is context-only, and the controller says so itself.
+
+    Every other controller asserts its reviewer's access position; this one took
+    the configured role on trust, so a configuration declaring the reviewer
+    write-enabled passed both tool allowlists and would have run with file tools
+    in the draft's own record directory. Found by a release review.
+    """
+
+    from research_os.automation.config import AutomationConfig, resolve_roles
+    from research_os.automation.models import Access, Budget, RoleSetting
+    from research_os.errors import AutomationError
+    from research_os.paper.controller import PaperController
+    from tests.fake_providers import FakeProvider
+
+    config = AutomationConfig(
+        roles={
+            "planner": RoleSetting(
+                provider="fake", read_only=True, access=Access.CONTEXT_ONLY, tools=[]
+            ),
+            "coder": RoleSetting(
+                provider="fake",
+                read_only=False,
+                access=Access.ISOLATED_WRITE,
+                tools=["Read", "Write", "Edit"],
+            ),
+            "reviewer": RoleSetting(
+                provider="fake",
+                read_only=False,
+                access=Access.ISOLATED_WRITE,
+                tools=["Read", "Write"],
+            ),
+        },
+        budget=Budget(),
+        allowed_check_programs=("pytest",),
+        source=None,
+        explicit_roles=frozenset(),
+    )
+    provider = FakeProvider(responses={})
+    controller = PaperController(providers={"fake": provider}, config=config)
+    resolved = resolve_roles(config, {"fake": provider.probe()})
+
+    with pytest.raises(AutomationError, match="context-only"):
+        controller._reviewer_setting(resolved)

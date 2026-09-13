@@ -333,23 +333,16 @@ FILLER: frozenset[str] = frozenset(
         "an",
         "and",
         "basic",
-        "case",
-        "check",
         "data",
         "dummy",
-        "field",
         "for",
         "generic",
         "goal",
         "here",
-        "input",
-        "item",
         "minimal",
         "of",
-        "output",
         "plan",
         "query",
-        "run",
         "sample",
         "simple",
         "step",
@@ -360,8 +353,6 @@ FILLER: frozenset[str] = frozenset(
         "things",
         "this",
         "to",
-        "value",
-        "values",
     }
 )
 
@@ -373,7 +364,7 @@ def _tokens(value: str) -> list[str]:
     for token in value.split():
         lowered = token.lower()
         stripped = lowered.strip(".,;:!?\"'()[]")
-        found.append(stripped if stripped and stripped not in lowered[:0] else lowered)
+        found.append(stripped or lowered)
     return [item for item in found if item]
 
 

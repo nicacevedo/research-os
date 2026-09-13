@@ -336,8 +336,10 @@ def test_contending_processes_never_both_enter_the_critical_section(
     """Contention with a witness inside the critical section.
 
     Looping acquire/release is what a single-acquisition test cannot do: give
-    each racer one attempt and a winner that holds for 400ms, and no process is
-    ever mid-acquire while another releases, which is the only window there is.
+    each racer one attempt and a winner that holds it for the whole of its one
+    turn, and no process is ever mid-acquire while another releases -- which is
+    the only window there is. The argument below is an iteration count, not a
+    duration.
 
     Two corrections to what this docstring used to claim, both from a release
     review that mutation-tested this file. It is *not* the only test here that

@@ -41,6 +41,14 @@ from research_os.paper.models import (
 )
 from research_os.paper.packet import render_source_packet
 
+#: How much of one deterministic check's message and detail is quoted.
+#:
+#: A check's message is the controller's own wording, but its detail often
+#: quotes what the writer put in the prose -- a citation key it invented, an
+#: identifier that resolves to nothing. That makes the section
+#: writer-influenced, which is why it is fenced.
+MAX_CHECK_MESSAGE_CHARS = 2_000
+
 MAX_INSTRUCTION_CHARS = 6_000
 MAX_LABEL_CHARS = 300
 MAX_DIFF_CHARS = 200_000
@@ -266,13 +274,21 @@ def build_repair_prompt(
     rather than opinions and the writer can act on them directly.
     """
 
-    issues = (
-        "\n".join(
-            f"- [{item.severity}] {item.check}: {item.message}"
-            + (f"\n    {prompt_safe(item.detail, limit=2_000)}" if item.detail else "")
-            for item in grounding.issues
-        )
-        or "- (the deterministic checks found nothing)"
+    issues = render_data_block(
+        CHECK_OUTPUT_FENCE,
+        (
+            "\n".join(
+                f"- [{item.severity}] {item.check}: "
+                + prompt_safe(item.message, limit=MAX_CHECK_MESSAGE_CHARS)
+                + (
+                    f"\n    {prompt_safe(item.detail, limit=MAX_CHECK_MESSAGE_CHARS)}"
+                    if item.detail
+                    else ""
+                )
+                for item in grounding.issues
+            )
+            or "- (the deterministic checks found nothing)"
+        ).split("\n"),
     )
     findings = ""
     if review_findings:

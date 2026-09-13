@@ -659,7 +659,6 @@ def test_a_writer_cannot_forge_a_controller_section_in_its_reviewers_prompt() ->
 
     from research_os.automation.promptdata import FENCES, WORKER_REPORT_FENCE
     from research_os.paper.models import (
-        GroundingReport,
         SectionKind,
         SourceManifest,
     )
@@ -694,7 +693,7 @@ def test_a_writer_cannot_forge_a_controller_section_in_its_reviewers_prompt() ->
         instruction="Write the results section.",
         packet=_empty_packet(),
         manifest=manifest,
-        grounding=GroundingReport(draft_id=manifest.draft_id, issues=[]),
+        grounding=_hostile_grounding(manifest.draft_id, forged),
         diff="+ a line",
     )
 
@@ -806,7 +805,7 @@ def _reviewer_prompts_with_hostile_input() -> list[str]:
 
     from research_os.automation.models import CommandResult, RiskClass, Role
     from research_os.automation.reviewer import build_reviewer_prompt
-    from research_os.paper.models import GroundingReport, SectionKind, SourceManifest
+    from research_os.paper.models import SectionKind, SourceManifest
     from research_os.paper.reviewer import build_writing_review_prompt
     from tests.test_auto_models import make_order
 
@@ -849,7 +848,32 @@ def _reviewer_prompts_with_hostile_input() -> list[str]:
         instruction=hostile,
         packet=_empty_packet(),
         manifest=manifest,
-        grounding=GroundingReport(draft_id=manifest.draft_id, issues=[]),
+        grounding=_hostile_grounding(manifest.draft_id, hostile),
         diff=hostile,
     )
     return [automation, writing]
+
+
+def _hostile_grounding(draft_id: str, hostile: str):
+    """A grounding report whose issue detail is writer-controlled.
+
+    This is the channel a delta review showed the previous version of this
+    helper never populated: every report was built with ``issues=[]``, so the
+    one field carrying the defect was the one never exercised. A check's detail
+    quotes what the writer wrote -- an invented citation key, taken out of the
+    prose by a regex that accepts arbitrary text between the braces.
+    """
+
+    from research_os.paper.models import GroundingIssue, GroundingReport
+
+    return GroundingReport(
+        draft_id=draft_id,
+        issues=[
+            GroundingIssue(
+                check="citations_resolve",
+                severity="blocker",
+                message="the draft cites keys that name no supplied work",
+                detail=hostile,
+            )
+        ],
+    )

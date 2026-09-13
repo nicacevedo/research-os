@@ -108,4 +108,10 @@ is optional it is read from the environment and never stored.
   counters for local runs and cluster submissions.
 - Do not touch real scientific project repositories unless explicitly instructed
 - Do not expose secrets in chat, logs, or commits
+- The interactive-terminal gate on `review` and `propose promote` is
+  `sys.stdin.isatty()`. It is a usability and safety guard, not authentication:
+  anything that allocates a PTY satisfies it. The binding rule that an agent
+  must not record a human Review lives in `AGENTS.md`, and the structural
+  guarantee is the acceptance gate in `validate.py`, which no automated path
+  writes.
 - Do not push or merge unless explicitly instructed
