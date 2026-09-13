@@ -724,6 +724,8 @@ def _finished_experiment_worktrees() -> list[tuple[str, Path]]:
     could see, because both looked only at the automation run store.
     """
 
+    from research_os.automation.worktree import lock_path as worktree_lock_path
+
     found: list[tuple[str, Path]] = []
     for run_id in _experiment_run_ids():
         run = _experiment_run(run_id)
@@ -732,7 +734,11 @@ def _finished_experiment_worktrees() -> list[tuple[str, Path]]:
         if not _experiment_worktree_is_idle(run.state):
             continue
         target = Path(run.worktree_path)
-        if target.exists():
+        # The lock counts as something to release even with no directory beside
+        # it. A run killed between taking the lock and creating the worktree
+        # leaves exactly that, and a report that looked only for the directory
+        # called it nothing to do while the path stayed permanently locked.
+        if target.exists() or worktree_lock_path(target).exists():
             found.append((run_id, target))
     return found
 

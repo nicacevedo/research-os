@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 
 from research_os.automation.gitutil import (
@@ -82,7 +83,7 @@ def create_worktree(
             commit=base_commit,
         )
     except Exception:
-        lock.unlink(missing_ok=True)
+        release_worktree_lock(target)
         raise
 
     record = WorktreeRecord(
@@ -138,11 +139,55 @@ def assert_isolated(record: WorktreeRecord, *, canonical_repository: Path) -> No
         )
 
 
+#: The shape of a worktree lock's filename: the digest ``lock_path`` derives.
+#:
+#: Worktree locks share a directory with the run locks, and the two have
+#: opposite lifecycles -- a worktree lock is released by removing it, a run lock
+#: must *never* be removed, because a ``flock`` is held on an inode and
+#: unlinking the name lets the next arrival lock a different one. That race was
+#: measured for real. So every removal here is checked against this pattern
+#: rather than trusting a caller's path.
+_WORKTREE_LOCK_NAME_RE = re.compile(r"^[0-9a-f]{16}\.lock$")
+
+
+def release_worktree_lock(target: Path) -> bool:
+    """Remove the worktree lock guarding ``target``. Return whether one existed.
+
+    The lock to remove is *derived* from the worktree path, never accepted from
+    a caller, and the derived name is checked again before the unlink. Both
+    guards exist for the same reason: ``run-<id>.lock`` lives in this directory
+    too and is the one file in Research OS that must never be deleted while
+    anything is running. A cleanup path that took a path on trust could delete
+    it and hand two processes the same run.
+    """
+
+    lock = lock_path(target)
+    if (
+        lock.parent != locks_root()
+        or _WORKTREE_LOCK_NAME_RE.fullmatch(lock.name) is None
+    ):
+        raise WorktreeError(  # pragma: no cover - unreachable via lock_path
+            f"refusing to remove {lock}: it is not a worktree lock"
+        )
+    try:
+        lock.unlink()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise WorktreeError(f"cannot remove worktree lock {lock}: {exc}") from exc
+    return True
+
+
 def release_worktree(record: WorktreeRecord, *, repository: Path) -> WorktreeRecord:
     """Remove the worktree directory and its lock, keeping the branch.
 
     The branch is deliberately kept: it holds whatever the worker produced, and
     discarding a failed attempt's evidence is not cleanup, it is deletion.
+
+    The lock is released even when the directory is not there. A process killed
+    between taking the lock and creating the worktree leaves exactly that state,
+    and leaving the lock behind makes the path permanently unusable: the next
+    attempt is refused by a lock whose owner died.
     """
 
     target = Path(record.path)
@@ -150,7 +195,7 @@ def release_worktree(record: WorktreeRecord, *, repository: Path) -> WorktreeRec
     if target.exists():
         _assert_outside_repository(target, canonical)
         remove_worktree(repository=canonical, target=target)
-    Path(record.lock_path).unlink(missing_ok=True)
+    release_worktree_lock(target)
     return record.model_copy(update={"removed_at": utc_now()})
 
 
