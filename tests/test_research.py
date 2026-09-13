@@ -58,7 +58,7 @@ from research_os.research.planner import (
 )
 from research_os.research.report import render_run, render_run_list, render_status
 from research_os.research.store import ResearchStore, make_research_run_id
-from tests.fake_providers import ScriptedResponse
+from tests.fake_providers import FakeProvider, ScriptedResponse
 from tests.research_helpers import (
     PROJECT_ID,
     analysis_task,
@@ -243,6 +243,109 @@ def test_a_plan_naming_an_undeclared_experiment_is_refused() -> None:
             budget=ResearchBudget(),
             declared_experiments=frozenset({"fit-model"}),
         )
+
+
+def test_a_plan_omitting_a_required_experiment_parameter_is_refused() -> None:
+    """Found by a live pilot, at the worst possible moment to find it.
+
+    Checking that the command *name* was declared and not that its required
+    parameters were supplied left the check half-done. A synthetic full-workflow
+    run named a declared command, omitted its required seed, and only discovered
+    it at the moment of spending: three model calls and one human checkpoint
+    after the plan arrived, on something decidable the instant it did.
+    """
+
+    plan = ResearchPlan.model_validate(
+        plan_payload(tasks=[experiment_task(experiment_parameters={})])
+    )
+    with pytest.raises(ResearchPlanError, match="without the parameter"):
+        validate_research_plan(
+            plan,
+            budget=ResearchBudget(),
+            declared_experiments=frozenset({"fit-model"}),
+            required_parameters={"fit-model": frozenset({"seed"})},
+        )
+
+
+def test_a_plan_supplying_every_required_experiment_parameter_is_accepted() -> None:
+    plan = ResearchPlan.model_validate(plan_payload(tasks=[experiment_task()]))
+
+    validate_research_plan(
+        plan,
+        budget=ResearchBudget(),
+        declared_experiments=frozenset({"fit-model"}),
+        required_parameters={"fit-model": frozenset({"seed"})},
+    )
+
+
+def test_an_optional_experiment_parameter_need_not_be_supplied() -> None:
+    """Only required parameters are required. The rule may not invent strictness."""
+
+    plan = ResearchPlan.model_validate(
+        plan_payload(tasks=[experiment_task(experiment_parameters={"seed": "7"})])
+    )
+
+    validate_research_plan(
+        plan,
+        budget=ResearchBudget(),
+        declared_experiments=frozenset({"fit-model"}),
+        required_parameters={"fit-model": frozenset({"seed"})},
+    )
+
+
+def test_a_missing_required_parameter_is_correctable_by_the_bounded_re_ask(
+    research_home: Path, tmp_path: Path
+) -> None:
+    """The point of refusing at plan time: the existing correction can fix it."""
+
+    from tests.research_helpers import make_controller
+
+    provider = planner_scripted(
+        [
+            ScriptedResponse(
+                structured=plan_payload(
+                    tasks=[experiment_task(experiment_parameters={})]
+                )
+            ),
+            ScriptedResponse(structured=plan_payload(tasks=[analysis_task()])),
+        ]
+    )
+    from research_os.experiment.config import (
+        ExecutionLimits,
+        ExperimentConfig,
+        ProjectExperiments,
+        SlurmSettings,
+    )
+    from research_os.experiment.spec import CommandSpec, ParameterSpec
+
+    spec = CommandSpec(
+        name="fit-model",
+        description="Fit the model.",
+        argv=["python3", "fit.py", "--seed", "{seed}"],
+        parameters=[ParameterSpec(name="seed", type="integer", required=True)],
+        outputs=["results/fit.json"],
+        timeout_seconds=60,
+    )
+    controller = make_controller(
+        provider,
+        experiments=ExperimentConfig(
+            slurm=SlurmSettings(),
+            limits=ExecutionLimits(),
+            projects={"widget": ProjectExperiments(commands={"fit-model": spec})},
+            source=None,
+        ),
+    )
+    repo = init_repo(tmp_path / "project")
+    store, run = controller.start(
+        project_path=repo,
+        goal="Find out whether widget deformation stays linear above 10N.",
+        budget=ResearchBudget(),
+    )
+
+    events = [record.get("event") for record in store.iter_events()]
+    assert "plan_rejected" in events
+    assert "plan_correction_started" in events
+    assert run.state is ResearchState.PLAN_READY, "the re-ask recovered the run"
 
 
 def test_a_declared_experiment_is_accepted() -> None:
@@ -1752,3 +1855,121 @@ def test_two_delegated_runs_on_one_task_are_not_double_charged(
         if record.get("charged_total") is not None
     ]
     assert totals == sorted(totals), f"charged_total went backwards: {totals}"
+
+
+# -- a provider that does not answer at all -----------------------------------
+
+
+def planner_failure() -> ScriptedResponse:
+    """The failure a live pilot actually hit: the provider gave up on the schema."""
+
+    return ScriptedResponse(
+        structured=None,
+        text=None,
+        exit_code=1,
+        error="error_max_structured_output_retries",
+    )
+
+
+def planner_scripted(responses: list[ScriptedResponse]) -> Any:
+    from tests.automation_helpers import analysis_payload, review_payload
+
+    return FakeProvider(
+        responses={
+            str(Role.PLANNER): responses,
+            str(Role.ANALYST): [ScriptedResponse(structured=analysis_payload())],
+            str(Role.REVIEWER): [ScriptedResponse(structured=review_payload())],
+        }
+    )
+
+
+def test_a_planner_provider_failure_is_retried_once_and_then_succeeds(
+    research_home: Path, tmp_path: Path
+) -> None:
+    """Found by a live pilot, not by review.
+
+    A read-only run against a real project died on its very first planner call
+    with ``error_max_structured_output_retries`` -- the provider's own
+    structured-output machinery giving up -- and the whole run was abandoned
+    with thirteen of its fourteen model calls unspent. Nothing had been
+    rejected, because nothing had arrived.
+    """
+
+    provider = planner_scripted(
+        [
+            planner_failure(),
+            ScriptedResponse(structured=plan_payload(tasks=[analysis_task()])),
+        ]
+    )
+    controller, store, run, _ = start(tmp_path, provider=provider)
+    run = controller.execute(store)
+
+    assert run.state is ResearchState.READY_FOR_HUMAN
+    events = [record.get("event") for record in store.iter_events()]
+    assert "plan_provider_failed" in events
+    assert "plan_retry_started" in events
+    planner_calls = [call for call in provider.calls if call.role is Role.PLANNER]
+    assert len(planner_calls) == 2
+    # The same question, because the question was never answered.
+    assert planner_calls[0].prompt == planner_calls[1].prompt
+
+
+def test_a_planner_that_fails_twice_ends_the_run(
+    research_home: Path, tmp_path: Path
+) -> None:
+    """A provider that fails twice is a provider that is not working."""
+
+    provider = planner_scripted(
+        [
+            planner_failure(),
+            planner_failure(),
+            ScriptedResponse(structured=plan_payload(tasks=[analysis_task()])),
+        ]
+    )
+    with pytest.raises(ProviderInvocationError, match="error_max_structured"):
+        start(tmp_path, provider=provider)
+
+    planner_calls = [call for call in provider.calls if call.role is Role.PLANNER]
+    assert len(planner_calls) == 2, "one retry, never two"
+
+
+def test_a_provider_failure_and_a_rejected_plan_share_one_allowance(
+    research_home: Path, tmp_path: Path
+) -> None:
+    """The bound is two planner calls however they are spent.
+
+    Otherwise a run could fail over, then be corrected, then be corrected
+    again -- and the single re-ask this controller promises would quietly have
+    become three attempts.
+    """
+
+    provider = planner_scripted(
+        [
+            planner_failure(),
+            ScriptedResponse(
+                structured=plan_payload(tasks=[analysis_task(title="test")])
+            ),
+            ScriptedResponse(structured=plan_payload(tasks=[analysis_task()])),
+        ]
+    )
+    with pytest.raises((ResearchPlanError, ProviderInvocationError)):
+        start(tmp_path, provider=provider)
+
+    planner_calls = [call for call in provider.calls if call.role is Role.PLANNER]
+    assert len(planner_calls) == 2
+
+
+def test_a_planner_failure_with_no_budget_left_is_not_retried(
+    research_home: Path, tmp_path: Path
+) -> None:
+    provider = planner_scripted(
+        [
+            planner_failure(),
+            ScriptedResponse(structured=plan_payload(tasks=[analysis_task()])),
+        ]
+    )
+    with pytest.raises(ProviderInvocationError):
+        start(tmp_path, provider=provider, budget=ResearchBudget(max_model_calls=1))
+
+    planner_calls = [call for call in provider.calls if call.role is Role.PLANNER]
+    assert len(planner_calls) == 1, "a retry it cannot pay for must not be attempted"

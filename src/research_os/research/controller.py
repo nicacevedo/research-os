@@ -264,6 +264,10 @@ class ResearchController:
             setting=resolved.roles["planner"],
             prompt=prompt,
             declared=frozenset(declared),
+            required={
+                name: frozenset(item.name for item in spec.parameters if item.required)
+                for name, spec in declared.items()
+            },
         )
         tasks = to_tasks(plan)
         self._assert_budget_could_finish(run, tasks)
@@ -288,6 +292,7 @@ class ResearchController:
         setting: RoleSetting,
         prompt: str,
         declared: frozenset[str],
+        required: dict[str, frozenset[str]] | None = None,
     ) -> tuple[ResearchRun, ResearchPlan]:
         """Get one validated plan, allowing at most one bounded re-ask.
 
@@ -300,6 +305,20 @@ class ResearchController:
 
         One re-ask, charged against the same allowance everything else uses. A
         second failure ends the run.
+
+        The same single re-ask now also covers a provider that failed to answer
+        at all, which a live pilot showed was not covered. A run against a real
+        project died on its first planner call with
+        ``error_max_structured_output_retries`` -- the provider's own structured
+        output machinery giving up -- and the run was abandoned with thirteen of
+        its fourteen model calls unspent. A transport or schema failure is not a
+        statement about the plan; nothing was rejected, because nothing arrived.
+        Re-asking is therefore the *same* question, not a correction: there is
+        nothing to correct.
+
+        Still one extra attempt in total, because the loop is two iterations
+        wide however it is spent. A provider that fails twice is a provider that
+        is not working, and the honest answer to that is a failed run.
         """
 
         attempt = prompt
@@ -314,16 +333,31 @@ class ResearchController:
                 json_schema=PLAN_SCHEMA,
             )
             if not result.ok:
-                raise ProviderInvocationError(
-                    f"the research planner failed: "
-                    f"{invocation.error or 'unknown error'}"
+                detail = invocation.error or "unknown error"
+                store.append_event(
+                    "plan_provider_failed",
+                    invocation_id=invocation.invocation_id,
+                    detail=detail,
+                    retried=not correction,
                 )
+                if correction or run.remaining_model_calls < 1:
+                    raise ProviderInvocationError(
+                        f"the research planner failed: {detail}"
+                    )
+                # Deliberately the same prompt. The question was never answered,
+                # so asking a different one would be answering a question the
+                # researcher did not pose.
+                store.append_event("plan_retry_started", reason=detail)
+                continue
             try:
                 plan = parse_research_plan(
                     structured=result.structured, text=result.text
                 )
                 validate_research_plan(
-                    plan, budget=run.budget, declared_experiments=declared
+                    plan,
+                    budget=run.budget,
+                    declared_experiments=declared,
+                    required_parameters=required,
                 )
             except ResearchPlanError as exc:
                 store.append_event(

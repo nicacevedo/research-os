@@ -439,6 +439,7 @@ def validate_research_plan(
     *,
     budget: ResearchBudget,
     declared_experiments: frozenset[str],
+    required_parameters: dict[str, frozenset[str]] | None = None,
 ) -> None:
     """Reject a plan the controller must not execute.
 
@@ -446,6 +447,14 @@ def validate_research_plan(
     request and this is the rule. The experiment check is the one that matters
     most: a plan naming a command the researcher never declared would otherwise
     fail at the moment of spending rather than at the moment of planning.
+
+    ``required_parameters`` extends that argument to the rest of the command.
+    Checking only the *name* left the check half-done, and a live pilot paid for
+    the other half: a plan named a declared command and omitted its required
+    seed, so the run spent three model calls and stopped a human before failing
+    on something that was decidable the moment the plan arrived. A missing
+    parameter is refused here instead, where the bounded plan correction can
+    still fix it.
     """
 
     assert_plan_says_something(plan)
@@ -474,6 +483,18 @@ def validate_research_plan(
                 "Experiment commands are declared by the researcher in "
                 "experiments.yaml, outside every worktree, and a plan cannot add "
                 "one. Declared: " + (", ".join(sorted(declared_experiments)) or "none")
+            )
+        required = (required_parameters or {}).get(
+            task.experiment_task or "", frozenset()
+        )
+        missing = sorted(required - set(task.experiment_parameters))
+        if missing:
+            raise ResearchPlanError(
+                f"{task.id} would run the experiment command "
+                f"{task.experiment_task!r} without the parameter(s) it requires: "
+                + ", ".join(missing)
+                + ". Set them in this task's 'experiment_parameters'. A plan may "
+                "fill in the parameters the researcher declared and no others."
             )
 
 
