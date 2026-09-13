@@ -150,12 +150,22 @@ def build_writing_review_prompt(
             )
         ],
     )
-    caveats = (
-        "\n".join(
-            f"  - {prompt_safe(item, limit=MAX_STATEMENT_CHARS)}"
-            for item in manifest.unresolved_caveats
-        )
-        or "  (the writer reported none)"
+    # The last worker-authored string in this prompt that stood outside every
+    # data block. Sanitised, so it could never forge a heading -- it folds to
+    # one line -- but a released property test asserts something stronger and
+    # simpler than "no heading": that nothing the writer chose appears outside
+    # a block at all. Four reviews found this class of defect in four different
+    # prompts; the fifth was found by asserting the property rather than the
+    # symptom.
+    caveats = render_data_block(
+        WORKER_REPORT_FENCE,
+        (
+            "\n".join(
+                f"  - {prompt_safe(item, limit=MAX_STATEMENT_CHARS)}"
+                for item in manifest.unresolved_caveats
+            )
+            or "  (the writer reported none)"
+        ).split("\n"),
     )
 
     return f"""You are the writing-review worker of a deterministic research

@@ -556,7 +556,51 @@ its disposition. Nothing is omitted because later code changed.
 | R4-5 | Stress-test docstring made a false claim | FIXED | docstring corrected, floor raised |
 | P1 | Degenerate plan of bare placeholders | FIXED | `test_a_plan_made_of_placeholders_is_refused` |
 | P2 | Degenerate plan dressed in real words | FIXED | `test_a_plan_dressed_up_in_real_words_is_still_refused` |
+| D1-1 | Sixth instance: `checks` rendered raw in both writing prompts | FIXED | `test_no_worker_authored_text_reaches_a_prompt_outside_a_data_block` |
+| D1-2 | `TASK_FENCE` rewrite falsified the automation reviewer's own paragraph | FIXED | prose corrected at `automation/reviewer.py` |
+| A1 | Seventh instance: `unresolved_caveats` sanitised but unfenced | FIXED | as D1-1 |
 | — | Fifth unfenced channel: all task text | FIXED | `test_every_reviewer_prompt_renders_worker_text_through_the_boundary` |
+
+### The property that ended the series
+
+Seven findings across five reviews are one defect: worker-authored text reaching
+the part of a prompt that speaks in the controller's own voice. Each round was
+found in a prompt the previous round had not examined -- automation reviewer,
+writing reviewer, proposal assessor, manifest ids, the deterministic-check list,
+then the caveat list -- and each fix was verified against the headings of the
+prompt that had just been broken. That is testing the instance.
+
+The release audit replaced it with the property. `_worker_prompt_pairs` renders
+each of the four prompts a worker string reaches -- both reviewers and, more
+importantly, both *repair* prompts, whose reader is write-enabled -- twice from
+identical structure, varying only the worker-authored fields. The assertion is
+that everything outside every data block is byte-identical between the two
+renderings: the controller's own voice is written entirely by the controller.
+
+It needs no list of headings to maintain, it covers a prompt the day that prompt
+joins the builder, and it catches the folded single-line injection a
+heading-shaped search cannot see -- which is exactly how finding A1 was found,
+after the heading test had passed.
+
+Mutation-tested against every one of the known defect sites, each restored to
+its pre-fix rendering one at a time:
+
+| mutant restored | caught |
+| --- | --- |
+| `paper/reviewer.py` manifest ids unfenced (R4-1) | yes |
+| `paper/reviewer.py` checks unfenced (D1-1) | yes |
+| `paper/writer.py` repair checks unfenced (D1-1, second copy) | yes |
+| `paper/reviewer.py` caveats unfenced (A1) | yes |
+| `automation/reviewer.py` diff unfenced | yes |
+| `automation/executor.py` repair diff unfenced | yes |
+| `automation/executor.py` check output unfenced | yes |
+
+Two of those escaped the first version of the test, and both escapes were the
+same mistake this record has now logged four times: the harness did not vary the
+field carrying the defect. The first version varied only the caveat list, so the
+manifest-id mutant went unseen; the fix was to drive every worker-authored field
+of the manifest, bypassing the validators on purpose so that the test stays a
+test of the prompt boundary rather than a second test of the validators.
 
 ### Deferred, with stated residual risk
 
