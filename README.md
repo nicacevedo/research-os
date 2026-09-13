@@ -14,15 +14,29 @@ its own `.research/` capsule.
 - No agent approves its own scientific work
 - Local deterministic computation before any later LLM reasoning
 
-See `DESIGN_INVARIANTS.md` and `ARCHITECTURE.md`. The automation control plane
-is described in `docs/AUTOMATION_MVP.md`.
+See `DESIGN_INVARIANTS.md` and `ARCHITECTURE.md`.
+
+| document | what it covers |
+| --- | --- |
+| `docs/CAPSULE.md` | the scientific record: objects, digests, the acceptance rule |
+| `docs/RESEARCH.md` | research runs: one goal to a human handoff |
+| `docs/AUTOMATION_MVP.md` | the automation control plane a code task is dispatched to |
+| `docs/LITERATURE.md` | retrieval, identity, indexing, and search |
+| `docs/EXPERIMENTS.md` | declared commands, local and Slurm execution, evidence packets |
+| `docs/OPERATIONS.md` | `doctor`, `storage`, recovery, and budgets |
 
 ## Status
 
-**R0 — Kernel** is under implementation. Implemented: the Research Capsule
-layout, scientific object schemas, project-scoped semantic digests, cross-object
-validation with the review-gated Claim acceptance rule, the global project
-registry, and the CLI below.
+**R0 — Kernel** is complete: the Research Capsule layout, scientific object
+schemas, project-scoped semantic digests, cross-object validation with the
+review-gated Claim acceptance rule, the global project registry, and the human
+review flow.
+
+**Research OS v1** adds the layers above it: literature retrieval, a
+read-only analyst, structured proposals, declared-command experiment execution,
+evidence-grounded manuscript drafting, cross-project insights, and the unified
+research runs that orchestrate all of it. Every one of them is bounded,
+delegated to a deterministic controller, and stops at a human.
 
 `docs/CAPSULE.md` is the live specification and is authoritative on anything
 scientific. Canonical Git-tracked YAML and Markdown under `.research/` are the
@@ -70,15 +84,36 @@ uv run researchctl auto events RUN_ID
 uv run researchctl auto runs
 uv run researchctl auto cancel RUN_ID
 uv run researchctl auto cleanup RUN_ID
+uv run researchctl research start PROJECT --goal "..." [--run]
+uv run researchctl research run RUN_ID
+uv run researchctl research answer RUN_ID --answer "..." [--stop]
+uv run researchctl research resume RUN_ID [--retry] [--force]
+uv run researchctl research status|report|cancel|cleanup|events RUN_ID
+uv run researchctl research list
+uv run researchctl lit sources|retrieve|fetch|search|show|index|status
+uv run researchctl propose start|list|show|promote|events
+uv run researchctl experiment commands|scheduler|run|show|poll|cancel|runs
+uv run researchctl insight list|show|nominate|promote|search
+uv run researchctl paper sources|write|show|list|cleanup
+uv run researchctl storage [--reclaim]
 ```
 
 `version` prints `0.1.0`.
 
-`doctor` checks that the process is Python 3.12, that `git` is on `PATH`, and
-that the four Research OS XDG directories exist, are directories, and are
-writable. It does not create those directories, does not require `config.toml`,
-`secrets.env`, or a project registry, and does not inspect firmware. It tests
-only what the kernel actually needs.
+`doctor` reports what this machine can actually do: Python and `git`, the four
+Research OS XDG directories, the agent providers and how the roles would be
+assigned, whether the review would be independent, the literature configuration
+and index, the declared experiment commands and the scheduler, any run that is
+stuck or waiting, and disk. It makes no network request, submits no job and
+invokes no model. `PASS` works, `FAIL` means something you asked for is broken
+and exits `1`, and `WARN` means a capability is simply absent — one provider, no
+cluster — which exits `0`, because a machine in that state is a perfectly good
+machine and an exit code that said otherwise would train you to ignore it. It
+creates nothing. `--json` emits the same report for a script.
+
+`storage` measures every runtime store and releases, with `--reclaim`, only
+what a finished run is still holding and can be rebuilt: worktrees and check
+environments. Records, ledgers, prompts, model outputs and reviews are kept.
 
 `init-project` creates a new Research Capsule in an existing Git repository
 (default path: `.`). It never runs `git init`, never overwrites an existing
@@ -138,6 +173,24 @@ own code, including code a worker has just written, as your user. Worktree
 isolation keeps a worker out of your canonical checkout; it is not an OS
 sandbox, and containers are not yet provided. Do not point `auto` at an
 untrusted or freshly cloned repository.
+
+`research` is the whole architecture behind a few verbs. It plans a research
+goal into a bounded DAG of typed tasks — literature, analysis, proposal, code,
+experiment, paper, human checkpoint — dispatches each to the controller that
+already owns that kind of work, and stops at a human. It owns no worker: a code
+task becomes an automation run and gets that layer's worktree isolation, scope
+enforcement, command policy, acceptance checks, independent review and single
+bounded repair without any of it being reimplemented. Model calls, write tasks,
+experiments, cluster submissions and wall clock are separately budgeted and
+every spend is checked before it happens. Experiments do not execute without
+`--execute-experiments`; without it, an experiment task resolves its exact
+command and stops. See `docs/RESEARCH.md`.
+
+Everything automation produces is a candidate. Proposals are suggestions,
+evidence packets are candidates, drafts are prose. Promoting any of it into a
+project's scientific record is a human act through `propose promote`, and a
+Claim becomes `accepted` only through `review` plus a deliberate edit — both of
+which require an interactive terminal.
 
 Exit codes: `0` success, `1` project/validation/runtime failure (including a
 path that is not a Research OS project), `2` usage/argument error.

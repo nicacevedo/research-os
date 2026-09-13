@@ -21,6 +21,7 @@ from typing import Any
 
 import pytest
 
+from research_os.automation.models import Role
 from research_os.errors import (
     BudgetExceededError,
     ProviderInvocationError,
@@ -42,7 +43,10 @@ from research_os.research.models import (
     allowed_transitions,
 )
 from research_os.research.planner import (
+    PLAN_SCHEMA,
+    PlannedTask,
     ResearchPlan,
+    build_research_plan_prompt,
     parse_research_plan,
     to_tasks,
     validate_research_plan,
@@ -954,3 +958,326 @@ def test_a_pass_that_runs_out_of_time_stops_before_starting_the_next_task(
     assert any(
         record.get("event") == "wall_clock_exhausted" for record in store.iter_events()
     )
+
+
+# -- the prompt and the schema must agree ------------------------------------
+
+
+def _flowed(prompt: str) -> str:
+    """Return the prompt with line wrapping removed.
+
+    The prompt is hard-wrapped for the humans who maintain it, so asserting on
+    a sentence means asserting across a newline. Normalising here keeps these
+    tests about what the prompt says rather than where it happened to break.
+    """
+
+    return " ".join(prompt.split())
+
+
+def test_the_schema_requires_only_what_every_task_has() -> None:
+    """Requiring all thirteen task keys made the schema needlessly expensive.
+
+    A planner had to emit an empty value for every key its kind did not use,
+    and a live run failed outright when it did not. The rest of the keys have
+    defaults on ``PlannedTask``, and the local validators explain a missing one
+    far better than a structured-output retry loop does.
+
+    This was *not* the cause of the placeholder plans -- replaying the archived
+    prompts showed either prompt can produce either outcome -- but a schema
+    that is cheap to satisfy is the right shape regardless.
+    """
+
+    assert PLAN_SCHEMA["properties"]["tasks"]["items"]["required"] == [
+        "id",
+        "kind",
+        "title",
+        "goal",
+    ]
+    # Everything else still has a place to go, and is still refused if invented.
+    assert PLAN_SCHEMA["properties"]["tasks"]["items"]["additionalProperties"] is False
+
+
+def test_a_task_giving_only_the_required_keys_is_dispatchable() -> None:
+    """The defaults live on the model, so the planner need not write them."""
+
+    plan = ResearchPlan.model_validate(
+        plan_payload(
+            tasks=[
+                {
+                    "id": "T-001",
+                    "kind": "literature",
+                    "title": "Read the field",
+                    "goal": "Find out what is settled.",
+                    "query": "widget deformation",
+                }
+            ]
+        )
+    )
+    built = to_tasks(plan)[0]
+    assert built.query == "widget deformation"
+    assert built.read_paths == []
+    assert built.experiment_parameters == {}
+
+
+def test_the_prompt_names_every_key_the_schema_requires() -> None:
+    """A required key the prompt never mentions is a run that cannot plan."""
+
+    prompt = build_research_plan_prompt(
+        goal="anything",
+        budget=ResearchBudget(),
+        science_context="",
+        repository_context="",
+        declared_experiments=["fit-model"],
+    )
+    required = PLAN_SCHEMA["properties"]["tasks"]["items"]["required"]
+    missing = [key for key in required if key not in prompt]
+    assert not missing, f"the prompt never mentions {missing}"
+
+
+def test_the_prompt_says_what_to_put_in_a_key_that_does_not_apply() -> None:
+    """Otherwise a model omits it, which the schema refuses."""
+
+    prompt = _flowed(
+        build_research_plan_prompt(
+            goal="anything",
+            budget=ResearchBudget(),
+            science_context="",
+            repository_context="",
+            declared_experiments=[],
+        )
+    )
+    assert 'Every task has "id", "kind", "title" and "goal"' in prompt
+    assert "set only the keys the kind actually uses" in prompt
+
+
+def test_the_output_shape_is_stated_as_prose_and_never_as_a_form() -> None:
+    """Each key is described where its kind is, as the automation planner does.
+
+    An earlier version stated them in a key-by-key table. Replaying the
+    archived prompts showed the table was not what produced the placeholder
+    plans, so this is a readability choice rather than a fix -- but it keeps
+    the two planners in this codebase written the same way, and the one that
+    predates it has never had the problem.
+    """
+
+    raw = build_research_plan_prompt(
+        goal="anything",
+        budget=ResearchBudget(),
+        science_context="SCIENCE-MARKER",
+        repository_context="REPO-MARKER",
+        declared_experiments=[],
+    )
+    prompt = _flowed(raw)
+    assert "set only the keys the kind actually uses" in prompt
+    assert "the researcher reads them" in prompt
+    # No field-by-field form: each key is described where its kind is.
+    assert "FILLING IN THE JSON" not in prompt
+    assert raw.index('Sets "query"') < raw.index("SCIENCE-MARKER")
+
+
+def test_every_task_key_the_model_may_return_maps_onto_the_task_model() -> None:
+    """The schema cannot drift from what a ResearchTask can actually hold."""
+
+    schema_keys = set(PLAN_SCHEMA["properties"]["tasks"]["items"]["properties"])
+    planned_keys = set(PlannedTask.model_fields)
+    assert schema_keys == planned_keys
+    task_fields = set(ResearchTask.model_fields)
+    assert (planned_keys - {"id"}) <= task_fields
+
+
+def test_a_plan_made_of_placeholders_is_refused(
+    research_home: Path, tmp_path: Path
+) -> None:
+    """The failure this exists for, reproduced exactly.
+
+    Seen live, three runs in a row, after thirteen thousand output tokens of
+    genuine planning against a real project: a one-task plan whose summary,
+    title, goal and query were all the word "test". Everything downstream then
+    ran on it -- a literature search for "test" reached three providers and
+    retrieved sixty works.
+
+    Replaying the archived prompts showed the prompt is not the variable: the
+    prompt that first produced an excellent four-task plan produces "test" on
+    replay, and the one that produced "test" produces a good plan. A provider's
+    structured-output enforcement can converge on the smallest object that
+    validates, silently, so the controller assumes it can happen at any time.
+    """
+
+    stub = {
+        "summary": "test",
+        "tasks": [
+            {
+                "id": "T-001",
+                "kind": "literature",
+                "title": "test",
+                "goal": "test",
+                "query": "test",
+            }
+        ],
+    }
+    with pytest.raises(ResearchPlanError, match="placeholder"):
+        start(tmp_path, plan=stub)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("summary", "TODO"),
+        ("summary", "n/a"),
+        ("summary", "..."),
+        ("title", "placeholder"),
+        ("goal", "TBD."),
+        ("query", "test"),
+    ],
+)
+def test_each_placeholder_field_is_named_in_the_refusal(field: str, value: str) -> None:
+    """A refusal that does not say which field is a refusal nobody can act on."""
+
+    payload = plan_payload(tasks=[task()])
+    if field == "summary":
+        payload["summary"] = value
+    else:
+        payload["tasks"][0][field] = value
+    plan = ResearchPlan.model_validate(payload)
+    with pytest.raises(ResearchPlanError) as exit_info:
+        validate_research_plan(
+            plan, budget=ResearchBudget(), declared_experiments=frozenset()
+        )
+    message = str(exit_info.value)
+    assert value.strip() in message
+    assert "placeholder" in message
+
+
+def test_a_terse_but_real_plan_is_not_second_guessed() -> None:
+    """The check is about placeholders, not about prose quality.
+
+    A controller that refused a short goal would be grading writing, which is
+    not its job and not something it could do well.
+    """
+
+    plan = ResearchPlan.model_validate(
+        plan_payload(
+            summary="Read the field, then decide.",
+            tasks=[
+                task(
+                    title="Read it",
+                    goal="Find out what is settled.",
+                    query="widget deformation",
+                )
+            ],
+        )
+    )
+    validate_research_plan(
+        plan, budget=ResearchBudget(), declared_experiments=frozenset()
+    )
+
+
+def test_a_word_that_merely_contains_a_placeholder_is_fine() -> None:
+    """ "Testing the estimator" is a real goal. Only whole-token matches count."""
+
+    plan = ResearchPlan.model_validate(
+        plan_payload(
+            summary="Testing the estimator against the Berry benchmark.",
+            tasks=[
+                task(
+                    title="Testbed comparison",
+                    goal="Compare the estimator against the published testbed.",
+                    query="assessment ratio testbed",
+                )
+            ],
+        )
+    )
+    validate_research_plan(
+        plan, budget=ResearchBudget(), declared_experiments=frozenset()
+    )
+
+
+def test_a_placeholder_plan_is_re_asked_once_and_then_accepted(
+    research_home: Path, tmp_path: Path
+) -> None:
+    """A degenerate plan is worth one more call, not a failed run."""
+
+    stub = {
+        "summary": "test",
+        "tasks": [
+            {
+                "id": "T-001",
+                "kind": "literature",
+                "title": "test",
+                "goal": "test",
+                "query": "test",
+            }
+        ],
+    }
+    provider = scripted()
+    provider.responses["planner"] = [
+        ScriptedResponse(structured=stub),
+        ScriptedResponse(structured=plan_payload()),
+    ]
+    _controller, store, run, _ = start(tmp_path, provider=provider)
+
+    assert run.state is ResearchState.PLAN_READY
+    assert run.plan_summary != "test"
+    assert run.model_calls_used == 2
+    events = [record["event"] for record in store.iter_events()]
+    assert events.count("plan_rejected") == 1
+    assert "plan_correction_started" in events
+    assert "plan_correction_accepted" in events
+
+
+def test_the_planner_correction_carries_the_validator_s_exact_objection(
+    research_home: Path, tmp_path: Path
+) -> None:
+    stub = {
+        "summary": "TODO",
+        "tasks": [
+            {
+                "id": "T-001",
+                "kind": "literature",
+                "title": "TODO",
+                "goal": "TODO",
+                "query": "TODO",
+            }
+        ],
+    }
+    provider = scripted()
+    provider.responses["planner"] = [
+        ScriptedResponse(structured=stub),
+        ScriptedResponse(structured=plan_payload()),
+    ]
+    start(tmp_path, provider=provider)
+
+    retry = provider.requests_for(Role.PLANNER)[1]
+    assert "YOUR PREVIOUS ANSWER WAS REJECTED" in retry.prompt
+    assert "placeholder" in retry.prompt
+    assert "This is your one correction" in retry.prompt
+
+
+def test_a_second_placeholder_plan_ends_the_run(
+    research_home: Path, tmp_path: Path
+) -> None:
+    """One correction, not a loop."""
+
+    stub = {
+        "summary": "test",
+        "tasks": [
+            {
+                "id": "T-001",
+                "kind": "literature",
+                "title": "test",
+                "goal": "test",
+                "query": "test",
+            }
+        ],
+    }
+    provider = scripted()
+    provider.responses["planner"] = [
+        ScriptedResponse(structured=stub),
+        ScriptedResponse(structured=stub),
+    ]
+    with pytest.raises(ResearchPlanError, match="placeholder"):
+        start(tmp_path, provider=provider)
+
+    run = ResearchStore.open(ResearchStore.list_run_ids()[-1]).load()
+    assert run.state is ResearchState.FAILED
+    assert len(provider.requests_for(Role.PLANNER)) == 2

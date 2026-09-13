@@ -143,3 +143,49 @@ Worktree isolation is Git isolation, not an OS sandbox. A `code` task's
 acceptance commands execute project code — including code a model just wrote —
 with your own operating-system permissions. Run research runs against
 repositories you trust, on a machine where that is an acceptable risk.
+
+## When a worker gets it slightly wrong
+
+Two of the failures this system actually hit against a live provider were not
+security problems and not bugs in the worker's judgment. They were mechanical:
+output that did not match what the controller would accept.
+
+**A plan that is not a plan.** A planner can return something that satisfies
+the schema and says nothing: a one-task plan whose summary, title, goal and
+query are all the word `test`. This happened against a live provider after
+thirteen thousand output tokens of genuine planning, and everything downstream
+then ran on it — a literature search for "test" reached three providers and
+retrieved sixty works.
+
+It is worth being precise about the cause, because the obvious answers are
+wrong. Replaying the archived prompts establishes it: the prompt that first
+produced an excellent four-task plan produces `test` on replay, and the prompt
+that produced `test` produces an excellent plan on replay. The prompt is not
+the variable. Neither is the schema, though it was made less demanding anyway —
+requiring only `id`, `kind`, `title` and `goal`, since the rest have defaults
+on the task model and the local validators give better messages than a
+structured-output retry loop does.
+
+What is actually true is that a provider's structured-output enforcement can
+converge on the smallest object that validates, and it does so silently. So the
+controller assumes it:
+
+- `assert_plan_says_something` refuses a plan whose summary, title, goal, query
+  or question is made entirely of placeholder tokens. Deliberately narrow — a
+  terse but real goal is nobody's business but the researcher's, and a
+  controller grading prose would be worse than one that does not.
+- A refused plan gets one bounded re-ask carrying the validator's exact
+  objection, charged against the same allowance everything else uses. A second
+  failure ends the run.
+
+**A report that cites a finding it never made.** An analyst may return evidence
+whose `finding_id` matches nothing in its own `findings`. The validator refuses
+it, and it should: analyst output reaches a downstream worker and a human as
+evidence. But the failure is mechanical and the worker is the only thing that
+can fix it, so the controller asks once more, quoting the rejected answer back
+as data with the validator's exact message.
+
+That re-ask is not leniency. The parser stays fail-closed; the second report is
+validated by identical rules; a second failure ends the work order; and the
+attempt spends the same bounded-repair allowance the coder has, so a run
+configured for no repairs gets none.

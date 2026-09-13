@@ -24,7 +24,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from research_os.automation.promptdata import prompt_safe_block
+from research_os.automation.promptdata import prompt_safe, prompt_safe_block
 from research_os.automation.structured import extract_json_object
 from research_os.errors import ResearchPlanError
 from research_os.models import NonBlankStr
@@ -36,6 +36,9 @@ from research_os.research.models import (
 )
 
 MAX_GOAL_CHARS = 6_000
+
+#: How much of a validator message is quoted into a correction.
+MAX_REASON_CHARS = 1_000
 
 PLAN_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -49,21 +52,19 @@ PLAN_SCHEMA: dict[str, Any] = {
             "items": {
                 "type": "object",
                 "additionalProperties": False,
-                "required": [
-                    "id",
-                    "kind",
-                    "title",
-                    "goal",
-                    "depends_on",
-                    "query",
-                    "read_paths",
-                    "allowed_paths",
-                    "acceptance_commands",
-                    "experiment_task",
-                    "experiment_parameters",
-                    "section",
-                    "question",
-                ],
+                # Only the keys every task genuinely has.
+                #
+                # Requiring all thirteen was a mistake, and an expensive one to
+                # find: a planner writing a rich four-task plan had to emit an
+                # empty value for every key its kind did not use, and when one
+                # was missed the provider's structured-output retries degraded
+                # the whole answer to the smallest object that validated -- a
+                # one-task plan whose every string was the word "test", after
+                # thirteen thousand output tokens of real work. The rest of the
+                # keys have defaults on ``PlannedTask``; what each kind actually
+                # needs is checked by the validators below, which can say so in
+                # a sentence a person can act on.
+                "required": ["id", "kind", "title", "goal"],
                 "properties": {
                     "id": {"type": "string"},
                     "kind": {
@@ -160,25 +161,34 @@ THE RESEARCHER'S GOAL
 
 TASK KINDS
 
-- "literature": retrieve and read published work. Needs "query". Cheap. Do this
-  first when the goal touches anything somebody else may already have settled.
+Every task has "id", "kind", "title" and "goal". Beyond those, set only the
+keys the kind actually uses -- each kind below says which -- and leave the rest
+out. "depends_on" is a list of earlier task ids, on any kind that needs one.
+
+- "literature": retrieve and read published work. Sets "query" to the search
+  you want run. Cheap. Do this first when the goal touches anything somebody
+  else may already have settled.
 - "analysis": a read-only investigation of this repository inside a pinned
-  snapshot, with Read, Glob, and Grep and nothing else. Needs "read_paths".
-  Use it when the goal needs the code understood before it can be changed.
+  snapshot, with Read, Glob, and Grep and nothing else. Sets "read_paths" to
+  the repository-relative paths the analysis should concentrate on. Use it when
+  the goal needs the code understood before it can be changed.
 - "proposal": turn what is known into structured, reviewable scientific
-  proposals -- questions, hypotheses, experiments, claims. Produces nothing the
-  project accepts; a human promotes anything worth keeping.
-- "code": a write-enabled implementation in an isolated worktree, verified by
-  acceptance commands the controller runs itself. Needs "allowed_paths" and
-  "acceptance_commands". Available programs: {programs}.
-- "experiment": run a command the researcher has already declared. Needs
-  "experiment_task", naming one of the declared commands below, and
-  "experiment_parameters" filling in that command's declared parameters as
-  strings. You cannot add a command, change its argv, or introduce a parameter
-  it did not declare. This is the only kind that can spend real compute.
-- "paper": draft a manuscript section from accepted claims. Needs
+  proposals -- questions, hypotheses, experiments, claims. Sets no key of its
+  own. Produces nothing the project accepts; a human promotes anything worth
+  keeping.
+- "code": a write-enabled implementation in an isolated worktree. Sets
+  "allowed_paths" to the paths it may change and "acceptance_commands" to the
+  argument vectors the controller will run to verify it, for example
+  ["pytest", "-q"]. Available programs: {programs}.
+- "experiment": run a command the researcher has already declared. Sets
+  "experiment_task" to one of the declared commands below and
+  "experiment_parameters" to that command's declared parameters, as strings.
+  You cannot add a command, change its argv, or introduce a parameter it did
+  not declare. This is the only kind that can spend real compute.
+- "paper": draft a manuscript section from accepted claims. Sets
   "allowed_paths" and "section".
-- "human_checkpoint": stop and ask the researcher something. Needs "question".
+- "human_checkpoint": stop and ask the researcher something. Sets "question" to
+  what you want them to decide.
 
 DECLARED EXPERIMENT COMMANDS FOR THIS PROJECT
 {experiments}
@@ -214,9 +224,40 @@ accepting a scientific conclusion. The controller stops there and waits.
 Keep the plan as small as it can be and still achieve the goal. This run has
 {budget.max_model_calls} model calls in total.
 
+Write the summary, titles, goals and queries for the researcher, because the
+researcher reads them. Each one should say something specific about this
+project and this goal that they could act on.
+
+
 {insight_section}
 {science_context}
 {repository_context}
+"""
+
+
+def build_plan_correction_prompt(prompt: str, *, reason: str) -> str:
+    """Return the planner's one re-ask, with the validator's exact objection.
+
+    The original prompt in full, then what was wrong with the answer. Nothing
+    from the rejected plan is quoted back: unlike the analyst's correction,
+    where the worker needs its own findings to repair a reference, a plan that
+    was refused for being placeholders is better rewritten than edited.
+    """
+
+    return f"""{prompt}
+
+YOUR PREVIOUS ANSWER WAS REJECTED
+
+The controller validated your last plan and refused it. This is the reason,
+exactly as the validator produced it:
+
+    {prompt_safe(reason, limit=MAX_REASON_CHARS)}
+
+Write the plan again, properly this time. Every summary, title, goal, query and
+question is read by the researcher and has to say something specific about
+their project and their goal.
+
+This is your one correction. There is no second.
 """
 
 
@@ -238,6 +279,98 @@ def parse_research_plan(
         ) from exc
 
 
+#: Strings that are never an answer, whatever else is true of them.
+#:
+#: Not style policing, and deliberately narrow. A provider's structured-output
+#: retry loop does not fail loudly when a rich answer keeps missing a strict
+#: schema -- it converges on the smallest object that validates, and what comes
+#: back is a plan whose every string is one placeholder word. Seen live, after
+#: thirteen thousand output tokens of real planning. Refusing exactly that turns
+#: a run that silently executes a placeholder into one that says what happened.
+#:
+#: A terse but real goal is none of this controller's business. Only a field
+#: made of nothing but these is refused.
+PLACEHOLDERS: frozenset[str] = frozenset(
+    {
+        "...",
+        "bar",
+        "baz",
+        "example",
+        "foo",
+        "n/a",
+        "na",
+        "none",
+        "null",
+        "placeholder",
+        "tbd",
+        "test",
+        "tests",
+        "todo",
+        "xxx",
+    }
+)
+
+
+def _is_placeholder(value: str) -> bool:
+    """Return whether every token in ``value`` is a placeholder.
+
+    A token counts either as written or with surrounding punctuation removed, so
+    both "TBD." and a bare "..." are caught. Stripping alone would reduce "..."
+    to nothing and let it through, which is the one that actually turned up.
+    """
+
+    tokens = value.split()
+    if not tokens:
+        return False
+    for token in tokens:
+        lowered = token.lower()
+        if lowered in PLACEHOLDERS:
+            continue
+        if lowered.strip(".,;:!?\"'()[]") in PLACEHOLDERS:
+            continue
+        return False
+    return True
+
+
+def _assert_not_a_placeholder(value: str, *, what: str, where: str) -> None:
+    if _is_placeholder(value):
+        raise ResearchPlanError(
+            f"{where} is {value.strip()!r}, which is a placeholder rather than "
+            f"{what}. The planner did not produce a usable plan, so nothing was "
+            "run. Try again, or raise the model-call budget."
+        )
+
+
+def assert_plan_says_something(plan: ResearchPlan) -> None:
+    """Refuse a plan that validates structurally but says nothing.
+
+    Every string checked here is one a researcher reads. A plan that satisfies
+    the schema and fails this is not a plan worth spending anything on, and
+    saying so immediately beats discovering it in the report afterwards.
+    """
+
+    _assert_not_a_placeholder(
+        plan.summary, what="a plan summary", where="the plan summary"
+    )
+    for task in plan.tasks:
+        _assert_not_a_placeholder(
+            task.title, what="a task title", where=f"{task.id}'s title"
+        )
+        _assert_not_a_placeholder(
+            task.goal, what="a task goal", where=f"{task.id}'s goal"
+        )
+        if task.kind is TaskKind.LITERATURE:
+            _assert_not_a_placeholder(
+                task.query, what="a literature query", where=f"{task.id}'s query"
+            )
+        if task.kind is TaskKind.HUMAN_CHECKPOINT:
+            _assert_not_a_placeholder(
+                task.question,
+                what="a question for the researcher",
+                where=f"{task.id}'s question",
+            )
+
+
 def validate_research_plan(
     plan: ResearchPlan,
     *,
@@ -252,6 +385,7 @@ def validate_research_plan(
     fail at the moment of spending rather than at the moment of planning.
     """
 
+    assert_plan_says_something(plan)
     if len(plan.tasks) > budget.max_tasks:
         raise ResearchPlanError(
             f"the plan has {len(plan.tasks)} tasks; this run's budget allows "

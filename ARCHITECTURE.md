@@ -237,18 +237,22 @@ in `AGENTS.md`.
 
 | Release | Role | Status |
 |---|---|---|
-| **R0 — Kernel** | repo, CLI, capsule, schemas, Git-tracked canonical state | in implementation |
-| **R1 — Literature** | APIs, shared library, PDF cache, ranking, retrieval | not started |
-| **R2 — Co-Explorer** | explorers, literature verification, hypothesis portfolio | not started |
-| **R3 — Experimentalist** | Work Orders, execution, validation, Slurm | not started |
-| **R4 — Author / Referee** | writing packets, independent review tooling | not started |
-| **R5 — Autonomous OS** | watchers, MCP, cross-project exploration, optional UI | not started |
+| **R0 — Kernel** | repo, CLI, capsule, schemas, Git-tracked canonical state | complete and frozen |
+| **R1 — Literature** | scholarly APIs, shared index, PDF cache, BM25 retrieval | in v1 (`researchctl lit`) |
+| **R2 — Co-Explorer** | read-only analyst, structured proposals, cross-project insights | in v1 (`propose`, `insight`) |
+| **R3 — Experimentalist** | declared commands, local and Slurm execution, evidence packets | in v1 (`experiment`) |
+| **R4 — Author / Referee** | source packets, grounded drafting, independent writing review | in v1 (`paper`) |
+| **R5 — Autonomous OS** | watchers, MCP, background services, optional UI | not started |
 
-**R2 is the first major scientific-value target.** Future releases must not be
-treated as if they already exist.
+Research OS v1 delivers the working core of R1 through R4, orchestrated by
+`researchctl research`. What it deliberately does not deliver is R5: there are
+no watchers, no background services, no MCP, and no UI. Nothing runs unless a
+person runs it.
 
-R0 includes Claim/Review/Evidence schemas as kernel state. R4 adds identity and
-frozen review-packet tooling around that kernel.
+R0 includes Claim/Review/Evidence schemas as kernel state, and v1 did not
+change them. The writing layer builds review packets around that kernel rather
+than reimplementing its acceptance rule: `paper` calls the validator's own
+`claim_approval()`, so there is exactly one definition of what "accepted" means.
 
 ## 11. Automation control plane
 
@@ -275,15 +279,72 @@ Work Orders, Handoffs, and RUN records still have no *scientific* schema. The
 runtime work-order and run records the control plane keeps are orchestration
 state under `~/.local/state/research-os/`, not capsule objects.
 
+## 11a. Research runs
+
+Above the automation control plane, and equally outside the kernel, sits the
+unified research layer (`research_os.research`, `researchctl research`). It
+turns one research goal into a bounded DAG of typed tasks and dispatches each to
+the controller that already owns that kind of work.
+
+It owns no worker. A `code` or `analysis` task becomes an automation run with a
+supplied plan, and therefore inherits that layer's worktree isolation, scope
+enforcement from the observed diff, command policy, acceptance checks,
+independent review and single bounded repair without reimplementation. A
+`proposal`, `experiment` or `paper` task is delegated the same way.
+
+What this layer owns is dispatch, ordering, budgeting and stopping:
+
+- `TaskKind` is a closed enum and dispatch is a table with no default branch.
+  A kind with no handler is refused when the plan is validated.
+- A plan is a forward-only DAG, so declaration order is a valid execution order
+  and a cycle cannot be expressed.
+- Model calls, write tasks, experiments, cluster submissions and wall clock are
+  separately budgeted, checked before the spend, against the value on disk.
+- A `human_checkpoint` halts the run until a person answers; declining ends it.
+- A crashed run becomes `INTERRUPTED` rather than a stale `EXECUTING`, and only
+  `researchctl research resume` moves it.
+
+`docs/RESEARCH.md` is its live specification; `docs/OPERATIONS.md` covers
+`doctor`, `storage` and recovery.
+
+## 11b. Untrusted text
+
+Two kinds of text in this system were written by something that is not the
+controller, and both are handled as data rather than instruction.
+
+**Model-originated strings** pass through one serializer
+(`research_os.automation.promptdata`) on their way into any later prompt. Every
+delimiter it knows about is inert inside every block it renders, and a rendered
+block is re-read before it is returned, so an ambiguous fence is a failure
+rather than an escape.
+
+**Retrieved external content** — a paper's abstract, a fetched full text — is
+quoted behind a fence that says so in the delimiter itself, because its author
+has never heard of this system and a paper about prompt injection contains
+prompt injections as its subject matter. Raw external content never reaches a
+write- or execute-enabled worker directly.
+
+A third boundary, the display, escapes control characters on the way to a
+terminal (`research_os.textsafe`). Archives keep the raw bytes; machine-readable
+JSON is ASCII-escaped. The three boundaries agree about which characters are
+dangerous and differ only in what they do about them.
+
 ## 12. Postponed technologies
 
 Research OS does not include and must not opportunistically add:
 
 Docker, Podman, Apptainer, PostgreSQL, vector database servers, MCP, LangGraph,
-PaperQA, local LLMs, Ollama, web UI, background systemd services, Slurm, HPC
-abstraction, literature APIs, embeddings, unofficial browser automation,
-firmware/Secure Boot/MOK automation, automatic merge, and automatic scientific
-acceptance.
+PaperQA, local LLMs, Ollama, web UI, background systemd services, embeddings,
+unofficial browser automation, firmware/Secure Boot/MOK automation, automatic
+merge, and automatic scientific acceptance.
+
+Two items left this list in v1, and how they arrived matters. **Literature
+APIs** are three plain HTTP clients over OpenAlex, Crossref and arXiv with a
+SQLite FTS5 index — no embeddings, no vector store, no framework. **Slurm** is
+`sbatch`/`squeue`/`sacct` behind an abstraction thin enough to read in one
+sitting, invoked over `ssh <alias>` with no credential handling of its own.
+Neither brought a dependency of any size, which was the condition for adding
+them at all.
 
 ## 13. Human versus agent authority
 

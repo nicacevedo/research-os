@@ -98,12 +98,15 @@ from research_os.research.models import (
 )
 from research_os.research.planner import (
     PLAN_SCHEMA,
+    ResearchPlan,
+    build_plan_correction_prompt,
     build_research_plan_prompt,
     parse_research_plan,
     to_tasks,
     validate_research_plan,
 )
 from research_os.research.store import ResearchStore, make_research_run_id
+from research_os.runlock import run_lock
 
 PLANNER_TIMEOUT_SECONDS = 900
 
@@ -234,22 +237,12 @@ class ResearchController:
             execute_experiments=run.execute_experiments,
             allowed_programs=self.config.allowed_check_programs,
         )
-        run, invocation, result = self._invoke(
+        run, plan = self._planned(
             store,
             run,
-            role=Role.PLANNER,
             setting=resolved.roles["planner"],
             prompt=prompt,
-            timeout_seconds=PLANNER_TIMEOUT_SECONDS,
-            json_schema=PLAN_SCHEMA,
-        )
-        if not result.ok:
-            raise ProviderInvocationError(
-                f"the research planner failed: {invocation.error or 'unknown error'}"
-            )
-        plan = parse_research_plan(structured=result.structured, text=result.text)
-        validate_research_plan(
-            plan, budget=run.budget, declared_experiments=frozenset(declared)
+            declared=frozenset(declared),
         )
         tasks = to_tasks(plan)
         self._assert_budget_could_finish(run, tasks)
@@ -265,6 +258,70 @@ class ResearchController:
             minimum_model_calls=sum(MINIMUM_CALLS[item.kind] for item in tasks),
         )
         return self._transition(store, run, ResearchState.PLAN_READY)
+
+    def _planned(
+        self,
+        store: ResearchStore,
+        run: ResearchRun,
+        *,
+        setting: RoleSetting,
+        prompt: str,
+        declared: frozenset[str],
+    ) -> tuple[ResearchRun, ResearchPlan]:
+        """Get one validated plan, allowing at most one bounded re-ask.
+
+        A planner can return something that satisfies the schema and is not a
+        plan -- a provider's structured-output retry loop converges on the
+        smallest valid object when a rich answer keeps missing the schema, and
+        what arrives is a run's worth of placeholders. The validators catch it;
+        this asks once more with the exact reason, because the alternative is a
+        failed run the researcher has to restart by hand.
+
+        One re-ask, charged against the same allowance everything else uses. A
+        second failure ends the run.
+        """
+
+        attempt = prompt
+        for correction in (False, True):
+            run, invocation, result = self._invoke(
+                store,
+                run,
+                role=Role.PLANNER,
+                setting=setting,
+                prompt=attempt,
+                timeout_seconds=PLANNER_TIMEOUT_SECONDS,
+                json_schema=PLAN_SCHEMA,
+            )
+            if not result.ok:
+                raise ProviderInvocationError(
+                    f"the research planner failed: "
+                    f"{invocation.error or 'unknown error'}"
+                )
+            try:
+                plan = parse_research_plan(
+                    structured=result.structured, text=result.text
+                )
+                validate_research_plan(
+                    plan, budget=run.budget, declared_experiments=declared
+                )
+            except ResearchPlanError as exc:
+                store.append_event(
+                    "plan_rejected",
+                    invocation_id=invocation.invocation_id,
+                    detail=str(exc),
+                    corrected=correction,
+                )
+                if correction or run.budget.max_repair_attempts < 1:
+                    raise
+                if run.remaining_model_calls < 1:
+                    raise
+                attempt = build_plan_correction_prompt(prompt, reason=str(exc))
+                store.append_event("plan_correction_started")
+                continue
+            if correction:
+                store.append_event("plan_correction_accepted")
+            return run, plan
+        raise ResearchPlanError("the research planner produced no usable plan")
 
     @staticmethod
     def _assert_budget_could_finish(
@@ -291,6 +348,10 @@ class ResearchController:
     def execute(self, store: ResearchStore) -> ResearchRun:
         """Run the plan until it finishes, stops for a human, or fails."""
 
+        with run_lock(store.run_id, action="research run"):
+            return self._execute(store)
+
+    def _execute(self, store: ResearchStore) -> ResearchRun:
         run = store.load()
         if run.terminal:
             raise ResearchStateError(f"{run.run_id} is already {run.state}")
@@ -771,6 +832,12 @@ class ResearchController:
         answer = answer.strip()
         if not answer:
             raise ResearchStateError("a checkpoint answer needs at least one character")
+        with run_lock(store.run_id, action="research answer"):
+            return self._answer(store, answer=answer, proceed=proceed)
+
+    def _answer(
+        self, store: ResearchStore, *, answer: str, proceed: bool
+    ) -> ResearchRun:
         run = store.load()
         pending = run.pending_checkpoints
         if not pending:
@@ -842,6 +909,10 @@ class ResearchController:
         mistake that costs real money.
         """
 
+        with run_lock(store.run_id, action="research resume"):
+            return self._resume(store, retry=retry, force=force)
+
+    def _resume(self, store: ResearchStore, *, retry: bool, force: bool) -> ResearchRun:
         run = store.load()
         if run.state not in INTERRUPTIBLE_STATES:
             raise ResearchStateError(
@@ -927,6 +998,17 @@ class ResearchController:
         return run
 
     def cancel(self, store: ResearchStore, *, reason: str) -> ResearchRun:
+        """Stop a run that has not finished.
+
+        Takes the same lock the executing process holds, so a cancel either
+        happens between tasks or is refused outright. It must never be accepted
+        and then silently overwritten by a run that carried on regardless.
+        """
+
+        with run_lock(store.run_id, action="research cancel"):
+            return self._cancel(store, reason=reason)
+
+    def _cancel(self, store: ResearchStore, *, reason: str) -> ResearchRun:
         run = store.load()
         if run.terminal:
             raise ResearchStateError(f"{run.run_id} is already {run.state}")

@@ -111,6 +111,14 @@ class RunStoreError(AutomationError):
     """Raised when the runtime run store cannot be read or written."""
 
 
+class RunLockedError(AutomationError):
+    """Raised when another process is already changing this run.
+
+    Refusing is the whole point: two processes writing one run record means the
+    loser's decision disappears under the winner's next write, silently.
+    """
+
+
 class RunNotFoundError(AutomationError):
     """Raised when a run id names no run directory."""
 

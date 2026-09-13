@@ -222,50 +222,94 @@ def plan_payload(
     return {"summary": summary, "tasks": tasks if tasks is not None else [task()]}
 
 
+def _task_of(defaults: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:
+    """Build a planned task where a caller's value always wins.
+
+    The kind helpers below preset the keys their kind needs. Forwarding those as
+    keyword arguments would make an override collide with the preset rather than
+    replace it, which is a confusing way for a test to fail.
+    """
+
+    return task(**{**defaults, **overrides})
+
+
 def analysis_task(**overrides: Any) -> dict[str, Any]:
-    return task(
-        kind="analysis",
-        title="Understand the adder",
-        goal="Explain what adder.py does and why its tests fail.",
-        query="",
-        read_paths=["adder.py", "test_adder.py"],
-        **overrides,
+    return _task_of(
+        {
+            "kind": "analysis",
+            "title": "Understand the adder",
+            "goal": "Explain what adder.py does and why its tests fail.",
+            "query": "",
+            "read_paths": ["adder.py", "test_adder.py"],
+        },
+        overrides,
     )
 
 
 def code_task(**overrides: Any) -> dict[str, Any]:
-    return task(
-        kind="code",
-        title="Implement add",
-        goal="Make add return the sum of its two arguments.",
-        query="",
-        allowed_paths=["adder.py"],
-        acceptance_commands=[["pytest", "-q"]],
-        **overrides,
+    return _task_of(
+        {
+            "kind": "code",
+            "title": "Implement add",
+            "goal": "Make add return the sum of its two arguments.",
+            "query": "",
+            "allowed_paths": ["adder.py"],
+            "acceptance_commands": [["pytest", "-q"]],
+        },
+        overrides,
     )
 
 
 def experiment_task(**overrides: Any) -> dict[str, Any]:
-    payload: dict[str, Any] = {
-        "kind": "experiment",
-        "title": "Fit the model",
-        "goal": "Run the declared fit and see what it produces.",
-        "query": "",
-        "experiment_task": "fit-model",
-        "experiment_parameters": {"seed": "7"},
-    }
-    payload.update(overrides)
-    return task(**payload)
+    return _task_of(
+        {
+            "kind": "experiment",
+            "title": "Fit the model",
+            "goal": "Run the declared fit and see what it produces.",
+            "query": "",
+            "experiment_task": "fit-model",
+            "experiment_parameters": {"seed": "7"},
+        },
+        overrides,
+    )
 
 
 def checkpoint_task(**overrides: Any) -> dict[str, Any]:
-    return task(
-        kind="human_checkpoint",
-        title="Decide whether to spend compute",
-        goal="Ask the researcher before anything expensive runs.",
-        query="",
-        question="Should I run the fit on the cluster?",
-        **overrides,
+    return _task_of(
+        {
+            "kind": "human_checkpoint",
+            "title": "Decide whether to spend compute",
+            "goal": "Ask the researcher before anything expensive runs.",
+            "query": "",
+            "question": "Should I run the fit on the cluster?",
+        },
+        overrides,
+    )
+
+
+def proposal_task(**overrides: Any) -> dict[str, Any]:
+    return _task_of(
+        {
+            "kind": "proposal",
+            "title": "Propose what would settle it",
+            "goal": "Propose the hypothesis and experiment that would settle Q-0001.",
+            "query": "",
+        },
+        overrides,
+    )
+
+
+def paper_task(**overrides: Any) -> dict[str, Any]:
+    return _task_of(
+        {
+            "kind": "paper",
+            "title": "Draft the results section",
+            "goal": "Write the results section from the accepted claim.",
+            "query": "",
+            "section": "results",
+            "allowed_paths": ["paper/manuscript.md"],
+        },
+        overrides,
     )
 
 
@@ -318,26 +362,4 @@ def make_controller(
         else ExperimentConfig(
             slurm=SlurmSettings(), limits=ExecutionLimits(), projects={}, source=None
         ),
-    )
-
-
-def proposal_task(**overrides: Any) -> dict[str, Any]:
-    return task(
-        kind="proposal",
-        title="Propose what would settle it",
-        goal="Propose the hypothesis and experiment that would settle Q-0001.",
-        query="",
-        **overrides,
-    )
-
-
-def paper_task(**overrides: Any) -> dict[str, Any]:
-    return task(
-        kind="paper",
-        title="Draft the results section",
-        goal="Write the results section from the accepted claim.",
-        query="",
-        section="results",
-        allowed_paths=["paper/manuscript.md"],
-        **overrides,
     )
