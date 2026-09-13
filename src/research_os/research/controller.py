@@ -613,6 +613,7 @@ class ResearchController:
                 automation_run_id=inner.run_id,
                 state=str(inner_store.load().state),
                 model_calls=spent,
+                charged_total=spent,
             )
         detail = f"automation run {inner.run_id} finished {inner.state}"
         order = inner.work_orders[0] if inner.work_orders else None
@@ -1004,39 +1005,48 @@ class ResearchController:
         from research_os.automation.store import RunStore
         from research_os.errors import AutomationError
 
-        # What this run has already been told about, taken from the ledger
-        # rather than from the task record: a task that never finished reports
-        # zero, so a second interruption would otherwise charge the first
-        # attempt all over again.
-        already = max(
-            (
-                int(record.get("model_calls", 0))
-                for record in store.iter_events()
-                if record.get("task_id") == task_id
-                and record.get("event")
-                in {"automation_run_finished", "delegated_spend_reconciled"}
-            ),
-            default=run.task(task_id).model_calls,
-        )
+        # What this task has actually spent: the sum over every delegated run
+        # it ever started, read from those runs' own records.
         spent = 0
+        inner_ids: list[str] = []
         for record in store.iter_events():
             if record.get("event") != "automation_run_started":
                 continue
             if record.get("task_id") != task_id:
                 continue
-            inner_id = str(record.get("automation_run_id", ""))
+            inner_ids.append(str(record.get("automation_run_id", "")))
+        for inner_id in inner_ids:
             try:
                 spent += RunStore.open(inner_id).load().model_calls_used
             except (AutomationError, OSError):
                 continue
-        owed = spent - already
+
+        # What this run has already been charged for it. Every event that
+        # records a charge writes the running total under one key, so this is a
+        # maximum over one quantity rather than over a mixture.
+        #
+        # It was a mixture, and a third independent review caught it: the
+        # finished event carried an inner run's total and the reconcile event
+        # carried a delta, so a second interruption compared a total against a
+        # delta and charged the difference twice.
+        charged = max(
+            (
+                int(record.get("charged_total", 0))
+                for record in store.iter_events()
+                if record.get("task_id") == task_id
+                and record.get("charged_total") is not None
+            ),
+            default=run.task(task_id).model_calls,
+        )
+        owed = spent - charged
         if owed <= 0:
             return store.load()
         store.append_event(
             "delegated_spend_reconciled",
             task_id=task_id,
             model_calls=owed,
-            previously_recorded=already,
+            charged_total=spent,
+            previously_charged=charged,
         )
         return self._charge(store, run, owed)
 

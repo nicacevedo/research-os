@@ -641,7 +641,8 @@ def _reclaimable() -> tuple[int, int, str]:
     try:
         run_ids = RunStore.list_run_ids()
     except ResearchOSError:
-        return 0, 0, ""
+        # An unreadable automation store must not hide the experiment ones.
+        run_ids = ()
     for run_id in run_ids:
         try:
             run = RunStore.open(run_id).load()
@@ -667,12 +668,25 @@ def _reclaimable() -> tuple[int, int, str]:
     return worktrees, environments, note
 
 
-def _terminal_experiment_states() -> frozenset:
-    """The experiment states after which a worktree is no longer in use."""
+def _experiment_worktree_is_idle(state: object) -> bool:
+    """Return whether an experiment in ``state`` is still using its worktree.
 
-    from research_os.experiment.models import TERMINAL_STATES
+    Asking the question the other way round, which is the correction a third
+    independent review forced. Gating on ``TERMINAL_STATES`` looked right and
+    missed the likeliest case of all: a run that failed its containment scan
+    before starting is ``PREPARED``, which is neither terminal nor active, so
+    its worktree, lock and branch were invisible to ``storage`` and to
+    ``reclaim`` alike. ``UNKNOWN`` -- a cluster job the scheduler has lost track
+    of -- fell through the same gap.
 
-    return TERMINAL_STATES
+    A worktree is in use only while something is running in it. Everything else
+    is releasable, and being wrong in this direction costs a rebuildable
+    checkout rather than an orphan nobody can find.
+    """
+
+    from research_os.experiment.models import ACTIVE_STATES
+
+    return state not in ACTIVE_STATES
 
 
 def _experiment_controller():
@@ -710,13 +724,12 @@ def _finished_experiment_worktrees() -> list[tuple[str, Path]]:
     could see, because both looked only at the automation run store.
     """
 
-    terminal = _terminal_experiment_states()
     found: list[tuple[str, Path]] = []
     for run_id in _experiment_run_ids():
         run = _experiment_run(run_id)
         if run is None or not run.isolated or not run.worktree_path:
             continue
-        if run.state not in terminal:
+        if not _experiment_worktree_is_idle(run.state):
             continue
         target = Path(run.worktree_path)
         if target.exists():
@@ -906,10 +919,10 @@ def reclaim() -> Reclaimed:
             touched.append(run_id)
             released.extend(paths)
 
+    from research_os.experiment.store import ExperimentStore
+
     experiments = _experiment_controller()
     for run_id, _target in _finished_experiment_worktrees():
-        from research_os.experiment.store import ExperimentStore
-
         try:
             _, paths = experiments.cleanup(ExperimentStore.open(run_id))
         except (ResearchOSError, OSError) as exc:

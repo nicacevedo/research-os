@@ -778,3 +778,59 @@ def test_storage_sees_and_reclaims_an_experiment_worktree(
     assert run.run_id in result.run_ids
     assert not result.failures
     assert not worktree.exists()
+
+
+def test_a_worktree_an_active_job_is_using_is_not_removed(
+    research_home: Path, tmp_path: Path
+) -> None:
+    """A submitted job's working directory *is* the worktree.
+
+    Found by a third independent review: ``cleanup`` had no state guard, so a
+    live cluster job could have the directory it was running in force-removed.
+    """
+
+    from research_os.errors import ExperimentStoreError
+
+    project = git_project(tmp_path / "widget", script=SUCCESS_SCRIPT)
+    controller = ExperimentController(config=config())
+    store, run, _packet = controller.run(
+        project_path=project,
+        task_name="fit-model",
+        parameters={"seed": 7},
+        project_id=PROJECT_ID,
+        execute=True,
+    )
+    store.save(run.model_copy(update={"state": ExecutionState.RUNNING}))
+    with pytest.raises(ExperimentStoreError, match="still using this worktree"):
+        controller.cleanup(store)
+    assert Path(run.worktree_path or "").is_dir()
+
+
+def test_a_worktree_left_by_a_run_that_never_started_is_reclaimable(
+    research_home: Path, tmp_path: Path
+) -> None:
+    """The likeliest orphan of all, and the one the first fix missed.
+
+    A run refused by the containment scan never reaches a terminal state -- it
+    stays PREPARED -- so gating cleanup on TERMINAL_STATES left its worktree,
+    lock and branch invisible to both ``storage`` and ``reclaim``.
+    """
+
+    from research_os import diagnostics
+
+    project = git_project(tmp_path / "widget", script=SUCCESS_SCRIPT)
+    controller = ExperimentController(config=config())
+    store, run, _packet = controller.run(
+        project_path=project,
+        task_name="fit-model",
+        parameters={"seed": 7},
+        project_id=PROJECT_ID,
+        execute=True,
+    )
+    store.save(run.model_copy(update={"state": ExecutionState.PREPARED}))
+
+    measured = {item.name: item for item in diagnostics.storage_usage()}
+    assert measured["worktrees"].reclaimable > 0, "a never-started run is invisible"
+    result = diagnostics.reclaim()
+    assert run.run_id in result.run_ids
+    assert not Path(run.worktree_path or "").exists()

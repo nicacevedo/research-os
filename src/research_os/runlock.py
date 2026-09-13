@@ -25,6 +25,11 @@ exactly one file description, and releases it when the holder exits for any
 reason -- including ``SIGKILL``, which no amount of cleanup code survives. There
 is no staleness to detect, so there is no takeover to race.
 
+The lock file itself is never removed, and that is not an oversight. A flock is
+held on an inode; unlinking the name while holding it lets the next arrival
+create a new inode at the same path and lock that. The second review measured
+exactly that happening, so the file stays -- a few hundred bytes per run id.
+
 The trade is that flock is advisory and is unreliable over NFS. Both are fine
 here: nothing outside Research OS writes these files, and runtime state lives
 under the local state home by design.
@@ -51,6 +56,13 @@ from research_os.errors import RunLockedError
 #: order and an inner block cannot drop the outer block's lock. ``research start
 #: --run`` plans and then executes, and both take the lock; a non-reentrant lock
 #: would deadlock the most ordinary command there is.
+#:
+#: Process-global, and therefore *not* thread-safe: a second thread asking for a
+#: lock this process holds would be granted it. Every entry point here is a CLI
+#: command running on one thread, so that cannot happen today; it is recorded
+#: because the reentrancy that makes ``start --run`` work is the same mechanism
+#: that would make a threaded caller wrong, and a future one should see this
+#: before adding threads rather than after.
 _HELD: dict[str, list[int]] = {}
 
 
@@ -136,19 +148,25 @@ def _acquire(target: Path, *, run_id: str, action: str) -> int:
 
 
 def _release(handle: int, target: Path) -> None:
-    """Drop the lock and remove its file, in that order and without racing.
+    """Drop the lock. Never remove its file.
 
-    The file is unlinked while the lock is still held, so no other process can
-    be holding *this* file when it goes away. A process that opened the same
-    path a moment earlier is waiting on a file that no longer has a name, and
-    its own ``flock`` will succeed on a file nobody else can reach -- so it
-    proceeds, which is correct: the run really is free.
+    The file stays, and that is the whole correctness argument. A ``flock`` is
+    held on an *inode*, not on a name; unlinking the name while holding the lock
+    leaves the holder locking an inode nobody can reach, and the next arrival
+    creates a fresh inode at the same path and locks that instead. Two holders,
+    one run.
+
+    An earlier version of this function unlinked first and argued that the
+    interleaving was harmless. An independent reviewer measured it: ten
+    processes contending produced violations in roughly one acquisition in
+    fifty, and a control run differing *only* in the removal of that unlink
+    produced none. Reproduced here at eight percent.
+
+    So the lock file is permanent, one small file per run under the locks
+    directory. That is the cost of the guarantee, and it is a few hundred bytes.
     """
 
-    try:
-        target.unlink(missing_ok=True)
-    except OSError:
-        pass
+    del target  # deliberately unused: see above
     try:
         fcntl.flock(handle, fcntl.LOCK_UN)
     except OSError:

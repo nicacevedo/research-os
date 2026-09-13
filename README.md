@@ -112,10 +112,14 @@ machine and an exit code that said otherwise would train you to ignore it. It
 creates nothing. `--json` emits the same report for a script.
 
 `storage` measures every runtime store and releases, with `--reclaim`, only
-what a finished run is still holding and can be rebuilt: worktrees — from
-automation, paper and experiment runs alike — and check environments. Records,
-ledgers, prompts, model outputs, reviews and branches are kept. A single run can
-be released on its own with `auto cleanup`, `paper cleanup` or
+what a run that is no longer using it is still holding and can be rebuilt:
+worktrees and check environments. Records, ledgers, prompts, model outputs,
+reviews and branches are kept.
+
+`--reclaim` covers automation runs and experiment runs. A **draft's** worktree
+is released by `paper cleanup DRAFT_ID` and by nothing else — drafts are keyed
+by draft id rather than by run id, so the sweep cannot find them. A single run
+of either other kind can also be released on its own, with `auto cleanup` or
 `experiment cleanup`.
 
 `init-project` creates a new Research Capsule in an existing Git repository

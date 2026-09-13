@@ -40,6 +40,7 @@ from research_os.automation.worktree import create_worktree, release_worktree
 from research_os.errors import (
     ExperimentAuthorizationError,
     ExperimentConfigError,
+    ExperimentStoreError,
     SchedulerUnavailableError,
 )
 from research_os.experiment.config import (
@@ -535,10 +536,21 @@ class ExperimentController:
 
         from research_os.automation.models import WorktreeRecord
         from research_os.automation.worktree import lock_path as worktree_lock_path
+        from research_os.experiment.models import ACTIVE_STATES
 
         run = store.load()
         if not run.isolated or not run.worktree_path:
             return run, ()
+        if run.state in ACTIVE_STATES:
+            # A submitted cluster job's working directory *is* this worktree.
+            # Removing it under a running job was possible until a third
+            # independent review pointed it out; the automation controller has
+            # always refused the equivalent.
+            raise ExperimentStoreError(
+                f"{run.run_id} is {run.state}: something is still using this "
+                "worktree. Poll it with 'researchctl experiment poll', or cancel "
+                "it, before releasing the directory it is running in."
+            )
         target = Path(run.worktree_path)
         if not target.exists():
             return run, ()

@@ -70,8 +70,11 @@ itself, and no amount of disk pressure makes deleting them the right move.
 `--reclaim` releases it, through each controller's own cleanup — the automation
 controller for code and analysis runs, the experiment controller for experiment
 runs — each of which knows which worktrees it created and refuses any path
-outside them. A single run can also be released on its own with `auto cleanup`,
-`paper cleanup`, or `experiment cleanup`.
+outside them. An experiment whose job is still `submitted`, `pending` or
+`running` is refused: a cluster job's working directory *is* that worktree.
+
+A draft's worktree is not covered. Drafts are keyed by draft id rather than run
+id, so the sweep cannot find them; release one with `paper cleanup DRAFT_ID`.
 
 Branches are kept, deliberately: a branch holds the exact tree the work ran in,
 and an experiment's artifacts are recorded by path as well as content hash, so

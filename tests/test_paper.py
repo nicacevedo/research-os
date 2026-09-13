@@ -21,6 +21,7 @@ What they pin:
 
 from __future__ import annotations
 
+import argparse
 import subprocess
 from pathlib import Path
 
@@ -28,6 +29,7 @@ import pytest
 
 from research_os.automation.models import Access, Role
 from research_os.errors import (
+    EXIT_OK,
     PaperManifestError,
     PaperPacketError,
     PaperWritingError,
@@ -756,3 +758,41 @@ def test_a_scope_larger_than_anyone_would_read_is_refused(
             packet=packet,
             allowed_paths=[f"paper/section{index}.md" for index in range(20)],
         )
+
+
+def test_paper_cleanup_releases_the_worktree_and_its_lock(
+    automation_home: Path, tmp_path: Path
+) -> None:
+    """``paper cleanup`` had no test at all, and had been leaking its lock file.
+
+    It derived the lock path by changing the worktree's suffix, which named a
+    file that never existed, so every cleanup left the real one behind. Found by
+    an independent reviewer; this is the test that was missing.
+    """
+
+    from research_os.automation.worktree import lock_path as worktree_lock_path
+    from research_os.paper.commands import _cleanup
+    from research_os.paper.store import DraftStore
+
+    repo = init_paper_project(tmp_path / "paper-project")
+    provider = writer_provider(drafts=[GROUNDED_RESULTS])
+    controller = PaperController(providers={"fake": provider}, config=fake_config())
+    outcome = controller.write(
+        project_path=repo,
+        section=SectionKind.RESULTS,
+        instruction="Write the results section.",
+        packet=build_source_packet(repo),
+        allowed_paths=["paper/manuscript.md"],
+    )
+    draft = DraftStore.open(outcome.draft.draft_id).load()
+    worktree = Path(draft.worktree_path or "")
+    assert worktree.is_dir()
+    assert worktree_lock_path(worktree).exists()
+
+    args = argparse.Namespace(draft_id=draft.draft_id)
+    assert _cleanup(args) == EXIT_OK
+    assert not worktree.exists()
+    assert not worktree_lock_path(worktree).exists(), "the lock file leaked"
+
+    # Cleaning up twice is not an error.
+    assert _cleanup(args) == EXIT_OK

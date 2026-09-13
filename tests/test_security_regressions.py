@@ -560,32 +560,48 @@ def test_a_read_only_role_cannot_declare_a_write_tool() -> None:
 # -- 12. no worker-controlled text is ever quoted in a markdown fence ---------
 
 
-def test_no_prompt_builder_quotes_a_diff_in_a_bare_markdown_fence() -> None:
-    """The class of defect, not the three instances of it.
+def test_no_prompt_builder_wraps_untrusted_text_in_a_markdown_fence() -> None:
+    """The class of defect, and the version of this test that can see it.
 
-    An independent reviewer found this twice. The first time it was the
-    automation reviewer's prompt; the fixes were applied there, and the same
-    construct was still live in the paper reviewer -- the gate that keeps a
-    writing worker from approving its own draft. ``prompt_safe_block``
-    neutralises the delimiters this system assembles and has no reason to know
-    about a markdown fence, because nothing assembles one.
+    Three independent reviews found this construct three times: the automation
+    reviewer, then the paper reviewer, then the proposal assessor. Each time the
+    fix closed the instance. The first attempt at a class-wide test grepped for
+    "```diff" and therefore could not see the third, which used a bare "```".
 
-    So this asserts the absence of the construct across every module that builds
-    a prompt, which is the only version of this test that would have caught the
-    second instance.
+    So this looks for a markdown fence *anywhere* in a module that builds
+    prompts. A rendered data block is the only delimiter a prompt may put around
+    text it did not write, because only that one is assembled and re-read by the
+    prompt-data boundary and is inert inside every other block.
     """
 
     import research_os
 
     root = Path(research_os.__file__).parent
+    #: Modules that assemble prompt text. Everything else may use markdown in a
+    #: docstring or a report without it meaning anything.
+    builders = {
+        "analyst.py",
+        "context.py",
+        "planner.py",
+        "reviewer.py",
+        "writer.py",
+        "executor.py",
+        "packet.py",
+        "assessor.py",
+        "promptdata.py",
+    }
     offenders: list[str] = []
     for path in sorted(root.rglob("*.py")):
-        source = path.read_text(encoding="utf-8")
-        if "```diff" not in source:
+        if path.name not in builders:
             continue
-        offenders.append(path.relative_to(root).as_posix())
+        for number, line in enumerate(
+            path.read_text(encoding="utf-8").split("\n"), start=1
+        ):
+            stripped = line.strip().strip('"').strip("'")
+            if stripped.startswith("```"):
+                offenders.append(f"{path.relative_to(root).as_posix()}:{number}")
     assert not offenders, (
-        "these modules quote a diff inside a markdown fence rather than a "
+        "these prompt builders delimit text with a markdown fence rather than a "
         f"rendered data block: {', '.join(offenders)}"
     )
 

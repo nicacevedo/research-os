@@ -1436,3 +1436,44 @@ def test_reconciling_twice_does_not_charge_the_same_attempt_again(
     store.save(interrupted())
     twice = controller.resume(store, retry=True).model_calls_used
     assert twice == once, "the first attempt was charged a second time"
+
+
+def test_a_second_interruption_after_a_completed_attempt_is_not_double_charged(
+    research_home: Path, tmp_path: Path
+) -> None:
+    """The exact sequence a third independent review reproduced.
+
+    Plan, kill, reconcile, run to completion, kill again, reconcile again. The
+    ledger recorded an inner run's *total* under one event and a reconcile
+    *delta* under another, so the second pass compared a total against a delta
+    and charged the difference a second time. Both now publish the same running
+    total under one key.
+    """
+
+    controller, store, _run, _ = start(
+        tmp_path, plan=plan_payload(tasks=[analysis_task()])
+    )
+    complete = controller.execute(store)
+    truth = complete.model_calls_used
+
+    def interrupt() -> None:
+        current = store.load()
+        store.save(
+            current.model_copy(
+                update={
+                    "state": ResearchState.EXECUTING,
+                    "tasks": [
+                        item.model_copy(update={"status": TaskStatus.RUNNING})
+                        for item in current.tasks
+                    ],
+                }
+            )
+        )
+
+    interrupt()
+    first = controller.resume(store, retry=False).model_calls_used
+    interrupt()
+    second = controller.resume(store, retry=False).model_calls_used
+
+    assert first == truth, "reconciliation invented spend that never happened"
+    assert second == truth, "the completed attempt was charged twice"

@@ -103,7 +103,12 @@ def test_the_lock_is_reentrant_within_one_process(automation_home: Path) -> None
             assert lock_path(RUN_ID).is_file()
         # The inner block must not have released the outer block's lock.
         assert lock_path(RUN_ID).is_file()
-    assert not lock_path(RUN_ID).exists()
+    # The file stays: a flock is held on an inode, and unlinking the name is
+    # exactly what let two processes hold one run. Freeness is proved by
+    # another process being able to take it, not by the file being gone.
+    assert lock_path(RUN_ID).is_file()
+    with run_lock(RUN_ID, action="research cancel"):
+        pass
 
 
 def test_two_runs_do_not_block_each_other(automation_home: Path) -> None:
@@ -119,7 +124,9 @@ def test_two_runs_do_not_block_each_other(automation_home: Path) -> None:
 def test_the_lock_is_released_when_the_body_raises(automation_home: Path) -> None:
     with pytest.raises(ValueError), run_lock(RUN_ID, action="research run"):
         raise ValueError("the run failed")
-    assert not lock_path(RUN_ID).exists()
+    # Released, not removed: another acquisition must succeed immediately.
+    with run_lock(RUN_ID, action="research cancel"):
+        pass
 
 
 # -- contention, with a process that really holds it -------------------------
@@ -293,3 +300,76 @@ def test_a_cancel_succeeds_once_the_run_is_no_longer_held(
     )
     assert result.returncode == 0, result.stderr
     assert store.load().state is ResearchState.CANCELLED
+
+
+#: Acquire and release in a tight loop, with a witness file inside the critical
+#: section, and report how many times mutual exclusion was violated.
+STRESS = """
+import os, sys, time
+from pathlib import Path
+from research_os.runlock import run_lock
+from research_os.errors import RunLockedError
+
+witness = Path(os.environ["RUNLOCK_WITNESS"])
+violations = acquisitions = 0
+for _ in range(int(sys.argv[2])):
+    try:
+        with run_lock(sys.argv[1], action="stress"):
+            acquisitions += 1
+            try:
+                handle = os.open(witness, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                violations += 1
+            else:
+                os.close(handle)
+                time.sleep(0.0002)
+                witness.unlink(missing_ok=True)
+    except RunLockedError:
+        pass
+print(f"{violations} {acquisitions}", flush=True)
+"""
+
+
+def test_contending_processes_never_both_enter_the_critical_section(
+    automation_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The only test here that can actually observe the failure mode.
+
+    An independent reviewer measured what the previous version of this file
+    could not: give each racer one attempt and a winner that holds for 400ms,
+    and no process is ever mid-acquire while another releases -- which is the
+    only window there is. Looping acquire/release with a witness file inside the
+    critical section finds it in roughly one acquisition in fifty.
+
+    It found two real bugs this way. First an ``os.link`` takeover that unlinked
+    a live lock; then a release that unlinked the lock file *before* dropping
+    the flock, leaving one process holding an unreachable inode while the next
+    created a fresh one at the same path. Both produced two simultaneous
+    holders; this test produced 8% violations against the second.
+    """
+
+    witness = tmp_path / "witness"
+    monkeypatch.setenv("RUNLOCK_WITNESS", str(witness))
+    workers = [
+        subprocess.Popen(
+            [sys.executable, "-c", STRESS, RUN_ID, "400"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=dict(os.environ),
+        )
+        for _ in range(4)
+    ]
+    results = [process.communicate(timeout=180)[0] for process in workers]
+
+    violations = 0
+    acquisitions = 0
+    for line in results:
+        assert line.strip(), "a stress worker produced no result"
+        first, second = line.split()
+        violations += int(first)
+        acquisitions += int(second)
+    assert acquisitions > 50, f"too few acquisitions to mean anything: {acquisitions}"
+    assert violations == 0, (
+        f"{violations} of {acquisitions} acquisitions had two holders at once"
+    )

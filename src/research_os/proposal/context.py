@@ -23,7 +23,12 @@ from pathlib import Path
 from pydantic import BaseModel, ConfigDict, Field
 
 from research_os.automation.models import utc_now
-from research_os.automation.promptdata import prompt_safe, prompt_safe_block
+from research_os.automation.promptdata import (
+    REPOSITORY_FENCE,
+    prompt_safe,
+    prompt_safe_block,
+    render_data_block,
+)
 from research_os.capsule import ProjectValidationReport, validate_project
 from research_os.digests import subject_digest
 from research_os.models import Reviewable, ScientificObject
@@ -277,13 +282,22 @@ def render_science_context(context: ScienceContext) -> str:
 
     for label, body in (("Charter", context.charter), ("State", context.state)):
         if body.strip():
+            # A rendered block, not a markdown fence. These are files, and this
+            # rendering reaches the proposal assessor -- a gate. A third
+            # independent review found the bare fence here after the same
+            # construct had been fixed in three other prompts: nothing
+            # automated can write these files today, but "a gate reads
+            # repository text inside a delimiter it does not control" is the
+            # shape of the defect, and its safety should not rest on which
+            # files happen to be writable this month.
             lines.extend(
                 [
                     "",
                     f"## {label} (.research/{label.upper()}.md)",
-                    "```",
-                    prompt_safe_block(body, limit=MAX_FILE_CHARS).rstrip("\n"),
-                    "```",
+                    render_data_block(
+                        REPOSITORY_FENCE,
+                        prompt_safe_block(body, limit=MAX_FILE_CHARS).split("\n"),
+                    ),
                 ]
             )
     if context.notes:
