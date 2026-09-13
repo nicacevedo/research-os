@@ -809,24 +809,34 @@ def _empty_packet(limitations: list[str] | None = None):
     )
 
 
-def test_the_automation_reviewer_prompt_holds_only_the_two_kinds_it_declares() -> None:
-    """Three repairs of that framing paragraph have been prose only.
+def test_the_automation_reviewer_prompt_holds_only_the_kinds_it_declares(
+    tmp_path: Path,
+) -> None:
+    """Four repairs of that framing paragraph, three of them prose only.
 
-    Twice a review failed this prompt for stating a rule about its own blocks
-    that the blocks did not satisfy: first because task text moved into data
-    blocks the paragraph said carried no controller authority, then because the
-    paragraph named a marker word the implementer's report does not carry. Both
-    repairs were wording, and wording cannot be rerun.
+    The paragraph describes its own blocks, and three times a review found the
+    description untrue of the prompt: task text moved into blocks the paragraph
+    said carried no controller authority; then the paragraph named a marker word
+    the implementer's report does not carry, and a kind of block the prompt did
+    not have; then the rewrite that fixed *that* dropped the clause covering
+    repository file content, which the prompt does carry, on every real run.
 
-    This asserts what the wording claims, against the rendered prompt: the
-    blocks it contains are worker output or they are the task's own text, and
-    both kinds are actually present. A prompt that gains a third kind fails
-    here rather than in a fifth review.
+    The detector shipped with the third repair could not see the fourth, for two
+    reasons worth keeping written down. It rendered ``context_text`` as a stub,
+    so the repository-file blocks the production prompt always contains never
+    appeared in the prompt it enumerated. And it asserted a *subset* against an
+    allow-set that pre-approved two fences the paragraph names nowhere, so a
+    prompt regaining exactly the defect it was written for still passed.
+
+    Both are fixed here by construction: the context is a real packet built from
+    a real repository by the same call the controller makes, and the assertion
+    is set *equality*, so a block appearing that the paragraph does not describe
+    fails, and so does a described block going missing.
     """
 
+    from research_os.automation.context import build_context, render_context
     from research_os.automation.models import CommandResult, RiskClass, Role
     from research_os.automation.promptdata import (
-        CHECK_OUTPUT_FENCE,
         DIFF_FENCE,
         FENCES,
         REPOSITORY_FENCE,
@@ -834,15 +844,23 @@ def test_the_automation_reviewer_prompt_holds_only_the_two_kinds_it_declares() -
         WORKER_REPORT_FENCE,
     )
     from research_os.automation.reviewer import build_reviewer_prompt
+    from tests.automation_helpers import init_repo
     from tests.test_auto_models import make_order
 
-    worker_output = {
+    # Exactly the kinds the paragraph names: what the worker produced, the
+    # repository content the controller read, and the task's own text. Adding a
+    # fence here without adding a kind to the paragraph is the mistake this
+    # test exists to make impossible.
+    declared = {
         DIFF_FENCE,
         WORKER_REPORT_FENCE,
-        CHECK_OUTPUT_FENCE,
         REPOSITORY_FENCE,
+        TASK_FENCE,
     }
-    task_text = {TASK_FENCE}
+
+    repo = init_repo(tmp_path / "project")
+    packet = build_context(project_path=repo, goal="Make add return a sum.")
+    context_text = render_context(packet)
 
     prompt = build_reviewer_prompt(
         make_order(role=Role.CODER, risk_class=RiskClass.WRITE_ISOLATED),
@@ -861,28 +879,34 @@ def test_the_automation_reviewer_prompt_holds_only_the_two_kinds_it_declares() -
             )
         ],
         worker_report="I changed adder.py.",
-        context_text="(context)",
+        context_text=context_text,
     )
 
     present = {fence for fence in FENCES if fence.begin in prompt}
-    assert present, "the reviewer prompt renders no data block at all"
-    unclassified = present - worker_output - task_text
-    assert not unclassified, (
-        "the prompt carries a kind of block its framing paragraph does not "
-        f"describe: {sorted(fence.begin for fence in unclassified)}"
+    assert REPOSITORY_FENCE in present, (
+        "the fixture must reproduce the repository blocks a real run carries; "
+        "a stubbed context is how the previous version of this test went blind"
     )
-    assert present & worker_output, "the paragraph promises worker output"
-    assert present & task_text, "the paragraph promises the task's own text"
+    assert present == declared, (
+        "the prompt's blocks and its framing paragraph disagree -- extra: "
+        f"{sorted(f.begin for f in present - declared)}, missing: "
+        f"{sorted(f.begin for f in declared - present)}"
+    )
 
 
 def _worker_prompt_pairs() -> list[tuple[str, str, str]]:
     """Every prompt a worker-authored string reaches, rendered benign and hostile.
 
-    Named for what it enumerates rather than for the reviewers alone. Two delta
-    reviews in a row found this class of defect in a prompt the previous helper
-    did not build, so the two repair prompts are here as well -- and they are
-    the ones that matter most, because their reader is write-enabled rather
-    than a reviewer with no tools.
+    Named for what it enumerates rather than for the reviewers alone. Three
+    reviews in a row found this class of defect in a prompt the previous version
+    of this helper did not build, so the repair prompts are here, and so is the
+    writer's own first prompt -- the manuscript it is given is what a previous
+    writer invocation left on disk, which makes it worker-authored text going
+    back into a write-enabled worker.
+
+    Add a prompt here when one is added to the system. A prompt this builder
+    does not render is a prompt no property below can defend, and that is how
+    the last three instances were reached.
 
     Each entry renders the same prompt twice from the same structure, varying
     only the worker-authored strings. Anything the controller writes is
@@ -896,6 +920,7 @@ def _worker_prompt_pairs() -> list[tuple[str, str, str]]:
     from research_os.paper.models import SectionKind, SourceManifest
     from research_os.paper.reviewer import build_writing_review_prompt
     from research_os.paper.writer import build_repair_prompt as build_paper_repair
+    from research_os.paper.writer import build_writer_prompt
     from tests.test_auto_models import make_order
 
     benign = "The adder returned the wrong sum for negative inputs."
@@ -922,9 +947,26 @@ def _worker_prompt_pairs() -> list[tuple[str, str, str]]:
 
     pairs: list[tuple[str, str, str]] = []
 
+    def order(text: str):
+        """A work order whose free text is the pair's own text.
+
+        ``goal`` and ``completion_condition`` are written by the research
+        planner, not by a human, and they reach both automation prompts through
+        ``TASK_FENCE``. Holding them fixed left those fences invisible to the
+        property below -- unfencing them changed nothing the test rendered.
+        """
+
+        return make_order(
+            role=Role.CODER,
+            risk_class=RiskClass.WRITE_ISOLATED,
+            goal=text,
+            completion_condition=text,
+            title=text,
+        )
+
     def automation_reviewer(text: str) -> str:
         return build_reviewer_prompt(
-            make_order(role=Role.CODER, risk_class=RiskClass.WRITE_ISOLATED),
+            order(text),
             diff=text,
             check_results=[result(0)],
             worker_report=text,
@@ -941,7 +983,7 @@ def _worker_prompt_pairs() -> list[tuple[str, str, str]]:
 
     def automation_repair(text: str) -> str:
         return build_repair_prompt(
-            make_order(role=Role.CODER, risk_class=RiskClass.WRITE_ISOLATED),
+            order(text),
             reason="a required check failed",
             diff=text,
             failed_checks=[result(1)],
@@ -996,6 +1038,21 @@ def _worker_prompt_pairs() -> list[tuple[str, str, str]]:
         )
 
     pairs.append(("writing repair", writing_repair(benign), writing_repair(hostile)))
+
+    def writer(text: str) -> str:
+        return build_writer_prompt(
+            section=SectionKind.RESULTS,
+            instruction=text,
+            packet=_empty_packet([text]),
+            allowed_paths=["paper/manuscript.md"],
+            # What a previous writer invocation left in the worktree. The
+            # controller reads it back with ``read_written`` and hands it to the
+            # next writer, so it is worker-authored text reaching a write-enabled
+            # reader -- and it was the one such channel no test rendered.
+            existing={"paper/manuscript.md": text},
+        )
+
+    pairs.append(("writer", writer(benign), writer(hostile)))
     return pairs
 
 

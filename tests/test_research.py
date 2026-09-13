@@ -1596,9 +1596,9 @@ def test_a_dispatch_is_numbered_before_it_is_attempted(
 
 
 def test_a_dispatch_that_dies_after_its_directory_exists_burns_its_number(
-    research_home: Path, tmp_path: Path
+    research_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The failure the pre-dispatch event exists to prevent, reproduced.
+    """The failure the pre-dispatch event exists to prevent, driven for real.
 
     ``AutomationController.start`` creates the run directory and then does more
     work -- context, planning -- any of which can fail. When it does, the
@@ -1608,50 +1608,79 @@ def test_a_dispatch_that_dies_after_its_directory_exists_burns_its_number(
     just found. Only a retry inside the same UTC second collides, which is
     exactly what a prompt ``resume --retry`` is.
 
-    Asserted against the event stream such a failure leaves rather than by
-    killing a real dispatch, so the collision is deterministic rather than a
-    race the test has to win.
+    A first version of this test hand-wrote the event and compared run ids. A
+    release gate pointed out that it proved nothing: with no dispatch executed,
+    its closing comparison reduced to ``make_run_id(X) == make_run_id(X)``, and
+    the rest was a property of ``make_run_id``'s signature rather than of the
+    dispatch path. So this one kills a real dispatch inside ``start``, freezes
+    the clock so the retry lands in the colliding second, and lets the retry run.
     """
 
-    from research_os.automation.store import make_run_id
-    from research_os.research.controller import ResearchController
+    from research_os.automation import controller as automation_controller
 
-    controller, store, run, _ = start(
+    controller, store, _run, _ = start(
         tmp_path, plan=plan_payload(tasks=[analysis_task()])
     )
-    del controller
 
-    # What a dispatch that died inside ``start`` leaves behind: it was numbered,
-    # and it never started.
-    store.append_event("automation_dispatch_attempted", task_id="T-001", attempt=1)
+    # Every dispatch now shares one second, which is the only case in which two
+    # run ids can collide at all.
+    monkeypatch.setattr(
+        automation_controller, "utc_now", lambda: "2026-09-13T10:15:00Z"
+    )
 
-    started = sum(
-        1
+    real_build_context = automation_controller.build_context
+    attempts: list[int] = []
+
+    def die_on_the_first_dispatch(**kwargs: object):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise RuntimeError("the worker died after the run directory existed")
+        return real_build_context(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        automation_controller, "build_context", die_on_the_first_dispatch
+    )
+
+    with pytest.raises(RuntimeError):
+        controller.execute(store)
+
+    # The directory the dead dispatch created is still there, and it wrote no
+    # ``automation_run_started`` -- which is what made the old counter blind.
+    numbered = [
+        record
+        for record in store.iter_events()
+        if record.get("event") == "automation_dispatch_attempted"
+    ]
+    started = [
+        record
         for record in store.iter_events()
         if record.get("event") == "automation_run_started"
-    )
-    assert started == 0, "the fixture must leave no started event"
-    assert ResearchController._delegated_attempts(store, "T-001") == 1, (
-        "the dead dispatch must still count against the task"
-    )
+    ]
+    assert [record["attempt"] for record in numbered] == [1]
+    assert not started, "the fixture must leave a dispatch that never started"
 
-    # Both dispatches share everything a run id is derived from, including the
-    # second -- the only case in which the ids can collide at all.
-    same = {
-        "project_path": run.project_path,
-        "goal": "Make add return a sum.",
-        "created_at": "2026-09-13T10:15:00Z",
-    }
-    dead = make_run_id(**same, attempt="T-001#1")
-    retry = make_run_id(
-        **same,
-        attempt=f"T-001#{ResearchController._delegated_attempts(store, 'T-001') + 1}",
-    )
-    assert retry != dead, "the retry reused the dead dispatch's run id"
+    # The retry, in the same second, against the same project and goal. Without
+    # the pre-dispatch event this raises RunStoreError: run directory already
+    # exists.
+    recovered = controller.resume(store, retry=True)
+    controller.execute(store)
+    del recovered
 
-    # And the counter this replaced -- one over the *started* events -- hands
-    # back the dead dispatch's own id.
-    assert make_run_id(**same, attempt=f"T-001#{started + 1}") == dead
+    numbered = [
+        record
+        for record in store.iter_events()
+        if record.get("event") == "automation_dispatch_attempted"
+    ]
+    assert [record["attempt"] for record in numbered] == [1, 2], (
+        "the retry reused the dead dispatch's attempt number"
+    )
+    started = [
+        record
+        for record in store.iter_events()
+        if record.get("event") == "automation_run_started"
+    ]
+    assert len(started) == 1
+    assert started[0]["automation_run_id"] != numbered[0].get("automation_run_id")
 
 
 def test_two_delegated_runs_on_one_task_are_not_double_charged(

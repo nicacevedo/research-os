@@ -87,7 +87,8 @@ def build_coder_prompt(
 controller. You are running inside a disposable, isolated Git worktree created
 for this task alone. It is not the researcher's checkout.
 
-TASK {order.task_id}: {prompt_safe(order.title, limit=MAX_LABEL_CHARS)}
+TASK {order.task_id}
+{render_data_block(TASK_FENCE, [prompt_safe(order.title, limit=MAX_LABEL_CHARS)])}
 {_dependency_section(order, dependency_data)}
 
 GOAL
@@ -215,7 +216,8 @@ This is the only repair attempt this run allows. After you stop, the controller
 re-runs every required acceptance command. If any of them still fails, the task
 fails; there is no third attempt, so do not leave anything half-finished.
 
-TASK {order.task_id}: {prompt_safe(order.title, limit=MAX_LABEL_CHARS)}
+TASK {order.task_id}
+{render_data_block(TASK_FENCE, [prompt_safe(order.title, limit=MAX_LABEL_CHARS)])}
 
 GOAL
 {render_data_block(TASK_FENCE, prompt_safe_block(order.goal, limit=MAX_FREE_TEXT_CHARS).split(chr(10)))}

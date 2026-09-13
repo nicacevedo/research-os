@@ -96,11 +96,14 @@ def build_writing_review_prompt(
 ) -> str:
     """Return the frozen packet a writing reviewer judges."""
 
-    truncated = render_data_block(
-        DIFF_FENCE, prompt_safe_block(diff, limit=MAX_DIFF_CHARS).split("\n")
-    )
+    # The truncation notice goes *inside* the block, as the automation reviewer's
+    # equivalent already does. Outside it, whether the line appears at all is a
+    # bit the writer controls by choosing how long a diff to produce -- the only
+    # byte of this prompt's own voice that a worker could influence.
+    diff_body = prompt_safe_block(diff, limit=MAX_DIFF_CHARS).split("\n")
     if len(diff) > MAX_DIFF_CHARS:
-        truncated += "\n[diff truncated for review]\n"
+        diff_body.append("[diff truncated for review]")
+    truncated = render_data_block(DIFF_FENCE, diff_body)
     # Fenced, and for a reason that is not obvious from the variable name: a
     # check's *message* is the controller's own wording, but its *detail* often
     # quotes what the writer put in the prose -- a citation key it invented, an

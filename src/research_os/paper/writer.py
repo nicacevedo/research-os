@@ -126,7 +126,7 @@ def build_writer_prompt(
     if existing:
         blocks = []
         for path, text in sorted(existing.items()):
-            blocks.append(f"--- {path} ---")
+            blocks.append(f"--- {prompt_safe(path, limit=MAX_LABEL_CHARS)} ---")
             blocks.append(prompt_safe_block(text, limit=40_000))
         current = f"""
 THE MANUSCRIPT AS IT STANDS

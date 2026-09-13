@@ -500,7 +500,7 @@ run the two quantities coincide.
 
 | Exercise | Result |
 | --- | --- |
-| Full suite | **2,202 passed** |
+| Full suite | **2,202 passed** in 730s |
 | Ruff check / format / `git diff --check` | clean |
 | R0 scientific regression | **411 passed**; digests and models byte-unchanged |
 | Synthetic end-to-end, real CLI | **22/22** |
@@ -581,6 +581,13 @@ its disposition. Nothing is omitted because later code changed.
 | F11 | `paper/writer.py::build_repair_prompt` had no test at all | FIXED | covered by F1's pair builder; mutation-tested |
 | F12 | This ledger omitted the findings its own commit repaired | FIXED | these rows |
 | F9 | New event records `attempt` but not the inner run id | **DEFERRED** | stated below |
+| G1 | F5's detector rendered a stubbed context and asserted a subset against a pre-approved allow-set; the F5 relapse passed it | FIXED | real context packet, set equality; relapse now caught |
+| G2 | The framing paragraph's rewrite dropped the clause covering repository file content, which the prompt does carry | FIXED | as G1 |
+| G3 | `_worker_prompt_pairs` omitted `build_writer_prompt`, whose manuscript is worker-authored and whose reader is write-enabled | FIXED | prompt added; unfencing it now caught |
+| G4 | `..._burns_its_number` hand-wrote its own event; its closing assertion reduced to `make_run_id(X) == make_run_id(X)` | FIXED | rewritten to kill a real dispatch inside `start` |
+| G5 | Eighth instance: `order.title`, written by the research planner, outside every block in four prompts | FIXED | as G3 |
+| G6 | `[diff truncated for review]` sat outside the block; its presence is worker-influenced | FIXED | moved inside, matching the automation reviewer |
+| G7 | Manuscript path separators in `build_writer_prompt` unsanitised | FIXED | `prompt_safe` |
 
 ### The property that ended the series
 
@@ -661,6 +668,54 @@ project have passed by not exercising what they named -- the lock racer, the
 builder. The correction is not more tests; it is asserting the property rather
 than the instance, and then mutating the implementation to prove the assertion
 can fail.
+
+### The gate that caught the detectors
+
+The final release gate returned no BLOCKER and two REGRESSIONs, and both were
+about the two detectors the previous commit had just shipped as its headline
+work. Neither detected what its docstring claimed.
+
+`test_the_automation_reviewer_prompt_holds_only_the_two_kinds_it_declares` was
+written so that "a prompt that gains a third kind fails here rather than in a
+fifth review". It could not. It rendered `context_text` as the literal string
+`"(context)"`, so the `REPOSITORY FILE` blocks the production prompt carries on
+every real run -- `AutomationController._invoke_reviewer` passes a full rendered
+context packet -- never appeared in the prompt it enumerated. And it asserted a
+*subset* against an allow-set that pre-approved `REPOSITORY_FENCE` and
+`CHECK_OUTPUT_FENCE`, two kinds the paragraph names nowhere. Reinstating the
+exact defect it was written for -- the acceptance-check list back inside a
+`CHECK OUTPUT (UNTRUSTED PROGRAM OUTPUT)` block -- passed the whole file.
+
+Worse, the paragraph it was guarding had become false in a new way. The rewrite
+that closed F5 dropped the clause "file content from its worktree", which the
+previous wording had, while keeping the "Two kinds" framing. The prompt carries
+three.
+
+`_worker_prompt_pairs` opened "Every prompt a worker-authored string reaches".
+It built four and there are five: `build_writer_prompt` is handed the manuscript
+as a previous writer invocation left it on disk, which is worker-authored text
+going back into a *write-enabled* reader. Unfencing it left the entire suite
+green.
+
+The repairs are structural rather than another instance. The kind-enumeration
+test now builds its context with the same `build_context` call the controller
+makes, and asserts set *equality*, so an undescribed block fails and so does a
+described one going missing. The pair builder gained the writer's prompt, and
+gained the order's own free text -- `goal`, `completion_condition`, `title` --
+which it had been holding fixed, making every `TASK_FENCE` site invisible to it.
+
+Varying that text immediately failed the property, which is how the eighth
+instance of this defect was found: `order.title`, written by the research
+planner, interpolated on the `TASK T-001: ...` line outside every data block in
+four prompts. The task id is regex-pinned and stays in the controller's voice;
+the title moved inside the block.
+
+Three tests in this project have now been *proven* by an outside reviewer to
+pass without exercising what they name, on top of the four found earlier. The
+count matters more than any individual fix: the lesson the build record keeps
+re-learning is that a test written alongside its fix tends to encode the fix's
+assumptions, and only mutation -- restoring the defect and demanding the test
+fail -- distinguishes a detector from a decoration.
 
 ### Deferred, with stated residual risk
 

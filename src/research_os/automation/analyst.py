@@ -140,7 +140,8 @@ You have exactly three tools: Read, Glob, and Grep. You have no Write, no Edit,
 and no Bash. You cannot change a file, run a command, run the tests, commit, or
 install anything, so do not plan to: report what you established by reading.
 
-TASK {order.task_id}: {prompt_safe(order.title, limit=MAX_LABEL_CHARS)}
+TASK {order.task_id}
+{render_data_block(TASK_FENCE, [prompt_safe(order.title, limit=MAX_LABEL_CHARS)])}
 
 GOAL
 {render_data_block(TASK_FENCE, prompt_safe_block(order.goal, limit=MAX_FREE_TEXT_CHARS).split(chr(10)))}
