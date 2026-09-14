@@ -201,22 +201,12 @@ def build_research_plan_prompt(
 themselves: spending real compute, changing the project's direction, or
 accepting a scientific conclusion. The controller stops there and waits."""
         if checkpoint_policy is CheckpointPolicy.STANDARD
-        else """THIS RUN IS UNATTENDED.
-
-It was started with the scientific-only checkpoint policy, which means nobody is
-waiting to answer you. Only a HARD checkpoint may stop it: """
+        else """This run is unattended, so nobody is waiting to answer a question.
+Only a hard checkpoint may stop it: """
         + ", ".join(sorted(item.value for item in HARD_CHECKPOINT_KINDS))
         + """.
-
-Do not plan a checkpoint to ask whether to continue, which of two reasonable
-options to take, or whether the plan looks right. Decide it, say in the task
-goal what you decided and why, and carry on -- the researcher reads the whole
-run afterwards and can disagree with a decision that is written down.
-Any plan containing a discretionary checkpoint is refused.
-
-Plan a hard checkpoint when the next action would genuinely cross a boundary of
-human scientific authority, and say which boundary in the question. Those still
-stop the run, and nothing about this policy changes that."""
+Any plan containing a discretionary checkpoint is refused. Where you would have
+asked, decide, and say in the task goal what you decided."""
     )
     proposal_kind = (
         """turn what is known into structured, reviewable scientific

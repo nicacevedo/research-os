@@ -438,9 +438,10 @@ def test_the_scientific_only_prompt_says_nobody_is_waiting() -> None:
         declared_experiments=[],
         checkpoint_policy=CheckpointPolicy.SCIENTIFIC_ONLY,
     )
-    assert "THIS RUN IS UNATTENDED" in prompt
+    assert "This run is unattended" in prompt
     assert "prespecified_change" in prompt
     assert "Any plan containing a discretionary checkpoint is refused." in prompt
+    assert "Where you would have" in prompt
 
 
 def test_the_standard_prompt_is_unchanged_in_substance() -> None:
@@ -452,7 +453,7 @@ def test_the_standard_prompt_is_unchanged_in_substance() -> None:
         declared_experiments=[],
         checkpoint_policy=CheckpointPolicy.STANDARD,
     )
-    assert "THIS RUN IS UNATTENDED" not in prompt
+    assert "This run is unattended" not in prompt
     assert "The controller stops there and waits." in prompt
 
 
