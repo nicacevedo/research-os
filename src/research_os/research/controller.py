@@ -299,6 +299,10 @@ class ResearchController:
             science_context=render_science_context(science),
             repository_context=render_context(repository),
             declared_experiments=sorted(declared),
+            experiment_parameters={
+                name: [_describe_parameter(item) for item in spec.parameters]
+                for name, spec in sorted(declared.items())
+            },
             insight_section=insights_for(run.goal, project_id=run.project_id),
             execute_experiments=run.execute_experiments,
             allowed_programs=self.config.allowed_check_programs,
@@ -1795,6 +1799,44 @@ class ResearchController:
             for item in run.tasks
         ]
         return store.save(run.model_copy(update={"tasks": tasks}))
+
+
+def _bound(value: float | None, unbounded: str) -> str:
+    """Render one numeric bound the way the researcher declared it.
+
+    ``minimum`` and ``maximum`` are floats on the model, so an integer seed
+    bounded at 0 and 7 would otherwise be shown to the planner as "0.0..7.0" --
+    a range that looks like it accepts 3.5 and does not.
+    """
+
+    if value is None:
+        return unbounded
+    return str(int(value)) if float(value).is_integer() else str(value)
+
+
+def _describe_parameter(parameter: object) -> str:
+    """Render one declared experiment parameter as the planner needs to see it.
+
+    Name, type, whether it is required, and the bound or choice set it will be
+    checked against. Everything the validator will hold the plan to, said before
+    the plan is written rather than after it is refused.
+    """
+
+    name = getattr(parameter, "name", "?")
+    kind = getattr(parameter, "type", "")
+    detail = [f"{name} ({kind}"]
+    detail.append(
+        ", required" if getattr(parameter, "required", False) else ", optional"
+    )
+    minimum = getattr(parameter, "minimum", None)
+    maximum = getattr(parameter, "maximum", None)
+    if minimum is not None or maximum is not None:
+        detail.append(f", {_bound(minimum, '-inf')}..{_bound(maximum, 'inf')}")
+    choices = getattr(parameter, "choices", None)
+    if choices:
+        detail.append(", one of: " + ", ".join(str(item) for item in choices))
+    detail.append(")")
+    return "".join(detail)
 
 
 def _checkpoint_context(

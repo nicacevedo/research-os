@@ -151,6 +151,7 @@ def build_research_plan_prompt(
     science_context: str,
     repository_context: str,
     declared_experiments: list[str],
+    experiment_parameters: dict[str, list[str]] | None = None,
     insight_section: str = "",
     execute_experiments: bool = False,
     allowed_programs: tuple[str, ...] = (),
@@ -161,8 +162,22 @@ def build_research_plan_prompt(
 ) -> str:
     """Return the complete prompt for the research planner."""
 
+    # The declared commands *and* what each of them requires. Listing only the
+    # names was a defect a live pilot paid for twice: the validator refuses a
+    # plan that omits a required parameter -- correctly, since the researcher
+    # declared it -- and the prompt had never said the parameter existed. The
+    # controller knew, and did not say.
+    parameters = experiment_parameters or {}
     experiments = (
-        "\n".join(f"    {item}" for item in declared_experiments)
+        "\n".join(
+            f"    {item}"
+            + (
+                "\n        parameters: " + ", ".join(parameters[item])
+                if parameters.get(item)
+                else "\n        parameters: none"
+            )
+            for item in declared_experiments
+        )
         or "    (none - this project has declared no experiment commands, so an\n"
         "     experiment task cannot be dispatched)"
     )
@@ -261,9 +276,10 @@ out. "depends_on" is a list of earlier task ids, on any kind that needs one.
 - "code": {code_kind}
 - "experiment": run a command the researcher has already declared. Sets
   "experiment_task" to one of the declared commands below and
-  "experiment_parameters" to that command's declared parameters, as strings.
-  You cannot add a command, change its argv, or introduce a parameter it did
-  not declare. This is the only kind that can spend real compute.
+  "experiment_parameters" to a value for every parameter that command lists as
+  required, as strings. A plan that omits one is refused. You cannot add a
+  command, change its argv, or introduce a parameter it did not declare. This
+  is the only kind that can spend real compute.
 - "paper": draft a manuscript section from accepted claims. Sets
   "allowed_paths" and "section".
 - "human_checkpoint": stop and ask the researcher something. Sets "question" to

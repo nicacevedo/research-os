@@ -2089,3 +2089,61 @@ def test_the_exact_plan_that_reached_ready_for_human_is_refused() -> None:
     }
     with pytest.raises(ResearchPlanError, match="placeholder"):
         assert_plan_says_something(ResearchPlan.model_validate(payload))
+
+
+def test_the_prompt_names_every_declared_experiment_parameter() -> None:
+    """A plan cannot satisfy a rule it was never told about.
+
+    The validator refuses an experiment task that omits a required parameter --
+    correctly, because the researcher declared it. The prompt listed only the
+    command *names*, so a planner could not know the parameter existed. Two live
+    Pilot E attempts were refused for exactly that, one release after the
+    validator was completed and the prompt was not.
+    """
+
+    prompt = build_research_plan_prompt(
+        goal="Measure the estimator.",
+        budget=ResearchBudget(),
+        science_context="",
+        repository_context="",
+        declared_experiments=["compare-estimators", "sweep"],
+        experiment_parameters={
+            "compare-estimators": ["seed (integer, required, 0..7)"],
+            "sweep": [],
+        },
+    )
+    assert "seed (integer, required, 0..7)" in prompt
+    assert "parameters: none" in prompt
+    assert "A plan that omits one is refused." in prompt
+
+
+def test_a_command_with_no_parameters_says_none() -> None:
+    prompt = build_research_plan_prompt(
+        goal="Run it.",
+        budget=ResearchBudget(),
+        science_context="",
+        repository_context="",
+        declared_experiments=["fit-model"],
+    )
+    assert "fit-model" in prompt
+    assert "parameters: none" in prompt
+
+
+def test_a_declared_parameter_is_described_with_what_it_is_checked_against() -> None:
+    from research_os.experiment.models import ParameterSpec
+    from research_os.research.controller import _describe_parameter
+
+    assert (
+        _describe_parameter(
+            ParameterSpec(
+                name="seed", type="integer", required=True, minimum=0, maximum=7
+            )
+        )
+        == "seed (integer, required, 0..7)"
+    )
+    assert (
+        _describe_parameter(
+            ParameterSpec(name="mode", type="choice", choices=["fast", "exact"])
+        )
+        == "mode (choice, optional, one of: fast, exact)"
+    )
