@@ -412,29 +412,59 @@ FILLER: frozenset[str] = frozenset(
         "a",
         "an",
         "and",
+        "answer",
         "basic",
         "data",
+        "description",
         "dummy",
+        "first",
         "for",
         "generic",
         "goal",
         "here",
         "minimal",
         "of",
+        "one",
+        "output",
         "plan",
         "query",
+        "result",
+        "results",
         "sample",
+        "second",
         "simple",
         "step",
         "stuff",
+        "summary",
         "task",
         "the",
         "thing",
         "things",
+        "third",
         "this",
+        "three",
+        "title",
         "to",
+        "two",
     }
 )
+
+#: The shortest a field a researcher reads may be and still say anything.
+#:
+#: Two characters. Not a style rule and not a guess at what is interesting: a
+#: title of "t", a goal of "g" and a literature query of "q" are not terse, they
+#: are empty, and the placeholder guard could not see them because a single
+#: letter is neither a known placeholder word nor a word carrying subject
+#: matter.
+#:
+#: Found live, and the way it was found is the reason the bound is here rather
+#: than in a longer word list. A run against a real repository was handed
+#: ``{"summary": "test summary two", "tasks": [{"title": "t", "goal": "g",
+#: "query": "q"}]}``, searched three literature providers for "q", and reported
+#: READY_FOR_HUMAN. The build record describes the same shape of failure one
+#: release earlier, caught then by adding words; this is the rule that does not
+#: depend on having guessed the word.
+MIN_FIELD_CHARS = 3
 
 
 def _tokens(value: str) -> list[str]:
@@ -451,36 +481,54 @@ def _tokens(value: str) -> list[str]:
 def _is_placeholder(value: str) -> bool:
     """Return whether ``value`` says nothing but "this is a placeholder".
 
-    True when at least one token is a placeholder and no token carries any
-    subject matter -- so "test", "TBD.", a bare "...", and "Test task" are all
-    refused, while "Read the field", "Testing the estimator" and any title with
-    a real noun in it are not.
+    Two independent rules, because there are two ways for a field to say
+    nothing and only one of them is about words.
 
-    Both halves matter. Requiring a placeholder token keeps the rule from
-    grading ordinary terse prose; requiring every *other* token to be structural
-    filler is what closes the gap the release pilot found.
+    **Too short to say anything.** A field of one or two characters carries no
+    subject matter whatever those characters are. This is the rule that does not
+    depend on having guessed a word in advance: "t", "g" and "q" are caught by
+    it, and they were not caught by anything before it existed.
+
+    **No token carries subject matter.** Every token is either a known
+    placeholder or a structural word -- so "test", "TBD.", a bare "...", "Test
+    task", "test summary two" and "summary two" are all refused, while "Read the
+    field", "Testing the estimator" and any field with a real noun in it are
+    not.
+
+    That second rule is stronger than the one this guard shipped with, which
+    additionally required *at least one* token to be a known placeholder. Each
+    live pilot has found the same hole from a different angle -- "test", then
+    "Test task", then "test summary two" -- and each time the repair was to
+    guess one more word. The prompt asks for fields that say something specific
+    about this project and this goal; a field built entirely out of structural
+    words says nothing specific by construction, whether or not "test" happens
+    to be one of them.
+
+    The trade is deliberate and it is asymmetric. A false positive costs a
+    researcher one re-run of a goal they still have. A false negative cost a
+    real run against a real repository three literature providers searched for
+    "q" and a report of READY_FOR_HUMAN with nothing behind it.
     """
 
+    stripped = value.strip()
+    if not stripped:
+        return False
+    if len(stripped) < MIN_FIELD_CHARS:
+        return True
     tokens = _tokens(value)
     if not tokens:
         return False
-    seen_placeholder = False
-    for token in tokens:
-        if token in PLACEHOLDERS:
-            seen_placeholder = True
-            continue
-        if token in FILLER:
-            continue
-        return False
-    return seen_placeholder
+    return all(token in PLACEHOLDERS or token in FILLER for token in tokens)
 
 
 def _assert_not_a_placeholder(value: str, *, what: str, where: str) -> None:
     if _is_placeholder(value):
         raise ResearchPlanError(
             f"{where} is {value.strip()!r}, which is a placeholder rather than "
-            f"{what}. The planner did not produce a usable plan, so nothing was "
-            "run. Try again, or raise the model-call budget."
+            f"{what}. Every one of these is read by the researcher and has to "
+            "say something specific about their project and their goal. The "
+            "planner did not produce a usable plan, so nothing was run. Try "
+            "again, or raise the model-call budget."
         )
 
 

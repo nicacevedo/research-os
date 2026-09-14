@@ -51,6 +51,8 @@ from research_os.research.planner import (
     PLAN_SCHEMA,
     PlannedTask,
     ResearchPlan,
+    _is_placeholder,
+    assert_plan_says_something,
     build_research_plan_prompt,
     parse_research_plan,
     to_tasks,
@@ -2014,3 +2016,76 @@ def test_a_failed_proposal_task_charges_the_run_for_what_it_spent(
     assert after - before == failed["model_calls"], (
         "the run was charged exactly what the failed proposal spent"
     )
+
+
+# -- the degenerate plans each live pilot has produced ------------------------
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "test",
+        "TBD.",
+        "...",
+        "Test task",
+        "test summary two",
+        "summary two",
+        "t",
+        "g",
+        "q",
+        "x",
+        "the data",
+        "a plan",
+    ],
+)
+def test_a_field_that_says_nothing_is_refused(value: str) -> None:
+    """Every shape of degenerate field a live pilot has actually produced.
+
+    Three releases have found this hole from three angles: "test", then "Test
+    task", then `{"summary": "test summary two", "title": "t", "goal": "g",
+    "query": "q"}` -- which reached READY_FOR_HUMAN having searched three
+    literature providers for "q".
+    """
+
+    assert _is_placeholder(value) is True
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "Read the field",
+        "Testing the estimator",
+        "fix",
+        "Re-score Gate E.4 as a sensitivity disclosure",
+        "Assess the solver's restart rule",
+        "widget deformation under load",
+        "Recover the Gate E.4 table",
+    ],
+)
+def test_terse_but_real_prose_is_not_refused(value: str) -> None:
+    """The guard grades emptiness, not brevity."""
+
+    assert _is_placeholder(value) is False
+
+
+def test_the_exact_plan_that_reached_ready_for_human_is_refused() -> None:
+    """The live payload, replayed verbatim.
+
+    Recorded from a real run against cuPDLP.jl. It validated, executed, searched
+    crossref and openalex for "q", and reported success.
+    """
+
+    payload = {
+        "summary": "test summary two",
+        "tasks": [
+            {
+                "id": "T-001",
+                "kind": "literature",
+                "title": "t",
+                "goal": "g",
+                "query": "q",
+            }
+        ],
+    }
+    with pytest.raises(ResearchPlanError, match="placeholder"):
+        assert_plan_says_something(ResearchPlan.model_validate(payload))
