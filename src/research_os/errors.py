@@ -295,6 +295,37 @@ class PromotionRefusedError(ProposalError):
     """
 
 
+class AssessmentError(ResearchOSError):
+    """A technical assessment could not be produced, stored, or trusted.
+
+    Its own family rather than a kind of :class:`ProposalError`, because the two
+    objects have different authority and conflating their failures is the first
+    step to conflating the objects. A proposal is proposed science; an
+    assessment is a reading of a repository and is never science at all.
+    """
+
+
+class AssessmentValidationError(AssessmentError):
+    """The assessment a worker returned is not a usable assessment."""
+
+
+class AssessmentGroundingError(AssessmentValidationError):
+    """The assessment cited something this run did not supply.
+
+    A subclass because every grounding failure is a validation failure, and
+    separate because exactly one of them is eligible for the single bounded
+    correction. A caller that catches the parent still fails closed.
+    """
+
+
+class AssessmentStoreError(AssessmentError):
+    """The assessment store could not be read or written."""
+
+
+class AssessmentNotFoundError(AssessmentError):
+    """No assessment with that id exists."""
+
+
 class ExperimentError(ResearchOSError):
     """Base class for experiment-execution failures.
 

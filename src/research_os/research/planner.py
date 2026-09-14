@@ -136,6 +136,7 @@ def build_research_plan_prompt(
     execute_experiments: bool = False,
     allowed_programs: tuple[str, ...] = (),
     profile_context: str = "",
+    capsule_present: bool = True,
 ) -> str:
     """Return the complete prompt for the research planner."""
 
@@ -145,6 +146,20 @@ def build_research_plan_prompt(
         "     experiment task cannot be dispatched)"
     )
     programs = ", ".join(sorted(allowed_programs)) or "none"
+    proposal_kind = (
+        """turn what is known into structured, reviewable scientific
+  proposals -- questions, hypotheses, experiments, claims. Sets no key of its
+  own. Produces nothing the project accepts; a human promotes anything worth
+  keeping."""
+        if capsule_present
+        else """produce a grounded TECHNICAL ASSESSMENT of this
+  repository. Sets no key of its own. This project has no Research Capsule, so
+  there is no scientific proposal to make and no scientific identifier to cite:
+  the controller dispatches this task to the assessment worker, which reasons
+  about repository files, deterministic checks and retrieved literature. Use it
+  when the goal asks what state this repository is in or what to do next with
+  it."""
+    )
     execution = (
         "Experiments in this run ARE authorised to execute."
         if execute_experiments
@@ -180,10 +195,7 @@ out. "depends_on" is a list of earlier task ids, on any kind that needs one.
   snapshot, with Read, Glob, and Grep and nothing else. Sets "read_paths" to
   the repository-relative paths the analysis should concentrate on. Use it when
   the goal needs the code understood before it can be changed.
-- "proposal": turn what is known into structured, reviewable scientific
-  proposals -- questions, hypotheses, experiments, claims. Sets no key of its
-  own. Produces nothing the project accepts; a human promotes anything worth
-  keeping.
+- "proposal": {proposal_kind}
 - "code": a write-enabled implementation in an isolated worktree. Sets
   "allowed_paths" to the paths it may change and "acceptance_commands" to the
   argument vectors the controller will run to verify it, for example

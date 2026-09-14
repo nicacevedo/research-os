@@ -29,6 +29,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from research_os.assessment.controller import AssessmentController
 from research_os.automation.config import AutomationConfig, ResolvedRoles, resolve_roles
 from research_os.automation.context import build_context, render_context
 from research_os.automation.controller import (
@@ -50,7 +51,7 @@ from research_os.automation.planner import (
     PlannedRole,
     PlannedTask,
 )
-from research_os.automation.profile import render_project_profile
+from research_os.automation.profile import ProvenanceMode, render_project_profile
 from research_os.automation.projectcontext import ResolvedProject, resolve_project
 from research_os.automation.providers import (
     InvocationRequest,
@@ -60,6 +61,8 @@ from research_os.automation.providers import (
 )
 from research_os.automation.store import make_run_id
 from research_os.errors import (
+    AssessmentError,
+    AssessmentGroundingError,
     AutomationError,
     BudgetExceededError,
     ExperimentError,
@@ -147,6 +150,7 @@ MINIMUM_CALLS: dict[TaskKind, int] = {
 #: Caught so the run's own record says which task failed and why, then re-raised
 #: unchanged: a research run must not turn another layer's refusal into a success.
 WORKER_ERRORS = (
+    AssessmentError,
     AutomationError,
     ExperimentError,
     InsightError,
@@ -291,6 +295,7 @@ class ResearchController:
             execute_experiments=run.execute_experiments,
             allowed_programs=self.config.allowed_check_programs,
             profile_context=render_project_profile(project.profile),
+            capsule_present=project.profile.capsule_present,
         )
         run, plan = self._planned(
             store,
@@ -754,6 +759,119 @@ class ResearchController:
         )
 
     def _run_proposal(
+        self, store: ResearchStore, run: ResearchRun, task_id: str
+    ) -> ResearchRun:
+        """Reason about this project in whichever universe it actually has.
+
+        One task kind, two provenance modes, and the controller picks. A project
+        with a Research Capsule gets the scientific proposal pipeline, whose
+        citations are Questions, Hypotheses, Claims and Evidence. A project
+        without one gets a technical assessment, whose citations are repository
+        files, deterministic checks and retrieved works.
+
+        The choice is made from :class:`ProjectProfile`, which was established
+        deterministically before the planner was asked anything. A worker cannot
+        reach it, and that is the point: v1.0.0's capsule-less pilot failed
+        because the worker was handed the scientific universe for a project that
+        had none, so the only identifiers available to it were invented ones.
+        """
+
+        mode = self._provenance_mode(run)
+        if mode is ProvenanceMode.REPOSITORY_ASSESSMENT:
+            return self._run_assessment(store, run, task_id)
+        return self._run_scientific_proposal(store, run, task_id)
+
+    @staticmethod
+    def _provenance_mode(run: ResearchRun) -> ProvenanceMode:
+        """Return the provenance mode this run's project was profiled into.
+
+        A run recorded before v1.1 carries no profile. Such a run reasons the way
+        it always did -- the scientific pipeline refuses an ungrounded citation
+        on its own -- so the absent profile degrades to the old behaviour rather
+        than to a new one nobody asked for.
+        """
+
+        if run.profile is None:
+            return ProvenanceMode.SCIENTIFIC_PROJECT
+        return run.profile.provenance_mode
+
+    def _run_assessment(
+        self, store: ResearchStore, run: ResearchRun, task_id: str
+    ) -> ResearchRun:
+        """Assess a repository that is not a capsule project. Writes nothing."""
+
+        task = run.task(task_id)
+        self._assert_calls_remain(run, 1)
+        literature_keys = tuple(task.literature_keys) or tuple(
+            key for item in task.depends_on for key in run.task(item).literature_keys
+        )
+        controller = AssessmentController(
+            providers=self.providers,
+            config=self.config,
+            literature_config=self.literature_config,
+            literature_store=self.literature_store,
+        )
+        profile = run.profile
+        assert profile is not None  # _provenance_mode returned REPOSITORY_ASSESSMENT
+        check_ids = tuple(
+            self._resolve_project(
+                Path(run.project_path), project_id=run.project_id
+            ).check_ids
+        )
+        try:
+            outcome = controller.assess(
+                project_path=Path(run.project_path),
+                goal=task.goal,
+                profile=profile,
+                check_ids=check_ids,
+                with_literature=bool(literature_keys),
+                literature_keys=literature_keys,
+                max_model_calls=run.remaining_model_calls,
+            )
+        except (AssessmentError, ProviderInvocationError) as failure:
+            run = self._charge(store, run, getattr(failure, "model_calls", 0))
+            if isinstance(failure, AssessmentGroundingError):
+                store.append_event(
+                    "assessment_grounding_failed", task_id=task_id, detail=str(failure)
+                )
+            store.append_event(
+                "assessment_failed",
+                task_id=task_id,
+                model_calls=getattr(failure, "model_calls", 0),
+                error=type(failure).__name__,
+            )
+            raise
+        run = self._charge(store, run, outcome.model_calls)
+        correction = outcome.grounding_correction
+        if correction is not None:
+            store.append_event(
+                "assessment_grounding_corrected",
+                task_id=task_id,
+                assessment_id=outcome.assessment.assessment_id,
+                unsupplied=list(correction.refused),
+            )
+        store.append_event(
+            "assessment_produced",
+            task_id=task_id,
+            assessment_id=outcome.assessment.assessment_id,
+            mode=str(outcome.assessment.mode),
+            observations=len(outcome.assessment.observations),
+            cited_files=len(outcome.assessment.cited_files),
+            grounding_corrections=1 if correction is not None else 0,
+        )
+        return self._finish_task(
+            store,
+            run,
+            task_id,
+            detail=(
+                f"{len(outcome.assessment.observations)} grounded observation(s) "
+                "in a technical assessment; this repository has no capsule"
+            ),
+            artifact_id=outcome.assessment.assessment_id,
+            model_calls=outcome.model_calls,
+        )
+
+    def _run_scientific_proposal(
         self, store: ResearchStore, run: ResearchRun, task_id: str
     ) -> ResearchRun:
         """Turn what is known into structured proposals. Writes no capsule object."""
