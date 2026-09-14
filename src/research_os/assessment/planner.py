@@ -596,6 +596,12 @@ Replace a broken reference with a real one, or drop the thing that rested on it.
 Do not invent a replacement. If an observation cannot stand on anything you were
 actually given, drop it and say so in "uncertainties".
 
+If you drop an observation, RENUMBER the ones that remain so the ids are still
+"OB-001", "OB-002", ... with no gap, and update every "blocks" and
+"addresses_observations" entry to the new ids. An assessment whose ids skip a
+number is refused, and dropping an observation is the most likely reason to
+create a gap.
+
 Change nothing else. This is your one correction; there is no second.
 """
 

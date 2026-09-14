@@ -534,6 +534,33 @@ def test_the_correction_prompt_explains_what_an_observation_id_is(
     assert "an observation id" in prompt
 
 
+def test_the_correction_prompt_says_to_renumber_after_dropping(
+    tmp_path: Path,
+) -> None:
+    """The prompt must not ask for something another validator then refuses.
+
+    Pilot C's correction did exactly what it was told -- dropped an observation
+    that could not be grounded -- and left the remaining ids non-contiguous, so
+    the sequential-id rule refused the repair. The instruction was achievable
+    only if you already knew about a rule the prompt never mentioned.
+    """
+
+    from research_os.assessment.planner import build_grounding_correction_prompt
+
+    root = capsule_less_repo(tmp_path / "solver")
+    payload = assessment_payload()
+    payload["observations"][1].pop("file_refs")
+    grounding = grounding_for(root)
+    prompt = build_grounding_correction_prompt(
+        goal="Assess this repository.",
+        payload=payload,
+        violations=grounding_violations(payload, grounding),
+        grounding=grounding,
+    )
+    assert "RENUMBER" in prompt
+    assert "with no gap" in prompt
+
+
 def test_every_reference_failure_is_correctable_and_no_shape_failure_is(
     tmp_path: Path,
 ) -> None:
