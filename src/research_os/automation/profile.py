@@ -394,7 +394,18 @@ def _discover(
     structure = CapabilityOrigin.DETERMINISTIC_STRUCTURE
     repo_metadata = CapabilityOrigin.REPOSITORY_METADATA
 
-    def structural(name: CapabilityName, present: bool, detail: str) -> Capability:
+    def structural(
+        name: CapabilityName, present: bool, when_present: str, when_absent: str
+    ) -> Capability:
+        """Return one structural capability, with the detail that is actually true.
+
+        Two strings rather than one. A single detail is written for whichever
+        case the author had in mind and is then printed for both, which is how
+        the profile came to tell a planner "manuscripts: no -- tracked manuscript
+        sources were found". A block that opens by saying these are facts and not
+        to contradict them cannot then contradict itself.
+        """
+
         if not tracked_known:
             return Capability(
                 name=name,
@@ -402,7 +413,12 @@ def _discover(
                 origin=unavailable,
                 detail="the tracked file list could not be read",
             )
-        return Capability(name=name, present=present, origin=structure, detail=detail)
+        return Capability(
+            name=name,
+            present=present,
+            origin=structure,
+            detail=when_present if present else when_absent,
+        )
 
     has_pyproject = "pyproject.toml" in tracked
     has_uv_lock = "uv.lock" in tracked
@@ -410,7 +426,9 @@ def _discover(
     flat_packages = _flat_packages(tracked)
     dependency_names = dependencies
 
-    def from_metadata(name: CapabilityName, present: bool, detail: str) -> Capability:
+    def from_metadata(
+        name: CapabilityName, present: bool, when_present: str, when_absent: str
+    ) -> Capability:
         if not metadata_readable:
             return Capability(
                 name=name,
@@ -419,9 +437,17 @@ def _discover(
                 detail="pyproject.toml could not be parsed",
             )
         if not has_pyproject:
-            return structural(name, False, "the repository tracks no pyproject.toml")
+            return structural(
+                name,
+                False,
+                when_present,
+                "the repository tracks no pyproject.toml to declare it in",
+            )
         return Capability(
-            name=name, present=present, origin=repo_metadata, detail=detail
+            name=name,
+            present=present,
+            origin=repo_metadata,
+            detail=when_present if present else when_absent,
         )
 
     found: dict[CapabilityName, Capability] = {
@@ -438,54 +464,52 @@ def _discover(
         CapabilityName.PYPROJECT_TOML: structural(
             CapabilityName.PYPROJECT_TOML,
             has_pyproject,
-            "pyproject.toml is tracked"
-            if has_pyproject
-            else "no tracked pyproject.toml",
+            "pyproject.toml is tracked",
+            "no tracked pyproject.toml",
         ),
         CapabilityName.UV_LOCK: structural(
             CapabilityName.UV_LOCK,
             has_uv_lock,
-            "uv.lock is tracked" if has_uv_lock else "no tracked uv.lock",
+            "uv.lock is tracked",
+            "no tracked uv.lock",
         ),
         CapabilityName.PYTHON_PROJECT: structural(
             CapabilityName.PYTHON_PROJECT,
             has_pyproject or bool(src_packages) or bool(flat_packages),
             "pyproject.toml or an importable package directory is tracked",
+            "no tracked pyproject.toml and no importable package directory",
         ),
         CapabilityName.PYTHON_SRC_LAYOUT: structural(
             CapabilityName.PYTHON_SRC_LAYOUT,
             bool(src_packages),
-            (
-                "tracked importable packages under src/: "
-                + ", ".join(sorted(src_packages))
-                if src_packages
-                else "no tracked importable package under src/"
-            ),
+            "tracked importable packages under src/: "
+            + ", ".join(sorted(src_packages)),
+            "no tracked importable package under src/",
         ),
         CapabilityName.PYTHON_FLAT_LAYOUT: structural(
             CapabilityName.PYTHON_FLAT_LAYOUT,
             bool(flat_packages) and not src_packages,
-            (
-                "tracked top-level importable packages: "
-                + ", ".join(sorted(flat_packages))
-                if flat_packages and not src_packages
-                else "no top-level importable package outside src/"
-            ),
+            "tracked top-level importable packages: "
+            + ", ".join(sorted(flat_packages)),
+            "no top-level importable package outside src/",
         ),
         CapabilityName.PYTEST_AVAILABLE: from_metadata(
             CapabilityName.PYTEST_AVAILABLE,
             "pytest" in dependency_names or "pytest" in tool_sections,
             "pytest is declared in pyproject.toml",
+            "pyproject.toml declares no pytest",
         ),
         CapabilityName.RUFF_AVAILABLE: from_metadata(
             CapabilityName.RUFF_AVAILABLE,
             "ruff" in dependency_names or "ruff" in tool_sections,
             "ruff is declared in pyproject.toml",
+            "pyproject.toml declares no ruff",
         ),
         CapabilityName.JULIA_PROJECT: structural(
             CapabilityName.JULIA_PROJECT,
             "Project.toml" in tracked,
             "Project.toml is tracked",
+            "no tracked Project.toml",
         ),
         CapabilityName.EXPERIMENT_REGISTRY: Capability(
             name=CapabilityName.EXPERIMENT_REGISTRY,
@@ -515,6 +539,7 @@ def _discover(
             CapabilityName.MANUSCRIPTS,
             bool(_manuscripts(tracked)),
             "tracked manuscript sources were found",
+            "no tracked manuscript source at a name or directory this build reads",
         ),
     }
     return found

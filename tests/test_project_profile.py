@@ -203,6 +203,61 @@ def test_manuscripts_are_named_conservatively(tmp_path: Path) -> None:
     assert profile.has(CapabilityName.MANUSCRIPTS)
 
 
+def test_every_capability_detail_agrees_with_its_own_value(tmp_path: Path) -> None:
+    """A profile must not contradict itself.
+
+    The rendered block opens by telling the planner these are facts and not to
+    contradict them, and then said "manuscripts: no -- tracked manuscript sources
+    were found". One detail string was being written for whichever case its
+    author had in mind and printed for both. Found by reading a real planner
+    prompt during Pilot B.
+    """
+
+    for root in (
+        _flat_python(tmp_path / "flat"),
+        _src_python(tmp_path / "src"),
+        _capsule_project(tmp_path / "capsule"),
+        _repository(tmp_path / "plain", {"README.md": "# notes\n"}),
+    ):
+        profile = build_project_profile(project_path=root)
+        for capability in profile.capabilities:
+            detail = capability.detail.lower()
+            if not capability.known:
+                continue
+            if capability.present:
+                assert not detail.startswith("no "), (
+                    f"{capability.name.value} is present but its detail denies it: "
+                    f"{capability.detail}"
+                )
+            else:
+                assert not detail.endswith("were found"), (
+                    f"{capability.name.value} is absent but its detail asserts it: "
+                    f"{capability.detail}"
+                )
+                assert " is tracked" not in detail or detail.startswith("no "), (
+                    f"{capability.name.value} is absent but its detail asserts it: "
+                    f"{capability.detail}"
+                )
+
+
+def test_an_absent_manuscript_capability_says_it_is_absent(tmp_path: Path) -> None:
+    root = _flat_python(tmp_path / "flat")
+    capability = build_project_profile(project_path=root).capability(
+        CapabilityName.MANUSCRIPTS
+    )
+    assert capability.present is False
+    assert "no tracked manuscript source" in capability.detail
+
+
+def test_a_present_src_layout_names_the_packages(tmp_path: Path) -> None:
+    root = _src_python(tmp_path / "src")
+    capability = build_project_profile(project_path=root).capability(
+        CapabilityName.PYTHON_SRC_LAYOUT
+    )
+    assert capability.present is True
+    assert "demo" in capability.detail
+
+
 # -- precedence ----------------------------------------------------------
 
 
