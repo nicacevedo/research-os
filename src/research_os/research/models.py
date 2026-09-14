@@ -213,6 +213,20 @@ class ResearchTask(BaseModel):
     read_paths: list[str] = Field(default_factory=list)
     allowed_paths: list[str] = Field(default_factory=list)
     acceptance_commands: list[list[str]] = Field(default_factory=list)
+    """Argument vectors the plan authored itself. Only where no profile exists."""
+
+    required_checks: list[str] = Field(default_factory=list)
+    """Named controller-owned checks this task must pass, by id.
+
+    The preferred form by a long way. A plan says ``["tests", "lint"]``; the
+    controller resolves each id to the exact argv it already knows for this
+    project. A plan cannot change that argv, cannot reorder it, and cannot ask
+    for a check the project has no profile for.
+    """
+
+    resolved_checks: list[list[str]] = Field(default_factory=list)
+    """What ``required_checks`` resolved to. Written by the controller, for the record."""
+
     experiment_task: str = ""
     experiment_parameters: dict[str, str] = Field(default_factory=dict)
     section: str = ""
@@ -278,10 +292,12 @@ class ResearchTask(BaseModel):
         if self.kind is TaskKind.CODE:
             if not self.allowed_paths:
                 raise ValueError(f"{self.task_id} is a code task with no allowed_paths")
-            if not self.acceptance_commands:
+            if not self.acceptance_commands and not self.required_checks:
                 raise ValueError(
-                    f"{self.task_id} is a code task with no acceptance command, so "
-                    "the controller could not verify it"
+                    f"{self.task_id} is a code task with nothing to verify it: name "
+                    "the controller-owned checks it must pass in 'required_checks', "
+                    "or, for a project with no validation profile, the acceptance "
+                    "commands in 'acceptance_commands'"
                 )
         if self.kind is TaskKind.EXPERIMENT and not self.experiment_task.strip():
             raise ValueError(

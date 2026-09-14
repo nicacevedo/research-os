@@ -129,6 +129,16 @@ class PlannedCommand(BaseModel):
 
     argv: list[NonBlankStr] = Field(min_length=1)
     description: str = ""
+    required: bool = True
+    """Whether failing this command fails the work order.
+
+    Controller-owned. A plan the *controller* builds -- the research layer
+    resolving a project's named check profiles -- may declare an optional check;
+    a plan a *model* wrote may not, because lowering a gate is not a planning
+    decision. :func:`parse_plan` enforces that at the one boundary where model
+    output becomes a plan, so the field being settable on the type does not make
+    it reachable from a prompt.
+    """
 
 
 class PlannedTask(BaseModel):
@@ -278,9 +288,23 @@ def parse_plan(
             "planner returned no JSON object; expected structured plan output"
         )
     try:
-        return PlanDocument.model_validate(payload)
+        document = PlanDocument.model_validate(payload)
     except ValidationError as exc:
         raise PlanValidationError(f"planner output is not a valid plan: {exc}") from exc
+    for task in document.tasks:
+        for command in task.acceptance_commands:
+            if not command.required:
+                # The one field on a plan a model must not be able to set. Every
+                # other planner decision is about what to do; this one is about
+                # whether the controller's own verdict counts, and a worker that
+                # can mark its acceptance command optional has been handed the
+                # gate it was supposed to pass.
+                raise PlanValidationError(
+                    f"{task.id} marks an acceptance command optional. A plan may "
+                    "say what must be verified; whether a failing check stops the "
+                    "run is the controller's decision, not the planner's."
+                )
+    return document
 
 
 #: Model calls the controller must be able to make for one coding task.
@@ -530,6 +554,7 @@ def _coding_order(
             AcceptanceCommand(
                 argv=list(command.argv),
                 description=command.description or None,
+                required=command.required,
             )
             for command in task.acceptance_commands
         ],

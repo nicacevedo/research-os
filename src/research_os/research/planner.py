@@ -24,6 +24,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from research_os.automation.checkprofiles import CheckProfile, render_check_profiles
 from research_os.automation.promptdata import (
     TASK_FENCE,
     prompt_safe,
@@ -86,6 +87,10 @@ PLAN_SCHEMA: dict[str, Any] = {
                         "type": "array",
                         "items": {"type": "array", "items": {"type": "string"}},
                     },
+                    "required_checks": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
                     "experiment_task": {"type": "string"},
                     "experiment_parameters": {
                         "type": "object",
@@ -112,6 +117,7 @@ class PlannedTask(BaseModel):
     read_paths: list[str] = Field(default_factory=list)
     allowed_paths: list[str] = Field(default_factory=list)
     acceptance_commands: list[list[str]] = Field(default_factory=list)
+    required_checks: list[str] = Field(default_factory=list)
     experiment_task: str = ""
     experiment_parameters: dict[str, str] = Field(default_factory=dict)
     section: str = ""
@@ -137,6 +143,7 @@ def build_research_plan_prompt(
     allowed_programs: tuple[str, ...] = (),
     profile_context: str = "",
     capsule_present: bool = True,
+    check_profiles: tuple[CheckProfile, ...] = (),
 ) -> str:
     """Return the complete prompt for the research planner."""
 
@@ -146,6 +153,34 @@ def build_research_plan_prompt(
         "     experiment task cannot be dispatched)"
     )
     programs = ", ".join(sorted(allowed_programs)) or "none"
+    checks = render_check_profiles(check_profiles)
+    check_rule = (
+        'A "code" task must set "required_checks" and must NOT set '
+        '"acceptance_commands". This project has controller-owned validation '
+        "profiles, so the environment invocation is already decided and a plan "
+        "that writes its own command will be refused."
+        if check_profiles
+        else 'A "code" task must set "acceptance_commands". This project has '
+        "no controller-owned validation profile, so there is no check id to "
+        "name."
+    )
+    code_kind = (
+        f"""a write-enabled implementation in an isolated worktree. Sets
+  "allowed_paths" to the paths it may change and "required_checks" to the ids of
+  the checks below that must pass, for example ["tests", "lint"].
+  Do not write a command yourself: the controller already knows the exact
+  argument vector each id runs for this project, and it is the one that actually
+  works in this project's environment.
+
+  THIS PROJECT'S CONTROLLER-OWNED CHECKS
+{checks}"""
+        if check_profiles
+        else f"""a write-enabled implementation in an isolated worktree. Sets
+  "allowed_paths" to the paths it may change and "acceptance_commands" to the
+  argument vectors the controller will run to verify it, for example
+  ["pytest", "-q"]. This project has no controller-owned validation profile, so
+  the plan must name the commands itself. Available programs: {programs}."""
+    )
     proposal_kind = (
         """turn what is known into structured, reviewable scientific
   proposals -- questions, hypotheses, experiments, claims. Sets no key of its
@@ -196,10 +231,7 @@ out. "depends_on" is a list of earlier task ids, on any kind that needs one.
   the repository-relative paths the analysis should concentrate on. Use it when
   the goal needs the code understood before it can be changed.
 - "proposal": {proposal_kind}
-- "code": a write-enabled implementation in an isolated worktree. Sets
-  "allowed_paths" to the paths it may change and "acceptance_commands" to the
-  argument vectors the controller will run to verify it, for example
-  ["pytest", "-q"]. Available programs: {programs}.
+- "code": {code_kind}
 - "experiment": run a command the researcher has already declared. Sets
   "experiment_task" to one of the declared commands below and
   "experiment_parameters" to that command's declared parameters, as strings.
@@ -227,6 +259,7 @@ runs, so satisfy them rather than explaining them:
   and only a human changes them.
 - An acceptance command is an argument vector with no shell syntax: no pipes,
   no redirection, no "&&". Paths in it are relative to the worktree.
+- {check_rule}
 - A "code" or "paper" task must list the specific paths it may change. "src/"
   is a scope; the whole repository is not.
 
@@ -455,6 +488,7 @@ def validate_research_plan(
     budget: ResearchBudget,
     declared_experiments: frozenset[str],
     required_parameters: dict[str, frozenset[str]] | None = None,
+    check_profiles: tuple[CheckProfile, ...] = (),
 ) -> None:
     """Reject a plan the controller must not execute.
 
@@ -473,6 +507,7 @@ def validate_research_plan(
     """
 
     assert_plan_says_something(plan)
+    _assert_checks_are_the_controllers(plan, check_profiles)
     if len(plan.tasks) > budget.max_tasks:
         raise ResearchPlanError(
             f"the plan has {len(plan.tasks)} tasks; this run's budget allows "
@@ -513,6 +548,71 @@ def validate_research_plan(
             )
 
 
+def _assert_checks_are_the_controllers(
+    plan: ResearchPlan, check_profiles: tuple[CheckProfile, ...]
+) -> None:
+    """Refuse a plan that writes its own command where the controller has one.
+
+    The trap this closes is recorded in the v1.0.0 build record. A ``src``-layout
+    Python project's tests only import under ``uv run``; a planner wrote a bare
+    ``pytest``; collection failed; the single bounded repair spent itself on the
+    import error and the run failed closed. Nothing about that was a model being
+    careless -- it was a model being asked an environment question it had no way
+    to answer.
+
+    Where the controller can answer it, the model is not asked. A plan naming
+    ``["tests", "lint"]`` gets whatever this project's tests and lint actually
+    are; a plan writing argv beside those profiles is refused here, early enough
+    that the bounded plan correction can fix it.
+    """
+
+    available = {item.check_id for item in check_profiles}
+    for task in plan.tasks:
+        if task.kind is not TaskKind.CODE:
+            if task.required_checks:
+                raise ResearchPlanError(
+                    f"{task.id} is a {task.kind} task and names required_checks; "
+                    "only a code task is verified by the controller's checks"
+                )
+            continue
+        if check_profiles:
+            if task.acceptance_commands:
+                raise ResearchPlanError(
+                    f"{task.id} writes its own acceptance command, but this "
+                    "project has controller-owned validation profiles. Name the "
+                    "checks by id in 'required_checks' instead and leave "
+                    "'acceptance_commands' out; the controller already knows the "
+                    "exact command each id runs in this project's environment. "
+                    "Available: " + ", ".join(sorted(available))
+                )
+            if not task.required_checks:
+                raise ResearchPlanError(
+                    f"{task.id} is a code task that names no required_checks. "
+                    "This project's controller-owned checks are: "
+                    + ", ".join(sorted(available))
+                )
+            unknown = sorted(set(task.required_checks) - available)
+            if unknown:
+                raise ResearchPlanError(
+                    f"{task.id} requires checks this project has no profile for: "
+                    + ", ".join(unknown)
+                    + ". Available: "
+                    + ", ".join(sorted(available))
+                )
+            continue
+        if task.required_checks:
+            raise ResearchPlanError(
+                f"{task.id} names required_checks, but this project has no "
+                "controller-owned validation profile, so there is no check id to "
+                "resolve. Name the acceptance commands in 'acceptance_commands'."
+            )
+        if not task.acceptance_commands:
+            raise ResearchPlanError(
+                f"{task.id} is a code task with no acceptance command, so the "
+                "controller could not verify it"
+            )
+
+
 def to_tasks(plan: ResearchPlan) -> list[ResearchTask]:
     """Turn a validated plan into the tasks the controller will dispatch.
 
@@ -536,6 +636,7 @@ def to_tasks(plan: ResearchPlan) -> list[ResearchTask]:
                     acceptance_commands=[
                         list(item) for item in planned.acceptance_commands
                     ],
+                    required_checks=list(planned.required_checks),
                     experiment_task=planned.experiment_task,
                     experiment_parameters=dict(planned.experiment_parameters),
                     section=planned.section,

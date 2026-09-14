@@ -187,7 +187,7 @@ def test_task_ids_must_be_sequential() -> None:
     [
         (TaskKind.LITERATURE, {}, "no query"),
         (TaskKind.ANALYSIS, {}, "no read_paths"),
-        (TaskKind.CODE, {"allowed_paths": ["src"]}, "no acceptance command"),
+        (TaskKind.CODE, {"allowed_paths": ["src"]}, "nothing to verify it"),
         (TaskKind.CODE, {"acceptance_commands": [["pytest"]]}, "no allowed_paths"),
         (TaskKind.EXPERIMENT, {}, "names no declared"),
         (TaskKind.PAPER, {"allowed_paths": ["paper"]}, "no section"),

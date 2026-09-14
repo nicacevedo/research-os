@@ -205,6 +205,7 @@ def task(
         "read_paths": [],
         "allowed_paths": [],
         "acceptance_commands": [],
+        "required_checks": [],
         "experiment_task": "",
         "experiment_parameters": {},
         "section": "",

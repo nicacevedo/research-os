@@ -30,6 +30,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from research_os.assessment.controller import AssessmentController
+from research_os.automation.checkprofiles import CheckProfile, resolve_required_checks
 from research_os.automation.config import AutomationConfig, ResolvedRoles, resolve_roles
 from research_os.automation.context import build_context, render_context
 from research_os.automation.controller import (
@@ -296,6 +297,7 @@ class ResearchController:
             allowed_programs=self.config.allowed_check_programs,
             profile_context=render_project_profile(project.profile),
             capsule_present=project.profile.capsule_present,
+            check_profiles=project.check_profiles,
         )
         run, plan = self._planned(
             store,
@@ -307,6 +309,7 @@ class ResearchController:
                 name: frozenset(item.name for item in spec.parameters if item.required)
                 for name, spec in declared.items()
             },
+            check_profiles=project.check_profiles,
         )
         tasks = to_tasks(plan)
         self._assert_budget_could_finish(run, tasks)
@@ -333,6 +336,7 @@ class ResearchController:
         prompt: str,
         declared: frozenset[str],
         required: dict[str, frozenset[str]] | None = None,
+        check_profiles: tuple[CheckProfile, ...] = (),
     ) -> tuple[ResearchRun, ResearchPlan]:
         """Get one validated plan, allowing at most one bounded re-ask.
 
@@ -398,6 +402,7 @@ class ResearchController:
                     budget=run.budget,
                     declared_experiments=declared,
                     required_parameters=required,
+                    check_profiles=check_profiles,
                 )
             except ResearchPlanError as exc:
                 store.append_event(
@@ -638,6 +643,16 @@ class ResearchController:
         """
 
         task = run.task(task_id)
+        commands, resolved = self._acceptance_commands(run, task)
+        if resolved:
+            run = self._update(store, run, task_id, resolved_checks=resolved)
+            task = run.task(task_id)
+            store.append_event(
+                "checks_resolved",
+                task_id=task_id,
+                check_ids=list(task.required_checks),
+                argv=resolved,
+            )
         run = self._spend_write_task(store, run, task_id)
         plan = PlanDocument(
             summary=task.goal,
@@ -649,15 +664,53 @@ class ResearchController:
                     role=PlannedRole.CODER,
                     read_only=False,
                     allowed_paths=list(task.allowed_paths),
-                    acceptance_commands=[
-                        PlannedCommand(argv=list(item), description="from the plan")
-                        for item in task.acceptance_commands
-                    ],
+                    acceptance_commands=commands,
                     completion_condition="the acceptance commands pass",
                 )
             ],
         )
         return self._delegate_to_automation(store, run, task_id, plan)
+
+    def _acceptance_commands(
+        self, run: ResearchRun, task: ResearchTask
+    ) -> tuple[list[PlannedCommand], list[list[str]]]:
+        """Return the commands that will verify one code task, and where they came from.
+
+        A task naming ``required_checks`` is resolved here, now, against this
+        project's profiles as they are at the moment of execution rather than as
+        they were when the plan was written. A profile that has since gone is a
+        check this run cannot perform, and refusing is the only honest answer:
+        the alternative is a run that reports success having verified less than
+        its own plan said it would.
+        """
+
+        if not task.required_checks:
+            return (
+                [
+                    PlannedCommand(argv=list(item), description="from the plan")
+                    for item in task.acceptance_commands
+                ],
+                [],
+            )
+        project = self._resolve_project(
+            Path(run.project_path), project_id=run.project_id
+        )
+        profiles = resolve_required_checks(
+            project.check_profiles, list(task.required_checks)
+        )
+        return (
+            [
+                PlannedCommand(
+                    argv=list(item.argv),
+                    description=(
+                        f"controller-owned check {item.check_id!r} ({item.source})"
+                    ),
+                    required=item.required,
+                )
+                for item in profiles
+            ],
+            [list(item.argv) for item in profiles],
+        )
 
     def _delegate_to_automation(
         self,
