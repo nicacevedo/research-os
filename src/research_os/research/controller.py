@@ -50,6 +50,8 @@ from research_os.automation.planner import (
     PlannedRole,
     PlannedTask,
 )
+from research_os.automation.profile import render_project_profile
+from research_os.automation.projectcontext import ResolvedProject, resolve_project
 from research_os.automation.providers import (
     InvocationRequest,
     InvocationResult,
@@ -209,6 +211,7 @@ class ResearchController:
         root = repository_root(project_path)
         resolved = self._resolve_roles()
         science = build_science_context(root)
+        project = self._resolve_project(root, project_id=science.project_id)
         created_at = utc_now()
         run = ResearchRun(
             run_id=make_research_run_id(
@@ -218,6 +221,7 @@ class ResearchController:
             project_path=str(root),
             base_commit=head_commit(root) if has_commits(root) else None,
             goal=goal,
+            profile=project.profile,
             created_at=created_at,
             updated_at=created_at,
             budget=budget or ResearchBudget(),
@@ -235,13 +239,36 @@ class ResearchController:
             base_commit=run.base_commit,
             execute_experiments=execute_experiments,
             independence=str(resolved.independence),
+            provenance_mode=str(project.profile.provenance_mode),
+            capsule_present=project.profile.capsule_present,
+            check_profiles=list(project.check_ids),
         )
         try:
-            run = self._plan(store, run, science, resolved)
+            run = self._plan(store, run, science, resolved, project)
         except (ResearchError, AutomationError, ProposalError) as exc:
             self._fail(store, store.load(), str(exc))
             raise
         return store, run
+
+    def _resolve_project(
+        self, root: Path, *, project_id: str | None
+    ) -> ResolvedProject:
+        """Establish what this project is, once, before anything is asked of a model.
+
+        Every fact here is read from Git and from the researcher's own
+        configuration. None of it is a judgement, so none of it is a question for
+        a planner -- and a planner that is told a repository has no capsule does
+        not have to decide whether to invent one.
+        """
+
+        declared = self.experiment_config.for_project(project_id).commands
+        return resolve_project(
+            project_path=root,
+            config=self.config,
+            project_id=project_id,
+            registered=project_id is not None,
+            declared_experiments=tuple(sorted(declared)),
+        )
 
     def _plan(
         self,
@@ -249,6 +276,7 @@ class ResearchController:
         run: ResearchRun,
         science: object,
         resolved: ResolvedRoles,
+        project: ResolvedProject,
     ) -> ResearchRun:
         run = self._transition(store, run, ResearchState.PLANNING)
         declared = self.experiment_config.for_project(run.project_id).commands
@@ -262,6 +290,7 @@ class ResearchController:
             insight_section=insights_for(run.goal, project_id=run.project_id),
             execute_experiments=run.execute_experiments,
             allowed_programs=self.config.allowed_check_programs,
+            profile_context=render_project_profile(project.profile),
         )
         run, plan = self._planned(
             store,
@@ -280,6 +309,7 @@ class ResearchController:
             run.model_copy(update={"tasks": tasks, "plan_summary": plan.summary})
         )
         store.write_json("plan/plan.json", plan.model_dump(mode="json"))
+        store.write_json("plan/profile.json", project.profile.model_dump(mode="json"))
         store.append_event(
             "plan_accepted",
             tasks=[item.task_id for item in tasks],

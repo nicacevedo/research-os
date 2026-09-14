@@ -7,17 +7,27 @@ and are recorded per run as whatever the provider actually reported using.
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-from research_os.automation.command_policy import SUPPORTED_PROGRAMS
+from research_os.automation.checkprofiles import CheckProfileSpec
+from research_os.automation.command_policy import (
+    SUPPORTED_PROGRAMS,
+    authorize_planner_argv,
+)
 from research_os.automation.models import Access, Budget, Independence, RoleSetting
+from research_os.automation.profile import CONFIGURABLE_CAPABILITIES
 from research_os.automation.providers import provider_family
-from research_os.errors import AutomationError, ProviderUnavailableError
+from research_os.errors import (
+    AutomationError,
+    CommandPolicyError,
+    ProviderUnavailableError,
+)
 from research_os.paths import config_home
 
 CONFIG_FILENAME = "automation.yaml"
@@ -112,6 +122,38 @@ def _default_roles() -> dict[str, RoleSetting]:
     }
 
 
+class ProjectSettings(BaseModel):
+    """What a researcher has declared about one of their own projects.
+
+    Keyed by project id under ``projects:``, exactly as ``experiments.yaml``
+    keys its declared commands, and living in the same place for the same
+    reason: the config home is outside every automation worktree, so a
+    write-enabled worker cannot reach this file to declare itself new checks or
+    new capabilities.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    check_profiles: dict[str, CheckProfileSpec] = Field(default_factory=dict)
+    """Named validation checks, replacing discovery entirely when present."""
+
+    capabilities: dict[str, bool] = Field(default_factory=dict)
+    """Facts the researcher asserts about this project, overriding discovery."""
+
+    @field_validator("capabilities")
+    @classmethod
+    def _known_capability_names(cls, value: dict[str, bool]) -> dict[str, bool]:
+        unknown = sorted(set(value) - CONFIGURABLE_CAPABILITIES)
+        if unknown:
+            raise ValueError(
+                "capabilities names "
+                + ", ".join(unknown)
+                + ", which this build has no capability for. Known: "
+                + ", ".join(sorted(CONFIGURABLE_CAPABILITIES))
+            )
+        return value
+
+
 class ConfigDocument(BaseModel):
     """The on-disk shape of ``automation.yaml``. Every key is optional."""
 
@@ -125,6 +167,7 @@ class ConfigDocument(BaseModel):
     reviewer: RoleSetting | None = None
     budget: Budget | None = None
     allowed_check_programs: list[str] | None = None
+    projects: dict[str, ProjectSettings] = Field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,9 +179,22 @@ class AutomationConfig:
     allowed_check_programs: tuple[str, ...]
     source: Path | None
     explicit_roles: frozenset[str]
+    projects: dict[str, ProjectSettings] = dataclasses.field(default_factory=dict)
 
     def role(self, name: str) -> RoleSetting:
         return self.roles[name]
+
+    def for_project(self, project_id: str | None) -> ProjectSettings:
+        """Return one project's declarations, or an empty set.
+
+        An unregistered project has no id to key on, and a registered one
+        nobody has configured has nothing declared. Both are the same honest
+        answer: discovery decides, and the profile records that it did.
+        """
+
+        if project_id is None:
+            return ProjectSettings()
+        return self.projects.get(project_id, ProjectSettings())
 
 
 def default_config() -> AutomationConfig:
@@ -148,6 +204,7 @@ def default_config() -> AutomationConfig:
         allowed_check_programs=DEFAULT_ALLOWED_CHECK_PROGRAMS,
         source=None,
         explicit_roles=frozenset(),
+        projects={},
     )
 
 
@@ -196,12 +253,23 @@ def load_config(path: Path | None = None) -> AutomationConfig:
             "command policy has no grammar for. Configuration may only narrow "
             f"the supported programs: {', '.join(SUPPORTED_PROGRAMS)}"
         )
+    for project_id, settings in sorted(document.projects.items()):
+        for name, spec in sorted(settings.check_profiles.items()):
+            try:
+                authorize_planner_argv(spec.argv, allowed_programs=programs)
+            except CommandPolicyError as exc:
+                raise AutomationError(
+                    f"invalid automation config at {target}: the check profile "
+                    f"{name!r} declared for project {project_id!r} is not a "
+                    f"command the controller may run: {exc}"
+                ) from exc
     return AutomationConfig(
         roles=roles,
         budget=document.budget or Budget(),
         allowed_check_programs=programs,
         source=target,
         explicit_roles=frozenset(explicit),
+        projects=dict(document.projects),
     )
 
 

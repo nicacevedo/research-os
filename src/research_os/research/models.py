@@ -31,6 +31,7 @@ from typing import Self
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from research_os.automation.models import safe_relative_path, utc_now
+from research_os.automation.profile import ProjectProfile
 from research_os.models import NonBlankStr
 
 RESEARCH_RUN_ID_RE = re.compile(r"^RR-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$")
@@ -359,6 +360,15 @@ class ResearchRun(BaseModel):
     project_path: NonBlankStr
     base_commit: str | None = None
     goal: NonBlankStr
+    profile: ProjectProfile | None = None
+    """What the controller established about this project before planning.
+
+    Persisted rather than recomputed on demand, because it is the context the
+    planner was actually given. A run whose plan looks wrong is read by someone
+    asking what the planner knew, and "what it knew" has to be a record rather
+    than a re-derivation against a tree that has since moved.
+    """
+
     created_at: str = Field(default_factory=utc_now)
     updated_at: str = Field(default_factory=utc_now)
     finished_at: str | None = None

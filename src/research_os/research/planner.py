@@ -135,6 +135,7 @@ def build_research_plan_prompt(
     insight_section: str = "",
     execute_experiments: bool = False,
     allowed_programs: tuple[str, ...] = (),
+    profile_context: str = "",
 ) -> str:
     """Return the complete prompt for the research planner."""
 
@@ -156,6 +157,8 @@ def build_research_plan_prompt(
     return f"""You are the research planner of a deterministic research automation
 controller. You have no tools and no repository access. Plan only from the
 context below.
+
+{profile_context}
 
 Produce a small, bounded plan out of typed tasks. A deterministic controller
 dispatches each kind to a worker it already has; it cannot dispatch anything
