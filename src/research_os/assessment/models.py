@@ -60,10 +60,19 @@ _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 #: A symbol reference: a function, class, method, or module path.
 #:
 #: Deliberately permissive about language and strict about shape. ``solve``,
-#: ``Solver.step``, ``cuPDLP::restart`` and ``Module.fn!`` are all things a
-#: reader can find; anything with whitespace or a control character is not a
-#: symbol, it is a sentence.
-_SYMBOL = re.compile(r"^[A-Za-z_][A-Za-z0-9_.:!?<>-]{0,127}$")
+#: ``solve()``, ``Solver.step``, ``Solver::step(x)``, ``cuPDLP::restart`` and
+#: ``Module.fn!`` are all things a reader can find; anything with whitespace or
+#: a control character is not a symbol, it is a sentence.
+#:
+#: Parentheses were added after a delta review pointed out that ``solve()`` is a
+#: very common way to name a function, that the prompt asks for "a function,
+#: class or module name" without forbidding them, and that the resulting failure
+#: is a shape error with nothing to reground -- so a whole valid assessment was
+#: discarded over two characters and no correction was even offered. They are
+#: inert at the prompt boundary: the no-whitespace rule already prevents a
+#: symbol from standing alone on a line, which is the only way a delimiter is
+#: recognised.
+_SYMBOL = re.compile(r"^[A-Za-z_][A-Za-z0-9_.:!?<>()\[\],-]{0,127}$")
 
 
 class AssessmentMode(StrEnum):

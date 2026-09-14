@@ -40,7 +40,7 @@ from research_os.errors import (
     AssessmentGroundingError,
     AssessmentValidationError,
 )
-from research_os.research.models import ResearchBudget, ResearchState
+from research_os.research.models import ResearchBudget, ResearchRun, ResearchState
 from tests.fake_providers import FakeProvider, ScriptedResponse
 from tests.proposal_helpers import fake_config
 from tests.research_helpers import make_controller, plan_payload, proposal_task
@@ -912,3 +912,76 @@ def test_a_capsule_project_still_uses_the_scientific_pipeline(tmp_path: Path) ->
     assert "assessment_produced" not in events
     assert run.tasks[0].artifact_id is not None
     assert run.tasks[0].artifact_id.startswith("PROP-")
+
+
+def test_a_symbol_may_be_written_with_parentheses(tmp_path: Path) -> None:
+    """Found by the delta review.
+
+    `solve()` is a very common way to name a function and the prompt asks for
+    "a function, class or module name" without forbidding it. The resulting
+    failure was a shape error with nothing to reground, so a whole valid
+    assessment was discarded over two characters with no correction offered.
+    Parentheses are inert at the prompt boundary: the no-whitespace rule already
+    prevents a symbol from standing alone on a line.
+    """
+
+    for symbol in ("solve()", "Solver::step(x)", "Vec<T>", "items[0]"):
+        assert FileRef(path="a.py", symbol=symbol).symbol == symbol
+    with pytest.raises(ValueError, match="not a symbol"):
+        FileRef(path="a.py", symbol="the function that handles restarts")
+
+
+def test_a_capsule_less_assessment_fits_a_budget_of_one(tmp_path: Path) -> None:
+    """Found by the delta review.
+
+    `MINIMUM_CALLS[PROPOSAL]` is three -- literature, the proposal, the
+    assessment -- which is right for the scientific pipeline and wrong for a
+    capsule-less project, whose whole assessment ceiling is two. Over-reserving
+    is the safe direction, but the refusal stated a requirement that was false
+    for the dispatch it refused.
+    """
+
+    from research_os.automation.profile import build_project_profile
+    from research_os.research.controller import ResearchController
+    from research_os.research.models import ResearchBudget, ResearchTask, TaskKind
+
+    root = capsule_less_repo(tmp_path / "solver")
+    profile = build_project_profile(project_path=root)
+    run = ResearchRun(
+        run_id="RR-20260914T101500Z-0a1b2c3d",
+        project_path=str(root),
+        goal="Assess it.",
+        profile=profile,
+        budget=ResearchBudget(max_model_calls=2),
+        model_calls_used=1,
+    )
+    task = ResearchTask(
+        task_id="T-001", kind=TaskKind.PROPOSAL, title="Assess", goal="Assess it."
+    )
+    # One call remains; an assessment needs one, so the plan is affordable.
+    ResearchController._assert_budget_could_finish(run, [task])
+
+
+def test_a_capsule_project_still_reserves_the_full_proposal_cost(
+    tmp_path: Path,
+) -> None:
+    from research_os.automation.profile import build_project_profile
+    from research_os.errors import ResearchPlanError
+    from research_os.research.controller import ResearchController
+    from research_os.research.models import ResearchBudget, ResearchTask, TaskKind
+    from tests.research_helpers import init_repo
+
+    root = init_repo(tmp_path / "capsule", capsule=True)
+    run = ResearchRun(
+        run_id="RR-20260914T101500Z-0a1b2c3d",
+        project_path=str(root),
+        goal="Propose.",
+        profile=build_project_profile(project_path=root),
+        budget=ResearchBudget(max_model_calls=2),
+        model_calls_used=1,
+    )
+    task = ResearchTask(
+        task_id="T-001", kind=TaskKind.PROPOSAL, title="Propose", goal="Propose it."
+    )
+    with pytest.raises(ResearchPlanError, match="at least 3 model calls"):
+        ResearchController._assert_budget_could_finish(run, [task])

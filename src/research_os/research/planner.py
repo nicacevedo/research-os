@@ -505,25 +505,23 @@ def _is_placeholder(value: str) -> bool:
     depend on having guessed a word in advance: "t", "g" and "q" are caught by
     it, and they were not caught by anything before it existed.
 
-    **No token carries subject matter.** Every token is either a known
-    placeholder or a structural word -- so "test", "TBD.", a bare "...", "Test
-    task", "test summary two" and "summary two" are all refused, while "Read the
-    field", "Testing the estimator" and any field with a real noun in it are
+    **Placeholder words and nothing else.** At least one token is a known
+    placeholder and every other token is structural filler -- so "test", "TBD.",
+    a bare "...", "Test task" and "test summary two" are refused, while "Read
+    the field", "Testing the estimator" and any field with a real noun in it are
     not.
 
-    That second rule is stronger than the one this guard shipped with, which
-    additionally required *at least one* token to be a known placeholder. Each
-    live pilot has found the same hole from a different angle -- "test", then
-    "Test task", then "test summary two" -- and each time the repair was to
-    guess one more word. The prompt asks for fields that say something specific
-    about this project and this goal; a field built entirely out of structural
-    words says nothing specific by construction, whether or not "test" happens
-    to be one of them.
+    That second rule dropped its placeholder requirement for one commit, and an
+    independent review was right to object. Refusing any field built entirely of
+    filler also refuses "Query the data", "Results summary" and "First results"
+    -- ordinary titles a planner may legitimately write -- and the cost of that
+    is a re-ask spent on a plan that was fine, then a failed run on the second
+    identical phrasing. The rule is back to requiring a placeholder token, which
+    still catches every degenerate field any live pilot has produced, because
+    every one of them contained "test".
 
-    The trade is deliberate and it is asymmetric. A false positive costs a
-    researcher one re-run of a goal they still have. A false negative cost a
-    real run against a real repository three literature providers searched for
-    "q" and a report of READY_FOR_HUMAN with nothing behind it.
+    What the length rule catches is the class the word list cannot: "t", "g" and
+    "q" are not placeholders in any list and never will be.
     """
 
     stripped = value.strip()
@@ -534,7 +532,15 @@ def _is_placeholder(value: str) -> bool:
     tokens = _tokens(value)
     if not tokens:
         return False
-    return all(token in PLACEHOLDERS or token in FILLER for token in tokens)
+    seen_placeholder = False
+    for token in tokens:
+        if token in PLACEHOLDERS:
+            seen_placeholder = True
+            continue
+        if token in FILLER:
+            continue
+        return False
+    return seen_placeholder
 
 
 def _assert_not_a_placeholder(value: str, *, what: str, where: str) -> None:

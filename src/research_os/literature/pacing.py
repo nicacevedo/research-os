@@ -32,6 +32,7 @@ science at all.
 
 from __future__ import annotations
 
+import contextlib
 import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -160,17 +161,25 @@ class SourcePacer:
     def health(self, source: str) -> SourceHealth:
         """Return what is known about ``source``. An unseen source is fresh."""
 
-        row = self.connection.execute(
-            "SELECT * FROM source_health WHERE source = ?", (source,)
-        ).fetchone()
+        try:
+            row = self.connection.execute(
+                "SELECT * FROM source_health WHERE source = ?", (source,)
+            ).fetchone()
+        except sqlite3.Error as exc:
+            raise LiteratureStoreError(
+                f"cannot read the pacing state for {source}: {exc}"
+            ) from exc
         if row is None:
             return SourceHealth(source=source)
         return _hydrate(row)
 
     def all_health(self) -> list[SourceHealth]:
-        rows = self.connection.execute(
-            "SELECT * FROM source_health ORDER BY source"
-        ).fetchall()
+        try:
+            rows = self.connection.execute(
+                "SELECT * FROM source_health ORDER BY source"
+            ).fetchall()
+        except sqlite3.Error as exc:
+            raise LiteratureStoreError(f"cannot read the pacing state: {exc}") from exc
         return [_hydrate(row) for row in rows]
 
     # -- reserving -------------------------------------------------------
@@ -253,6 +262,16 @@ class SourcePacer:
     ) -> None:
         """Record that ``source`` answered. Clears any rate limit it had."""
 
+        # Only the fields this call actually learned something about. Passing
+        # `quota_reset_at=None` unconditionally meant every successful search
+        # erased a reset a provider had reported, while the stale
+        # `quota_remaining` beside it survived -- a row in a state no provider
+        # ever described. Found by an independent review.
+        learned: dict[str, object] = {}
+        if quota_remaining is not None:
+            learned["quota_remaining"] = quota_remaining
+        if quota_reset_at is not None:
+            learned["quota_reset_at"] = quota_reset_at
         with self._immediate() as connection:
             _write(
                 connection,
@@ -261,9 +280,8 @@ class SourcePacer:
                 last_status=SourceStatus.OK.value,
                 last_detail=detail,
                 last_success_at=utc_stamp(now),
-                quota_remaining=quota_remaining,
-                quota_reset_at=quota_reset_at,
                 updated_at=utc_stamp(now),
+                **learned,
             )
 
     def record_rate_limited(
@@ -295,17 +313,18 @@ class SourcePacer:
                 )
             )
         stamp = utc_stamp(until)
+        reset = {"quota_reset_at": stamp} if reset_at is not None else {}
         with self._immediate() as connection:
             _write(
                 connection,
                 source,
                 rate_limited_until=stamp,
                 next_allowed_at=stamp,
-                quota_reset_at=stamp if reset_at is not None else None,
                 last_status=SourceStatus.RATE_LIMITED.value,
                 last_detail=detail,
                 last_failure_at=utc_stamp(now),
                 updated_at=utc_stamp(now),
+                **reset,
             )
         return stamp
 
@@ -380,6 +399,13 @@ class _ImmediateTransaction:
             else:
                 self.connection.execute("ROLLBACK")
         except sqlite3.Error as exc:  # pragma: no cover - only on a broken handle
+            # A failed COMMIT leaves the transaction open. Restoring the old
+            # isolation level over an open transaction means the next write
+            # silently joins it, because legacy mode will not begin a
+            # transaction when one is already running -- so the rollback is not
+            # optional tidying, it is what makes the connection usable again.
+            with contextlib.suppress(sqlite3.Error):
+                self.connection.execute("ROLLBACK")
             if kind is None:
                 raise LiteratureStoreError(
                     f"literature pacing write failed: {exc}"
@@ -403,10 +429,13 @@ _FIELDS = (
 
 #: Columns whose ``None`` means "clear this", rather than "leave it alone".
 #:
-#: Only the two that describe a *current* restriction. Everything else is a
-#: historical fact -- when this source last succeeded, what it last said -- and
-#: a later partial update must not erase history it was not talking about.
-_CLEARABLE = frozenset({"rate_limited_until", "quota_reset_at"})
+#: Exactly one: the current rate limit, which a success genuinely lifts.
+#: ``quota_reset_at`` used to be here too, which meant any successful search
+#: erased a reset a provider had reported while the stale ``quota_remaining``
+#: beside it survived. Everything else is a fact that happened -- when this
+#: source last succeeded, what it last said -- and a later partial update must
+#: not erase history it was not talking about.
+_CLEARABLE = frozenset({"rate_limited_until"})
 
 
 def _write(connection: sqlite3.Connection, source: str, **fields: object) -> None:

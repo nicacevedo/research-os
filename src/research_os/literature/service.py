@@ -67,6 +67,15 @@ class ProviderOutcome:
     from_cache: bool = False
     """Whether this outcome was served from the store without a provider call."""
 
+    attempted: bool = True
+    """Whether a request was actually issued to the provider.
+
+    Explicit rather than inferred. A refused reservation and a real 429 both
+    report ``RATE_LIMITED``, and only one of them spent quota -- so a count that
+    filtered on status answered the quota question wrongly in exactly the case
+    somebody was asking it.
+    """
+
     next_allowed_at: str | None = None
     """When this provider may be asked again, when it has told us."""
 
@@ -113,15 +122,12 @@ class RetrievalReport:
         """How many provider requests this retrieval actually issued.
 
         A provider served from cache made none, and one whose reservation was
-        refused made none either -- which is the number that matters when
-        somebody asks whether a run spent quota.
+        refused made none either. A provider that *was* asked and answered 429
+        made one, and it is counted -- it spent quota, which is the question
+        being asked.
         """
 
-        return sum(
-            1
-            for item in self.outcomes
-            if not item.from_cache and item.status is not SourceStatus.RATE_LIMITED
-        )
+        return sum(1 for item in self.outcomes if item.attempted)
 
     @property
     def rate_limited(self) -> tuple[ProviderOutcome, ...]:
@@ -285,6 +291,7 @@ class LiteratureService:
                 ingested=(),
                 rate_limit_note="",
                 next_allowed_at=reservation.next_allowed_at,
+                attempted=False,
             )
 
         # The archive timestamp comes from the same clock the pacing does. Two
@@ -381,20 +388,29 @@ class LiteratureService:
         )
         if found is None:
             return None
-        search_id, keys = found
-        return ProviderOutcome(
-            provider=name,
+        _, keys = found
+        # Archived like every other outcome, because the docstring above
+        # promises it and a reader auditing whether this run asked a provider
+        # could otherwise only see the *earlier* run's row and not tell them
+        # apart. Written with an empty cache_key on purpose: a cache hit must
+        # not itself become a cache entry, or the freshness window would extend
+        # itself indefinitely and the store would never refresh.
+        return self._archive(
+            name,
+            query=query,
+            requested_at=utc_stamp(now),
+            parameters=parameters,
             status=SourceStatus.OK,
-            records=len(keys),
-            ingested=keys,
-            request_url="",
             detail=(
                 f"answered from the literature store; {name} was last asked this "
                 f"within the last {ttl} seconds"
             ),
+            request_url="",
+            ingested=keys,
             rate_limit_note="",
-            search_id=search_id,
+            record_count=len(keys),
             from_cache=True,
+            attempted=False,
         )
 
     def _record_outcome(
@@ -420,6 +436,20 @@ class LiteratureService:
         if result.status is SourceStatus.OK:
             pacer.record_success(name, now=now, detail=result.detail)
             return None
+        if result.retry_after_seconds is not None:
+            # A provider that failed and still said when to come back has told
+            # us something, and it is the same thing a 429 tells us. The HTTP
+            # client returns a 503 with a long Retry-After immediately rather
+            # than sleeping through it; that only helps if what it asked for is
+            # then written down. Found by an independent review, which observed
+            # that the early return delivered its stated benefit for one of the
+            # five statuses it applies to.
+            return pacer.record_rate_limited(
+                name,
+                now=now,
+                retry_after_seconds=result.retry_after_seconds,
+                detail=result.detail,
+            )
         pacer.record_failure(name, now=now, status=result.status, detail=result.detail)
         return None
 
@@ -438,6 +468,8 @@ class LiteratureService:
         record_count: int | None = None,
         next_allowed_at: str | None = None,
         cacheable: bool = False,
+        from_cache: bool = False,
+        attempted: bool = True,
     ) -> ProviderOutcome:
         record = SearchRecord(
             query=query,
@@ -468,6 +500,8 @@ class LiteratureService:
             detail=detail,
             rate_limit_note=rate_limit_note,
             search_id=search_id,
+            from_cache=from_cache,
+            attempted=attempted,
             next_allowed_at=next_allowed_at,
         )
 

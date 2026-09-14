@@ -150,6 +150,13 @@ MINIMUM_CALLS: dict[TaskKind, int] = {
     TaskKind.HUMAN_CHECKPOINT: 0,
 }
 
+#: What a proposal task costs when the project has no capsule.
+#:
+#: One: the assessment worker. Its one bounded grounding correction is optional,
+#: exactly as the automation layer's bounded repair is, so requiring budget for
+#: it up front would refuse plans that never need it.
+ASSESSMENT_MINIMUM_CALLS = 1
+
 #: Errors a task may fail with without the failure being a bug in this layer.
 #:
 #: Caught so the run's own record says which task failed and why, then re-raised
@@ -337,7 +344,7 @@ class ResearchController:
             tasks=[item.task_id for item in tasks],
             kinds=[str(item.kind) for item in tasks],
             summary=plan.summary,
-            minimum_model_calls=sum(MINIMUM_CALLS[item.kind] for item in tasks),
+            minimum_model_calls=sum(self._minimum_calls(run, item) for item in tasks),
         )
         return self._transition(store, run, ResearchState.PLAN_READY)
 
@@ -441,9 +448,9 @@ class ResearchController:
             return run, plan
         raise ResearchPlanError("the research planner produced no usable plan")
 
-    @staticmethod
+    @classmethod
     def _assert_budget_could_finish(
-        run: ResearchRun, tasks: list[ResearchTask]
+        cls, run: ResearchRun, tasks: list[ResearchTask]
     ) -> None:
         """Refuse a plan this run could never pay for.
 
@@ -452,7 +459,7 @@ class ResearchController:
         partial result nobody asked for.
         """
 
-        required = sum(MINIMUM_CALLS[item.kind] for item in tasks)
+        required = sum(cls._minimum_calls(run, item) for item in tasks)
         remaining = run.remaining_model_calls
         if required > remaining:
             raise ResearchPlanError(
@@ -460,6 +467,27 @@ class ResearchController:
                 f"{remaining} of {run.budget.max_model_calls} remain. Either raise "
                 "the budget or ask for less."
             )
+
+    @staticmethod
+    def _minimum_calls(run: ResearchRun, task: ResearchTask) -> int:
+        """Return the fewest model calls this task could possibly need.
+
+        ``MINIMUM_CALLS`` is keyed on :class:`TaskKind`, which stopped
+        determining the worker when a ``proposal`` task began dispatching to the
+        assessment controller for a capsule-less project. Three is right for the
+        scientific pipeline -- literature, the proposal, the assessment -- and
+        wrong for an assessment, whose whole ceiling is two. Over-reserving is
+        the safe direction, but it made the refusal state a requirement that was
+        false for the dispatch it was refusing. Found by an independent review.
+        """
+
+        if (
+            task.kind is TaskKind.PROPOSAL
+            and ResearchController._provenance_mode(run)
+            is ProvenanceMode.REPOSITORY_ASSESSMENT
+        ):
+            return ASSESSMENT_MINIMUM_CALLS
+        return MINIMUM_CALLS[task.kind]
 
     # -- executing -------------------------------------------------------
 

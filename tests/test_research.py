@@ -2029,13 +2029,10 @@ def test_a_failed_proposal_task_charges_the_run_for_what_it_spent(
         "...",
         "Test task",
         "test summary two",
-        "summary two",
         "t",
         "g",
         "q",
         "x",
-        "the data",
-        "a plan",
     ],
 )
 def test_a_field_that_says_nothing_is_refused(value: str) -> None:
@@ -2060,10 +2057,19 @@ def test_a_field_that_says_nothing_is_refused(value: str) -> None:
         "Assess the solver's restart rule",
         "widget deformation under load",
         "Recover the Gate E.4 table",
+        # Ordinary fields an all-filler rule refused for one commit, until an
+        # independent review pointed out the cost: a re-ask spent on a plan that
+        # was fine, then a failed run on the second identical phrasing.
+        "Query the data",
+        "Results summary",
+        "First results",
+        "Summary of results",
+        "the data",
+        "a plan",
     ],
 )
 def test_terse_but_real_prose_is_not_refused(value: str) -> None:
-    """The guard grades emptiness, not brevity."""
+    """The guard grades emptiness, not brevity, and not ordinary vocabulary."""
 
     assert _is_placeholder(value) is False
 

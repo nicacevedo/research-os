@@ -626,3 +626,222 @@ def test_the_source_report_never_prints_a_credential(monkeypatch) -> None:
         now=clock.now,
     )
     assert "super-secret-value" not in rendered
+
+
+# -- what the delta review found -----------------------------------------
+
+
+def test_a_cache_hit_is_archived_like_every_other_outcome() -> None:
+    """Found by the delta review.
+
+    `_call`'s docstring promises every path records a `SearchRecord`. The cached
+    path returned before reaching the archive, so a reader auditing whether a
+    run asked a provider saw only the *earlier* run's rows and could not tell
+    them apart.
+    """
+
+    clock = Clock()
+    store = LiteratureStore.open_memory()
+    built, client = service(
+        store, [openalex_page()], clock=clock, cache_ttl_seconds=3600
+    )
+    built.retrieve("widgets")
+    before = len(store.searches(limit=100))
+    clock.advance(600)
+    report = built.retrieve("widgets")
+
+    assert report.outcomes[0].from_cache is True
+    assert len(client.requests) == 1
+    rows = store.searches(limit=100)
+    assert len(rows) == before + 1, "the cache hit was not archived"
+    assert "answered from the literature store" in rows[0].detail
+
+
+def test_an_archived_cache_hit_cannot_itself_become_a_cache_entry() -> None:
+    """Otherwise the freshness window would extend itself indefinitely."""
+
+    clock = Clock()
+    store = LiteratureStore.open_memory()
+    built, client = service(
+        store, [openalex_page()], clock=clock, cache_ttl_seconds=600
+    )
+    built.retrieve("widgets")  # real request, cacheable
+    clock.advance(300)
+    built.retrieve("widgets")  # served from cache, archived
+    clock.advance(400)  # now 700s past the real request
+    built.retrieve("widgets")  # must ask again
+
+    assert len(client.requests) == 2
+    assert all(
+        row.cache_key == ""
+        for row in store.searches(limit=100)
+        if "from the literature store" in row.detail
+    )
+
+
+def test_a_real_429_counts_as_a_provider_request_and_a_refusal_does_not() -> None:
+    """Found by the delta review.
+
+    Both report RATE_LIMITED and only one spent quota, so a count that filtered
+    on status answered the quota question wrongly in the case it was asked.
+    """
+
+    clock = Clock()
+    store = LiteratureStore.open_memory()
+    limited, _ = service(
+        store,
+        [
+            ScriptedResponse(
+                match="api.openalex.org",
+                status=429,
+                headers={"retry-after": "3600"},
+                body=b"{}",
+            )
+        ],
+        clock=clock,
+    )
+    report = limited.retrieve("widgets")
+    assert report.outcomes[0].status is SourceStatus.RATE_LIMITED
+    assert report.outcomes[0].attempted is True
+    assert report.network_calls == 1, "a real 429 spent a request"
+
+    clock.advance(1)
+    refused, _ = service(store, [openalex_page()], clock=clock)
+    second = refused.retrieve("widgets")
+    assert second.outcomes[0].status is SourceStatus.RATE_LIMITED
+    assert second.outcomes[0].attempted is False
+    assert second.network_calls == 0, "a refused reservation spent nothing"
+
+
+def test_a_long_retry_after_on_a_5xx_is_persisted_too() -> None:
+    """Found by the delta review.
+
+    The early return fires for 429 and four 5xx statuses, but only the 429 path
+    read `Retry-After`, so a `503 Retry-After: 3600` was returned immediately
+    and then written down as an ordinary failure -- and the next run asked again
+    seconds later. The stated benefit of the change was delivered for one of the
+    five statuses it applies to.
+    """
+
+    clock = Clock()
+    store = LiteratureStore.open_memory()
+    built, _ = service(
+        store,
+        [
+            ScriptedResponse(
+                match="api.openalex.org",
+                status=503,
+                headers={"retry-after": "3600"},
+                body=b"{}",
+            )
+        ],
+        clock=clock,
+    )
+    built.retrieve("widgets")
+    health = store.pacer().health("openalex")
+    assert health.rate_limited_until == utc_stamp(START + timedelta(hours=1))
+    assert health.availability(clock.now) == "RATE_LIMITED"
+
+
+def test_a_5xx_with_no_retry_after_is_still_only_a_failure() -> None:
+    """A provider that failed without saying when has not asked us to wait."""
+
+    clock = Clock()
+    store = LiteratureStore.open_memory()
+    built, _ = service(
+        store,
+        [ScriptedResponse(match="api.openalex.org", status=500, body=b"{}")],
+        clock=clock,
+    )
+    built.retrieve("widgets")
+    health = store.pacer().health("openalex")
+    assert health.rate_limited_until is None
+    assert health.availability(clock.now) == "FAILED"
+
+
+def test_a_success_does_not_erase_a_recorded_quota_reset() -> None:
+    """Found by the delta review.
+
+    `quota_reset_at` was clearable and `record_success` passed it as None on
+    every call, so any successful search wiped a reset a provider had reported
+    -- while the stale `quota_remaining` beside it survived, leaving a row in a
+    state no provider ever described.
+    """
+
+    pacer = LiteratureStore.open_memory().pacer()
+    pacer.record_rate_limited(
+        "openalex", now=START, reset_at=START + timedelta(hours=2), detail="429"
+    )
+    recorded = pacer.health("openalex").quota_reset_at
+    assert recorded == utc_stamp(START + timedelta(hours=2))
+
+    pacer.record_success("openalex", now=START + timedelta(hours=3), detail="ok")
+    after = pacer.health("openalex")
+    assert after.quota_reset_at == recorded, "a success erased the reset"
+    assert after.rate_limited_until is None, "a success must lift the rate limit"
+
+
+def test_a_retry_after_only_429_does_not_erase_a_recorded_reset() -> None:
+    pacer = LiteratureStore.open_memory().pacer()
+    pacer.record_rate_limited(
+        "crossref", now=START, reset_at=START + timedelta(hours=2), detail="429"
+    )
+    pacer.record_rate_limited(
+        "crossref", now=START + timedelta(hours=3), retry_after_seconds=30, detail="429"
+    )
+    assert pacer.health("crossref").quota_reset_at == utc_stamp(
+        START + timedelta(hours=2)
+    )
+
+
+def test_the_pacer_reports_a_broken_store_as_its_own_error() -> None:
+    """A raw sqlite3 error is not in WORKER_ERRORS, so it escapes a research
+    task unhandled and leaves it RUNNING rather than FAILED."""
+
+    store = LiteratureStore.open_memory()
+    pacer = store.pacer()
+    store.connection.execute("DROP TABLE source_health")
+    with pytest.raises(LiteratureStoreError, match="pacing state"):
+        pacer.health("arxiv")
+    with pytest.raises(LiteratureStoreError, match="pacing state"):
+        pacer.all_health()
+
+
+def test_a_failed_commit_does_not_leave_the_transaction_open() -> None:
+    """Restoring the isolation level over an open transaction would make the
+    next write silently join it, so the rollback is not tidying -- it is what
+    makes the connection usable again. Found by the delta review."""
+
+    import sqlite3
+
+    class RefusesToCommit:
+        """A connection proxy whose COMMIT fails once, as a full disk would."""
+
+        def __init__(self, inner: sqlite3.Connection) -> None:
+            self._inner = inner
+            self.failed = False
+
+        def execute(self, sql, *args, **kwargs):
+            if sql.strip().upper() == "COMMIT" and not self.failed:
+                self.failed = True
+                raise sqlite3.OperationalError("disk I/O error")
+            return self._inner.execute(sql, *args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        def __setattr__(self, name, value):
+            if name in {"_inner", "failed"}:
+                object.__setattr__(self, name, value)
+            else:
+                setattr(self._inner, name, value)
+
+    store = LiteratureStore.open_memory()
+    proxy = RefusesToCommit(store.connection)
+    pacer = SourcePacer(proxy)  # type: ignore[arg-type]
+
+    with pytest.raises(LiteratureStoreError, match="pacing write failed"):
+        pacer.reserve("arxiv", now=START)
+
+    assert store.connection.in_transaction is False, "the transaction was left open"
+    assert store.pacer().reserve("arxiv", now=START).granted is True

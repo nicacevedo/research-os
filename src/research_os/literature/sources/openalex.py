@@ -173,6 +173,7 @@ class OpenAlexSource:
             )
         if response.status != 200:
             return SourceResult(
+                retry_after_seconds=retry_after_seconds(response),
                 provider=self.name,
                 status=SourceStatus.FAILED,
                 request_url=url,
