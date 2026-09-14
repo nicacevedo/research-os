@@ -56,6 +56,49 @@ An unusable provider reports `UNAVAILABLE` rather than raising. "We could not
 ask OpenAlex today" is a fact about a literature review that has to survive into
 the record.
 
+## Pacing that outlives the process
+
+The HTTP client paces one process: each host has a minimum interval and the
+client waits. What it could not do was remember. Two runs started an hour apart
+each began believing every provider was fresh, and a provider that answered the
+first with `429 Retry-After: 3600` answered the second the same way, for the
+same reason, at the same cost.
+
+Four rules now, over one table in the literature store.
+
+**Cache first, before the slot rather than after it.** A query this store
+already answered successfully inside the freshness window is answered from the
+store, for no provider quota at all. Only a successful search is served back: a
+provider that failed last time has not answered this query, and serving that as
+a cache hit would turn one outage into a permanent empty result. The window is
+`cache_ttl_seconds`, a day by default; set it to `0` to ask every time, which is
+what a reproducibility check wants.
+
+**The reservation is atomic.** Deciding a slot is free and taking it happen
+inside one `BEGIN IMMEDIATE` transaction, so two concurrent runs cannot both see
+"available" and both issue a request. The network call happens after that
+transaction commits — a write lock is never held across I/O, because that would
+turn one slow provider into a stalled literature subsystem for every other
+process on the machine.
+
+**Only what a provider actually said is recorded.** `Retry-After` in both forms
+RFC 9110 allows, a 429, a timeout, a permanent error. A 429 with no
+`Retry-After` is held for that source's own minimum interval and nothing longer:
+inventing a cooldown a provider did not ask for would be this client deciding,
+on no evidence, that a literature review should stop. A quota nobody reported
+stays unknown, and unknown is a value. A failure is not a rate limit — a
+provider that timed out has not asked us to wait.
+
+**Nothing is waited out irrationally.** A provider asking for an hour gets an
+hour recorded, not slept through. The response comes straight back, the source
+is marked `RATE_LIMITED` with the time it may be asked again, and the rest of
+the retrieval asks the providers that will answer.
+
+This is operational state, not scientific state. Deleting it costs a run some
+politeness and no science at all. `researchctl lit sources` shows it beside the
+probe: the probe says what this machine *could* do with a provider, the
+persisted health says what that provider last actually did.
+
 ## Identity and deduplication
 
 A precedence, not a similarity score:
@@ -200,6 +243,7 @@ enabled_sources: [openalex, crossref, arxiv]
 offline: false                     # true reaches nothing and says so
 default_search_limit: 20
 fetch_fulltext: true
+cache_ttl_seconds: 86400           # 0 asks the providers every time
 ```
 
 A contact address may also come from `RESEARCH_OS_CONTACT_EMAIL`. Credentials

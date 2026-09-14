@@ -39,6 +39,79 @@ researcher has declared. It returns a small plan. Everything the prompt asked
 for is then re-checked locally, because the prompt is a request and the
 validator is the rule.
 
+It also sees a **project profile**, and that part is not a request at all.
+
+## The project profile
+
+Before anything is asked of a model, the controller reads the repository and
+the researcher's configuration and writes down what it found: whether there is
+a Research Capsule, whether this is a Python project, whether it has a lock
+file, whether its package lives under `src/`, which experiment commands are
+declared, which validation checks can be resolved, which files are manuscripts.
+Each fact carries where it came from -- `explicit_config`,
+`repository_metadata`, `deterministic_structure`, or `unavailable`, which is
+never the same as "no".
+
+The profile reaches the planner as controller-authored context and comes back
+as nothing at all. A worker cannot edit it, argue with it, or cause it to be
+recomputed. Nothing in building it executes repository code: it reads
+`git ls-files`, checks whether named files are tracked, and parses
+`pyproject.toml`. Facts come from tracked files rather than the working tree, so
+a scratch file cannot change what kind of project this is, and a profile carries
+no timestamp, so two profiles of one tree are equal.
+
+Explicit configuration always wins. A researcher who has declared something
+about their own project is not overruled by a heuristic.
+
+## Two provenance modes
+
+The profile decides which universe a run's reasoning may draw on, and the
+decision is the controller's:
+
+| the project | mode | what a worker may cite |
+| --- | --- | --- |
+| has `.research/` | `scientific_project` | Questions, Hypotheses, Experiments, Evidence, Claims, Decisions, retrieved works |
+| has no `.research/` | `repository_assessment` | tracked files at the base commit, symbols, check ids, retrieved works |
+
+A `proposal` task in a capsule project produces a scientific proposal, exactly
+as before. The same task in an ordinary repository produces a **technical
+assessment**: observations about the code, each resting on a file, a check, or a
+paper; the single highest-value unresolved question; and what would answer it.
+It is not science, has no promotion path, is never written under `.research/`,
+and never enters the repository at all.
+
+Scientific identifiers fail closed in that mode rather than being unmodelled.
+The field that could carry one is checked against an allowlist the controller
+leaves empty, so a worker writing `CLAIM-0001` is refused. Where the repository
+would benefit from becoming a Research OS project, the assessment may say so --
+as advice. Research OS never creates a capsule on its own.
+
+## Validation profiles
+
+A plan says **what** must be verified. The controller decides **how**.
+
+For a project with a `pyproject.toml` and a `uv.lock`, the controller resolves
+named checks itself:
+
+```
+tests   uv run pytest -q
+lint    uv run ruff check .
+format  uv run ruff format --check .
+```
+
+A code task then names `required_checks: ["tests", "lint"]`, and a plan that
+writes its own command instead is refused. This closes a trap v1.0.0
+documented: a `src`-layout project's tests only import under `uv run`, a planner
+wrote a bare `pytest`, and the run failed closed having verified nothing. That
+was a model being asked an environment question it had no way to answer.
+
+Explicit configuration replaces discovery entirely when present -- declare
+`projects.<id>.check_profiles` in `automation.yaml`. Discovery is what happens
+when nobody has said. Either way the resolved argument vector passes the same
+command policy a planner-authored command faces, so a profile can never
+introduce a program the policy forbids. A project with no resolvable profile
+falls back to naming its own acceptance commands.
+
 ## Task kinds
 
 | kind | what runs it | writes? | can spend compute? |
@@ -63,6 +136,35 @@ records the question, and moves to `WAITING_FOR_HUMAN`. Nothing after it runs.
 `researchctl research answer` records the answer and lets the run continue;
 `--stop` records a refusal and ends the run instead. A researcher who declines
 has decided something, and the run honours it rather than going on.
+
+Not every checkpoint is the same kind of thing, and `--checkpoint-policy`
+decides which kinds may stop this run:
+
+| policy | what may stop the run |
+| --- | --- |
+| `standard` (default) | anything the planner asks |
+| `scientific-only` | hard checkpoints only |
+
+A **hard** checkpoint is a boundary of human scientific authority: a human
+Review, accepting a Claim, changing a criterion that was prespecified before the
+result was known, promoting a conclusion across projects, or authorising
+something expensive or irreversible. A **discretionary** one is the planner
+preferring to ask -- reasonable interactively, and the thing that makes an
+unattended run not unattended.
+
+Every checkpoint carries a typed kind, and the controller decides two things the
+model does not. Whether the kind is possible here, from what the capsule
+actually holds: a Claim acceptance in a project with no Claims is refused
+outright, under both policies, so a preference cannot become a scientific
+boundary by relabelling. And whether the kind is permitted under this run's
+policy: a discretionary checkpoint under `scientific-only` is refused at
+validation with one deterministic reason, the planner gets its single bounded
+re-ask, and a second discretionary plan fails explicitly rather than being asked
+again.
+
+`scientific-only` narrows what may stop a run. It widens nothing: it does not
+authorise experiments, does not let automation author a Review, and does not let
+a task write under `.research/`.
 
 **An unauthorised experiment.** Experiments do not execute unless the run was
 started with `--execute-experiments`. Without it, an experiment task still

@@ -343,13 +343,20 @@ def validate_assessment(assessment: TechnicalAssessment) -> None:
 
 @dataclass(frozen=True, slots=True)
 class GroundingViolation:
-    """One thing wrong with what an observation rests on.
+    """One reference an assessment made that does not resolve.
 
-    Two shapes, because there are two ways to get grounding wrong and both are
-    facts about the payload rather than about the wording of an error. An
-    observation can cite something the controller never supplied, or it can cite
-    nothing at all. The repair is the same in either case -- re-ground against
-    what this run actually had -- so both reach the single bounded correction.
+    Three shapes, and the set is the whole set on purpose. Each live pilot in
+    this release found a different one of them, and each time the temptation was
+    to repair the instance: an observation that cited an identifier the
+    controller never supplied, an observation that cited nothing at all, and an
+    uncertainty that pointed at ``"open_question"`` instead of an observation id.
+
+    They are the same failure. A reference that does not resolve has exactly one
+    repair -- point at something real or drop the thing that rested on it -- and
+    the correction prompt already says so. What is *not* in this set is equally
+    deliberate: a blank statement, a duplicate id, a non-sequential id. Those are
+    shape problems with nothing to reground, and sending one to a correction
+    worker would be asking a model again in the hope of a different answer.
     """
 
     observation_id: str
@@ -357,13 +364,21 @@ class GroundingViolation:
     label: str
     cited: str
     ungrounded: bool = False
-    """Whether this observation rests on nothing, rather than on the wrong thing."""
+    """This observation rests on nothing, rather than on the wrong thing."""
+
+    internal: bool = False
+    """This reference points inside the assessment, at an id that is not there."""
 
     def describe(self) -> str:
         if self.ungrounded:
             return (
                 f"{self.observation_id} rests on nothing: it names no repository "
                 "file, no retrieved work and no deterministic check"
+            )
+        if self.internal:
+            return (
+                f"{self.observation_id} refers to {self.cited!r} in "
+                f"'{self.field}', which is not an observation in this assessment"
             )
         return (
             f"{self.observation_id} cites {self.label} {self.cited!r} in "
@@ -445,7 +460,63 @@ def grounding_violations(
                             cited=value,
                         )
                     )
+
+    known = {
+        item.get("observation_id")
+        for item in observations
+        if isinstance(item, dict) and isinstance(item.get("observation_id"), str)
+    }
+    found.extend(
+        _internal_violations(
+            payload.get("next_actions"),
+            field="addresses_observations",
+            what="recommended action",
+            known=known,
+        )
+    )
+    found.extend(
+        _internal_violations(
+            payload.get("uncertainties"),
+            field="blocks",
+            what="uncertainty",
+            known=known,
+        )
+    )
     return tuple(found)
+
+
+def _internal_violations(
+    entries: Any, *, field: str, what: str, known: set[str | None]
+) -> list[GroundingViolation]:
+    """Return references to observations this assessment does not contain.
+
+    Internal rather than supplied, but the same kind of broken pointer and the
+    same repair. Found by Pilot C, where an uncertainty declared it blocked
+    ``"open_question"`` -- a field name rather than an observation id -- and the
+    whole assessment was discarded for it with no correction available.
+    """
+
+    found: list[GroundingViolation] = []
+    if not isinstance(entries, list):
+        return found
+    for index, entry in enumerate(entries, start=1):
+        if not isinstance(entry, dict):
+            continue
+        cited = entry.get(field)
+        if not isinstance(cited, list):
+            continue
+        for value in cited:
+            if isinstance(value, str) and value not in known:
+                found.append(
+                    GroundingViolation(
+                        observation_id=f"{what} {index}",
+                        field=field,
+                        label="observation",
+                        cited=value,
+                        internal=True,
+                    )
+                )
+    return found
 
 
 def build_grounding_correction_prompt(
@@ -512,13 +583,18 @@ and "related_capsule_ids" must be empty or absent on every observation.
 
 WHAT TO DO
 
-Return the whole assessment again, in the same schema, so that every observation
-rests on at least one entry from the lists above -- a "file_refs" path, a
-"literature_keys" key, or a "check_ids" id -- and cites nothing outside them.
-Replace a refused citation with a real one, or drop the observation along with
-whatever rested on it. Do not invent a replacement. If an observation cannot
-stand on anything you were actually given, drop it and say so in
-"uncertainties".
+Return the whole assessment again, in the same schema, so that:
+
+- every observation rests on at least one entry from the lists above -- a
+  "file_refs" path, a "literature_keys" key, or a "check_ids" id -- and cites
+  nothing outside them;
+- every "blocks" and "addresses_observations" entry is an observation id that
+  is actually present in this assessment, such as "OB-001". A field name is not
+  an observation id. Leave the list empty if nothing specific is blocked.
+
+Replace a broken reference with a real one, or drop the thing that rested on it.
+Do not invent a replacement. If an observation cannot stand on anything you were
+actually given, drop it and say so in "uncertainties".
 
 Change nothing else. This is your one correction; there is no second.
 """

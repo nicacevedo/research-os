@@ -85,6 +85,12 @@ evidence-grounded manuscript drafting, cross-project insights, and the unified
 research runs that orchestrate all of it. Every one of them is bounded,
 delegated to a deterministic controller, and stops at a human.
 
+**v1.1** moves five things out of a model's judgement and into the controller's:
+what a project is, which grounding universe its reasoning may draw on, how its
+validation checks are actually invoked, which interruptions are a person's
+decision rather than a preference, and how long a literature provider asked us
+to wait. None of it changes what a human still decides.
+
 `docs/CAPSULE.md` is the live specification and is authoritative on anything
 scientific. Canonical Git-tracked YAML and Markdown under `.research/` are the
 only project scientific state: there is no materialized project index, and the
@@ -138,7 +144,7 @@ uv run researchctl auto events RUN_ID
 uv run researchctl auto runs
 uv run researchctl auto cancel RUN_ID
 uv run researchctl auto cleanup RUN_ID
-uv run researchctl research start PROJECT --goal "..." [--run]
+uv run researchctl research start PROJECT --goal "..." [--run] [--checkpoint-policy standard|scientific-only]
 uv run researchctl research run RUN_ID
 uv run researchctl research answer RUN_ID --answer "..." [--stop]
 uv run researchctl research resume RUN_ID [--retry] [--force]
@@ -250,6 +256,38 @@ experiments, cluster submissions and wall clock are separately budgeted and
 every spend is checked before it happens. Experiments do not execute without
 `--execute-experiments`; without it, an experiment task resolves its exact
 command and stops. See `docs/RESEARCH.md`.
+
+Before a model is asked anything, the controller establishes what the project
+**is**. It reads the repository and your configuration — capsule or no capsule,
+Python or not, lock file, `src` layout, declared experiment commands — and hands
+the planner those facts rather than asking it to infer them. Nothing in that
+reads anything a model wrote, and nothing a model writes can change it.
+
+Two things follow from the profile, and both used to be a planner's guess.
+
+**Your repository does not need a capsule.** A project with `.research/` gets
+the scientific pipeline it always had. A project without one gets a *technical
+assessment* instead: observations about the code, each resting on a tracked file
+at a pinned commit, on a deterministic check, or on a retrieved paper; the one
+highest-value unresolved question; and what would answer it. It is not science,
+nothing in it is promotable, and it is never written into your repository.
+
+**The controller decides how to run your checks.** For a project with a
+`uv.lock`, a plan asks for `required_checks: ["tests", "lint"]` and the
+controller resolves that to `uv run pytest -q` and `uv run ruff check .` — the
+invocations that actually work in your project's environment. A plan that writes
+its own command instead is refused. You can declare the exact commands yourself
+under `projects.<id>.check_profiles` in `automation.yaml`, and configuration
+always wins over discovery.
+
+`--checkpoint-policy scientific-only` is for a run you are not sitting in front
+of. It permits only **hard** checkpoints — a human Review, accepting a Claim,
+changing a criterion that was prespecified before the result was known,
+promoting a conclusion across projects, or authorising something expensive — and
+refuses a plan that stops merely to ask whether it should continue. It narrows
+what may *stop* a run and widens nothing about what a run may *do*: no flag
+authorises an experiment, lets automation write a Review, or lets a task touch
+`.research/`. The default is `standard`, which behaves exactly as before.
 
 Everything automation produces is a candidate. Proposals are suggestions,
 evidence packets are candidates, drafts are prose. Promoting any of it into a

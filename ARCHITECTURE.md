@@ -244,6 +244,10 @@ in `AGENTS.md`.
 | **R4 — Author / Referee** | source packets, grounded drafting, independent writing review | in v1 (`paper`) |
 | **R5 — Autonomous OS** | watchers, MCP, background services, optional UI | not started |
 
+v1.1 is an increment within that boundary, not a step toward R5. It adds no
+watcher, no service and no background process; everything it does happens inside
+a run a person started.
+
 Research OS v1 delivers the working core of R1 through R4, orchestrated by
 `researchctl research`. What it deliberately does not deliver is R5: there are
 no watchers, no background services, no MCP, and no UI. Nothing runs unless a
@@ -306,6 +310,45 @@ What this layer owns is dispatch, ordering, budgeting and stopping:
 
 `docs/RESEARCH.md` is its live specification; `docs/OPERATIONS.md` covers
 `doctor`, `storage` and recovery.
+
+## 11a-bis. What the controller establishes before a model is asked
+
+Three decisions moved out of model judgement in v1.1, and all three have the
+same shape: a fact the machine can read, read by the machine.
+
+**The project profile** (`research_os.automation.profile`) is a closed set of
+capabilities with an origin apiece — `explicit_config`, `repository_metadata`,
+`deterministic_structure`, `unavailable`. It is computed from tracked files,
+`pyproject.toml` and the researcher's configuration; it executes no repository
+code; it carries no timestamp, so two profiles of one tree are equal; and
+explicit configuration always beats discovery. It reaches a prompt as
+controller-authored context and comes back as nothing.
+
+**The provenance mode** follows from one bit of it. A project with `.research/`
+reasons in `scientific_project` mode, over capsule identifiers. A project
+without one reasons in `repository_assessment` mode, over tracked files at the
+base commit, symbols, deterministic check ids and retrieved works, and produces
+a `TechnicalAssessment` (`research_os.assessment`) rather than a proposal. That
+object is explicitly not science: no promotion path, never written under
+`.research/`, never written into the project at all, and its one field that
+could name a scientific object is validated against an allowlist the controller
+leaves empty in that mode.
+
+**Validation profiles** (`research_os.automation.checkprofiles`) name checks the
+controller owns. A plan selects `required_checks: ["tests", "lint"]`; the
+controller resolves each id to argv it already knows. Configuration replaces
+discovery entirely when present; discovery is deliberately one ecosystem wide
+(`pyproject.toml` beside `uv.lock`); and every resolved argv — configured or
+discovered — passes the same `command_policy` grammar planner-authored commands
+face. A profile is not permission: the policy is asked after configuration is
+read, never before.
+
+Alongside them, `CheckpointPolicy` (`research_os.research.checkpoints`) makes
+"autonomous" a controller property rather than a prompt. Checkpoints carry a
+typed kind; the controller decides whether that kind is *possible* in this
+project from what the capsule holds, and whether it is *permitted* under this
+run's policy. `scientific_only` narrows what may stop a run and widens nothing
+about what a run may do.
 
 ## 11b. Untrusted text
 

@@ -462,6 +462,148 @@ def test_a_truncated_file_list_says_so_in_both_places(tmp_path: Path) -> None:
     assert "cannot rest on a path that is not listed" in context
 
 
+def test_an_uncertainty_pointing_at_a_non_observation_is_a_violation(
+    tmp_path: Path,
+) -> None:
+    """Found by Pilot C.
+
+    An uncertainty declared it blocked ``"open_question"`` -- the name of a
+    sibling field rather than an observation id -- and the whole assessment was
+    discarded for it with no correction available.
+    """
+
+    root = capsule_less_repo(tmp_path / "solver")
+    payload = assessment_payload()
+    payload["uncertainties"][0]["blocks"] = ["open_question"]
+    violations = grounding_violations(payload, grounding_for(root))
+    assert len(violations) == 1
+    assert violations[0].internal is True
+    assert "not an observation in this assessment" in violations[0].describe()
+
+
+def test_an_action_pointing_at_a_missing_observation_is_a_violation(
+    tmp_path: Path,
+) -> None:
+    root = capsule_less_repo(tmp_path / "solver")
+    payload = assessment_payload()
+    payload["next_actions"][0]["addresses_observations"] = ["OB-009"]
+    violations = grounding_violations(payload, grounding_for(root))
+    assert len(violations) == 1
+    assert violations[0].cited == "OB-009"
+
+
+def test_a_broken_internal_reference_is_repaired_by_the_one_correction(
+    tmp_path: Path,
+) -> None:
+    root = capsule_less_repo(tmp_path / "solver")
+    broken = assessment_payload()
+    broken["uncertainties"][0]["blocks"] = ["open_question"]
+    provider = assessment_provider(
+        [
+            ScriptedResponse(structured=broken),
+            ScriptedResponse(structured=assessment_payload()),
+        ]
+    )
+    outcome = AssessmentController(
+        providers={provider.name: provider}, config=fake_config()
+    ).assess(
+        project_path=root,
+        goal="Assess this repository.",
+        profile=build_project_profile(project_path=root),
+    )
+    assert outcome.grounding_correction is not None
+    assert outcome.model_calls == 2
+
+
+def test_the_correction_prompt_explains_what_an_observation_id_is(
+    tmp_path: Path,
+) -> None:
+    from research_os.assessment.planner import build_grounding_correction_prompt
+
+    root = capsule_less_repo(tmp_path / "solver")
+    payload = assessment_payload()
+    payload["uncertainties"][0]["blocks"] = ["open_question"]
+    grounding = grounding_for(root)
+    prompt = build_grounding_correction_prompt(
+        goal="Assess this repository.",
+        payload=payload,
+        violations=grounding_violations(payload, grounding),
+        grounding=grounding,
+    )
+    assert "A field name is not" in prompt
+    assert "an observation id" in prompt
+
+
+def test_every_reference_failure_is_correctable_and_no_shape_failure_is(
+    tmp_path: Path,
+) -> None:
+    """The class, not the instances.
+
+    Three live pilots in this release each found a different broken-reference
+    shape. This asserts the set: every way an assessment can point at something
+    that is not there reaches the single bounded correction, and every way it
+    can simply be malformed does not.
+    """
+
+    root = capsule_less_repo(tmp_path / "solver")
+    grounding = grounding_for(root)
+
+    def violations_for(mutate) -> tuple:
+        payload = assessment_payload()
+        mutate(payload)
+        return grounding_violations(payload, grounding)
+
+    def set_ref(field: str, value: object):
+        def apply(payload: dict[str, Any]) -> None:
+            payload["observations"][0][field] = value
+
+        return apply
+
+    correctable = [
+        set_ref("file_refs", [{"path": "nowhere.py"}]),
+        set_ref("literature_keys", ["doi:10.0000/invented"]),
+        set_ref("check_ids", ["typecheck"]),
+        set_ref("related_capsule_ids", ["CLAIM-0001"]),
+        lambda payload: payload["observations"][1].pop("file_refs"),
+        lambda payload: payload["uncertainties"][0].update({"blocks": ["nope"]}),
+        lambda payload: payload["next_actions"][0].update(
+            {"addresses_observations": ["OB-404"]}
+        ),
+    ]
+    for mutate in correctable:
+        assert violations_for(mutate), "a broken reference must be correctable"
+
+    def renumber_without_dangling(payload: dict[str, Any]) -> None:
+        """A non-sequential id, with nothing left pointing at the old one."""
+
+        payload["next_actions"][0]["addresses_observations"] = []
+        payload["uncertainties"][0]["blocks"] = []
+        payload["observations"][1]["observation_id"] = "OB-007"
+
+    not_correctable = [
+        lambda payload: payload["observations"][0].update({"statement": ""}),
+        lambda payload: payload.update({"summary": ""}),
+        lambda payload: payload.pop("open_question"),
+        renumber_without_dangling,
+    ]
+    for mutate in not_correctable:
+        assert not violations_for(mutate), (
+            "a shape failure has nothing to reground and must not be re-asked"
+        )
+
+    # A payload carrying both kinds enters the correction on the strength of its
+    # grounding half, exactly as the proposal layer does. That was reviewed and
+    # accepted one release ago: the cost is one budget-checked, non-recursive
+    # call, and the second failure is reported honestly.
+    both = violations_for(
+        lambda payload: (
+            payload["observations"][0].update({"statement": ""}),
+            payload["observations"][0].update({"check_ids": ["typecheck"]}),
+        )
+    )
+    assert both
+
+
 def test_the_prompt_forbids_scientific_identifiers(tmp_path: Path) -> None:
     root = capsule_less_repo(tmp_path / "solver")
     prompt = build_assessment_prompt(
