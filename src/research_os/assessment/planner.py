@@ -343,12 +343,32 @@ def validate_assessment(assessment: TechnicalAssessment) -> None:
 
 @dataclass(frozen=True, slots=True)
 class GroundingViolation:
-    """One citation an assessment made that the controller never supplied."""
+    """One thing wrong with what an observation rests on.
+
+    Two shapes, because there are two ways to get grounding wrong and both are
+    facts about the payload rather than about the wording of an error. An
+    observation can cite something the controller never supplied, or it can cite
+    nothing at all. The repair is the same in either case -- re-ground against
+    what this run actually had -- so both reach the single bounded correction.
+    """
 
     observation_id: str
     field: str
     label: str
     cited: str
+    ungrounded: bool = False
+    """Whether this observation rests on nothing, rather than on the wrong thing."""
+
+    def describe(self) -> str:
+        if self.ungrounded:
+            return (
+                f"{self.observation_id} rests on nothing: it names no repository "
+                "file, no retrieved work and no deterministic check"
+            )
+        return (
+            f"{self.observation_id} cites {self.label} {self.cited!r} in "
+            f"'{self.field}', which this run did not supply"
+        )
 
 
 def grounding_violations(
@@ -379,6 +399,25 @@ def grounding_violations(
         observation_id = (
             raw_id if isinstance(raw_id, str) and raw_id else f"item {index}"
         )
+        if not any(
+            isinstance(item.get(field), list) and item.get(field)
+            for field in ("file_refs", "literature_keys", "check_ids")
+        ):
+            # An observation resting on nothing. Found by the cuPDLP pilot: one
+            # observation of seven omitted its grounding and the whole assessment
+            # was refused with no correction available, because the correction
+            # trigger only knew about citations that were wrong rather than
+            # citations that were absent. Same category, same repair, same single
+            # bounded attempt.
+            found.append(
+                GroundingViolation(
+                    observation_id=observation_id,
+                    field="file_refs/literature_keys/check_ids",
+                    label="grounding",
+                    cited="",
+                    ungrounded=True,
+                )
+            )
         refs = item.get("file_refs")
         if isinstance(refs, list):
             for entry in refs:
@@ -427,11 +466,7 @@ def build_grounding_correction_prompt(
     """
 
     refused = json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False)
-    errors = "\n".join(
-        f"- {item.observation_id} cites {item.label} {item.cited!r} in "
-        f"'{item.field}', which this run did not supply"
-        for item in violations
-    )
+    errors = "\n".join(f"- {item.describe()}" for item in violations)
     files = sorted(grounding.repository_files)[:MAX_CORRECTION_IDS]
     citable = "\n".join(f"- {prompt_safe(item)}" for item in files) or "- (none)"
     literature = (
@@ -477,10 +512,12 @@ and "related_capsule_ids" must be empty or absent on every observation.
 
 WHAT TO DO
 
-Return the whole assessment again, in the same schema, with every refused
-citation either replaced by one from the lists above or removed along with
+Return the whole assessment again, in the same schema, so that every observation
+rests on at least one entry from the lists above -- a "file_refs" path, a
+"literature_keys" key, or a "check_ids" id -- and cites nothing outside them.
+Replace a refused citation with a real one, or drop the observation along with
 whatever rested on it. Do not invent a replacement. If an observation cannot
-stand on anything you were actually given, drop the observation and say so in
+stand on anything you were actually given, drop it and say so in
 "uncertainties".
 
 Change nothing else. This is your one correction; there is no second.

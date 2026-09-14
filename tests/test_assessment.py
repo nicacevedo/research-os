@@ -343,12 +343,81 @@ def test_violations_are_computed_from_the_payload(tmp_path: Path) -> None:
 def test_a_structurally_broken_payload_reports_no_grounding_violation(
     tmp_path: Path,
 ) -> None:
-    """Only a grounding failure may enter the correction path."""
+    """Only a grounding failure may enter the correction path.
+
+    A blank statement is a shape problem, not a grounding problem: there is
+    nothing for a correction worker to reground, and sending it to one would be
+    asking a model again in the hope of a different answer.
+    """
 
     root = capsule_less_repo(tmp_path / "solver")
     payload = assessment_payload()
     payload["observations"][0]["statement"] = ""
     assert grounding_violations(payload, grounding_for(root)) == ()
+
+
+def test_an_observation_resting_on_nothing_is_a_grounding_violation(
+    tmp_path: Path,
+) -> None:
+    """Found by the cuPDLP pilot.
+
+    One observation of seven omitted its grounding entirely and the whole
+    assessment was refused with no correction available, because the correction
+    trigger knew only about citations that were *wrong* and not about citations
+    that were *absent*. Those are the same category and have the same repair.
+    """
+
+    root = capsule_less_repo(tmp_path / "solver")
+    payload = assessment_payload()
+    payload["observations"][1].pop("file_refs")
+    violations = grounding_violations(payload, grounding_for(root))
+    assert len(violations) == 1
+    assert violations[0].observation_id == "OB-002"
+    assert violations[0].ungrounded is True
+    assert "rests on nothing" in violations[0].describe()
+
+
+def test_an_ungrounded_observation_is_repaired_by_the_one_correction(
+    tmp_path: Path,
+) -> None:
+    root = capsule_less_repo(tmp_path / "solver")
+    ungrounded = assessment_payload()
+    ungrounded["observations"][1].pop("file_refs")
+    provider = assessment_provider(
+        [
+            ScriptedResponse(structured=ungrounded),
+            ScriptedResponse(structured=assessment_payload()),
+        ]
+    )
+    outcome = AssessmentController(
+        providers={provider.name: provider}, config=fake_config()
+    ).assess(
+        project_path=root,
+        goal="Assess this repository.",
+        profile=build_project_profile(project_path=root),
+    )
+    assert outcome.grounding_correction is not None
+    assert outcome.model_calls == 2
+    assert len(outcome.assessment.observations) == 2
+
+
+def test_the_correction_prompt_names_an_ungrounded_observation(
+    tmp_path: Path,
+) -> None:
+    from research_os.assessment.planner import build_grounding_correction_prompt
+
+    root = capsule_less_repo(tmp_path / "solver")
+    payload = assessment_payload()
+    payload["observations"][1].pop("file_refs")
+    grounding = grounding_for(root)
+    prompt = build_grounding_correction_prompt(
+        goal="Assess this repository.",
+        payload=payload,
+        violations=grounding_violations(payload, grounding),
+        grounding=grounding,
+    )
+    assert "OB-002 rests on nothing" in prompt
+    assert "rests on at least one entry from the lists above" in prompt
 
 
 def test_the_prompt_forbids_scientific_identifiers(tmp_path: Path) -> None:
