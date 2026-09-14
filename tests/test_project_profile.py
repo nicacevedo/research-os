@@ -96,16 +96,23 @@ def _src_python(root: Path) -> Path:
 
 
 def _capsule_project(root: Path) -> Path:
-    return _repository(
-        root,
-        {
-            ".research/project.yaml": (
-                "schema_version: 1\nid: demo-project\ntitle: Demo\n"
-            ),
-            ".research/CHARTER.md": "# Charter\n",
-            "analysis/run.py": "print('hi')\n",
-        },
-    )
+    """A repository with a capsule the kernel itself created.
+
+    Built through ``init_project`` rather than by hand, because the profile now
+    asks the same question ``build_science_context`` asks -- whether
+    ``validate_project`` returns a parsed project -- and a hand-written
+    ``project.yaml`` that does not satisfy the schema is not a capsule. A
+    fixture that faked one would have made these tests agree with a profile that
+    was wrong.
+    """
+
+    from research_os.capsule import init_project
+
+    root = _repository(root, {"analysis/run.py": "print('hi')\n"})
+    init_project(root, project_id="demo-project", title="Demo")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "capsule")
+    return root
 
 
 # -- what a profile says about a repository ------------------------------
@@ -230,13 +237,18 @@ def test_every_capability_detail_agrees_with_its_own_value(tmp_path: Path) -> No
                     f"{capability.detail}"
                 )
             else:
-                assert not detail.endswith("were found"), (
-                    f"{capability.name.value} is absent but its detail asserts it: "
-                    f"{capability.detail}"
+                # An absent capability's detail must deny it somewhere, not
+                # merely mention the thing it is absent of. "a project.yaml is
+                # tracked but does not parse into a project" is an honest
+                # account of an absence; "tracked manuscript sources were found"
+                # was not.
+                denies = any(
+                    marker in detail
+                    for marker in ("no ", "not ", "cannot", "could not", "declares no")
                 )
-                assert " is tracked" not in detail or detail.startswith("no "), (
-                    f"{capability.name.value} is absent but its detail asserts it: "
-                    f"{capability.detail}"
+                assert denies, (
+                    f"{capability.name.value} is absent but its detail never says "
+                    f"so: {capability.detail}"
                 )
 
 
@@ -305,6 +317,96 @@ def test_configuration_refuses_an_unknown_capability_name() -> None:
         ProjectSettings.model_validate({"capabilities": {"telepathy": True}})
 
 
+# -- the capsule question, which decides the whole provenance mode --------
+
+
+def test_an_untracked_capsule_directory_does_not_make_a_capsule_project(
+    tmp_path: Path,
+) -> None:
+    """Found by the delta review.
+
+    The old test also accepted an on-disk ``.research/`` directory, so a crashed
+    ``init-project``, a manually created directory or a symlink flipped the
+    single most consequential capability in a module whose premise is that a
+    file left in the working tree cannot change what kind of project this is.
+    """
+
+    root = _flat_python(tmp_path / "flat")
+    (root / ".research").mkdir()
+    (root / ".research" / "project.yaml").write_text(
+        "schema_version: 1\nid: sneaky\ntitle: Sneaky\n", encoding="utf-8"
+    )
+    profile = build_project_profile(project_path=root)
+    assert profile.capsule_present is False
+    assert profile.provenance_mode is ProvenanceMode.REPOSITORY_ASSESSMENT
+
+
+def test_a_symlinked_capsule_directory_does_not_make_a_capsule_project(
+    tmp_path: Path,
+) -> None:
+    root = _flat_python(tmp_path / "flat")
+    other = _capsule_project(tmp_path / "real")
+    (root / ".research").symlink_to(other / ".research", target_is_directory=True)
+    assert build_project_profile(project_path=root).capsule_present is False
+
+
+def test_a_tracked_but_unreadable_capsule_is_not_a_capsule_project(
+    tmp_path: Path,
+) -> None:
+    """The profile must answer the capsule question the way the rest of the system does.
+
+    ``build_science_context`` requires ``validate_project`` to return a parsed
+    project. When the two disagreed, one prompt carried two controller-authored
+    blocks contradicting each other -- one saying scientific objects exist and
+    may be cited, the other saying the project holds none -- and the worker's
+    only available citations were invented ones.
+    """
+
+    root = _repository(
+        tmp_path / "broken",
+        {
+            ".research/project.yaml": "this: is: not: valid: yaml: [[[\n",
+            ".research/CHARTER.md": "# Charter\n",
+            "run.py": "print('hi')\n",
+        },
+    )
+    profile = build_project_profile(project_path=root)
+    assert profile.capsule_present is False
+    assert profile.provenance_mode is ProvenanceMode.REPOSITORY_ASSESSMENT
+    capability = profile.capability(CapabilityName.CAPSULE)
+    assert capability.present is False
+    assert "does not parse into a project" in capability.detail
+    assert any(
+        "could not be read" in item or "does not parse" in item
+        for item in profile.discovery_errors
+    )
+
+
+def test_the_profile_and_the_science_context_agree_about_the_capsule(
+    tmp_path: Path,
+) -> None:
+    """One question, one answer, whatever the repository looks like."""
+
+    from research_os.proposal.context import build_science_context
+
+    cases = [
+        _capsule_project(tmp_path / "good"),
+        _flat_python(tmp_path / "none"),
+        _repository(
+            tmp_path / "broken2",
+            {".research/project.yaml": "[[[\n", "x.py": "pass\n"},
+        ),
+    ]
+    stray = _flat_python(tmp_path / "stray")
+    (stray / ".research").mkdir()
+    cases.append(stray)
+
+    for root in cases:
+        profile = build_project_profile(project_path=root)
+        science = build_science_context(root)
+        assert profile.capsule_present == science.capsule_present, root
+
+
 # -- determinism ---------------------------------------------------------
 
 
@@ -332,6 +434,40 @@ def test_an_irrelevant_dirty_file_changes_no_capability(tmp_path: Path) -> None:
     after = build_project_profile(project_path=root)
     assert after == before
     assert not after.has(CapabilityName.JULIA_PROJECT)
+
+
+def test_a_truncated_file_list_makes_capabilities_unavailable_not_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Found by the delta review.
+
+    A repository whose ``pyproject.toml`` sorts below the cut was being told,
+    under a heading that says these are facts, that it does not have one.
+    ``unavailable`` exists for exactly this.
+    """
+
+    from research_os.automation import profile as profile_module
+
+    root = _src_python(tmp_path / "src")
+    monkeypatch.setattr(profile_module, "MAX_TRACKED_PATHS", 1)
+    built = build_project_profile(project_path=root)
+    for capability in built.capabilities:
+        if capability.name is CapabilityName.EXPERIMENT_REGISTRY:
+            continue  # declared in configuration, not read from the tree
+        assert capability.known is False, capability
+    assert built.has(CapabilityName.PYPROJECT_TOML) is False
+    assert any("cut" in item for item in built.discovery_errors)
+
+
+def test_a_truncated_file_list_discovers_no_check_profiles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from research_os.automation import profile as profile_module
+
+    root = _src_python(tmp_path / "src")
+    assert resolve_project(project_path=root, config=default_config()).has_checks
+    monkeypatch.setattr(profile_module, "MAX_TRACKED_PATHS", 1)
+    assert not resolve_project(project_path=root, config=default_config()).has_checks
 
 
 def test_a_profile_carries_no_timestamp(tmp_path: Path) -> None:

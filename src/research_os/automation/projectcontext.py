@@ -51,7 +51,10 @@ def resolve_project(
     facts = inspect_repository(project_path)
     settings = config.for_project(project_id)
     profiles, explicit = resolve_check_profiles(
-        tracked=facts.tracked,
+        # Discovery reads the tracked list, so a list that had to be cut is a
+        # list discovery must not reason from. Configuration still applies: the
+        # researcher's declaration does not depend on the file count.
+        tracked=facts.tracked if facts.tracked_known else frozenset(),
         dependencies=facts.dependencies,
         tool_sections=facts.tool_sections,
         allowed_programs=config.allowed_check_programs,

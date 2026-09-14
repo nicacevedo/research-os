@@ -160,11 +160,15 @@ def _discover(
     if "pyproject.toml" not in tracked or "uv.lock" not in tracked:
         return ()
 
+    # Declared dependencies only, and that is the whole rule. An independent
+    # review of this release found the earlier version offering `uv run pytest`
+    # to a project with a `tests/` directory and pytest declared nowhere, where
+    # the command cannot spawn -- reintroducing, through the profile, exactly
+    # the v1.0.0 trap this module exists to remove. `_dependency_names` already
+    # absorbs every list uv could have resolved the tool from, so a project
+    # where `uv run <tool>` works is a project where the tool is declared.
     found: list[CheckProfile] = []
-    has_tests = any(item.startswith("tests/") for item in tracked) or any(
-        item.startswith("test_") or item.endswith("_test.py") for item in tracked
-    )
-    if "pytest" in dependencies or "pytest" in tool_sections or has_tests:
+    if "pytest" in dependencies:
         found.append(
             CheckProfile(
                 check_id=TESTS,
@@ -176,7 +180,7 @@ def _discover(
                 ),
             )
         )
-    if "ruff" in dependencies or "ruff" in tool_sections:
+    if "ruff" in dependencies:
         found.append(
             CheckProfile(
                 check_id=LINT,

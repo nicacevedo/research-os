@@ -217,6 +217,9 @@ class RepositoryFacts:
     dependencies: frozenset[str]
     tool_sections: frozenset[str]
     capsule_present: bool
+    capsule_unreadable: bool
+    """A capsule is tracked here and could not be read as a project."""
+
     tracked_known: bool
     metadata_readable: bool
     errors: tuple[str, ...]
@@ -231,14 +234,22 @@ def inspect_repository(project_path: Path) -> RepositoryFacts:
     if tracked_error:
         errors.append(tracked_error)
     if truncated:
+        # F10 from the delta review: a truncated list was being reported as a
+        # deterministic *absence*. A repository whose pyproject.toml sorts below
+        # the cut was told, under a heading saying these are facts, that it has
+        # none. Truncation now makes every structural capability UNAVAILABLE,
+        # which is what that value is for.
         errors.append(
-            f"more than {MAX_TRACKED_PATHS} tracked paths; the profile reads the "
-            "first of them in sorted order"
+            f"more than {MAX_TRACKED_PATHS} tracked paths, so the tracked file "
+            "list was cut and no structural capability can be established from it"
         )
     metadata, metadata_error = _read_pyproject(root, tracked)
     if metadata_error:
         errors.append(metadata_error)
     metadata_readable = metadata_error is None
+    capsule_present, capsule_unreadable, capsule_error = _capsule_state(root, tracked)
+    if capsule_error:
+        errors.append(capsule_error)
     return RepositoryFacts(
         root=root,
         tracked=tracked,
@@ -246,13 +257,66 @@ def inspect_repository(project_path: Path) -> RepositoryFacts:
             _dependency_names(metadata) if metadata_readable else frozenset()
         ),
         tool_sections=_tool_sections(metadata) if metadata_readable else frozenset(),
-        capsule_present=(
-            ".research/project.yaml" in tracked or (root / ".research").is_dir()
-        ),
-        tracked_known=tracked_error is None,
+        capsule_present=capsule_present,
+        capsule_unreadable=capsule_unreadable,
+        tracked_known=tracked_error is None and not truncated,
         metadata_readable=metadata_readable,
         errors=tuple(errors),
     )
+
+
+def _capsule_state(
+    root: Path, tracked: frozenset[str]
+) -> tuple[bool, bool, str | None]:
+    """Decide whether this project has a Research Capsule, the way the rest of the system does.
+
+    Two rules, and the second is the one an independent review of this release
+    found missing.
+
+    **Tracked, not on disk.** The old test also accepted an on-disk
+    ``.research/`` directory, which meant a crashed ``init-project``, a manually
+    created directory, or a symlink flipped the single most consequential
+    capability in the profile -- in a module whose whole premise is that a file
+    somebody left in the working tree cannot change what kind of project this
+    is.
+
+    **Readable, not merely present.** :func:`build_science_context` decides the
+    same fact by asking whether ``validate_project`` returns a parsed project,
+    and the two answers could disagree. When they did, the prompt carried two
+    controller-authored blocks contradicting each other -- one saying scientific
+    objects exist and may be cited, the other saying the project holds no
+    scientific state -- and the worker's only available citations were invented
+    ones. That is precisely the capsule-less failure this release exists to
+    close, reached from the other side.
+
+    So the profile asks the same question the science context asks. A capsule
+    that is tracked and unreadable is reported as a discovery error and the
+    project reasons over its repository, which is the only grounded universe it
+    has left.
+    """
+
+    if ".research/project.yaml" not in tracked:
+        return False, False, None
+    from research_os.capsule import validate_project
+
+    try:
+        report = validate_project(root)
+    except Exception as exc:  # noqa: BLE001 - a broken capsule must not crash profiling
+        return (
+            False,
+            True,
+            f"a .research/project.yaml is tracked but could not be read: {exc}",
+        )
+    if report.project is None:
+        return (
+            False,
+            True,
+            (
+                "a .research/project.yaml is tracked but does not parse into a "
+                "project, so this run has no scientific objects to reason over"
+            ),
+        )
+    return True, False, None
 
 
 def build_project_profile(
@@ -293,6 +357,7 @@ def build_project_profile(
     discovered = _discover(
         tracked=tracked,
         capsule_present=capsule_present,
+        capsule_unreadable=facts.capsule_unreadable,
         dependencies=facts.dependencies,
         tool_sections=facts.tool_sections,
         metadata_readable=facts.metadata_readable,
@@ -380,6 +445,7 @@ def _discover(
     *,
     tracked: frozenset[str],
     capsule_present: bool,
+    capsule_unreadable: bool,
     dependencies: frozenset[str],
     tool_sections: frozenset[str],
     metadata_readable: bool,
@@ -388,9 +454,37 @@ def _discover(
     check_profiles_explicit: bool,
     tracked_known: bool,
 ) -> dict[CapabilityName, Capability]:
-    """Return one discovered capability per name. Never raises."""
+    """Return one discovered capability per name. Never raises.
+
+    One guard comes first. If the tracked file list could not be read, or had to
+    be cut, then *nothing* structural about this repository is established --
+    including the facts that happen to be derivable from a metadata file that
+    sorted above the cut. Scattering that check through each capability is how
+    the first version of this fix left ``pytest_available`` claiming
+    ``repository_metadata`` certainty about a tree it had only seen one file of.
+    """
 
     unavailable = CapabilityOrigin.UNAVAILABLE
+    if not tracked_known:
+        return {
+            name: (
+                _configured_capability(name, declared_experiments, check_profile_ids)
+                if name
+                in (
+                    CapabilityName.EXPERIMENT_REGISTRY,
+                    CapabilityName.VALIDATION_PROFILES,
+                )
+                and check_profiles_explicit
+                or name is CapabilityName.EXPERIMENT_REGISTRY
+                else Capability(
+                    name=name,
+                    present=False,
+                    origin=unavailable,
+                    detail="the tracked file list could not be read in full",
+                )
+            )
+            for name in CapabilityName
+        }
     structure = CapabilityOrigin.DETERMINISTIC_STRUCTURE
     repo_metadata = CapabilityOrigin.REPOSITORY_METADATA
 
@@ -451,15 +545,10 @@ def _discover(
         )
 
     found: dict[CapabilityName, Capability] = {
-        CapabilityName.CAPSULE: Capability(
-            name=CapabilityName.CAPSULE,
+        CapabilityName.CAPSULE: _capsule_capability(
             present=capsule_present,
-            origin=structure,
-            detail=(
-                "the repository holds a Research Capsule at .research/"
-                if capsule_present
-                else "no .research/ capsule; this is an ordinary repository"
-            ),
+            unreadable=capsule_unreadable,
+            tracked_known=tracked_known,
         ),
         CapabilityName.PYPROJECT_TOML: structural(
             CapabilityName.PYPROJECT_TOML,
@@ -543,6 +632,83 @@ def _discover(
         ),
     }
     return found
+
+
+def _configured_capability(
+    name: CapabilityName,
+    declared_experiments: tuple[str, ...],
+    check_profile_ids: tuple[str, ...],
+) -> Capability:
+    """Return a capability that comes from configuration rather than the tree.
+
+    These two survive an unreadable tracked list, because neither was read from
+    it: the researcher declared them.
+    """
+
+    if name is CapabilityName.EXPERIMENT_REGISTRY:
+        return Capability(
+            name=name,
+            present=bool(declared_experiments),
+            origin=CapabilityOrigin.EXPLICIT_CONFIG,
+            detail=(
+                f"{len(declared_experiments)} declared experiment command(s)"
+                if declared_experiments
+                else "the researcher has declared no experiment command"
+            ),
+        )
+    return Capability(
+        name=name,
+        present=bool(check_profile_ids),
+        origin=CapabilityOrigin.EXPLICIT_CONFIG,
+        detail=(
+            "controller-owned checks: " + ", ".join(check_profile_ids)
+            if check_profile_ids
+            else "no validation profile is configured for this project"
+        ),
+    )
+
+
+def _capsule_capability(
+    *, present: bool, unreadable: bool, tracked_known: bool
+) -> Capability:
+    """Return the capsule capability, which decides the whole provenance mode.
+
+    Its own function because it is the one capability with three answers rather
+    than two: there is a readable capsule, there is no capsule, or there is
+    something at ``.research/`` that could not be read. Only the first two are
+    facts a plan may be built on.
+    """
+
+    if not tracked_known:
+        return Capability(
+            name=CapabilityName.CAPSULE,
+            present=False,
+            origin=CapabilityOrigin.UNAVAILABLE,
+            detail="the tracked file list could not be read",
+        )
+    if present:
+        return Capability(
+            name=CapabilityName.CAPSULE,
+            present=True,
+            origin=CapabilityOrigin.DETERMINISTIC_STRUCTURE,
+            detail="the repository holds a Research Capsule at .research/",
+        )
+    if unreadable:
+        return Capability(
+            name=CapabilityName.CAPSULE,
+            present=False,
+            origin=CapabilityOrigin.REPOSITORY_METADATA,
+            detail=(
+                "not a usable capsule: a .research/project.yaml is tracked but "
+                "does not parse into a project, so there are no scientific objects"
+            ),
+        )
+    return Capability(
+        name=CapabilityName.CAPSULE,
+        present=False,
+        origin=CapabilityOrigin.DETERMINISTIC_STRUCTURE,
+        detail="no .research/ capsule; this is an ordinary repository",
+    )
 
 
 #: Directories whose tracked contents are read as manuscript sources.

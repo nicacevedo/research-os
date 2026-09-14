@@ -673,7 +673,7 @@ def _assert_checkpoints_are_permitted(
     """
 
     experiment_tasks = sum(1 for item in plan.tasks if item.kind is TaskKind.EXPERIMENT)
-    for task in plan.tasks:
+    for index, task in enumerate(plan.tasks):
         if task.kind is not TaskKind.HUMAN_CHECKPOINT:
             if task.checkpoint_kind is not CheckpointKind.DISCRETIONARY:
                 raise ResearchPlanError(
@@ -686,6 +686,12 @@ def _assert_checkpoints_are_permitted(
             task.checkpoint_kind,
             context=context,
             experiment_tasks=experiment_tasks,
+            position=index,
+            later_experiment_tasks=sum(
+                1
+                for item in plan.tasks[index + 1 :]
+                if item.kind is TaskKind.EXPERIMENT
+            ),
         )
         if failure is not None:
             raise ResearchPlanError(

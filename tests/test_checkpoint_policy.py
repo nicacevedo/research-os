@@ -47,6 +47,10 @@ from tests.research_helpers import (
 CAPSULE_CONTEXT = CheckpointContext(
     capsule_present=True, claim_count=1, prespecified_count=2
 )
+#: A project that could genuinely authorise expensive work.
+SPENDING_CONTEXT = CheckpointContext(
+    capsule_present=True, claim_count=1, prespecified_count=2, execute_experiments=True
+)
 BARE_CONTEXT = CheckpointContext(capsule_present=False)
 
 
@@ -154,11 +158,21 @@ def test_a_costly_authorization_needs_something_costly_in_the_plan() -> None:
     payload = plan_payload(
         tasks=[checkpoint_task(checkpoint_kind="costly_authorization")]
     )
-    with pytest.raises(ResearchPlanError, match="spends nothing that needs"):
-        validate(payload, policy=CheckpointPolicy.SCIENTIFIC_ONLY)
+    with pytest.raises(ResearchPlanError, match="no experiment task"):
+        validate(
+            payload,
+            policy=CheckpointPolicy.SCIENTIFIC_ONLY,
+            context=SPENDING_CONTEXT,
+        )
 
 
-def test_a_costly_authorization_is_eligible_beside_an_experiment() -> None:
+def test_a_costly_authorization_needs_the_run_to_be_able_to_spend() -> None:
+    """Found by the delta review.
+
+    A run started without ``--execute-experiments`` cannot spend anything, so a
+    checkpoint claiming to authorise expensive work is authorising nothing.
+    """
+
     from tests.research_helpers import experiment_task
 
     payload = plan_payload(
@@ -167,7 +181,69 @@ def test_a_costly_authorization_is_eligible_beside_an_experiment() -> None:
             experiment_task(task_id="T-002", depends_on=["T-001"]),
         ]
     )
-    validate(payload, policy=CheckpointPolicy.SCIENTIFIC_ONLY)
+    with pytest.raises(ResearchPlanError, match="not authorised to execute"):
+        validate(payload, policy=CheckpointPolicy.SCIENTIFIC_ONLY)
+
+
+def test_a_costly_authorization_after_the_last_experiment_authorises_nothing() -> None:
+    """A checkpoint the spending has already passed is not a gate."""
+
+    from tests.research_helpers import experiment_task
+
+    payload = plan_payload(
+        tasks=[
+            experiment_task(task_id="T-001"),
+            checkpoint_task(
+                task_id="T-002",
+                depends_on=["T-001"],
+                checkpoint_kind="costly_authorization",
+            ),
+        ]
+    )
+    with pytest.raises(ResearchPlanError, match="nothing left for it to authorise"):
+        validate(
+            payload,
+            policy=CheckpointPolicy.SCIENTIFIC_ONLY,
+            context=SPENDING_CONTEXT,
+        )
+
+
+def test_a_costly_authorization_is_eligible_before_an_authorised_experiment() -> None:
+    from tests.research_helpers import experiment_task
+
+    payload = plan_payload(
+        tasks=[
+            checkpoint_task(checkpoint_kind="costly_authorization"),
+            experiment_task(task_id="T-002", depends_on=["T-001"]),
+        ]
+    )
+    validate(payload, policy=CheckpointPolicy.SCIENTIFIC_ONLY, context=SPENDING_CONTEXT)
+
+
+def test_a_cross_project_promotion_needs_a_claim_to_promote() -> None:
+    """Found by the delta review.
+
+    This was the one hard label corroborated only by "there is a capsule", which
+    made it a free pass: any checkpoint in any capsule project could be
+    relabelled `cross_project_promotion` and stop an unattended run, recorded in
+    the ledger as hard. Promoting a conclusion needs strictly more than holding
+    a Claim, so it is checked for at least as much.
+    """
+
+    payload = plan_payload(
+        tasks=[
+            checkpoint_task(
+                question="Shall I continue with the second approach?",
+                checkpoint_kind="cross_project_promotion",
+            )
+        ]
+    )
+    with pytest.raises(ResearchPlanError, match="no settled conclusion to promote"):
+        validate(
+            payload,
+            policy=CheckpointPolicy.SCIENTIFIC_ONLY,
+            context=CheckpointContext(capsule_present=True, claim_count=0),
+        )
 
 
 def test_eligibility_is_checked_under_standard_too() -> None:
@@ -198,7 +274,19 @@ def test_only_a_checkpoint_task_may_declare_a_kind() -> None:
         (CheckpointKind.CLAIM_ACCEPTANCE, CAPSULE_CONTEXT, 0, None),
         (CheckpointKind.PRESPECIFIED_CHANGE, CAPSULE_CONTEXT, 0, None),
         (CheckpointKind.CROSS_PROJECT_PROMOTION, CAPSULE_CONTEXT, 0, None),
-        (CheckpointKind.COSTLY_AUTHORIZATION, CAPSULE_CONTEXT, 1, None),
+        (CheckpointKind.COSTLY_AUTHORIZATION, SPENDING_CONTEXT, 1, None),
+        (
+            CheckpointKind.COSTLY_AUTHORIZATION,
+            CAPSULE_CONTEXT,
+            1,
+            "not authorised to execute",
+        ),
+        (
+            CheckpointKind.CROSS_PROJECT_PROMOTION,
+            CheckpointContext(capsule_present=True, claim_count=0),
+            0,
+            "no settled conclusion",
+        ),
         (
             CheckpointKind.PRESPECIFIED_CHANGE,
             CheckpointContext(capsule_present=True, prespecified_count=0),
@@ -226,10 +314,11 @@ def test_eligibility_table(
 def test_scientific_only_does_not_suppress_a_hard_checkpoint() -> None:
     for kind in sorted(HARD_CHECKPOINT_KINDS):
         if kind is CheckpointKind.COSTLY_AUTHORIZATION:
-            continue
+            continue  # covered above; it needs a spending plan to be eligible
         validate(
             plan_payload(tasks=[checkpoint_task(checkpoint_kind=kind.value)]),
             policy=CheckpointPolicy.SCIENTIFIC_ONLY,
+            context=SPENDING_CONTEXT,
         )
 
 

@@ -146,6 +146,8 @@ def eligibility_failure(
     *,
     context: CheckpointContext,
     experiment_tasks: int,
+    position: int | None = None,
+    later_experiment_tasks: int = 0,
 ) -> str | None:
     """Return why ``kind`` cannot be a hard checkpoint here, or ``None``.
 
@@ -194,12 +196,36 @@ def eligibility_failure(
                 "this project holds no Research Capsule, so it has no scientific "
                 "conclusion to promote into another project"
             )
+        if context.claim_count == 0:
+            # Found by an independent review of this release. This kind was the
+            # one hard label with no corroboration beyond "there is a capsule",
+            # which made it a free pass: any checkpoint in any capsule project
+            # could be relabelled `cross_project_promotion` and stop an
+            # unattended run, recorded in the ledger as hard. Promoting a
+            # conclusion needs strictly more than holding a Claim, so it is
+            # checked for at least as much.
+            return (
+                "this project holds no Claim, so it has no settled conclusion to "
+                "promote into another project"
+            )
         return None
     if kind is CheckpointKind.COSTLY_AUTHORIZATION:
-        if experiment_tasks == 0 and not context.execute_experiments:
+        if not context.execute_experiments:
             return (
-                "this plan spends nothing that needs authorising: it has no "
-                "experiment task and this run was not authorised to execute one"
+                "this run was not authorised to execute experiments, so it can "
+                "spend nothing that needs authorising"
+            )
+        if experiment_tasks == 0:
+            return (
+                "this plan has no experiment task, so it spends nothing that "
+                "needs authorising"
+            )
+        if position is not None and later_experiment_tasks == 0:
+            # A checkpoint after the last experiment authorises nothing: the
+            # spending it claims to gate has already happened.
+            return (
+                "every experiment task in this plan runs before this checkpoint, "
+                "so there is nothing left for it to authorise"
             )
         return None
     return None  # pragma: no cover - the enum is exhaustive above

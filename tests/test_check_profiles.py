@@ -159,6 +159,101 @@ def test_ruff_is_only_offered_when_the_project_declares_it(tmp_path: Path) -> No
     assert {item.check_id for item in discover(root)[0]} == {"tests"}
 
 
+def test_a_tests_directory_alone_does_not_justify_uv_run_pytest(
+    tmp_path: Path,
+) -> None:
+    """Found by the delta review.
+
+    Offering `uv run pytest -q` to a project that declares pytest nowhere
+    reintroduces the v1.0.0 trap through the profile instead of through the
+    planner: the command cannot spawn, the plan is *forced* to name the check
+    because a profile exists, the bounded repair burns on an environment error,
+    and the run fails closed having verified nothing.
+
+    `_dependency_names` already reads every list uv could have resolved the tool
+    from, so a project where `uv run pytest` works is a project that declares
+    pytest.
+    """
+
+    root = repository(
+        tmp_path / "undeclared",
+        {
+            "pyproject.toml": (
+                '[project]\nname = "demo"\nversion = "0.1.0"\ndependencies = []\n'
+            ),
+            "uv.lock": "version = 1\n",
+            "tests/test_demo.py": "def test_x():\n    assert True\n",
+            "src/demo/__init__.py": "",
+        },
+    )
+    profiles, _ = discover(root)
+    assert profiles == (), [item.argv for item in profiles]
+
+
+def test_a_tool_ruff_table_alone_does_not_justify_uv_run_ruff(
+    tmp_path: Path,
+) -> None:
+    """ruff configured but installed globally or via pre-commit, not declared."""
+
+    root = repository(
+        tmp_path / "globalruff",
+        {
+            "pyproject.toml": (
+                '[project]\nname = "demo"\nversion = "0.1.0"\n'
+                'dependencies = []\n\n[dependency-groups]\ndev = ["pytest>=8"]\n'
+                "\n[tool.ruff]\nline-length = 88\n"
+            ),
+            "uv.lock": "version = 1\n",
+            "tests/test_demo.py": "def test_x():\n    assert True\n",
+        },
+    )
+    assert {item.check_id for item in discover(root)[0]} == {"tests"}
+
+
+def test_a_discovered_profile_never_contradicts_the_capability_beside_it(
+    tmp_path: Path,
+) -> None:
+    """The profile and the profiles must not disagree in one prompt.
+
+    A `tests` profile beside `pytest_available: no` is two controller-authored
+    lines contradicting each other, under a heading that says they are facts.
+    Asserted as an invariant over every fixture in this file rather than as one
+    case, because the disagreement was introduced by an extra disjunct nobody
+    read twice.
+    """
+
+    from research_os.automation.profile import CapabilityName, build_project_profile
+
+    roots = [
+        uv_src_repository(tmp_path / "uv"),
+        repository(tmp_path / "plain", {"README.md": "# x\n"}),
+        repository(
+            tmp_path / "undeclared2",
+            {
+                "pyproject.toml": (
+                    '[project]\nname = "d"\nversion = "0.1"\ndependencies = []\n'
+                ),
+                "uv.lock": "version = 1\n",
+                "tests/test_a.py": "def test_a():\n    assert True\n",
+            },
+        ),
+        repository(tmp_path / "nolock2", {"pyproject.toml": PYPROJECT_UV}),
+    ]
+    for root in roots:
+        facts = facts_of(root)
+        profiles, _ = discover(root)
+        profile = build_project_profile(
+            project_path=root,
+            facts=facts,
+            check_profile_ids=tuple(item.check_id for item in profiles),
+        )
+        ids = {item.check_id for item in profiles}
+        if "tests" in ids:
+            assert profile.has(CapabilityName.PYTEST_AVAILABLE), root
+        if "lint" in ids or "format" in ids:
+            assert profile.has(CapabilityName.RUFF_AVAILABLE), root
+
+
 def test_discovery_is_stable(tmp_path: Path) -> None:
     root = uv_src_repository(tmp_path / "src")
     assert discover(root) == discover(root)
