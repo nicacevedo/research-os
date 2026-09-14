@@ -420,6 +420,48 @@ def test_the_correction_prompt_names_an_ungrounded_observation(
     assert "rests on at least one entry from the lists above" in prompt
 
 
+def test_the_repository_context_does_not_repeat_the_citable_list(
+    tmp_path: Path,
+) -> None:
+    """One copy of the file list, not two.
+
+    The prompt enumerates every citable path once, under the heading that says
+    what citing one means. Repeating them in the repository block made an
+    assessment prompt for a 5,402-file repository 199,551 characters, of which
+    196,000 were the same list twice.
+    """
+
+    from research_os.assessment.planner import render_repository_context
+
+    root = capsule_less_repo(tmp_path / "solver")
+    grounding = grounding_for(root)
+    context = render_repository_context(
+        tracked=list(grounding.repository_files), base_commit="0" * 40, notes=[]
+    )
+    assert "solver.py" not in context
+    assert "tracked_files: 3" in context
+    assert "base_commit: " + "0" * 40 in context
+
+    prompt = build_assessment_prompt(
+        goal="Assess this repository.",
+        grounding=grounding,
+        repository_context=context,
+    )
+    assert prompt.count("solver.py") == 1
+
+
+def test_a_truncated_file_list_says_so_in_both_places(tmp_path: Path) -> None:
+    from research_os.assessment.planner import (
+        MAX_CITABLE_FILES,
+        render_repository_context,
+    )
+
+    many = [f"src/module_{index:05d}.py" for index in range(MAX_CITABLE_FILES + 50)]
+    context = render_repository_context(tracked=many, base_commit="0" * 40, notes=[])
+    assert f"tracked_files: {len(many)}" in context
+    assert "cannot rest on a path that is not listed" in context
+
+
 def test_the_prompt_forbids_scientific_identifiers(tmp_path: Path) -> None:
     root = capsule_less_repo(tmp_path / "solver")
     prompt = build_assessment_prompt(

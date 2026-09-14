@@ -527,16 +527,28 @@ Change nothing else. This is your one correction; there is no second.
 def render_repository_context(
     *, tracked: list[str], base_commit: str | None, notes: list[str]
 ) -> str:
-    """Render the bounded repository facts the assessment worker is given.
+    """Render the repository facts that are *not* already the citable allowlist.
 
-    A file list and a commit, fenced as repository content because the paths
-    were chosen by whoever wrote the repository rather than by this controller.
+    Deliberately does not list the files. The prompt already enumerates every
+    citable path once, under the heading that says what citing one means; naming
+    them a second time here made an assessment prompt for a 5,402-file
+    repository 199,551 characters, of which 196,000 were two copies of the same
+    list. Found by sizing the prompt for Pilot C rather than by running it.
+
+    What is left is what the file list cannot say: which commit those paths are
+    tracked at, how many there are, and what could not be established.
     """
 
-    body = [f"base_commit: {base_commit or 'none'}", "", "tracked files:"]
-    body.extend(f"  {item}" for item in sorted(tracked)[:MAX_CITABLE_FILES])
+    body = [
+        f"base_commit: {base_commit or 'none'}",
+        f"tracked_files: {len(tracked)}",
+    ]
     if len(tracked) > MAX_CITABLE_FILES:
-        body.append(f"  [list cut at {MAX_CITABLE_FILES} paths]")
+        body.append(
+            f"note: only the first {MAX_CITABLE_FILES} paths in sorted order are "
+            "listed as citable above; an observation cannot rest on a path that "
+            "is not listed"
+        )
     if notes:
         body.extend(["", "notes:"])
         body.extend(f"  {item}" for item in notes)
@@ -546,7 +558,7 @@ def render_repository_context(
             "",
             render_data_block(
                 REPOSITORY_FENCE,
-                prompt_safe_block("\n".join(body), limit=200_000).split("\n"),
+                prompt_safe_block("\n".join(body), limit=20_000).split("\n"),
             ),
         ]
     )
