@@ -1029,3 +1029,308 @@ ambiguous fence outright. Reserved run ids re-validated against `RUN_ID_RE`
 before any path is built. Transport retries and 5xx retries share one counter,
 so they cannot be alternated to exceed the bound. Settled refusals raise outside
 the retry `try` and are never retried.
+
+---
+
+# Part IV — v1.1, the operational autonomy candidate
+
+Branch `release/v1.1.0-autonomy`, from `b3fd03c` (v1.0.0). **Not merged, not
+tagged.** Fourteen commits, 8,655 insertions against 89 deletions, 2,362 tests
+to 2,552.
+
+## 23. What v1.1 is for
+
+Five things a model was being asked to judge that the controller can know.
+
+Three of them are the same defect wearing different clothes, and both v1.0.0
+pilots that went wrong went wrong this way. A `src`-layout project's tests only
+import under `uv run`; the planner wrote a bare `pytest`; the run failed closed
+having verified nothing. A repository with no `.research/` capsule was handed
+the scientific universe; the only identifiers available to the worker were ones
+it invented, and the grounding validator refused them. Neither was a model being
+careless. Both were a model being asked a question it had no way to answer, and
+being held to an answer it was never given.
+
+So: a deterministic **ProjectProfile**, a controller-chosen **provenance mode**
+with a capsule-less **TechnicalAssessment** beside the scientific proposal,
+controller-owned **validation profiles**, a typed **checkpoint policy** so
+"unattended" is a property rather than a hope, and **persistent literature
+pacing** so a provider's "wait an hour" survives the process that heard it.
+
+## 24. The fourteen commits
+
+| SHA | what |
+| --- | --- |
+| `91397ec` | deterministic project profiles |
+| `7b0134f` | grounded capsule-less assessments |
+| `5efa76d` | deterministic validation profiles |
+| `ae56391` | scientific-only autonomy policy |
+| `31a93bf` | persist literature provider pacing |
+| `fa23102` | repair what the first CCAO pilot found |
+| `3da5d37` | repair what the cuPDLP pilot found |
+| `c25d493` | stop quoting a repository's file list twice |
+| `2c612e3` | stop the profile contradicting itself |
+| `089bbe1` | close the plan guard a live run walked through |
+| `adb87da` | make every broken reference correctable, not just some |
+| `72600d9` | tell the correction worker to renumber what it drops |
+| `307236f` | tell the planner what a declared experiment requires |
+| `2da74e1` | say which ids belong in which proposal field |
+
+The first five are the planned work. The last nine are all pilot repairs, which
+is the honest ratio: the design took five commits and finding out what was wrong
+with it took nine. The user-facing documentation (`README.md`,
+`ARCHITECTURE.md`, `docs/RESEARCH.md`, `docs/LITERATURE.md`) landed inside
+`adb87da` rather than in a commit of its own — an accident of sequencing, noted
+here because a reader looking for it by commit message will not find it.
+
+## 25. The pilots, and the nine defects they found
+
+Nine defects reached production code. Not one was found by the test suite, by
+review, or by reading. Every one was found by pointing the thing at a real
+repository.
+
+**A shouty prompt made the planner produce garbage.** Pilot A against the CCAO
+capsule failed twice under `scientific_only`, both times with the documented
+degenerate plan: ten to twelve thousand output tokens of real work returned as
+`{"summary": "test", ...}`. That could have been stochasticity, so it was
+measured rather than assumed. Same goal, same project, same budgets: v1.0.0
+planned richly first try in 10,034 output tokens; v1.1 under `standard` planned
+richly first try in 9,130; v1.1 under `scientific-only` degenerated three times
+out of three, at 10,722–12,643 tokens. The schema additions are in both v1.1
+arms, so they are not implicated. The difference was 624 characters of emphatic
+three-paragraph prose, opening in capitals, restating one rule three ways. It
+says the rule once now, in 119 characters. Re-measured: no placeholder in three
+attempts. `fa23102`.
+
+**A refusal with no repair path.** Pilot B reached the assessment worker, which
+returned seven observations, one of which rested on nothing. Refused correctly
+— an ungrounded observation is an opinion — and terminally, because the
+correction trigger knew about citations that were *wrong* and not about
+citations that were *absent*. Fifty-five retrieved works and two completed
+analyses thrown away over something the controller could describe exactly.
+`3da5d37`.
+
+**The same file list, twice.** Sizing the assessment prompt for Pilot C *before*
+running it: 199,551 characters for a 5,402-file repository, of which ~196,000
+were two copies of the same 1,200 paths. `c25d493`.
+
+**A profile that contradicted itself.** Reading a real planner prompt during
+Pilot B: `manuscripts: no -- tracked manuscript sources were found`, and
+`python_project: no -- pyproject.toml or an importable package directory is
+tracked`. One detail string per capability, written for whichever branch its
+author had in mind and printed for both, inside a block whose opening line is
+"these are facts, do not contradict them". `2c612e3`.
+
+**The worst one.** A cuPDLP run reached `READY_FOR_HUMAN` on this plan:
+
+```json
+{"summary": "test summary two",
+ "tasks": [{"id": "T-001", "kind": "literature",
+            "title": "t", "goal": "g", "query": "q"}]}
+```
+
+It validated, executed, searched crossref and openalex for `"q"`, retrieved
+nineteen works, and reported success. The guard had refused `"test"` on the
+previous attempt and accepted `"test summary two"` for the same reason it
+accepted `"t"`: it required at least one token to be a *known placeholder word*
+and graded the rest against a word list. Three releases have now found this hole
+from three angles — `"test"`, then `"Test task"`, then this — and each repair
+added one more word. Two rules replace it, neither depending on having guessed a
+word: a field under three characters says nothing whatever those characters are,
+and a field whose every token is structural says nothing specific by
+construction. The trade is asymmetric on purpose. `089bbe1`.
+
+**Three shapes of one failure.** Pilot C's assessment pointed an uncertainty at
+`"open_question"` — a sibling field name rather than an observation id. That
+made three pilots finding three broken-reference shapes, each tempting a
+one-instance repair. The set is now stated as a set: every reference that does
+not resolve is correctable, because they all have one repair; every shape
+problem is not, because there is nothing to reground. `adb87da`.
+
+**A prompt asking for something another validator refuses.** Pilot C's
+correction did exactly what it was told — dropped the observation that could not
+be grounded — and left the ids running OB-001, OB-006. `72600d9`.
+
+**A rule the planner was never told.** Pilot E was refused on both planning
+attempts for omitting the `seed` its declared experiment requires. The refusal
+is right. The prompt listed only command *names*: the controller knew the
+command needed a seed in 0..7, never said so, and then refused the plan for not
+knowing. v1.0.0 completed that check and left the telling. `307236f`.
+
+**Three fields that look alike.** Pilot E's proposal correction removed the
+invented citations it was shown and then wrote a capsule id into
+`addresses_items`, which names proposed items. Prompt change only — no proposal
+validation was relaxed and no new failure was made correctable, because
+extending the proposal layer's *trigger* the way the assessment layer's was
+extended would change scientific-pipeline behaviour an independent review has
+already accepted. `2da74e1`.
+
+## 26. What the pilots established
+
+| pilot | project | mode | result |
+| --- | --- | --- | --- |
+| A | CCAO capsule, 1 Claim, 2 Experiments | `scientific_project` | READY_FOR_HUMAN, 5/12 calls |
+| B | cuPDLP.jl, 14 files, Julia, no capsule | `repository_assessment` | READY_FOR_HUMAN, 12 grounded observations |
+| C | 5,402-file results repository, no capsule | `repository_assessment` | READY_FOR_HUMAN, 11 grounded observations |
+| D | throwaway `src`-layout uv project | `repository_assessment` | READY_FOR_HUMAN, 0 repairs |
+| E | synthetic capsule project | `scientific_project` | READY_FOR_HUMAN, full pipeline |
+
+Across all five, and every failed attempt at them: **zero canonical project
+mutation**, verified by comparing `HEAD`, the tree object and the full index
+digest before and after. Zero automatic Claim acceptances, zero automatic
+Reviews, zero writes under `.research/`, zero merges, zero pushes.
+
+**Pilot A** produced the boundary arithmetic the goal asked for: Gate E.4's
+measured max M exceeds `M_accept_max` by 18.04% relative in exactly one cell of
+45, while the curvature ratio sits 3.5x past its own boundary everywhere — so
+the INDETERMINATE verdict is fragile only to a small relaxation of one of its
+four thresholds and robust to the other three. It proposed a per-cell sweep to
+verify that, because EVI-0008 reports only extrema, and it flagged as an open
+governance question whether stating flip-point arithmetic reads as advocacy for
+a threshold change. It changed no threshold and no verdict. One grounding
+correction fired and is recorded in the proposal's own summary.
+
+**Pilot B** asked whether the solver's reported residuals are measured in the
+original problem space or the space `preprocess.jl` leaves the problem in, and
+marked it `blocked_by_evidence: true` — there is no test, no CI and no benchmark
+harness to answer it with. No `PR-`, `CLAIM-`, `EVI-` or `HYP-` token appears
+anywhere in the object.
+
+**Pilot C** recommended a single scoped change with its exact paths, and
+separately flagged a file named `box_cookies.txt` under a validation log
+directory as a possible committed session token, marked `requires_human`. That
+is the researcher's decision and this session did not open the file.
+
+**Pilot D** is the src-layout regression as an operational fact. The plan set
+`required_checks: ["tests"]` and authored no command; the controller resolved
+`["uv", "run", "pytest", "-q"]`; the check ran and returned exit 0, which is
+what a bare `pytest` cannot do against that fixture; zero repairs; reviewer
+PASS.
+
+**Pilot E** ran Planner → literature (40 works, all three providers) → Analyst →
+a real local experiment producing a candidate evidence packet → Coder →
+controller-owned `uv run pytest -q` → Reviewer PASS → a grounded 11-item
+proposal assessed PASS → READY_FOR_HUMAN. Nine of sixteen model calls, no
+checkpoint, no manual intervention after execution began.
+
+**The writer stage was deliberately not exercised in Pilot E.** A `paper` task
+requires an accepted Claim, an accepted Claim requires a qualifying *human*
+Review, and this agent must not author one — not even against a throwaway
+fixture, because the act is what it is regardless of what it is performed on.
+The paper layer is covered by `test_complete_research_project.py`, where the
+human acts are performed by the test. This is a boundary being respected, not
+coverage being dropped.
+
+## 27. What the pilots could not be made to do
+
+The planner reasoned correctly about the policy without being told to in prose.
+Pilot B's final plan: *"no checkpoint task (nothing prespecified and no Claim
+exists to accept, so any checkpoint would be discretionary and refused)"*.
+Pilot E's: *"No checkpoint is included: this project holds no Claim, so there is
+nothing for a human to accept mid-run"*. Pilot D's: *"No checkpoint: the
+researcher's instruction already fixes the one decision that mattered."*
+
+One CCAO attempt produced two successive plans each containing a discretionary
+checkpoint. It was refused, re-asked once with the deterministic reason, refused
+again, and failed explicitly. That is WP4.5's specified behaviour and not a
+regression: one correction, no loop.
+
+Adapt-Q was refused outright because its working tree had one modified notebook.
+The v1.0.0 clean-tree preflight, doing its job.
+
+## 28. Mutation proofs
+
+Ten protections were disabled one at a time. Nine were detected. **One was
+not**, and finding it is the most useful thing in this section.
+
+| # | mutation | detected by |
+| --- | --- | --- |
+| M1 | discovery wins over declared capability | 2 profile precedence tests |
+| M2a | capsule-id grounding check removed | 5 assessment tests inc. the PR-002 replay |
+| M2b | repository-file grounding check removed | untracked-file and deleted-file regressions |
+| M3 | discovered `tests` profile reverted to bare `pytest` | 8 tests inc. the end-to-end run |
+| M4a | discretionary checkpoint allowed through `scientific_only` | 5 tests |
+| M4b | `HARD_CHECKPOINT_KINDS` emptied | 2 tests |
+| M4c | a claimed hard kind believed without corroboration | 5 tests |
+| M4d | `scientific_only` refuses hard checkpoints too | 3 tests inc. the Gate E.4 regression |
+| M5a | `BEGIN IMMEDIATE` downgraded to `BEGIN DEFERRED` | **initially MISSED** |
+| M5b | the service no longer reserves before it asks | 2 tests |
+| M5c | the cache is never consulted | 2 tests |
+| M6 | ungrounded-observation detection removed | 3 tests |
+| M7 | one capability detail printed for both branches | 2 tests |
+| M8a | the minimum-field-length rule removed | 4 cases |
+| M8b | the old require-a-placeholder-token rule restored | 3 cases inc. the live payload |
+| M9 | internal-reference detection removed | 4 tests |
+| M10 | experiment parameters dropped from the prompt | 1 test |
+
+**M5a is the one that matters.** The lock test accepted *any* database error,
+and a deferred transaction also fails — just later, from the write, after it has
+already read a row another run was replacing. The test passed under the
+mutation. It now asserts *which* failure: a run that takes the lock first fails
+at the `BEGIN` with this module's own error; a run that reads first fails at the
+`UPDATE` with a raw `sqlite3.OperationalError`. A second test holds a
+reservation open mid-flight and watches the other connection fail to enter.
+Re-mutated: detected by both.
+
+## 29. Validation results
+
+| gate | result |
+| --- | --- |
+| `uv run pytest -q` | 2,552 passed (2,362 at v1.0.0; none removed or disabled) |
+| `uv run ruff check .` | clean |
+| `uv run ruff format --check .` | clean |
+| `git diff --check` | clean |
+| R0 kernel | 480 passed |
+| security regressions | 580 passed |
+| prompt/data boundary | 206 passed |
+| command policy | 52 passed |
+| lock/concurrency | 14 passed |
+| crash recovery | 19 passed |
+| grounding | 42 passed |
+| ProjectProfile | 27 passed |
+| TechnicalAssessment | 42 passed |
+| validation profiles | 33 passed |
+| checkpoint policy | 28 passed |
+| literature pacing | 34 passed |
+| clean clone, full suite | 2,552 passed |
+| clean clone, hermetic subset with no credentials | 905 passed |
+
+The literature store migrated 1 → 2 on the real pre-existing database and the
+pacing state is live: three sources recorded, arXiv showing a real failure at
+19:11:18 and a real success at 20:16:15, which is the "a failure is not a rate
+limit" property demonstrated rather than asserted. Thirty-six of seventy-two
+archived searches carry a `cache_key`; the thirty-six written before the
+migration carry `''` and are correctly never served as a cache hit.
+
+## 30. Residual risks after v1.1
+
+- **No licence.** Human decision, unchanged from v1.0.0. Nothing is granted
+  until it is made.
+- **The default `sonnet` planner is unreliable on these prompts.** Across today
+  it degenerated or gave up on structured output in roughly half its attempts
+  against real repositories, and cuPDLP.jl was already failing this way at
+  v1.0.0 — two attempts, two failures, before any v1.1 code existed. Pilots B
+  through E were run with a configured `opus` planner, which is a researcher's
+  ordinary configuration choice and is recorded as one. The controller's
+  behaviour under the failure is correct throughout: it refuses, spends its one
+  re-ask, and fails closed. What it cannot do is make the answer arrive.
+- **An all-filler field is now refused.** "First results" as a task *title* is
+  refused where it was not before. The cost of that false positive is one
+  re-run; the false negative it replaces was a run reporting success having
+  searched for `"q"`.
+- **A large repository still makes a large prompt.** 101,704 characters for
+  5,402 tracked files, after halving. The 1,200-path cap on the citable list is
+  a documented bound, not a tuned one, and a repository past it has paths an
+  observation cannot rest on.
+- **The proposal layer's correction trigger was deliberately left narrow.** An
+  internal cross-reference error in a *proposal* is still terminal where the
+  same error in an *assessment* is now correctable. Widening it would change
+  reviewed scientific-pipeline behaviour, which this release does not do. The
+  prompt was clarified instead.
+- **Review independence is still degraded.** Only `claude` is installed. Every
+  run says `DEGRADED_SAME_PROVIDER_FAMILY` before it starts, and so does the
+  delta review of this release.
+- **Worktree isolation is not an OS sandbox.** Unchanged.
+- **10.8 GB of finished-run worktrees are held** after today's pilots.
+  `researchctl storage --reclaim` releases them; they were left in place so the
+  external reviewer can inspect the pilot evidence.

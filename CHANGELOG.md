@@ -2,6 +2,77 @@
 
 All notable changes to Research OS. Dates are release dates.
 
+## [Unreleased] — release candidate `release/v1.1.0-autonomy`
+
+**Not released.** Not merged, not tagged. The package still reports version
+`1.0.0`, deliberately: changing it would imply a release that has not happened.
+This entry describes the candidate awaiting external cross-family review.
+
+Five things a model was being asked to judge became things the controller
+knows. Nothing a human decides changed.
+
+### Added
+
+- **Deterministic project profiles.** Before a model is asked anything, the
+  controller reads the repository and the researcher's configuration and records
+  what it found — capsule or not, Python or not, lock file, `src` layout,
+  declared experiment commands, resolvable checks, manuscript sources — each
+  fact carrying its origin (`explicit_config`, `repository_metadata`,
+  `deterministic_structure`, `unavailable`, which is never the same as "no").
+  Profiling executes no repository code, reads tracked files rather than the
+  working tree, carries no timestamp, and cannot be influenced by model output.
+  Explicit configuration always beats discovery.
+- **Capsule-less `TechnicalAssessment`.** A project with no `.research/` now
+  reasons in `repository_assessment` mode over tracked files at the base commit,
+  symbols, deterministic check ids and retrieved works, and produces an
+  assessment rather than a scientific proposal. It is not science, has no
+  promotion path, is never written under `.research/`, and never enters the
+  repository. Scientific identifiers fail closed: the field that could carry one
+  is validated against an allowlist the controller leaves empty in that mode.
+  The controller chooses the mode from the profile; a worker cannot.
+- **Controller-owned validation profiles.** A plan selects `required_checks:
+  ["tests", "lint"]` and the controller resolves each id to argv it already
+  knows. For a `pyproject.toml` beside a `uv.lock` that is `uv run pytest -q`,
+  which is what actually imports a `src`-layout project. Explicit
+  `projects.<id>.check_profiles` in `automation.yaml` replaces discovery
+  entirely. Every resolved argv passes the same command policy planner-authored
+  commands face, so a profile cannot introduce a forbidden program.
+- **`--checkpoint-policy scientific-only`.** Checkpoints carry a typed kind. The
+  controller decides whether that kind is possible here, from what the capsule
+  holds, and whether it is permitted under this run's policy. A discretionary
+  checkpoint in an unattended run is refused with one deterministic reason, gets
+  the existing single bounded replan, and then fails explicitly. Hard
+  checkpoints — human Review, Claim acceptance, prespecified-criterion change,
+  cross-project promotion, costly authorisation — are unreachable by any flag.
+  Default is `standard`, which behaves exactly as v1.0.0 did.
+- **Persistent literature pacing** (store schema 2). Cache first, before the
+  slot; an atomic `BEGIN IMMEDIATE` reservation so two concurrent runs cannot
+  both issue a request; only provider-reported information persisted; a
+  `Retry-After` beyond the inline budget recorded rather than slept through.
+  `lit sources` shows the persisted health beside the probe. New
+  `cache_ttl_seconds` in `literature.yaml`, a day by default, `0` to ask every
+  time.
+
+### Fixed
+
+- A plan whose every field was structural filler, or under three characters,
+  could validate and execute. A live run searched two providers for the query
+  `"q"` and reported `READY_FOR_HUMAN`.
+- A `Retry-After` of an hour caused two minutes of inline sleeping across
+  retries; it is now recorded and the other providers are asked instead.
+- An assessment that cited nothing, or pointed at an id that is not in it, could
+  not reach the single bounded grounding correction and failed terminally.
+- The research planner was refused for omitting a declared experiment's required
+  parameter without ever having been told the parameter existed.
+- A project profile could state a capability's absence with a sentence
+  asserting its presence.
+
+### Unchanged
+
+R0 kernel semantics, scientific object schemas, digests, stale-review detection,
+Claim acceptance, worktree isolation, argv-based execution with no shell, the
+prompt/data boundary, and the one-repair bound everywhere it already applied.
+
 ## [1.0.0] — 2026-09-13
 
 First stable operational release. The architecture of `research-os-v1` plus the
