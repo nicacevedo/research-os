@@ -33,6 +33,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from research_os.automation.models import safe_relative_path, utc_now
 from research_os.automation.profile import ProjectProfile
 from research_os.models import NonBlankStr
+from research_os.research.checkpoints import CheckpointKind, CheckpointPolicy, is_hard
 
 RESEARCH_RUN_ID_RE = re.compile(r"^RR-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$")
 TASK_ID_RE = re.compile(r"^T-[0-9]{3}$")
@@ -235,6 +236,15 @@ class ResearchTask(BaseModel):
     question: str = ""
     """What the human is being asked, for a checkpoint."""
 
+    checkpoint_kind: CheckpointKind = CheckpointKind.DISCRETIONARY
+    """What kind of decision this checkpoint asks for.
+
+    Defaults to discretionary, which is the honest default: a checkpoint is a
+    preference unless something about the project corroborates a stronger claim.
+    The controller validates the kind against what it knows before the plan is
+    accepted, so this field states a category rather than conferring one.
+    """
+
     started_at: str | None = None
     finished_at: str | None = None
     detail: str = ""
@@ -355,6 +365,9 @@ class HumanCheckpoint(BaseModel):
 
     task_id: str
     question: NonBlankStr
+    kind: CheckpointKind = CheckpointKind.DISCRETIONARY
+    """The validated kind. Copied from the task, which the controller checked."""
+
     reached_at: str = Field(default_factory=utc_now)
     answered_at: str | None = None
     answer: str | None = None
@@ -363,6 +376,10 @@ class HumanCheckpoint(BaseModel):
     @property
     def pending(self) -> bool:
         return self.answered_at is None
+
+    @property
+    def hard(self) -> bool:
+        return is_hard(self.kind)
 
 
 class ResearchRun(BaseModel):
@@ -390,6 +407,15 @@ class ResearchRun(BaseModel):
     finished_at: str | None = None
     state: ResearchState = ResearchState.CREATED
     budget: ResearchBudget = Field(default_factory=ResearchBudget)
+    checkpoint_policy: CheckpointPolicy = CheckpointPolicy.STANDARD
+    """How much this run may be interrupted.
+
+    ``standard`` by default, so every run a researcher already has keeps
+    behaving exactly as it did. ``scientific_only`` is asked for explicitly, and
+    it narrows what may stop a run without narrowing anything a human must still
+    decide.
+    """
+
     plan_summary: str = ""
     tasks: list[ResearchTask] = Field(default_factory=list)
     checkpoints: list[HumanCheckpoint] = Field(default_factory=list)

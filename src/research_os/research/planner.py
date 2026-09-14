@@ -34,6 +34,14 @@ from research_os.automation.promptdata import (
 from research_os.automation.structured import extract_json_object
 from research_os.errors import ResearchPlanError
 from research_os.models import NonBlankStr
+from research_os.research.checkpoints import (
+    HARD_CHECKPOINT_KINDS,
+    SCIENTIFIC_ONLY_REASON,
+    CheckpointContext,
+    CheckpointKind,
+    CheckpointPolicy,
+    eligibility_failure,
+)
 from research_os.research.models import (
     WRITING_KINDS,
     ResearchBudget,
@@ -98,6 +106,10 @@ PLAN_SCHEMA: dict[str, Any] = {
                     },
                     "section": {"type": "string"},
                     "question": {"type": "string"},
+                    "checkpoint_kind": {
+                        "type": "string",
+                        "enum": [item.value for item in CheckpointKind],
+                    },
                 },
             },
         },
@@ -122,6 +134,7 @@ class PlannedTask(BaseModel):
     experiment_parameters: dict[str, str] = Field(default_factory=dict)
     section: str = ""
     question: str = ""
+    checkpoint_kind: CheckpointKind = CheckpointKind.DISCRETIONARY
 
 
 class ResearchPlan(BaseModel):
@@ -143,6 +156,7 @@ def build_research_plan_prompt(
     allowed_programs: tuple[str, ...] = (),
     profile_context: str = "",
     capsule_present: bool = True,
+    checkpoint_policy: CheckpointPolicy = CheckpointPolicy.STANDARD,
     check_profiles: tuple[CheckProfile, ...] = (),
 ) -> str:
     """Return the complete prompt for the research planner."""
@@ -180,6 +194,29 @@ def build_research_plan_prompt(
   argument vectors the controller will run to verify it, for example
   ["pytest", "-q"]. This project has no controller-owned validation profile, so
   the plan must name the commands itself. Available programs: {programs}."""
+    )
+    checkpoint_kinds = "\n".join(f"    {item.value}" for item in CheckpointKind)
+    checkpoint_guidance = (
+        """Put a "human_checkpoint" before anything the researcher would want to decide
+themselves: spending real compute, changing the project's direction, or
+accepting a scientific conclusion. The controller stops there and waits."""
+        if checkpoint_policy is CheckpointPolicy.STANDARD
+        else """THIS RUN IS UNATTENDED.
+
+It was started with the scientific-only checkpoint policy, which means nobody is
+waiting to answer you. Only a HARD checkpoint may stop it: """
+        + ", ".join(sorted(item.value for item in HARD_CHECKPOINT_KINDS))
+        + """.
+
+Do not plan a checkpoint to ask whether to continue, which of two reasonable
+options to take, or whether the plan looks right. Decide it, say in the task
+goal what you decided and why, and carry on -- the researcher reads the whole
+run afterwards and can disagree with a decision that is written down.
+Any plan containing a discretionary checkpoint is refused.
+
+Plan a hard checkpoint when the next action would genuinely cross a boundary of
+human scientific authority, and say which boundary in the question. Those still
+stop the run, and nothing about this policy changes that."""
     )
     proposal_kind = (
         """turn what is known into structured, reviewable scientific
@@ -240,7 +277,14 @@ out. "depends_on" is a list of earlier task ids, on any kind that needs one.
 - "paper": draft a manuscript section from accepted claims. Sets
   "allowed_paths" and "section".
 - "human_checkpoint": stop and ask the researcher something. Sets "question" to
-  what you want them to decide.
+  what you want them to decide and "checkpoint_kind" to what kind of decision it
+  is. The kinds are:
+{checkpoint_kinds}
+  The controller checks the kind against what it knows about this project: a
+  kind this project cannot corroborate -- a Claim acceptance where there is no
+  Claim, a prespecified-criterion change where nothing is prespecified -- is
+  refused, and labelling a preference as a scientific boundary does not make it
+  one.
 
 DECLARED EXPERIMENT COMMANDS FOR THIS PROJECT
 {experiments}
@@ -270,9 +314,7 @@ make the expensive step unnecessary; an experiment can spend real cluster time
 and a writing task spends a frontier call on prose. A plan that reaches for the
 expensive step first is usually a plan that did not need it.
 
-Put a "human_checkpoint" before anything the researcher would want to decide
-themselves: spending real compute, changing the project's direction, or
-accepting a scientific conclusion. The controller stops there and waits.
+{checkpoint_guidance}
 
 Keep the plan as small as it can be and still achieve the goal. This run has
 {budget.max_model_calls} model calls in total.
@@ -489,6 +531,8 @@ def validate_research_plan(
     declared_experiments: frozenset[str],
     required_parameters: dict[str, frozenset[str]] | None = None,
     check_profiles: tuple[CheckProfile, ...] = (),
+    checkpoint_policy: CheckpointPolicy = CheckpointPolicy.STANDARD,
+    checkpoint_context: CheckpointContext | None = None,
 ) -> None:
     """Reject a plan the controller must not execute.
 
@@ -508,6 +552,11 @@ def validate_research_plan(
 
     assert_plan_says_something(plan)
     _assert_checks_are_the_controllers(plan, check_profiles)
+    _assert_checkpoints_are_permitted(
+        plan,
+        policy=checkpoint_policy,
+        context=checkpoint_context or CheckpointContext.empty(),
+    )
     if len(plan.tasks) > budget.max_tasks:
         raise ResearchPlanError(
             f"the plan has {len(plan.tasks)} tasks; this run's budget allows "
@@ -545,6 +594,61 @@ def validate_research_plan(
                 + ", ".join(missing)
                 + ". Set them in this task's 'experiment_parameters'. A plan may "
                 "fill in the parameters the researcher declared and no others."
+            )
+
+
+def _assert_checkpoints_are_permitted(
+    plan: ResearchPlan,
+    *,
+    policy: CheckpointPolicy,
+    context: CheckpointContext,
+) -> None:
+    """Refuse a checkpoint this run must not stop at, or cannot honestly claim.
+
+    Two separate rules, applied in this order on purpose.
+
+    **Eligibility first, under every policy.** A hard kind the project cannot
+    corroborate is refused whether or not the run is unattended, because a run
+    that stops for a "Claim acceptance" in a project with no Claims has stopped
+    for nothing, and a ``standard`` run that accepted the label would leave the
+    relabelling path open for the unattended one to walk down later.
+
+    **Then the policy.** ``scientific_only`` permits hard checkpoints only. The
+    reason it gives is one fixed string, quoted verbatim into the planner's one
+    bounded correction, so the planner is told the rule rather than a paraphrase.
+    """
+
+    experiment_tasks = sum(1 for item in plan.tasks if item.kind is TaskKind.EXPERIMENT)
+    for task in plan.tasks:
+        if task.kind is not TaskKind.HUMAN_CHECKPOINT:
+            if task.checkpoint_kind is not CheckpointKind.DISCRETIONARY:
+                raise ResearchPlanError(
+                    f"{task.id} is a {task.kind} task and declares "
+                    f"checkpoint_kind {task.checkpoint_kind.value!r}; only a "
+                    "human_checkpoint task has a checkpoint kind"
+                )
+            continue
+        failure = eligibility_failure(
+            task.checkpoint_kind,
+            context=context,
+            experiment_tasks=experiment_tasks,
+        )
+        if failure is not None:
+            raise ResearchPlanError(
+                f"{task.id} declares checkpoint_kind "
+                f"{task.checkpoint_kind.value!r}, but {failure}. Give the "
+                "checkpoint the kind it actually is, or drop it and decide."
+            )
+        if (
+            policy is CheckpointPolicy.SCIENTIFIC_ONLY
+            and task.checkpoint_kind is CheckpointKind.DISCRETIONARY
+        ):
+            raise ResearchPlanError(
+                f"{task.id} is a discretionary checkpoint and this run's "
+                f"checkpoint policy is {policy.value}. "
+                + SCIENTIFIC_ONLY_REASON
+                + " Revise the plan to continue without it, within the same "
+                "budgets, and say in the task goal what you decided."
             )
 
 
@@ -641,6 +745,7 @@ def to_tasks(plan: ResearchPlan) -> list[ResearchTask]:
                     experiment_parameters=dict(planned.experiment_parameters),
                     section=planned.section,
                     question=planned.question,
+                    checkpoint_kind=planned.checkpoint_kind,
                 )
             )
         except ValidationError as exc:

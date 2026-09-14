@@ -92,6 +92,10 @@ from research_os.paper.models import SectionKind
 from research_os.paper.packet import build_source_packet
 from research_os.proposal.context import build_science_context, render_science_context
 from research_os.proposal.controller import ProposalController
+from research_os.research.checkpoints import (
+    CheckpointContext,
+    CheckpointPolicy,
+)
 from research_os.research.models import (
     INTERRUPTIBLE_STATES,
     SATISFIED_STATUSES,
@@ -207,6 +211,7 @@ class ResearchController:
         goal: str,
         budget: ResearchBudget | None = None,
         execute_experiments: bool = False,
+        checkpoint_policy: CheckpointPolicy = CheckpointPolicy.STANDARD,
     ) -> tuple[ResearchStore, ResearchRun]:
         """Plan a research run. Never executes any of it."""
 
@@ -230,6 +235,7 @@ class ResearchController:
             created_at=created_at,
             updated_at=created_at,
             budget=budget or ResearchBudget(),
+            checkpoint_policy=checkpoint_policy,
             execute_experiments=execute_experiments,
             independence=str(resolved.independence),
             independence_note=resolved.note,
@@ -247,6 +253,7 @@ class ResearchController:
             provenance_mode=str(project.profile.provenance_mode),
             capsule_present=project.profile.capsule_present,
             check_profiles=list(project.check_ids),
+            checkpoint_policy=str(checkpoint_policy),
         )
         try:
             run = self._plan(store, run, science, resolved, project)
@@ -295,6 +302,7 @@ class ResearchController:
             insight_section=insights_for(run.goal, project_id=run.project_id),
             execute_experiments=run.execute_experiments,
             allowed_programs=self.config.allowed_check_programs,
+            checkpoint_policy=run.checkpoint_policy,
             profile_context=render_project_profile(project.profile),
             capsule_present=project.profile.capsule_present,
             check_profiles=project.check_profiles,
@@ -310,6 +318,8 @@ class ResearchController:
                 for name, spec in declared.items()
             },
             check_profiles=project.check_profiles,
+            checkpoint_policy=run.checkpoint_policy,
+            checkpoint_context=_checkpoint_context(science, run.execute_experiments),
         )
         tasks = to_tasks(plan)
         self._assert_budget_could_finish(run, tasks)
@@ -337,6 +347,8 @@ class ResearchController:
         declared: frozenset[str],
         required: dict[str, frozenset[str]] | None = None,
         check_profiles: tuple[CheckProfile, ...] = (),
+        checkpoint_policy: CheckpointPolicy = CheckpointPolicy.STANDARD,
+        checkpoint_context: CheckpointContext | None = None,
     ) -> tuple[ResearchRun, ResearchPlan]:
         """Get one validated plan, allowing at most one bounded re-ask.
 
@@ -403,6 +415,8 @@ class ResearchController:
                     declared_experiments=declared,
                     required_parameters=required,
                     check_profiles=check_profiles,
+                    checkpoint_policy=checkpoint_policy,
+                    checkpoint_context=checkpoint_context,
                 )
             except ResearchPlanError as exc:
                 store.append_event(
@@ -1143,7 +1157,9 @@ class ResearchController:
         """Stop and wait. Nothing after this runs until a person answers."""
 
         task = run.task(task_id)
-        checkpoint = HumanCheckpoint(task_id=task_id, question=task.question)
+        checkpoint = HumanCheckpoint(
+            task_id=task_id, question=task.question, kind=task.checkpoint_kind
+        )
         run = store.save(
             run.model_copy(update={"checkpoints": [*run.checkpoints, checkpoint]})
         )
@@ -1155,7 +1171,11 @@ class ResearchController:
             detail="waiting for the researcher",
         )
         store.append_event(
-            "human_checkpoint_reached", task_id=task_id, question=task.question
+            "human_checkpoint_reached",
+            task_id=task_id,
+            question=task.question,
+            kind=str(checkpoint.kind),
+            hard=checkpoint.hard,
         )
         return self._transition(store, run, ResearchState.WAITING_FOR_HUMAN)
 
@@ -1775,6 +1795,28 @@ class ResearchController:
             for item in run.tasks
         ]
         return store.save(run.model_copy(update={"tasks": tasks}))
+
+
+def _checkpoint_context(
+    science: object, execute_experiments: bool
+) -> CheckpointContext:
+    """Read what this project has, so a claimed hard checkpoint can be checked.
+
+    Counts, not identifiers. The question the eligibility rule asks is whether a
+    kind of decision is *possible* here, and a count answers that without
+    pretending the controller can tell which particular Claim a checkpoint is
+    about.
+    """
+
+    of_type = getattr(science, "of_type", None)
+    if of_type is None:  # pragma: no cover - science is always a ScienceContext
+        return CheckpointContext(execute_experiments=execute_experiments)
+    return CheckpointContext(
+        capsule_present=bool(getattr(science, "capsule_present", False)),
+        claim_count=len(of_type("claim")),
+        prespecified_count=len(of_type("experiment")) + len(of_type("hypothesis")),
+        execute_experiments=execute_experiments,
+    )
 
 
 def ready_blockers(run: ResearchRun) -> list[str]:

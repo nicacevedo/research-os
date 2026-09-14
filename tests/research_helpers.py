@@ -210,6 +210,7 @@ def task(
         "experiment_parameters": {},
         "section": "",
         "question": "",
+        "checkpoint_kind": "discretionary",
     }
     payload.update(overrides)
     return payload

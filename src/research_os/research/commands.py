@@ -25,6 +25,7 @@ import argparse
 from pathlib import Path
 
 from research_os.errors import EXIT_OK
+from research_os.research.checkpoints import CheckpointPolicy
 from research_os.research.models import ResearchBudget, ResearchState
 from research_os.research.report import render_run, render_run_list, render_status
 from research_os.research.store import ResearchStore
@@ -148,6 +149,20 @@ def _add_budget_arguments(parser: argparse.ArgumentParser) -> None:
             "Without it, an experiment resolves its command and stops."
         ),
     )
+    parser.add_argument(
+        "--checkpoint-policy",
+        choices=["standard", "scientific-only"],
+        default="standard",
+        help=(
+            "How much this run may be interrupted. 'standard' is the default and "
+            "lets the planner ask you anything. 'scientific-only' is for an "
+            "unattended run: only a hard checkpoint -- a human Review, a Claim "
+            "acceptance, a change to a prespecified criterion, a cross-project "
+            "promotion, or authorising something expensive -- may stop it. "
+            "Nothing about either setting lets automation decide a scientific "
+            "question on your behalf."
+        ),
+    )
 
 
 def dispatch(args: argparse.Namespace) -> int:
@@ -201,6 +216,17 @@ def _recording_controller():
     return ResearchController(providers={}, config=load_config(None))
 
 
+def _checkpoint_policy(args: argparse.Namespace) -> CheckpointPolicy:
+    """Return the policy this run was started with.
+
+    The CLI spells it with a hyphen because that is how flags read; the stored
+    value is the enum, because that is what the controller enforces.
+    """
+
+    raw = getattr(args, "checkpoint_policy", "standard") or "standard"
+    return CheckpointPolicy(raw.replace("-", "_"))
+
+
 def _budget(args: argparse.Namespace) -> ResearchBudget:
     supplied = {
         "max_tasks": args.max_tasks,
@@ -222,6 +248,7 @@ def _start(args: argparse.Namespace) -> int:
         goal=args.goal,
         budget=_budget(args),
         execute_experiments=bool(args.execute_experiments),
+        checkpoint_policy=_checkpoint_policy(args),
     )
     if args.run:
         run = controller.execute(store)
