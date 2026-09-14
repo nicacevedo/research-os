@@ -22,7 +22,12 @@ from typing import Any
 from xml.etree import ElementTree
 
 from research_os.errors import SourceUnavailableError
-from research_os.literature.http import HostPolicy, HttpClient, encode_query
+from research_os.literature.http import (
+    HostPolicy,
+    HttpClient,
+    encode_query,
+    retry_after_seconds,
+)
 from research_os.literature.identity import normalize_arxiv_id
 from research_os.literature.models import SourceProbe, SourceStatus
 from research_os.literature.sources.base import (
@@ -122,6 +127,7 @@ class ArxivSource:
                 status=SourceStatus.RATE_LIMITED,
                 request_url=url,
                 detail="arXiv returned 429; the three-second interval was not enough",
+                retry_after_seconds=retry_after_seconds(response),
             )
         if response.status != 200:
             return SourceResult(

@@ -23,9 +23,11 @@ import pytest
 
 from research_os.errors import SourceUnavailableError
 from research_os.literature.http import (
+    MAX_INLINE_WAIT_SECONDS,
     MAX_RETRIES,
     MAX_RETRY_AFTER_SECONDS,
     HttpClient,
+    retry_after_seconds,
 )
 from research_os.literature.models import SourceStatus
 from research_os.literature.sources.arxiv import ArxivSource
@@ -238,7 +240,17 @@ def test_a_malformed_retry_after_falls_back_instead_of_failing() -> None:
     assert transport.waited and max(transport.waited) <= MAX_RETRY_AFTER_SECONDS
 
 
-def test_a_retry_after_far_in_the_future_is_capped() -> None:
+def test_a_retry_after_far_in_the_future_is_not_waited_out() -> None:
+    """A provider asking for a week is recorded, not slept through.
+
+    v1.0.0 clamped the wait to a minute and retried anyway, twice, which is two
+    minutes a bounded run does not have to spend arguing with a provider that
+    has already said when it will answer. Now the response comes straight back
+    with its header intact; :mod:`research_os.literature.pacing` persists what
+    was asked for, and the rest of the retrieval asks the providers that will
+    answer.
+    """
+
     when = format_datetime(datetime.now(UTC) + timedelta(days=7))
     transport = client(
         responses=[
@@ -251,9 +263,34 @@ def test_a_retry_after_far_in_the_future_is_capped() -> None:
         ],
     )
 
+    response = transport.get("https://example.invalid/x")
+
+    assert response.status == 429
+    assert transport.waited == [], "a week-long Retry-After must not be slept on"
+    assert len(transport.requests) == 1, "nor retried against"
+    asked = retry_after_seconds(response)
+    assert asked is not None and asked > MAX_INLINE_WAIT_SECONDS
+
+
+def test_a_short_retry_after_is_still_honoured_inline() -> None:
+    """The other half: a provider asking for seconds still gets its seconds."""
+
+    transport = client(
+        responses=[
+            ScriptedResponse(
+                match="example",
+                status=429,
+                headers={"retry-after": "5"},
+                body=b"",
+            )
+        ],
+    )
+
     transport.get("https://example.invalid/x")
 
-    assert max(transport.waited) <= MAX_RETRY_AFTER_SECONDS
+    assert transport.waited
+    assert max(transport.waited) == 5.0
+    assert len(transport.requests) == MAX_RETRIES + 1
 
 
 # -- a settled refusal is never retried ---------------------------------------

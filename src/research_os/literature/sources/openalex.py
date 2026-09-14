@@ -28,7 +28,12 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from research_os.errors import SourceUnavailableError
-from research_os.literature.http import HostPolicy, HttpClient, encode_query
+from research_os.literature.http import (
+    HostPolicy,
+    HttpClient,
+    encode_query,
+    retry_after_seconds,
+)
 from research_os.literature.identity import normalize_doi
 from research_os.literature.models import SourceProbe, SourceStatus
 from research_os.literature.sources.base import (
@@ -155,6 +160,7 @@ class OpenAlexSource:
                 status=SourceStatus.RATE_LIMITED,
                 request_url=url,
                 detail="OpenAlex returned 429; the daily budget is exhausted",
+                retry_after_seconds=retry_after_seconds(response),
                 rate_limit_note=note,
             )
         if response.status == 404:

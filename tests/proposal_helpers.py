@@ -166,6 +166,7 @@ def make_controller(
             offline=True,
             default_search_limit=5,
             fetch_fulltext=False,
+            cache_ttl_seconds=0,
             source=None,
         ),
         literature_store=literature_store,

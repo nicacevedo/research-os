@@ -54,6 +54,18 @@ MAX_RETRIES = 2
 #: The longest a ``Retry-After`` is honoured before the request is abandoned.
 MAX_RETRY_AFTER_SECONDS = 60
 
+#: The longest this client will ever sleep inline before giving up on a retry.
+#:
+#: A provider that asks for an hour is telling us something true and useful, and
+#: the right response is to write it down rather than to sit in a sleep for an
+#: hour holding a run open. Past this bound the response is returned as it
+#: stands; ``retry_after_seconds`` carries what the provider asked for, the
+#: pacing layer persists it, and the other providers in the retrieval are asked
+#: instead. Found as a design gap rather than a live failure: the retry loop was
+#: already bounded at two attempts, so the worst case was two minutes, which is
+#: still two minutes a bounded run does not have.
+MAX_INLINE_WAIT_SECONDS = 60
+
 #: Statuses worth trying again. Everything else is the provider's answer.
 RETRYABLE_STATUSES: frozenset[int] = frozenset({429, 500, 502, 503, 504})
 
@@ -181,6 +193,19 @@ class HttpClient:
                 self._sleep(min(float(2**attempt), MAX_RETRY_AFTER_SECONDS))
                 continue
             if response.status in RETRYABLE_STATUSES and attempt < MAX_RETRIES:
+                asked = retry_after_seconds(response)
+                if asked is not None and asked > MAX_INLINE_WAIT_SECONDS:
+                    # The provider asked for longer than any single request
+                    # should wait. Returning now is not giving up: the status,
+                    # the headers, and what was asked for all travel back, and
+                    # the pacing layer persists them -- so the next run knows
+                    # without having to be refused again, and the rest of this
+                    # retrieval asks the providers that will answer.
+                    #
+                    # The clamped delay cannot express this. It is capped at the
+                    # same bound by construction, so the decision has to be made
+                    # against the number the provider actually sent.
+                    return response
                 attempt += 1
                 self._sleep(self._retry_delay(response, attempt))
                 continue
@@ -225,20 +250,16 @@ class HttpClient:
         believes it is being polite gets itself blocked.
         """
 
-        raw = (response.header("retry-after") or "").strip()
-        # ``isascii`` as well as ``isdigit``: the latter is True for characters
-        # ``float`` refuses, such as the superscript two, so a provider sending
-        # ``Retry-After: ²`` turned a header parse into an unhandled
-        # ValueError escaping a request that had already succeeded in reaching
-        # the provider. Found by an independent reviewer.
-        if raw.isascii() and raw.isdigit():
-            return min(float(raw), MAX_RETRY_AFTER_SECONDS)
-        if raw:
-            moment = parsedate_to_datetime_or_none(raw)
-            if moment is not None:
-                seconds = (moment - datetime.now(UTC)).total_seconds()
-                # A date already in the past means "you may retry now".
-                return min(max(seconds, 0.0), MAX_RETRY_AFTER_SECONDS)
+        # ``retry_after_seconds`` reads both header forms and is total; a
+        # provider sending ``Retry-After: ²`` once turned a header parse into an
+        # unhandled ValueError escaping a request that had already reached the
+        # provider. Found by an independent reviewer.
+        asked = retry_after_seconds(response)
+        if asked is not None:
+            # Clamped here and unclamped in the value the caller persists: this
+            # number decides how long *one request* waits, and that is a
+            # different question from when the provider will answer again.
+            return min(asked, MAX_RETRY_AFTER_SECONDS)
         return min(float(2**attempt), MAX_RETRY_AFTER_SECONDS)
 
     def _perform(self, url: str, headers: dict[str, str]) -> HttpResponse:
@@ -284,6 +305,32 @@ class HttpClient:
                 str(exc) or exc.__class__.__name__,
                 host=urllib.parse.urlparse(url).hostname or url,
             ) from exc
+
+
+def retry_after_seconds(response: HttpResponse) -> float | None:
+    """Return what ``Retry-After`` asked for, in seconds, or ``None``.
+
+    Both forms RFC 9110 allows, because a provider is free to send either and
+    reading only the seconds form is how a client that believes it is being
+    polite gets itself blocked. Total: a malformed header is a provider bug, not
+    a reason to fail a request that already reached the provider.
+
+    Separate from the retry delay this client computes for itself. That one is
+    clamped to what a single request may wait; this one is what the provider
+    actually said, which is the number worth persisting.
+    """
+
+    raw = (response.header("retry-after") or "").strip()
+    if not raw:
+        return None
+    # ``isascii`` as well as ``isdigit``: the latter is True for characters
+    # ``float`` refuses, such as the superscript two.
+    if raw.isascii() and raw.isdigit():
+        return float(raw)
+    moment = parsedate_to_datetime_or_none(raw)
+    if moment is None:
+        return None
+    return max((moment - datetime.now(UTC)).total_seconds(), 0.0)
 
 
 def read_bounded(stream: IO[bytes], max_bytes: int) -> tuple[bytes, bool]:

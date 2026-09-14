@@ -69,6 +69,15 @@ class SourceResult:
     request_url: str = ""
     detail: str = ""
     rate_limit_note: str = ""
+    retry_after_seconds: float | None = None
+    """What the provider's ``Retry-After`` asked for, unclamped, when it sent one.
+
+    Unclamped deliberately. The HTTP client clamps the delay *one request* may
+    wait; this is the number the provider actually said, and it is the one worth
+    persisting -- a provider asking for an hour is telling the next run
+    something true, and rounding it down to a minute would throw that away.
+    ``None`` means no header, which is not the same as zero.
+    """
 
     @property
     def ok(self) -> bool:

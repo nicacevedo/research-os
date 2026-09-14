@@ -17,7 +17,9 @@ so a literature review can distinguish "nothing matched" from "we never asked".
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from research_os.automation.models import utc_now
@@ -40,8 +42,13 @@ from research_os.literature.models import (
     SourceProbe,
     SourceStatus,
 )
+from research_os.literature.pacing import SourcePacer, utc_stamp
 from research_os.literature.sources import default_sources
-from research_os.literature.sources.base import ProviderRecord, SourceAdapter
+from research_os.literature.sources.base import (
+    ProviderRecord,
+    SourceAdapter,
+    SourceResult,
+)
 from research_os.literature.store import LiteratureStore, files_root
 
 
@@ -57,6 +64,11 @@ class ProviderOutcome:
     detail: str
     rate_limit_note: str
     search_id: int | None = None
+    from_cache: bool = False
+    """Whether this outcome was served from the store without a provider call."""
+
+    next_allowed_at: str | None = None
+    """When this provider may be asked again, when it has told us."""
 
     @property
     def ok(self) -> bool:
@@ -90,6 +102,33 @@ class RetrievalReport:
 
         return not self.skipped
 
+    @property
+    def cached(self) -> tuple[ProviderOutcome, ...]:
+        """Outcomes that cost no provider request at all."""
+
+        return tuple(item for item in self.outcomes if item.from_cache)
+
+    @property
+    def network_calls(self) -> int:
+        """How many provider requests this retrieval actually issued.
+
+        A provider served from cache made none, and one whose reservation was
+        refused made none either -- which is the number that matters when
+        somebody asks whether a run spent quota.
+        """
+
+        return sum(
+            1
+            for item in self.outcomes
+            if not item.from_cache and item.status is not SourceStatus.RATE_LIMITED
+        )
+
+    @property
+    def rate_limited(self) -> tuple[ProviderOutcome, ...]:
+        return tuple(
+            item for item in self.outcomes if item.status is SourceStatus.RATE_LIMITED
+        )
+
 
 @dataclass
 class LiteratureService:
@@ -100,6 +139,13 @@ class LiteratureService:
     sources: dict[str, SourceAdapter] = field(default_factory=dict)
     client: HttpClient | None = None
     files_directory: Path | None = None
+    clock: Callable[[], datetime] = field(default=lambda: datetime.now(UTC))
+    """Where "now" comes from.
+
+    Injectable so the pacing tests can move time deliberately rather than
+    sleeping, which is the difference between a test that checks the rule and a
+    test that checks the machine was slow enough.
+    """
 
     def __post_init__(self) -> None:
         if self.client is None:
@@ -151,6 +197,7 @@ class LiteratureService:
                 query=query,
                 parameters={"limit": bounded, "operation": "search"},
                 run=lambda adapter=adapter: adapter.search(query, limit=bounded),
+                cacheable=True,
             )
             outcomes.append(outcome)
             keys.extend(outcome.ingested)
@@ -193,19 +240,66 @@ class LiteratureService:
         query: str,
         parameters: dict[str, object],
         run,
+        cacheable: bool = False,
     ) -> ProviderOutcome:
         """Run one provider call, archive it, and ingest whatever it returned.
 
-        Every path through here records a :class:`SearchRecord`. A provider that
-        raised, a provider that was unavailable, and a provider that returned
-        nothing are three different rows, and a literature review that cannot
-        tell them apart is not reproducible.
+        Three things happen before the network is touched, in this order.
+
+        **The cache is asked.** An identical successful search inside the
+        freshness window is answered from the store, for no provider quota at
+        all. Spending a request to refresh data nothing needs refreshed is how a
+        daily budget disappears by lunchtime.
+
+        **A slot is reserved, atomically.** Two concurrent runs cannot both
+        observe "available" and both issue a request: the look and the take are
+        one transaction. A refused reservation is a first-class outcome --
+        ``RATE_LIMITED`` with the time the provider may be asked again -- and it
+        never becomes an empty result, because "we did not ask" and "there is
+        nothing" are different facts about a literature review.
+
+        **Then the request is made**, outside the transaction. A SQLite write
+        lock is never held across network I/O.
+
+        Every path still records a :class:`SearchRecord`, including the cached
+        and refused ones, so the archive says what actually happened.
         """
 
-        requested_at = utc_now()
+        pacer = self.store.pacer()
+        now = self.clock()
+        if cacheable:
+            cached = self._from_cache(name, query=query, parameters=parameters, now=now)
+            if cached is not None:
+                return cached
+
+        reservation = pacer.reserve(name, now=now)
+        if not reservation.granted:
+            return self._archive(
+                name,
+                query=query,
+                requested_at=utc_stamp(now),
+                parameters=parameters,
+                status=SourceStatus.RATE_LIMITED,
+                detail=reservation.reason,
+                request_url="",
+                ingested=(),
+                rate_limit_note="",
+                next_allowed_at=reservation.next_allowed_at,
+            )
+
+        # The archive timestamp comes from the same clock the pacing does. Two
+        # clocks for one request is how a cache window and a request record
+        # disagree about when something happened.
+        requested_at = utc_stamp(now)
         try:
             result = run()
         except SourceUnavailableError as exc:
+            pacer.record_failure(
+                name,
+                now=self.clock(),
+                status=SourceStatus.UNAVAILABLE,
+                detail=str(exc),
+            )
             return self._archive(
                 name,
                 query=query,
@@ -218,6 +312,9 @@ class LiteratureService:
                 rate_limit_note="",
             )
         except LiteratureError as exc:
+            pacer.record_failure(
+                name, now=self.clock(), status=SourceStatus.FAILED, detail=str(exc)
+            )
             return self._archive(
                 name,
                 query=query,
@@ -230,6 +327,7 @@ class LiteratureService:
                 rate_limit_note="",
             )
 
+        next_allowed = self._record_outcome(pacer, name, result)
         ingested: list[str] = []
         if result.ok:
             for record in result.records:
@@ -258,7 +356,72 @@ class LiteratureService:
             ingested=tuple(ingested),
             rate_limit_note=result.rate_limit_note,
             record_count=len(result.records),
+            next_allowed_at=next_allowed,
+            cacheable=cacheable,
         )
+
+    def _from_cache(
+        self,
+        name: str,
+        *,
+        query: str,
+        parameters: dict[str, object],
+        now: datetime,
+    ) -> ProviderOutcome | None:
+        """Return this query's stored answer, when one is fresh enough to use."""
+
+        ttl = self.config.cache_ttl_seconds
+        if ttl <= 0:
+            return None
+        found = self.store.cached_search(
+            query=query,
+            provider=name,
+            cache_key=_cache_key(parameters),
+            not_before=utc_stamp(now - timedelta(seconds=ttl)),
+        )
+        if found is None:
+            return None
+        search_id, keys = found
+        return ProviderOutcome(
+            provider=name,
+            status=SourceStatus.OK,
+            records=len(keys),
+            ingested=keys,
+            request_url="",
+            detail=(
+                f"answered from the literature store; {name} was last asked this "
+                f"within the last {ttl} seconds"
+            ),
+            rate_limit_note="",
+            search_id=search_id,
+            from_cache=True,
+        )
+
+    def _record_outcome(
+        self, pacer: SourcePacer, name: str, result: SourceResult
+    ) -> str | None:
+        """Persist what this provider's answer says about when to ask it again.
+
+        Only what the provider actually said. A 429 with ``Retry-After`` is
+        honoured to the second it asked for; a 429 without one is held for this
+        source's own minimum interval and nothing longer, because inventing a
+        cooldown a provider did not request would be this client deciding on no
+        evidence that a literature review should stop.
+        """
+
+        now = self.clock()
+        if result.status is SourceStatus.RATE_LIMITED:
+            return pacer.record_rate_limited(
+                name,
+                now=now,
+                retry_after_seconds=result.retry_after_seconds,
+                detail=result.detail,
+            )
+        if result.status is SourceStatus.OK:
+            pacer.record_success(name, now=now, detail=result.detail)
+            return None
+        pacer.record_failure(name, now=now, status=result.status, detail=result.detail)
+        return None
 
     def _archive(
         self,
@@ -273,14 +436,15 @@ class LiteratureService:
         ingested: tuple[str, ...],
         rate_limit_note: str,
         record_count: int | None = None,
+        next_allowed_at: str | None = None,
+        cacheable: bool = False,
     ) -> ProviderOutcome:
         record = SearchRecord(
             query=query,
             provider=name,
             requested_at=requested_at,
-            parameters=json.dumps(
-                {**parameters, "request_url": request_url}, sort_keys=True
-            ),
+            parameters=_parameter_key(parameters, request_url=request_url),
+            cache_key=_cache_key(parameters) if cacheable else "",
             status=status,
             result_count=record_count if record_count is not None else len(ingested),
             detail=detail,
@@ -304,6 +468,7 @@ class LiteratureService:
             detail=detail,
             rate_limit_note=rate_limit_note,
             search_id=search_id,
+            next_allowed_at=next_allowed_at,
         )
 
     def ingest_record(self, record: ProviderRecord) -> str:
@@ -435,3 +600,20 @@ class LiteratureService:
         """
 
         return f"https://arxiv.org/pdf/{arxiv_id}" if arxiv_id else None
+
+
+def _parameter_key(parameters: dict[str, object], *, request_url: str) -> str:
+    """Return the archived parameter JSON: what this request actually was."""
+
+    return json.dumps({**parameters, "request_url": request_url}, sort_keys=True)
+
+
+def _cache_key(parameters: dict[str, object]) -> str:
+    """Return what identifies this request before it is made.
+
+    Sorted, because a key whose text depends on dictionary ordering is a key
+    that misses at random. The response URL is deliberately absent: a caller
+    deciding whether to spend a request does not know it yet.
+    """
+
+    return json.dumps(parameters, sort_keys=True)

@@ -207,6 +207,16 @@ class SearchRecord(BaseModel):
     provider: NonBlankStr
     requested_at: str
     parameters: str = "{}"
+    cache_key: str = ""
+    """What identifies this request for cache purposes, without the response URL.
+
+    Separate from ``parameters`` on purpose. ``parameters`` records what
+    happened, including the URL the provider was actually asked -- valuable
+    provenance, and useless as a cache key, because a caller deciding whether to
+    make a request does not yet know what URL the adapter will build. This is
+    the part that is knowable beforehand.
+    """
+
     status: SourceStatus = SourceStatus.OK
     result_count: int = 0
     detail: str = ""

@@ -12,6 +12,8 @@ retracted, and whether a stored file's text could be extracted at all.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 from research_os.literature.evaluation import EvaluationReport
 from research_os.literature.models import (
     ExtractionStatus,
@@ -19,14 +21,30 @@ from research_os.literature.models import (
     SourceProbe,
     WorkRecord,
 )
+from research_os.literature.pacing import SourceHealth
 from research_os.literature.service import RetrievalReport
 from research_os.literature.store import LiteratureStore
 from research_os.textsafe import terminal_safe
 
 
-def render_sources(probes: dict[str, SourceProbe]) -> str:
-    """Render provider readiness without ever printing a credential."""
+def render_sources(
+    probes: dict[str, SourceProbe],
+    health: dict[str, SourceHealth] | None = None,
+    *,
+    now: datetime | None = None,
+) -> str:
+    """Render provider readiness without ever printing a credential.
 
+    Two different questions, answered side by side. The probe says what this
+    machine *could* do with a provider -- is it configured, is there a
+    credential, is the client offline. The persisted health says what the
+    provider last actually did, which is the half that survives the process and
+    the half that explains why a retrieval skipped a source it could otherwise
+    reach.
+    """
+
+    moment = now or datetime.now(UTC)
+    known = health or {}
     lines = ["", "Literature sources", ""]
     for name in sorted(probes):
         probe = probes[name]
@@ -44,10 +62,35 @@ def render_sources(probes: dict[str, SourceProbe]) -> str:
                 + ("configured" if probe.contact_configured else "not configured"),
                 f"  rate limits       {probe.rate_limit_note or 'unstated'}",
                 f"  detail            {probe.detail}",
-                "",
             ]
         )
+        lines.extend(_health_lines(known.get(name), moment))
+        lines.append("")
     return terminal_safe("\n".join(lines) + "\n")
+
+
+def _health_lines(health: SourceHealth | None, now: datetime) -> list[str]:
+    """Render one source's persisted operational state, or say there is none."""
+
+    if health is None:
+        return ["  availability      AVAILABLE (nothing recorded yet)"]
+    availability = health.availability(now)
+    lines = [f"  availability      {availability}"]
+    if availability == "RATE_LIMITED" and health.rate_limited_until:
+        lines.append(f"  available again   {health.rate_limited_until}")
+    elif health.next_allowed_at:
+        lines.append(f"  next allowed      {health.next_allowed_at}")
+    if health.quota_remaining is not None:
+        lines.append(f"  quota remaining   {health.quota_remaining}")
+    if health.quota_reset_at:
+        lines.append(f"  quota resets      {health.quota_reset_at}")
+    if health.last_success_at:
+        lines.append(f"  last success      {health.last_success_at}")
+    if health.last_failure_at:
+        lines.append(f"  last failure      {health.last_failure_at}")
+    if health.last_detail:
+        lines.append(f"  last said         {health.last_detail}")
+    return lines
 
 
 def render_retrieval(report: RetrievalReport) -> str:

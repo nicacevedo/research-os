@@ -231,13 +231,22 @@ def fake_config(
     enabled: tuple[str, ...] = ("openalex", "crossref", "arxiv"),
     offline: bool = False,
     fetch_fulltext: bool = True,
+    cache_ttl_seconds: int = 0,
 ) -> LiteratureConfig:
+    """A literature configuration for tests. Caching is off unless asked for.
+
+    Off by default so that every existing test still exercises the retrieval
+    path it was written to exercise. A test that wants the cache says so, which
+    also makes "this test is about caching" visible at its call site.
+    """
+
     return LiteratureConfig(
         contact_email=contact_email,
         enabled_sources=enabled,
         offline=offline,
         default_search_limit=5,
         fetch_fulltext=fetch_fulltext,
+        cache_ttl_seconds=cache_ttl_seconds,
         source=None,
     )
 

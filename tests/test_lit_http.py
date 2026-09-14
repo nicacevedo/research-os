@@ -194,6 +194,28 @@ def test_a_throttled_request_is_retried_a_bounded_number_of_times() -> None:
 
 
 def test_a_retry_after_is_honoured_but_bounded() -> None:
+    """A wait inside the inline budget is taken, and never exceeds the cap."""
+
+    transport = client(
+        responses=[
+            ScriptedResponse(
+                match="example",
+                status=503,
+                headers={"retry-after": "45"},
+                body=b"",
+            )
+        ],
+    )
+
+    transport.get("https://example.invalid/x")
+
+    assert transport.waited
+    assert max(transport.waited) <= 60
+
+
+def test_a_retry_after_beyond_the_inline_budget_is_not_waited_out() -> None:
+    """The response comes back so the pacing layer can persist what it says."""
+
     transport = client(
         responses=[
             ScriptedResponse(
@@ -205,10 +227,11 @@ def test_a_retry_after_is_honoured_but_bounded() -> None:
         ],
     )
 
-    transport.get("https://example.invalid/x")
+    response = transport.get("https://example.invalid/x")
 
-    assert transport.waited
-    assert max(transport.waited) <= 60
+    assert response.status == 503
+    assert transport.waited == []
+    assert len(transport.requests) == 1
 
 
 def test_an_unreachable_host_is_unavailable_rather_than_a_crash() -> None:

@@ -155,7 +155,8 @@ def _sources(args: argparse.Namespace) -> int:
     with LiteratureStore.open() as store:
         service = LiteratureService(store=store, config=config)
         probes = service.probe()
-    print(render_sources(probes), end="")
+        health = {item.source: item for item in store.pacer().all_health()}
+    print(render_sources(probes, health), end="")
     return EXIT_OK if any(item.usable for item in probes.values()) else EXIT_ERROR
 
 

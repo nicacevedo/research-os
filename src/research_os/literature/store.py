@@ -69,11 +69,13 @@ from research_os.literature.models import (
     SearchHit,
     SearchRecord,
     SourceRecord,
+    SourceStatus,
     TextChunk,
     TextDocument,
     WorkIdentifier,
     WorkRecord,
 )
+from research_os.literature.pacing import SourcePacer
 from research_os.paths import data_home
 
 DATABASE_DIRNAME = "literature"
@@ -81,7 +83,7 @@ DATABASE_FILENAME = "literature.sqlite3"
 FILES_DIRNAME = "files"
 
 #: The schema version this build writes and expects.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 #: The fields a merge tracks provenance for.
 #:
@@ -299,8 +301,42 @@ _MIGRATIONS: dict[int, tuple[str, ...]] = {
             tokenize = 'porter unicode61 remove_diacritics 2'
         )
         """,
-    )
+    ),
+    2: (
+        # The cache key a retrieval can compute *before* it makes a request.
+        # ``parameters`` already records what happened, URL included, which is
+        # exactly why it cannot serve as a lookup key.
+        "ALTER TABLE searches ADD COLUMN cache_key TEXT NOT NULL DEFAULT ''",
+        "CREATE INDEX searches_cache ON searches(provider, query, cache_key)",
+        # Operational state, not scientific state. What a provider told us about
+        # when it will answer again, so the next run does not have to rediscover
+        # it by being refused. Every column is something a provider actually
+        # said; nothing here is estimated, and a value nobody reported stays
+        # NULL rather than being guessed at.
+        """
+        CREATE TABLE source_health (
+            source             TEXT PRIMARY KEY,
+            next_allowed_at    TEXT,
+            rate_limited_until TEXT,
+            quota_remaining    INTEGER,
+            quota_reset_at     TEXT,
+            last_status        TEXT NOT NULL DEFAULT '',
+            last_detail        TEXT NOT NULL DEFAULT '',
+            last_success_at    TEXT,
+            last_failure_at    TEXT,
+            updated_at         TEXT
+        )
+        """,
+    ),
 }
+
+
+#: How long a connection waits for another process's write lock.
+#:
+#: Five seconds. Long enough to cover a reservation, which is three statements
+#: and no I/O; short enough that a genuinely stuck writer is reported rather
+#: than waited on forever.
+BUSY_TIMEOUT_MS = 5_000
 
 
 def database_root() -> Path:
@@ -379,6 +415,12 @@ class LiteratureStore:
         if self.path is not None:
             self.connection.execute("PRAGMA journal_mode = WAL")
         self.connection.execute("PRAGMA synchronous = NORMAL")
+        # Two Research OS runs may reasonably want the pacing lock at the same
+        # moment. Without a busy timeout the second gets SQLITE_BUSY
+        # immediately and a perfectly ordinary concurrent run fails; with one it
+        # waits for the first reservation to commit and then reads the state
+        # that reservation wrote, which is the whole point of taking the lock.
+        self.connection.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
@@ -438,6 +480,19 @@ class LiteratureStore:
                     (str(version),),
                 )
         return SCHEMA_VERSION
+
+    # -- operational pacing ----------------------------------------------
+
+    def pacer(self) -> SourcePacer:
+        """Return the persistent provider pacing over this store.
+
+        On the store rather than beside it because the state belongs in the one
+        database this subsystem already has: a second file, or a second service,
+        would be a second thing to back up, migrate, and explain, for rows that
+        are rebuildable by asking a provider once.
+        """
+
+        return SourcePacer(self.connection)
 
     # -- identity --------------------------------------------------------
 
@@ -1014,13 +1069,14 @@ class LiteratureStore:
         with self.transaction() as connection:
             cursor = connection.execute(
                 "INSERT INTO searches"
-                "(query, provider, requested_at, parameters, status, result_count,"
-                " detail) VALUES (?,?,?,?,?,?,?)",
+                "(query, provider, requested_at, parameters, cache_key, status,"
+                " result_count, detail) VALUES (?,?,?,?,?,?,?,?)",
                 (
                     record.query,
                     record.provider,
                     record.requested_at,
                     record.parameters,
+                    record.cache_key,
                     str(record.status),
                     record.result_count,
                     record.detail,
@@ -1065,6 +1121,37 @@ class LiteratureStore:
             )
         ]
 
+    def cached_search(
+        self, *, query: str, provider: str, cache_key: str, not_before: str
+    ) -> tuple[int, tuple[str, ...]] | None:
+        """Return the most recent successful identical search, if it is fresh enough.
+
+        Identical means the same query to the same provider with the same
+        parameters, which is why the parameter JSON is stored sorted: a cache
+        key that depends on dictionary ordering is a cache key that misses at
+        random. ``OK`` only -- a provider that failed or was rate limited last
+        time has not answered this query, and serving that back as a cache hit
+        would turn one outage into a permanent empty result.
+        """
+
+        row = self.connection.execute(
+            "SELECT search_id FROM searches WHERE query = ? AND provider = ? "
+            "AND cache_key = ? AND cache_key != '' AND status = ? "
+            "AND requested_at >= ? ORDER BY search_id DESC LIMIT 1",
+            (query, provider, cache_key, str(SourceStatus.OK), not_before),
+        ).fetchone()
+        if row is None:
+            return None
+        search_id = int(row["search_id"])
+        keys = tuple(
+            item["work_key"]
+            for item in self.connection.execute(
+                "SELECT work_key FROM search_results WHERE search_id = ? ORDER BY rank",
+                (search_id,),
+            )
+        )
+        return search_id, keys
+
     def searches(self, limit: int = 50) -> list[SearchRecord]:
         return [
             SearchRecord(
@@ -1073,6 +1160,7 @@ class LiteratureStore:
                 provider=row["provider"],
                 requested_at=row["requested_at"],
                 parameters=row["parameters"],
+                cache_key=row["cache_key"],
                 status=row["status"],
                 result_count=row["result_count"],
                 detail=row["detail"],

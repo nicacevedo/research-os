@@ -45,6 +45,14 @@ DEFAULT_SEARCH_LIMIT = 20
 #: pull into the store in a single step.
 MAX_SEARCH_LIMIT = 100
 
+#: How long a successful search stays fresh enough to answer from the store.
+#:
+#: A day. Long enough that a run repeated the same afternoon costs no provider
+#: quota; short enough that a review started tomorrow sees what was published
+#: today. Set it to 0 to ask the providers every time, which is what a
+#: reproducibility check wants and what ordinary work does not.
+DEFAULT_CACHE_TTL_SECONDS = 86_400
+
 
 class LiteratureDocument(BaseModel):
     """The on-disk shape of ``literature.yaml``. Every key is optional."""
@@ -57,6 +65,7 @@ class LiteratureDocument(BaseModel):
     offline: bool | None = None
     default_search_limit: int | None = None
     fetch_fulltext: bool | None = None
+    cache_ttl_seconds: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +77,7 @@ class LiteratureConfig:
     offline: bool
     default_search_limit: int
     fetch_fulltext: bool
+    cache_ttl_seconds: int
     source: Path | None
 
     def enabled(self, name: str) -> bool:
@@ -89,6 +99,7 @@ def default_config() -> LiteratureConfig:
         offline=False,
         default_search_limit=DEFAULT_SEARCH_LIMIT,
         fetch_fulltext=True,
+        cache_ttl_seconds=DEFAULT_CACHE_TTL_SECONDS,
         source=None,
     )
 
@@ -144,6 +155,11 @@ def load_config(path: Path | None = None) -> LiteratureConfig:
             document.fetch_fulltext
             if document.fetch_fulltext is not None
             else defaults.fetch_fulltext
+        ),
+        cache_ttl_seconds=(
+            max(document.cache_ttl_seconds, 0)
+            if document.cache_ttl_seconds is not None
+            else defaults.cache_ttl_seconds
         ),
         source=target,
     )
