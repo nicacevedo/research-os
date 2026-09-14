@@ -22,6 +22,7 @@ from research_os.automation.models import Role
 from research_os.errors import ProposalGroundingError, ProposalValidationError
 from research_os.proposal.models import ProposalGrounding
 from research_os.proposal.planner import (
+    GroundingViolation,
     build_grounding_correction_prompt,
     grounding_violations,
 )
@@ -659,3 +660,30 @@ def test_a_proposal_that_could_not_afford_its_first_call_reports_zero(
         )
 
     assert refused.value.model_calls == 0
+
+
+def test_the_correction_prompt_distinguishes_the_three_reference_fields() -> None:
+    """The prompt must not leave a worker to guess which ids go where.
+
+    A live Pilot E correction repaired the unsupplied citation it was shown and
+    then wrote a capsule id into "addresses_items", which names proposed items.
+    One correction had already been spent, so the run ended there. The fields
+    look alike, are checked separately, and the prompt now says so.
+    """
+
+    prompt = build_grounding_correction_prompt(
+        goal="Say what the measurement licenses.",
+        payload={"summary": "s", "items": []},
+        violations=(
+            GroundingViolation(
+                item_id="PR-001",
+                field="grounded_in_findings",
+                label="analyst finding",
+                cited="L-001",
+            ),
+        ),
+        grounding=ProposalGrounding(capsule_ids=["Q-0001"]),
+    )
+    assert "addresses_items" in prompt
+    assert "A capsule id is not a proposed item id." in prompt
+    assert "then renumber the remaining items" in prompt

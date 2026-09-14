@@ -568,6 +568,21 @@ Analyst finding ids, for the "grounded_in_findings" field:
 
 There is no other valid identifier. This list is complete.
 
+THREE FIELDS THAT LOOK SIMILAR AND ARE NOT
+
+These are cross-references *inside* your own proposal, not citations, and they
+are checked separately. Getting one wrong fails the task just as surely.
+
+- "addresses" on an item names CAPSULE object ids from the first list above.
+- "addresses_items" on a recommended action names PROPOSED ITEM ids from this
+  proposal -- "PR-001", "PR-002" -- and nothing else.
+  A capsule id is not a proposed item id.
+- "blocks" on an uncertainty also names PROPOSED ITEM ids from this proposal.
+
+If you remove a proposed item, remove every "addresses_items" and "blocks"
+entry that named it, and then renumber the remaining items so their ids run
+"PR-001", "PR-002", ... with no gap.
+
 WHAT TO DO
 
 For each unsupplied citation, do exactly one of:
