@@ -23,4 +23,4 @@ __all__ = ["RUNTIME_SCHEMA_VERSION"]
 
 #: The migration version this build expects to find applied. Bumped by the
 #: migration that introduces the change, never by hand afterwards.
-RUNTIME_SCHEMA_VERSION = "0001"
+RUNTIME_SCHEMA_VERSION = "0002"

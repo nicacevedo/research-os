@@ -202,6 +202,39 @@ REJECTED_PROPOSAL_FENCE = DataFence(
     end="----- END REFUSED PROPOSAL (UNTRUSTED MODEL OUTPUT) -----",
 )
 
+#: The unresolved frontier, as the runtime derived it from capsule files.
+#:
+#: Derived by ordinary Python from Git-tracked files, so its *provenance* is
+#: trustworthy -- but the statements inside it are the project's own scientific
+#: text, which a paper about prompt injection would fill with prompt injections.
+#: It reaches the planner and every explorer, so it is fenced like anything else
+#: that a model did not write and the controller did not compose.
+FRONTIER_FENCE = DataFence(
+    begin="----- BEGIN RESEARCH FRONTIER (QUOTED PROJECT STATE) -----",
+    end="----- END RESEARCH FRONTIER (QUOTED PROJECT STATE) -----",
+)
+
+#: A structured hypothesis proposal produced by one explorer.
+#:
+#: Reaches the skeptic and the scientific reviewer, whose whole job is to argue
+#: with it. A reviewer asked to critique text is being invited to read that text
+#: as instructions, so the delimiter states what the block is: another model's
+#: output, under review, not a brief.
+PROPOSAL_FENCE = DataFence(
+    begin="----- BEGIN HYPOTHESIS PROPOSAL (UNTRUSTED MODEL OUTPUT) -----",
+    end="----- END HYPOTHESIS PROPOSAL (UNTRUSTED MODEL OUTPUT) -----",
+)
+
+#: What an experiment actually produced, quoted for interpretation.
+#:
+#: Program output, and therefore whatever the program wrote -- including, if the
+#: experiment processes a corpus, text written by people who have never heard of
+#: this system. The interpretation worker reads it; it must not obey it.
+RESULT_FENCE = DataFence(
+    begin="----- BEGIN EXPERIMENT RESULT (QUOTED OUTPUT) -----",
+    end="----- END EXPERIMENT RESULT (QUOTED OUTPUT) -----",
+)
+
 #: Every fence the controller generates.
 #:
 #: One tuple, because :data:`ALL_DELIMITERS` is derived from it and that is what
@@ -221,6 +254,9 @@ FENCES: tuple[DataFence, ...] = (
     STATEMENT_FENCE,
     CHECK_RESULT_FENCE,
     REJECTED_PROPOSAL_FENCE,
+    FRONTIER_FENCE,
+    PROPOSAL_FENCE,
+    RESULT_FENCE,
 )
 
 #: Every delimiter, longest first, so a delimiter that contains another is

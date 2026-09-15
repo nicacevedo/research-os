@@ -74,3 +74,42 @@ def test_a_leased_row_must_have_an_owner_and_a_deadline(runtime_db: Database) ->
             "insert into work_items (work_id, project_id, kind, status) "
             "values ('WORK-20260101T000000Z-aaaaaaaa', 'p', 'k', 'LEASED')"
         )
+
+
+def test_the_declared_schema_version_matches_the_highest_migration() -> None:
+    """A constant that drifts from the files it describes is worse than no constant."""
+
+    from research_os.runtime import RUNTIME_SCHEMA_VERSION
+
+    assert RUNTIME_SCHEMA_VERSION == max(m.version for m in discover())
+
+
+def test_migrations_compose_from_an_empty_database(pg_dsn: str) -> None:
+    """Every migration applied in order, on a database that has seen none of them.
+
+    The session fixture migrates once and every later test inherits that, so
+    without this the second migration would only ever be exercised as an
+    upgrade. A fresh clone is the more common case.
+    """
+
+    from research_os.runtime.db import Database
+
+    with Database(pg_dsn) as db, db.autocommit() as conn:
+        conn.execute("drop database if exists research_os_migrate_probe")
+        conn.execute("create database research_os_migrate_probe")
+    probe_dsn = pg_dsn.replace("/research_os_test", "/research_os_migrate_probe")
+    try:
+        with Database(probe_dsn) as probe:
+            applied = migrate(probe)
+            assert applied == tuple(m.version for m in discover())
+            assert pending(probe) == ()
+            with probe.tx() as conn:
+                indexes = conn.execute(
+                    "select indexname from pg_indexes where tablename = 'artifact_links'"
+                ).fetchall()
+            assert any(
+                row["indexname"] == "artifact_links_identity_idx" for row in indexes
+            )
+    finally:
+        with Database(pg_dsn) as db, db.autocommit() as conn:
+            conn.execute("drop database if exists research_os_migrate_probe")
