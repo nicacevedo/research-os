@@ -16,10 +16,17 @@ What scientific state changed?
 ```
 
 Two rules throughout. Every view is plain text with a deterministic ``--json``
-counterpart, because a researcher pipes things. And every string that came from
-a model or from a fetched document goes through
-:mod:`research_os.textsafe` on its way to a terminal -- an escape sequence in a
-paper's abstract must not repaint the researcher's screen.
+counterpart, because a researcher pipes things. And every string this runtime
+did not compose itself goes through :mod:`research_os.textsafe` on its way to a
+terminal -- an escape sequence in a paper's abstract must not repaint the
+researcher's screen.
+
+"Did not compose itself" is broader than it first looks, and an independent
+review found several fields on the wrong side of it: a provider's reported model
+name, a scheduler job id parsed out of ``sbatch`` output, an event kind that
+came from a schedule row, and the *keys* of a decision packet's evidence
+mapping. All of them now go through :func:`_safe`, and the renderers tolerate a
+packet whose shape is not the one this runtime writes.
 """
 
 from __future__ import annotations
@@ -300,8 +307,9 @@ def render_status(report: StatusReport) -> str:
                 [
                     (
                         job.job_id,
-                        job.executor,
-                        job.scheduler_job_id or "-",
+                        _safe(job.executor, limit=20),
+                        # Parsed out of `sbatch` output, so not ours.
+                        _safe(job.scheduler_job_id or "-", limit=24),
                         str(job.status),
                         _age(job.last_polled_at),
                     )
@@ -423,11 +431,11 @@ def render_run_detail(
                 [
                     (
                         job.job_id,
-                        job.executor,
-                        job.scheduler_job_id or "-",
+                        _safe(job.executor, limit=20),
+                        _safe(job.scheduler_job_id or "-", limit=24),
                         str(job.status),
                         "-" if job.exit_code is None else str(job.exit_code),
-                        job.failure_class or "-",
+                        _safe(job.failure_class or "-", limit=32),
                     )
                     for job in jobs
                 ],
@@ -449,11 +457,12 @@ def render_run_detail(
                 ),
                 [
                     (
-                        call.role,
-                        call.provider,
-                        call.model or "-",
-                        call.prompt_version or "-",
-                        call.independence_group or "-",
+                        _safe(call.role, limit=24),
+                        _safe(call.provider, limit=16),
+                        # Reported by the provider, so not ours either.
+                        _safe(call.model or "-", limit=24),
+                        _safe(call.prompt_version or "-", limit=24),
+                        _safe(call.independence_group or "-", limit=40),
                         "-" if call.cost_usd is None else f"{call.cost_usd:.4f}",
                         str(call.status),
                     )
@@ -487,7 +496,9 @@ def render_run_detail(
             [
                 (
                     _age(event.created_at),
-                    event.kind,
+                    # A schedule's `kind` becomes an event kind, and a schedule
+                    # is configuration.
+                    _safe(event.kind, limit=32),
                     _safe(
                         ", ".join(f"{k}={v}" for k, v in sorted(event.payload.items())),
                         limit=70,
@@ -530,8 +541,8 @@ def render_approval(approval: Approval) -> str:
                 else str(value)
             )
             parts.append(f"  {key:26} {_safe(listed or '(none)', limit=200)}\n")
-    alternatives = packet.get("alternatives") or []
-    if alternatives:
+    alternatives = packet.get("alternatives")
+    if isinstance(alternatives, list) and alternatives:
         parts.append("\nWHAT HAPPENS AFTER EACH CHOICE\n")
         for option in alternatives:
             if not isinstance(option, dict):
@@ -565,7 +576,7 @@ def render_costs(
         _table(
             ("role", "calls", "cost usd"),
             [
-                (role, str(count), f"{cost:.4f}")
+                (_safe(role, limit=24), str(count), f"{cost:.4f}")
                 for role, (count, cost) in sorted(by_role.items())
             ],
         )
@@ -605,7 +616,7 @@ def render_events(events: tuple[Event, ...]) -> str:
         [
             (
                 _age(event.created_at),
-                event.kind,
+                _safe(event.kind, limit=32),
                 event.run_id or "-",
                 _safe(
                     ", ".join(f"{k}={v}" for k, v in sorted(event.payload.items())),
@@ -624,10 +635,10 @@ def render_jobs(jobs: tuple[ExternalJob, ...]) -> str:
             (
                 job.job_id,
                 job.run_id or "-",
-                job.executor,
-                job.scheduler_job_id or "-",
+                _safe(job.executor, limit=20),
+                _safe(job.scheduler_job_id or "-", limit=24),
                 str(job.status),
-                job.failure_class or "-",
+                _safe(job.failure_class or "-", limit=32),
                 _age(job.last_polled_at),
             )
             for job in jobs

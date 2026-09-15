@@ -85,7 +85,10 @@ def discover() -> tuple[Migration, ...]:
 
 def _applied(conn: object) -> dict[str, str]:
     cur = conn.execute(  # type: ignore[attr-defined]
-        "select to_regclass('public.schema_migrations') as present"
+        # Search-path relative, not hardcoded to `public`. Under a different
+        # search_path the qualified form returns NULL forever, so every startup
+        # would retry every migration and fail on the primary key.
+        "select to_regclass('schema_migrations') as present"
     ).fetchone()
     if not cur or cur["present"] is None:
         return {}

@@ -534,27 +534,46 @@ class Daemon:
 
         pending = self._store.list_approvals(pending_only=True, limit=20)
         for approval in pending:
-            _event, created = self._store.record_event(
+            # Claim the right to notify first, then notify, then let a failure
+            # roll the claim back by *not* being recorded. Recording first meant
+            # a notifier failure -- an unwritable state home -- consumed the one
+            # notification the researcher was ever going to get, and took the
+            # daemon down with it.
+            already = [
+                event
+                for event in self._store.list_events(run_id=approval.run_id, limit=200)
+                if event.kind == "APPROVAL_SURFACED"
+                and event.payload.get("approval_id") == approval.approval_id
+            ]
+            if already:
+                continue
+            try:
+                self._notifier.notify(
+                    subject=f"A scientific decision is required: {approval.kind}",
+                    body=(
+                        f"{approval.question}\n\n"
+                        f"Run `researchctl runtime approvals` to see the prepared "
+                        f"decision packet, then `researchctl runtime approve "
+                        f"{approval.approval_id}` or `... decline "
+                        f"{approval.approval_id}`."
+                    ),
+                    run_id=approval.run_id,
+                    urgent=True,
+                )
+            except Exception as exc:  # noqa: BLE001 - a notifier must not stop the plane
+                LOG.error("could not notify about %s: %s", approval.approval_id, exc)
+                report.notes.append(
+                    f"could not notify about {approval.approval_id}: {exc}"
+                )
+                continue
+            self._store.record_event(
                 kind="APPROVAL_SURFACED",
                 project_id=approval.project_id,
                 run_id=approval.run_id,
                 payload={"approval_id": approval.approval_id},
                 dedup_key=f"surfaced:{approval.approval_id}",
             )
-            if not created:
-                continue
             report.approvals_surfaced += 1
-            self._notifier.notify(
-                subject=f"A scientific decision is required: {approval.kind}",
-                body=(
-                    f"{approval.question}\n\n"
-                    f"Run `researchctl runtime approvals` to see the prepared decision "
-                    f"packet, then `researchctl runtime approve {approval.approval_id}` "
-                    f"or `... decline {approval.approval_id}`."
-                ),
-                run_id=approval.run_id,
-                urgent=True,
-            )
 
     # ------------------------------------------------------------ the work --
     def _claim_and_run(self, report: TickReport) -> None:

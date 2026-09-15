@@ -108,7 +108,7 @@ decision and the exact command to run, never an execution.
 ```text
 uv run ruff check .                     clean
 uv run ruff format --check .            clean
-uv run --extra runtime pytest -q        2966 passed   (2362 at v1.0.0)
+uv run --extra runtime pytest -q        3006 passed   (2362 at v1.0.0)
 ```
 
 The runtime suites and roughly what each pins:
@@ -125,6 +125,7 @@ The runtime suites and roughly what each pins:
 | `test_runtime_chaos.py` | 36 failure injections; the invariants after each |
 | `test_runtime_authority.py` | the boundary, asserted by parsing the package |
 | `test_runtime_actions.py` | the scientific constraints of each handler |
+| `test_runtime_cli.py` | every view renders empty; approvals refuse a non-TTY; untrusted strings cannot repaint a terminal |
 
 Where a crash is claimed, a real process dies. A simulated exception runs the
 `finally` blocks whose absence is the failure mode.
@@ -136,10 +137,30 @@ the runtime writes goes into a pilot-local XDG root; the project's `.research/`
 tree and Git HEAD are hashed before and after and the script fails if either
 moved.
 
-**Run against the real CCAO capsule.** Seven chained cycles, all `SUCCEEDED`,
-the project byte-for-byte unchanged, 15 model calls, 2.65 USD — and every cycle
-recomputed an *identical* frontier. That is the finding in `docs/RUNTIME.md`
-§16, and the reason continuation now hashes the frontier.
+**Run against the real CCAO capsule, twice.**
+
+| | before the frontier fix | after |
+|---|---|---|
+| cycles | 7 | **2** |
+| model calls | 15 | **4** |
+| cost | 2.65 USD | **0.84 USD** |
+| why it stopped | hit `max_cycles_per_objective` | the frontier was unchanged |
+| project repository | byte-for-byte unchanged | byte-for-byte unchanged |
+
+The first run is the finding in `docs/RUNTIME.md` §16: every cycle recomputed an
+*identical* frontier and concluded `START_NEXT_CYCLE`. The second is the fix
+working on the same real capsule — both cycles recorded the same frontier digest
+(`43866175b23b`), and the continuation work item's own result says why it
+stopped:
+
+```text
+continued=False  the frontier is unchanged from the previous cycle. The runtime
+                 cannot alter canonical scientific state, so repeating the cycle
+                 would repeat its cost without adding information.
+```
+
+Neither run modified the project. The harness hashes `.research/` and every Git
+ref before and after and exits non-zero on any difference; both diffs are empty.
 
 **cuPDLP.jl has no capsule.** The frontier is derived from capsule files, so
 there is nothing to derive. That is a genuine external prerequisite, not a

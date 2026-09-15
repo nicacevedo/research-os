@@ -513,7 +513,82 @@ def test_a_refutation_is_a_success(action_env: dict[str, Any]) -> None:
     """The property the whole failure taxonomy is shaped around.
 
     An experiment that ran correctly and answered "no" has succeeded. Nothing
-    in the interpretation step can express it as a failure.
+    in the interpretation step can express it as a failure, and the criteria it
+    is judged against are the ones the preregistration fixed beforehand.
+    """
+
+    declare_experiment_command()
+    context = _context(action_env, {"planner": _DESIGN})
+    design = dict(
+        design_experiment(
+            action_env["state"], context, {"addresses": ["HYP-0001"]}
+        ).data
+    )
+    submitted = run_local_experiment(
+        action_env["state"], context, {"parameters": {"design": design}}
+    )
+    assert submitted.ok, submitted.detail
+
+    outcome = interpret_results(
+        action_env["state"],
+        context,
+        {"parameters": {"job_id": submitted.data["job_id"]}},
+    )
+    assert outcome.ok is True
+    assert outcome.failure_class is None
+    assert outcome.data["ran_correctly"] is True
+    assert outcome.data["criteria_were_fixed_before_results"] is True
+    # Read back from the stored preregistration, not from graph state.
+    assert outcome.data["success_criteria"] == "mean > 0.5"
+    assert outcome.data["failure_criteria"] == "mean <= 0.5"
+    assert outcome.data["primary_endpoint"] == "the mean of column A"
+    assert len(outcome.data["preregistration_artifact"]) == 64
+
+
+def test_a_job_that_did_not_run_yields_no_scientific_conclusion(
+    action_env: dict[str, Any],
+) -> None:
+    """A crashed experiment is not a negative result."""
+
+    declare_experiment_command()
+    context = _context(action_env, {"planner": _DESIGN})
+    design = dict(
+        design_experiment(
+            action_env["state"], context, {"addresses": ["HYP-0001"]}
+        ).data
+    )
+    submitted = run_local_experiment(
+        action_env["state"], context, {"parameters": {"design": design}}
+    )
+    assert submitted.ok, submitted.detail
+    job_id = submitted.data["job_id"]
+    action_env["store"].update_external_job(
+        job_id,
+        status=ExternalJobStatus.FAILED,
+        exit_code=1,
+        allow_terminal_override=True,
+    )
+
+    outcome = interpret_results(
+        action_env["state"], context, {"parameters": {"job_id": job_id}}
+    )
+    assert outcome.ok
+    assert outcome.data["ran_correctly"] is False
+    assert "no scientific conclusion follows" in outcome.detail
+    # The criteria still come from the preregistration, unchanged.
+    assert outcome.data["success_criteria"] == "mean > 0.5"
+
+
+def test_a_job_with_no_preregistration_cannot_be_interpreted(
+    action_env: dict[str, Any],
+) -> None:
+    """Without the criteria there is nothing to compare against.
+
+    An earlier version read them from graph state -- which is empty on the
+    cross-cycle path this handler is normally reached by -- and asserted
+    `criteria_were_fixed_before_results: True` while reporting none of them.
+    That is the one claim in this handler that must never be made loosely, so
+    the absence of a preregistration is now a refusal.
     """
 
     context = _context(action_env, {"planner": _DESIGN})
@@ -527,47 +602,13 @@ def test_a_refutation_is_a_success(action_env: dict[str, Any]) -> None:
     action_env["store"].update_external_job(
         job.job_id, status=ExternalJobStatus.COMPLETED, exit_code=0
     )
-    state = {
-        **action_env["state"],
-        "action_result": {
-            "data": {
-                "job_id": job.job_id,
-                "primary_endpoint": "the mean of column A",
-                "success_criteria": "mean > 0.5",
-                "failure_criteria": "mean <= 0.5",
-            }
-        },
-    }
-    outcome = interpret_results(state, context, {})
-    assert outcome.ok is True
-    assert outcome.failure_class is None
-    assert outcome.data["ran_correctly"] is True
-    assert outcome.data["criteria_were_fixed_before_results"] is True
-    # The criteria are quoted back unchanged.
-    assert outcome.data["success_criteria"] == "mean > 0.5"
-
-
-def test_a_job_that_did_not_run_yields_no_scientific_conclusion(
-    action_env: dict[str, Any],
-) -> None:
-    """A crashed experiment is not a negative result."""
-
-    context = _context(action_env, {"planner": _DESIGN})
-    job = action_env["store"].create_external_job(
-        project_id="alpha-project",
-        run_id=action_env["run"].run_id,
-        executor="local",
-        spec_digest="d" * 64,
-        run_dir=str(action_env["repo"]),
+    outcome = interpret_results(
+        action_env["state"], context, {"parameters": {"job_id": job.job_id}}
     )
-    action_env["store"].update_external_job(
-        job.job_id, status=ExternalJobStatus.FAILED, exit_code=1
-    )
-    state = {**action_env["state"], "action_result": {"data": {"job_id": job.job_id}}}
-    outcome = interpret_results(state, context, {})
-    assert outcome.ok
-    assert outcome.data["ran_correctly"] is False
-    assert "no scientific conclusion follows" in outcome.detail
+    assert not outcome.ok
+    assert outcome.failure_class is FailureClass.ARTIFACT_MISSING
+    assert "no preregistration found" in outcome.detail
+    assert outcome.data["interpreted"] is False
 
 
 # ----------------------------------------------------------------- authoring --

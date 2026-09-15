@@ -97,7 +97,16 @@ def _statements(context: CycleContext, object_ids: tuple[str, ...]) -> list[str]
         try:
             obj = context.kernel.object(object_id)
         except Exception as exc:  # noqa: BLE001 - a missing object is not fatal here
-            LOG.debug("could not read %s: %s", object_id, exc)
+            # WARNING, not DEBUG. An unreadable object silently removes context
+            # from the *seeded* branch, which degrades it toward the blind one --
+            # and the difference between those two branches is the entire
+            # scientific value of running both.
+            LOG.warning(
+                "could not read %s for the seeded branch, which will run without "
+                "it: %s",
+                object_id,
+                exc,
+            )
             continue
         statement = getattr(obj, "statement", "") or getattr(obj, "title", "")
         lines.append(f"{object_id}: {statement}")

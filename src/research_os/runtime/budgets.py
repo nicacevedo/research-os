@@ -74,7 +74,6 @@ class Dimension(StrEnum):
     WALL_CLOCK_SECONDS = "wall_clock_seconds"
     EXTERNAL_JOBS = "external_jobs"
     WORK_ITEMS = "work_items"
-    STORAGE_BYTES = "storage_bytes"
     EXTERNAL_CALLS = "external_calls"
 
 
@@ -385,7 +384,12 @@ class BudgetLedger:
         of what was actually spent; this is only the capacity reservation
         catching up.
 
-        Aggregated in SQL, ordered by ``budget_id``, and bounded. The first
+        Aggregated in SQL and bounded. What makes it deadlock-safe is the ``for
+        update skip locked`` on the reservations: two daemons never contend for
+        the same rows, so there is no wait cycle. The ``order by budget_id`` is a
+        hint, not a guarantee -- PostgreSQL does not promise lock-acquisition
+        order from a subquery's ordering, and an earlier version of this
+        paragraph said it did. The first
         version issued one ``update budgets`` per stale row from a Python loop
         in arbitrary order, which two daemons could deadlock against each other
         -- and since this is the only thing that releases leaked capacity,

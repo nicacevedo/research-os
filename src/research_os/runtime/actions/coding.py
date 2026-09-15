@@ -89,6 +89,12 @@ def canonical_fingerprint(repo: Path) -> dict[str, str]:
     because a push or a branch write is as much of an escape as a commit, and
     ``show-ref`` lists all of them in one call.
 
+    One deliberate blind spot: ``.research/runtime/`` is excluded. It is
+    gitignored scratch space that the capsule specification reserves and nothing
+    parses, so a write there is not a scientific-state change. It does mean a
+    command that writes only to that directory is not detected, which is the
+    correct trade and is recorded here so it is not a surprise.
+
     Cheap: a capsule is a few dozen small YAML files.
     """
 

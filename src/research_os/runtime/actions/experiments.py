@@ -654,6 +654,52 @@ def submit_cluster_experiment(
     return _submit(state, context, plan, executor_name=SLURM)
 
 
+def _preregistered_criteria(
+    context: CycleContext, *, digest: str, project_id: str
+) -> dict[str, Any] | None:
+    """The criteria recorded before this spec ran, or ``None`` if there are none.
+
+    Looked up by spec digest through the same stored preregistrations the
+    submission guard consults, so "these were the criteria" is a claim about a
+    stored artifact rather than about whatever happens to be in memory.
+    """
+
+    with context.db.tx() as conn:
+        rows = conn.execute(
+            """
+            select distinct a.artifact_id, a.created_at
+            from artifacts a
+            join artifact_links l on l.artifact_id = a.artifact_id
+            join research_runs r on r.run_id = l.run_id
+            where a.role = 'preregistration' and r.project_id = %s
+            order by a.created_at desc
+            limit 500
+            """,
+            (project_id,),
+        ).fetchall()
+    for row in rows:
+        try:
+            record = json.loads(context.artifacts.get_text(str(row["artifact_id"])))
+        except (ResearchOSError, ValueError, UnicodeDecodeError) as exc:
+            LOG.warning(
+                "could not read preregistration artifact %s: %s",
+                row["artifact_id"],
+                exc,
+            )
+            continue
+        if str(record.get("spec_digest") or "") != digest:
+            continue
+        return {
+            "primary_endpoint": str(record.get("primary_endpoint", "")),
+            "secondary_endpoints": list(record.get("secondary_endpoints", ())),
+            "success_criteria": str(record.get("success_criteria", "")),
+            "failure_criteria": str(record.get("failure_criteria", "")),
+            "dataset_identity": str(record.get("dataset_identity", "")),
+            "preregistration_artifact": str(row["artifact_id"]),
+        }
+    return None
+
+
 def _latest_finished_job(context: CycleContext, *, project_id: str) -> Any | None:
     """The most recently finished job for this project, if any.
 
@@ -729,6 +775,36 @@ def interpret_results(
     ran_correctly = (
         job.status is ExternalJobStatus.COMPLETED and (job.exit_code or 0) == 0
     )
+    # The criteria come from the *stored preregistration*, looked up by the
+    # job's spec digest -- not from graph state, which is empty on the
+    # cross-cycle path this handler is normally reached by. An earlier version
+    # read them from state and asserted
+    # `criteria_were_fixed_before_results: True` while reporting none of them,
+    # which is the one claim in this handler that must never be made loosely.
+    criteria = _preregistered_criteria(
+        context, digest=job.spec_digest, project_id=str(state["project_id"])
+    )
+    if criteria is None and previous.get("success_criteria"):
+        criteria = {
+            "primary_endpoint": str(previous.get("primary_endpoint", "")),
+            "secondary_endpoints": list(previous.get("secondary_endpoints", ())),
+            "success_criteria": str(previous.get("success_criteria", "")),
+            "failure_criteria": str(previous.get("failure_criteria", "")),
+        }
+
+    if criteria is None:
+        # No preregistration can be found for what ran. That is not an
+        # interpretation problem to paper over: without the criteria there is
+        # nothing to compare against, and claiming they were fixed beforehand
+        # would be asserting exactly what cannot be shown.
+        return ActionOutcome.failed(
+            f"no preregistration found for {job.job_id} (spec "
+            f"{job.spec_digest[:12]}), so there are no prespecified criteria to "
+            f"compare the result against",
+            failure_class=FailureClass.ARTIFACT_MISSING,
+            data={"interpreted": False, "job_id": job.job_id},
+        )
+
     return ActionOutcome.succeeded(
         (
             "the experiment ran; the prespecified criteria decide the result"
@@ -743,11 +819,10 @@ def interpret_results(
             "exit_code": job.exit_code,
             "ran_correctly": ran_correctly,
             "spec_digest": job.spec_digest,
-            # Quoted back unchanged. If a later step wants different criteria,
-            # that is change_primary_endpoint, which a person performs.
-            "primary_endpoint": previous.get("primary_endpoint", ""),
-            "success_criteria": previous.get("success_criteria", ""),
-            "failure_criteria": previous.get("failure_criteria", ""),
+            # Quoted back unchanged from the preregistration. If a later step
+            # wants different criteria, that is change_primary_endpoint, which a
+            # person performs.
+            **criteria,
             "criteria_were_fixed_before_results": True,
         },
     )

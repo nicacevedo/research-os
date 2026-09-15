@@ -42,7 +42,7 @@ from research_os.runtime.config import DSN_ENV, RuntimeConfig, load_config, reda
 from research_os.runtime.db import Database
 from research_os.runtime.migrations import current_version, migrate, pending
 from research_os.runtime.models import Autonomy, BudgetScope, RunStatus
-from research_os.runtime.store import RuntimeStore
+from research_os.runtime.store import RuntimeStateError, RuntimeStore
 
 
 def add_runtime_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -487,12 +487,24 @@ def _cancel(args: argparse.Namespace) -> int:
     with _database(config) as db:
         store = RuntimeStore(db)
         cancelled_work = WorkQueue(db).cancel_run_work(args.run_id)
-        run = store.set_run_status(
-            args.run_id,
-            RunStatus.CANCELLED,
-            terminal_state=TerminalState.CANCELLED,
-            detail="cancelled by the researcher",
-        )
+        try:
+            run = store.set_run_status(
+                args.run_id,
+                RunStatus.CANCELLED,
+                terminal_state=TerminalState.CANCELLED,
+                detail="cancelled by the researcher",
+            )
+        except RuntimeStateError:
+            # Already finished. The queued work was still worth cancelling and
+            # was cancelled, so report that rather than erroring after the fact.
+            existing = store.get_run(args.run_id)
+            if existing is None:
+                raise
+            print(
+                f"{args.run_id} was already {existing.status}; "
+                f"{cancelled_work} queued or leased item(s) stopped."
+            )
+            return EXIT_OK
     print(f"{run.run_id} cancelled; {cancelled_work} queued or leased item(s) stopped.")
     return EXIT_OK
 
