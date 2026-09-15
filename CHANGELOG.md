@@ -11,6 +11,130 @@ candidate (`release/v1.1.0-autonomy`) and the R5 autonomous runtime
 (`r5/autonomous-runtime`). Both sets of changes are below, unedited except for
 heading depth, followed by what the convergence itself changed.
 
+### What the convergence itself changed
+
+The two lines above were developed in parallel and had never met. Merging them
+was the smaller half of this work; the larger half was closing the loop R5
+shipped without, and repairing what a semantic audit of the merged tree found.
+
+#### Added
+
+- **Runtime findings** (`research_os/runtime/findings.py`, schema 0007). Typed,
+  digested, immutable, noncanonical observations with an identifier a proposal
+  can cite. The v1 grounding allowlist has always had a `finding_ids` field and
+  always refused a citation it was not given — and nothing ever supplied one, so
+  an autonomous result reached the proposal layer as prose inside a
+  natural-language goal. A proposed change now traces to a finding, to the
+  artifacts, capsule objects, literature keys or experiment job it rests on, and
+  to bytes by content hash.
+- **`propose_capsule_change`.** A thin adapter over the v1 `ProposalController`,
+  not a second proposal engine. It writes no capsule file, does not import
+  `research_os.proposal.promote`, authors no Review and accepts no Claim;
+  `tests/test_runtime_authority.py` asserts each of those by parsing the
+  package. A cycle that produces one concludes
+  `WAITING_FOR_SCIENTIFIC_DECISION` rather than `DONE_FOR_NOW`, because
+  "finished" is the wrong word for "waiting for you".
+- **`nominate_insight`.** Reuses the v1 insight subsystem and leaves `scope`,
+  `assumptions` and `applicability` empty — those three fields *are* the
+  judgement that a finding transfers, so `missing_for_promotion` tells the
+  researcher what they must write. "Not worth nominating" is an expressible and
+  common answer. Every action in the policy table now has a handler or is one a
+  person performs.
+- **Automatic continuation after a human scientific change** (schema 0008).
+  `researchd` hashes each project's canonical capsule, emits exactly one
+  `CAPSULE_CHANGED` per `(project, digest)`, and opens a **successor cycle**
+  with recorded lineage — never a revival of the parked thread. The scientific
+  kernel is unchanged and notifies nobody: a kernel that depended on PostgreSQL
+  and a live daemon would be one a researcher could not use while either was
+  down.
+- **Durable experiment-interpretation identity** (schema 0006).
+  `interpret_results` used to read whichever job finished most recently.
+  Interpretations are now unique per `(job, interpreter version)`, selected
+  oldest-eligible-first, bound to the exact `spec_digest`, and crash-safe: a
+  process killed between writing the artifact and completing the claim
+  reconnects the same artifact rather than producing a second scientific
+  interpretation.
+- **Stale-basis protection** (`research_os/proposal/basis.py`). A proposal
+  records what it actually cited — project identity, each referenced object's
+  status and project-scoped semantic digest, schema versions, the charter when
+  used, the finding-packet digest — and promotion recomputes it. Deliberately
+  *not* the repository `HEAD`: failing a proposal because someone fixed a README
+  typo would teach a researcher to click past the warning.
+- **OS-level containment** (`research_os/sandbox.py`). One abstraction, a
+  bubblewrap backend, three modes (`required` / `preferred` / `off`), and
+  deny-by-default: no home, no SSH keys, no SSH agent, no Git credentials, no
+  provider credentials, no unrelated environment, no network. Both command
+  runners go through it, so `researchctl auto` gains it too. High-autonomy
+  runtime execution of model-written code overrides the configured mode to
+  `required`.
+- **`review_independence: require`.** A `CRITICAL` review that cannot obtain a
+  different provider family fails into `WAITING_FOR_EXTERNAL_DEPENDENCY`
+  instead of being recorded as degraded. `prefer` remains the default.
+- **`researchctl runtime findings`**, and findings and interpretations in
+  `runtime run <id>`. The findings view prints what a finding is *not*, every
+  time: a table of scientific-sounding statements with identifiers is exactly
+  what a reader might mistake for a project's record.
+- **A live-Slurm harness** behind `-m slurm_live`. Written, never executed —
+  there is no `sbatch` on this host.
+
+#### Fixed
+
+Found by a semantic audit of the merged tree, which is where these live: each is
+a place where R5 called into a v1 layer that v1.1 had changed, and no test on
+either line exercised the combination.
+
+- **A paced literature provider became a permanent empty review.** v1.1 added a
+  persistent pacer that reports a refused reservation as `RATE_LIMITED` with
+  `attempted=False` — "we did not ask", which its own docstring insists is a
+  different fact from "there is nothing". The runtime turned it into an empty
+  result *and recorded it in the idempotency ledger as COMPLETED*, so every
+  later cycle in that run short-circuited on the same key and never asked that
+  provider again. It now raises, the ledger records `FAILED`, and the queue
+  retries after the rate-limit backoff.
+- **The runtime ignored every configured model and effort.** It passed neither
+  `--model` nor `--effort`, so the provider CLI's own default answered —
+  including for the three runtime roles that map onto the v1 planner, whose
+  default v1.1 changed from `sonnet` to `opus` on thirty measured calls
+  precisely because every structured-output exhaustion and every placeholder
+  plan in that benchmark came from the smaller model. Those three roles are the
+  ones that issue schema-constrained requests.
+- **The coding action's crash reconciler was dead code.** It read
+  `plan["_reserved_run_id"]`, which nothing ever set, so it returned `None`
+  unconditionally and the crash window it existed to close was open: a crash
+  between the worktree being created and the ledger recording it left an orphan
+  branch and a retry that started a second automation run for one task. The id
+  is now reserved from the action's stable identity and the reconciler
+  re-derives it.
+- **A daemon-driven cycle could not run an experiment at all.** `build_context`
+  defaulted its executors to `{}` and nothing in the control plane supplied
+  any, so a planned `run_local_experiment` was refused with "no local executor
+  is available on this machine".
+- **A dead duplicate index rebuild** in `runtime/actions/inspect.py` called
+  `LiteratureStore()` — whose constructor requires a connection — and would
+  have raised `TypeError` past the `except ResearchOSError` meant to catch it.
+  Never registered, so never reached; removed rather than repaired. The live
+  implementation is in `runtime/actions/literature.py`.
+- **`CapsuleError` classified as `UNKNOWN`.** `kernel.frontier()` raises it and
+  the frontier is consulted at the start of every cycle, so an unreadable
+  capsule failed as "something we have not classified" rather than "your capsule
+  does not parse".
+- **The work-kind dispatch table was duplicated**, once inside `_run_item` and
+  once in a test's hand-written list, so adding a kind made an unrelated test
+  fail. It is one module constant now.
+
+#### Known divergence, reported rather than closed
+
+v1.1 moved validation-check resolution into the controller: `researchctl
+research run` resolves `projects.<id>.check_profiles` and runs the argv the
+*researcher* declared. The runtime's coding action dispatches through
+`AutomationController` without a plan, so its acceptance commands still come
+from the automation planner. Same project, same goal, two different gates. Not a
+correctness or authority defect — every resolved argv passes the same command
+policy and nothing merges or pushes either way — and `runtime doctor` now warns
+when a project declares profiles a runtime cycle would ignore. Closing it means
+threading the project profile through `AutomationController`, which is v1 work
+this integration did not take on.
+
 ### From the v1.1 autonomy line
 
 **Not released.** Not merged, not tagged. The package still reports version

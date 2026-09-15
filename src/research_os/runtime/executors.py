@@ -58,6 +58,7 @@ from research_os.runtime.failures import FailureClass
 from research_os.runtime.interfaces import ExecutionHandle, ExecutionSpec
 from research_os.runtime.models import ExternalJob, ExternalJobStatus
 from research_os.runtime.store import RuntimeStore
+from research_os.sandbox import SandboxError, SandboxMode, SandboxSpec, contain
 
 LOG = logging.getLogger("research_os.runtime.executors")
 
@@ -160,6 +161,19 @@ class LocalExecutor:
 
     name: str = LOCAL
     timeout_grace_seconds: int = 30
+    sandbox_mode: SandboxMode = SandboxMode.PREFERRED
+    """How much containment a local experiment requires.
+
+    A declared command is the *researcher's* argv, not a model's -- the
+    experimentalist selects from ``experiments.yaml`` and supplies validated
+    parameter values -- so this is a weaker exposure than the coding pipeline's.
+    It is still project code executing in the project checkout with model-chosen
+    parameters, and it is still worth containing where the host can, so the
+    default matches the configured default rather than being off.
+
+    The runtime raises it to ``required`` at high autonomy, where nobody is
+    watching.
+    """
 
     def submit(self, spec: ExecutionSpec, *, run_dir: Path) -> ExecutionHandle:
         digest = spec_digest(spec)
@@ -176,11 +190,31 @@ class LocalExecutor:
         stdout_path = run_dir / "logs" / "stdout.txt"
         stderr_path = run_dir / "logs" / "stderr.txt"
         try:
+            prepared = contain(
+                spec.argv,
+                spec=SandboxSpec(
+                    workdir=Path(spec.cwd),
+                    # The frozen run directory is where declared outputs are
+                    # collected from, so the command has to be able to write it.
+                    writable=(run_dir,),
+                    network=False,
+                    wall_seconds=spec.timeout_seconds,
+                    # Only the seeds the spec froze. Not `os.environ`: an
+                    # experiment that reads a provider key from the environment
+                    # is an experiment whose result depends on something that is
+                    # not in its provenance.
+                    environment=dict(spec.env),
+                ),
+                mode=self.sandbox_mode,
+            )
+        except SandboxError as exc:
+            raise ExecutorError(str(exc)) from None
+        try:
             with stdout_path.open("wb") as out, stderr_path.open("wb") as err:
                 completed = subprocess.run(
-                    list(spec.argv),
+                    list(prepared.argv),
                     cwd=spec.cwd,
-                    env=env,
+                    env=prepared.environment if prepared.contained else env,
                     stdin=subprocess.DEVNULL,
                     stdout=out,
                     stderr=err,
@@ -205,6 +239,8 @@ class LocalExecutor:
             finished=True,
             exit_code=completed.returncode,
             detail="completed" if completed.returncode == 0 else "non-zero exit",
+            contained=prepared.contained,
+            containment=f"{prepared.technology}: {prepared.detail}",
         )
 
     def poll(self, handle: ExecutionHandle) -> ExecutionHandle:
@@ -414,7 +450,10 @@ class SlurmExecutor:
 
 # ------------------------------------------------------------ reconciling --
 def build_executors(
-    config: RuntimeConfig, *, project_id: str | None = None
+    config: RuntimeConfig,
+    *,
+    project_id: str | None = None,
+    autonomy: str | None = None,
 ) -> dict[str, object]:
     """Whatever this machine can actually run work on.
 
@@ -427,7 +466,11 @@ def build_executors(
     from research_os.experiment.config import load_config as load_experiment_config
     from research_os.experiment.slurm import probe
 
-    executors: dict[str, object] = {LOCAL: LocalExecutor()}
+    # High autonomy means nobody is watching, so a local experiment runs
+    # contained or does not run. Lower settings use the researcher's configured
+    # mode, because there a person is at the keyboard.
+    mode = SandboxMode.REQUIRED if autonomy == "high" else _configured_sandbox_mode()
+    executors: dict[str, object] = {LOCAL: LocalExecutor(sandbox_mode=mode)}
     try:
         experiment_config = load_experiment_config()
     except ResearchOSError as exc:
@@ -437,6 +480,23 @@ def build_executors(
     if probe(settings).available:
         executors[SLURM] = SlurmExecutor(settings=settings)
     return executors
+
+
+def _configured_sandbox_mode() -> SandboxMode:
+    """The researcher's ``sandbox.mode``, or the safe default if unreadable.
+
+    ``preferred`` on failure rather than ``off``: a config file that cannot be
+    read is not permission to run model-adjacent code with the researcher's
+    environment.
+    """
+
+    from research_os.automation.config import load_config as load_automation_config
+
+    try:
+        return load_automation_config().sandbox.mode
+    except ResearchOSError as exc:
+        LOG.debug("could not read the sandbox configuration: %s", exc)
+        return SandboxMode.PREFERRED
 
 
 def poll_job(

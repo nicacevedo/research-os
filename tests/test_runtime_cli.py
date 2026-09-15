@@ -69,6 +69,8 @@ def cli(
         ("runtime", "jobs"),
         ("runtime", "costs"),
         ("runtime", "events"),
+        ("runtime", "findings"),
+        ("runtime", "findings", "--json"),
         ("runtime", "doctor"),
         ("runtime", "migrate"),
     ],
@@ -407,18 +409,61 @@ def test_cancel_stops_a_run_and_its_queued_work(
     assert queue.get(work.work_id).status is WorkStatus.CANCELLED  # type: ignore[union-attr]
 
 
-# ------------------------------------------------------------------ doctor --
-def test_doctor_reports_the_unimplemented_actions(
+def test_the_findings_view_says_what_a_finding_is_not(
     cli: dict[str, object],
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """The gap between "the policy knows this" and "this build can do it"."""
+    """A table of scientific-sounding statements with identifiers is exactly
+    what a reader might mistake for a project's record, so the heading says
+    otherwise every time it is rendered."""
+
+    from research_os.runtime.findings import FindingKind, RuntimeFinding
+
+    store = cli["store"]
+    store.record_finding(  # type: ignore[union-attr]
+        RuntimeFinding(
+            project_id="alpha-project",
+            kind=FindingKind.FRONTIER,
+            summary="Two hypotheses have no experiment.",
+            capsule_refs=("HYP-0001",),
+        )
+    )
+    assert run_cli(monkeypatch, "runtime", "findings") == 0
+    out = capsys.readouterr().out
+    assert "noncanonical" in out
+    assert "reviewed by nobody" in out
+    assert "HYP-0001" in out
+
+
+# ------------------------------------------------------------------ doctor --
+def test_doctor_reports_the_action_coverage_it_actually_has(
+    cli: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The gap between "the policy knows this" and "this build can do it".
+
+    This used to assert the *warning*, because two actions had a policy and no
+    handler. Both now have one -- ``propose_capsule_change`` and
+    ``nominate_insight`` -- so asserting the warning would be asserting that a
+    gap the release closed is still open. What is worth holding down is that
+    doctor reports the coverage either way, computed from the registry rather
+    than written in a string, so it cannot claim completeness it does not have.
+    """
+
+    from research_os.runtime.registry import unimplemented_actions
 
     assert run_cli(monkeypatch, "runtime", "doctor") == 0
     out = capsys.readouterr().out
     assert "schema" in out
-    assert "have a policy but no handler" in out
+    gaps = unimplemented_actions()
+    if gaps:
+        assert "have a policy but no handler" in out
+        for action in gaps:
+            assert str(action) in out
+    else:
+        assert "every policy action has a handler" in out
 
 
 def test_doctor_redacts_the_database_password(

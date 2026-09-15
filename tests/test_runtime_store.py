@@ -11,6 +11,7 @@ from __future__ import annotations
 import pytest
 
 from research_os.runtime.db import Database
+from research_os.runtime.findings import FindingKind, RuntimeFinding
 from research_os.runtime.models import (
     ApprovalStatus,
     ExternalJobStatus,
@@ -292,3 +293,151 @@ def test_a_schedule_that_fires_advances_in_the_same_transaction(
     assert len(first) == 1
     assert store.claim_due_schedules() == ()
     assert first[0].next_run_at > first[0].created_at
+
+
+# ------------------------------------------------------- runtime findings ----
+def _finding(project_id: str, **overrides: object) -> RuntimeFinding:
+    payload: dict[str, object] = {
+        "project_id": project_id,
+        "kind": FindingKind.FRONTIER,
+        "summary": "Two hypotheses have no experiment.",
+    }
+    payload.update(overrides)
+    return RuntimeFinding(**payload)  # type: ignore[arg-type]
+
+
+def test_the_same_observation_recorded_twice_is_one_finding(
+    store: RuntimeStore, runtime_project: str
+) -> None:
+    """The property that makes a finding citable.
+
+    The runtime recomputes an unchanged frontier on every cycle. Without
+    content dedupe, one fact would acquire a new citable identifier per cycle,
+    and a proposal grounded in "the finding from cycle 3" would be grounded in
+    something a reader could not tell apart from six others saying the same.
+    """
+
+    first, created_first = store.record_finding(_finding(runtime_project))
+    second, created_second = store.record_finding(_finding(runtime_project))
+    assert created_first is True
+    assert created_second is False
+    assert first.finding_id == second.finding_id
+    assert len(store.list_findings(project_id=runtime_project)) == 1
+
+
+def test_a_different_observation_is_a_different_finding(
+    store: RuntimeStore, runtime_project: str
+) -> None:
+    first, _ = store.record_finding(_finding(runtime_project))
+    second, created = store.record_finding(
+        _finding(runtime_project, summary="One claim has contrary evidence.")
+    )
+    assert created is True
+    assert first.finding_id != second.finding_id
+
+
+def test_the_cycle_that_observed_it_does_not_change_its_identity(
+    store: RuntimeStore, runtime_project: str
+) -> None:
+    """Deliberate: see ``RuntimeFinding.digest``.
+
+    A successor cycle observing the same thing must not mint a second id. The
+    row still records which cycle saw it first.
+    """
+
+    first, _ = store.record_finding(_finding(runtime_project, source_cycle=0))
+    second, created = store.record_finding(_finding(runtime_project, source_cycle=7))
+    assert created is False
+    assert second.finding_id == first.finding_id
+
+
+def test_the_same_observation_in_two_projects_is_two_findings(
+    store: RuntimeStore, runtime_project: str
+) -> None:
+    """Invariant 4: scientific state is project-isolated, findings included."""
+
+    store.upsert_project(project_id="beta", repo_path="/tmp/beta")
+    first, _ = store.record_finding(_finding(runtime_project))
+    second, created = store.record_finding(_finding("beta"))
+    assert created is True
+    assert first.finding_id != second.finding_id
+
+
+def test_a_finding_carries_its_references_back(
+    store: RuntimeStore, runtime_project: str
+) -> None:
+    stored, _ = store.record_finding(
+        _finding(
+            runtime_project,
+            artifact_ids=("a" * 64,),
+            capsule_refs=("HYP-0001", "Q-0001"),
+            literature_keys=("openalex:W1",),
+        )
+    )
+    loaded = store.get_finding(stored.finding_id)
+    assert loaded is not None
+    assert loaded.artifact_ids == ("a" * 64,)
+    assert loaded.capsule_refs == ("HYP-0001", "Q-0001")
+    assert loaded.literature_keys == ("openalex:W1",)
+
+
+def test_resolving_a_finding_this_project_lacks_fails_closed(
+    store: RuntimeStore, runtime_project: str
+) -> None:
+    """Fail-closed, because an allowlist assembled by dropping what it could not
+    find is an allowlist that permits a proposal to rest on nothing."""
+
+    stored, _ = store.record_finding(_finding(runtime_project))
+    assert store.resolve_findings((stored.finding_id,), project_id=runtime_project)
+    with pytest.raises(RuntimeStateError, match="no runtime finding"):
+        store.resolve_findings(("FIND-nope",), project_id=runtime_project)
+
+
+def test_a_finding_from_another_project_does_not_resolve(
+    store: RuntimeStore, runtime_project: str
+) -> None:
+    store.upsert_project(project_id="beta", repo_path="/tmp/beta")
+    foreign, _ = store.record_finding(_finding("beta"))
+    with pytest.raises(RuntimeStateError, match="no runtime finding"):
+        store.resolve_findings((foreign.finding_id,), project_id=runtime_project)
+
+
+def test_one_reservation_key_always_yields_one_proposal_id(
+    store: RuntimeStore, runtime_project: str
+) -> None:
+    """What makes a proposal replay-safe: the identity is reserved, not returned."""
+
+    first_id, first_status, created_first = store.reserve_proposal(
+        reservation_key="propose_capsule_change:RRUN-1:0",
+        proposal_id="PROP-19700101T000000Z-aaaaaaaa",
+        project_id=runtime_project,
+    )
+    second_id, second_status, created_second = store.reserve_proposal(
+        reservation_key="propose_capsule_change:RRUN-1:0",
+        # A different id offered; the reservation is authoritative.
+        proposal_id="PROP-19700101T000000Z-bbbbbbbb",
+        project_id=runtime_project,
+    )
+    assert created_first is True and created_second is False
+    assert first_id == second_id == "PROP-19700101T000000Z-aaaaaaaa"
+    assert first_status == second_status == "RESERVED"
+
+
+def test_a_settled_reservation_cannot_be_reopened(
+    store: RuntimeStore, runtime_project: str
+) -> None:
+    """A FAILED record of a proposal that did reach the store would be a lie."""
+
+    store.reserve_proposal(
+        reservation_key="k",
+        proposal_id="PROP-19700101T000000Z-cccccccc",
+        project_id=runtime_project,
+    )
+    store.settle_proposal_reservation("k", status="CREATED")
+    store.settle_proposal_reservation("k", status="FAILED", detail="too late")
+    _id, status, _created = store.reserve_proposal(
+        reservation_key="k",
+        proposal_id="PROP-19700101T000000Z-cccccccc",
+        project_id=runtime_project,
+    )
+    assert status == "CREATED"

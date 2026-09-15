@@ -46,9 +46,14 @@ from research_os.capsule import (
     TYPED_DIRECTORIES,
     validate_project,
 )
-from research_os.errors import CapsuleError, ProposalValidationError
+from research_os.errors import (
+    CapsuleError,
+    ProposalValidationError,
+    StaleProposalError,
+)
 from research_os.ids import TYPE_TO_PREFIX, next_id
 from research_os.models import ScientificObject, parse_object
+from research_os.proposal.basis import basis_status
 from research_os.proposal.models import (
     NON_PROMOTABLE_KINDS,
     PROMOTION_TARGETS,
@@ -106,12 +111,32 @@ def prepare_promotion(
     item_id: str,
     *,
     project_path: Path | None = None,
+    finding_packet_digest: str | None = None,
+    allow_stale_basis: bool = False,
 ) -> PreparedPromotion:
     """Build the draft capsule object one proposed item would become.
 
     Validates the result against the project's existing objects before it is
     ever offered, so a promotion that would make the capsule invalid is refused
     while it is still hypothetical.
+
+    **And refuses a stale scientific basis.** A proposal is asynchronous: it is
+    written by one bounded run and promoted by a person, possibly much later.
+    If a scientific object the proposal cited has changed in the meantime, its
+    reasoning rests on state this project no longer holds, and promoting it
+    would put a draft into the capsule justified by something that is not there.
+    So this fails closed, and the researcher regenerates and reassesses.
+
+    ``allow_stale_basis`` exists for the researcher who has read the change and
+    decided it does not affect the item. It is a parameter rather than a
+    default, it is reachable only from an interactive command, and the CLI shows
+    what changed before offering it -- because the point of failing closed is
+    that a person looks, not that promotion becomes impossible.
+
+    ``finding_packet_digest`` lets a caller that can recompute the runtime
+    findings a proposal was grounded in check those too. Omitted, the snapshot's
+    own recorded digest is compared with itself, which checks nothing about the
+    findings and says so rather than pretending otherwise.
     """
 
     try:
@@ -137,6 +162,20 @@ def prepare_promotion(
         raise ProposalValidationError(
             f"{root} has no Research Capsule, so there is nothing to promote into. "
             "Run 'researchctl init-project' first."
+        )
+
+    basis = basis_status(
+        proposal,
+        project_path=root,
+        finding_packet_digest=finding_packet_digest,
+    )
+    if basis.stale and not allow_stale_basis:
+        raise StaleProposalError(
+            f"{proposal.proposal_id} cannot be promoted: {basis.reason}. "
+            f"Regenerate the proposal against the current state "
+            f"(`researchctl propose start`) and let it be reassessed, or "
+            f"promote with --accept-stale-basis if you have read the change and "
+            f"decided it does not affect {item_id}."
         )
 
     existing = [obj.id for obj in report.objects]

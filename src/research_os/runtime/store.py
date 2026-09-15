@@ -29,10 +29,13 @@ from typing import Any
 
 from research_os.errors import ResearchOSError
 from research_os.runtime.db import Database, jsonb
+from research_os.runtime.findings import FindingKind, RuntimeFinding
 from research_os.runtime.ids import (
     new_approval_id,
     new_event_id,
     new_external_job_id,
+    new_finding_id,
+    new_interpretation_id,
     new_model_call_id,
     new_run_id,
     new_schedule_id,
@@ -44,6 +47,7 @@ from research_os.runtime.models import (
     ApprovalStatus,
     Autonomy,
     Event,
+    ExperimentInterpretation,
     ExternalJob,
     ExternalJobStatus,
     ModelCall,
@@ -77,6 +81,14 @@ MODEL_CALL_COLUMNS = (
     "independence_group, independence, independence_note, prompt_version, "
     "input_digest, output_artifact_id, tokens_in, tokens_out, cost_usd, latency_ms, "
     "status, error, created_at"
+)
+FINDING_COLUMNS = (
+    "finding_id, project_id, kind, summary, source_run_id, source_cycle, "
+    "source_work_id, source_action, experiment_job_id, spec_digest, digest, created_at"
+)
+INTERPRETATION_COLUMNS = (
+    "interpretation_id, job_id, project_id, run_id, work_id, spec_digest, "
+    "interpreter_version, artifact_id, status, detail, created_at, completed_at"
 )
 SCHEDULE_COLUMNS = (
     "schedule_id, project_id, kind, payload, interval_seconds, next_run_at, "
@@ -833,6 +845,631 @@ class RuntimeStore:
             ).fetchall()
         return tuple(ExternalJob.model_validate(row) for row in rows)
 
+    # -------------------------------------------- experiment interpretations --
+    def eligible_job_for_interpretation(
+        self, *, project_id: str, interpreter_version: str
+    ) -> ExternalJob | None:
+        """The oldest terminal job this reader version has not finished reading.
+
+        Three things about this query are the whole point of the table it reads.
+
+        **Oldest first, not newest.** The previous implementation ordered by
+        ``finished_at desc`` and took one row, so which experiment got
+        interpreted depended on the order the scheduler happened to reap two
+        jobs in. Oldest-eligible-first is a stable total order over a set that
+        only grows at one end, so two workers asking the same question at the
+        same time get the same answer, and a backlog drains in the order it
+        formed rather than newest-first forever.
+
+        **``not exists`` against a COMPLETED row, not against any row.** An
+        interpretation whose worker died mid-reading leaves an ``IN_PROGRESS``
+        row, and that job is still owed an interpretation. Excluding it on the
+        presence of *any* row would strand it permanently.
+
+        **Ties broken by ``job_id``.** ``finished_at`` has second-or-better
+        resolution and two jobs can share it; without the tiebreak the order is
+        not total and the "stable" claim above would be false.
+        """
+
+        with self._db.tx() as conn:
+            row = conn.execute(
+                f"""
+                select {JOB_COLUMNS} from external_jobs j
+                where j.project_id = %(project_id)s
+                  and j.status in ('COMPLETED','FAILED','TIMED_OUT','CANCELLED')
+                  and not exists (
+                      select 1 from experiment_interpretations i
+                      where i.job_id = j.job_id
+                        and i.interpreter_version = %(version)s
+                        and i.status = 'COMPLETED'
+                  )
+                order by j.finished_at nulls last, j.job_id
+                limit 1
+                """,
+                {"project_id": project_id, "version": interpreter_version},
+            ).fetchone()
+        return ExternalJob.model_validate(row) if row else None
+
+    def claim_interpretation(
+        self,
+        *,
+        job_id: str,
+        project_id: str,
+        spec_digest: str,
+        interpreter_version: str,
+        run_id: str | None = None,
+        work_id: str | None = None,
+    ) -> tuple[ExperimentInterpretation, bool]:
+        """Claim the right to interpret one experiment. Returns ``(row, created)``.
+
+        ``created=False`` means this ``(job, reader version)`` was already
+        claimed -- by an earlier cycle, or by this one before a crash -- and the
+        caller gets the existing row rather than a second one. The unique
+        constraint does the work; ``on conflict do nothing`` plus a re-read is
+        the whole API, exactly as the event ledger does it.
+
+        A claim happens *before* anything is read, so the row exists to be
+        reconciled if the process dies during the reading. That is the ordering
+        the invocation ledger uses for external effects, applied here because a
+        scientific interpretation is an effect too: the thing a later reader
+        must not do is produce a second one.
+        """
+
+        with self._db.tx() as conn:
+            inserted = conn.execute(
+                f"""
+                insert into experiment_interpretations
+                    (interpretation_id, job_id, project_id, run_id, work_id,
+                     spec_digest, interpreter_version)
+                values (%(interpretation_id)s, %(job_id)s, %(project_id)s, %(run_id)s,
+                        %(work_id)s, %(spec_digest)s, %(version)s)
+                on conflict (job_id, interpreter_version) do nothing
+                returning {INTERPRETATION_COLUMNS}
+                """,
+                {
+                    "interpretation_id": new_interpretation_id(),
+                    "job_id": job_id,
+                    "project_id": project_id,
+                    "run_id": run_id,
+                    "work_id": work_id,
+                    "spec_digest": spec_digest,
+                    "version": interpreter_version,
+                },
+            ).fetchone()
+            if inserted is not None:
+                return ExperimentInterpretation.model_validate(inserted), True
+            row = conn.execute(
+                f"""
+                select {INTERPRETATION_COLUMNS} from experiment_interpretations
+                where job_id = %(job_id)s and interpreter_version = %(version)s
+                """,
+                {"job_id": job_id, "version": interpreter_version},
+            ).fetchone()
+        if row is None:  # pragma: no cover - the conflict implies a row exists
+            raise RuntimeStateError(
+                f"could not claim an interpretation of {job_id} at "
+                f"{interpreter_version}"
+            )
+        return ExperimentInterpretation.model_validate(row), False
+
+    def complete_interpretation(
+        self,
+        interpretation_id: str,
+        *,
+        artifact_id: str | None = None,
+        detail: str | None = None,
+    ) -> ExperimentInterpretation:
+        """Record that the reading finished, once.
+
+        Guarded on ``status = 'IN_PROGRESS'`` so a replayed worker cannot
+        overwrite the artifact of a completed interpretation with its own. A
+        second caller gets the existing completed row back, which is what the
+        recovery path needs: the same artifact, not a new one.
+        """
+
+        with self._db.tx() as conn:
+            row = conn.execute(
+                f"""
+                update experiment_interpretations
+                set status = 'COMPLETED',
+                    artifact_id = coalesce(%(artifact_id)s, artifact_id),
+                    detail = coalesce(%(detail)s, detail),
+                    completed_at = now()
+                where interpretation_id = %(interpretation_id)s
+                  and status = 'IN_PROGRESS'
+                returning {INTERPRETATION_COLUMNS}
+                """,
+                {
+                    "interpretation_id": interpretation_id,
+                    "artifact_id": artifact_id,
+                    "detail": detail,
+                },
+            ).fetchone()
+            if row is None:
+                row = conn.execute(
+                    f"select {INTERPRETATION_COLUMNS} from experiment_interpretations "
+                    f"where interpretation_id = %s",
+                    (interpretation_id,),
+                ).fetchone()
+        if row is None:
+            raise RuntimeStateError(f"no such interpretation: {interpretation_id}")
+        return ExperimentInterpretation.model_validate(row)
+
+    def get_interpretation(
+        self, *, job_id: str, interpreter_version: str
+    ) -> ExperimentInterpretation | None:
+        with self._db.tx() as conn:
+            row = conn.execute(
+                f"""
+                select {INTERPRETATION_COLUMNS} from experiment_interpretations
+                where job_id = %(job_id)s and interpreter_version = %(version)s
+                """,
+                {"job_id": job_id, "version": interpreter_version},
+            ).fetchone()
+        return ExperimentInterpretation.model_validate(row) if row else None
+
+    def list_interpretations(
+        self,
+        *,
+        project_id: str | None = None,
+        run_id: str | None = None,
+        limit: int = 100,
+    ) -> tuple[ExperimentInterpretation, ...]:
+        with self._db.tx() as conn:
+            rows = conn.execute(
+                f"""
+                select {INTERPRETATION_COLUMNS} from experiment_interpretations
+                where (%(project_id)s::text is null or project_id = %(project_id)s)
+                  and (%(run_id)s::text is null or run_id = %(run_id)s)
+                order by created_at desc, interpretation_id
+                limit %(limit)s
+                """,
+                {"project_id": project_id, "run_id": run_id, "limit": limit},
+            ).fetchall()
+        return tuple(ExperimentInterpretation.model_validate(row) for row in rows)
+
+    def abandon_stale_interpretations(
+        self, *, older_than_seconds: float
+    ) -> tuple[ExperimentInterpretation, ...]:
+        """Mark long-running claims as ``ABANDONED`` so they can be resolved.
+
+        Not re-claimed and not deleted. An abandoned row still holds the
+        identity of the experiment whose reading was interrupted, and the
+        recovery path needs it to find the artifact the dead worker may already
+        have produced. Deleting it would turn a recoverable interruption into a
+        second interpretation of the same experiment.
+        """
+
+        with self._db.tx() as conn:
+            rows = conn.execute(
+                f"""
+                update experiment_interpretations
+                set status = 'ABANDONED',
+                    detail = coalesce(detail, 'the worker stopped reporting')
+                where status = 'IN_PROGRESS'
+                  and created_at < now() - make_interval(secs => %(age)s)
+                returning {INTERPRETATION_COLUMNS}
+                """,
+                {"age": float(older_than_seconds)},
+            ).fetchall()
+        return tuple(ExperimentInterpretation.model_validate(row) for row in rows)
+
+    # ------------------------------------------------- runtime findings ----
+    def record_finding(self, finding: RuntimeFinding) -> tuple[RuntimeFinding, bool]:
+        """Store one noncanonical finding. Returns ``(finding, created)``.
+
+        Deduplicated on ``(project_id, digest)``, so a deterministic repeat of
+        the same observation returns the *existing* finding and its existing id.
+        That is what makes a finding citable: the runtime recomputes an
+        unchanged frontier on every cycle, and a new id per recomputation would
+        give one fact seven identifiers over seven cycles.
+
+        The references are written in the same transaction as the row. A finding
+        whose edges landed separately could be cited while its provenance was
+        still absent, and "cited but we cannot say what it rests on" is the one
+        state this table exists to make impossible.
+        """
+
+        digest = finding.digest
+        with self._db.tx() as conn:
+            inserted = conn.execute(
+                f"""
+                insert into runtime_findings
+                    (finding_id, project_id, kind, summary, source_run_id,
+                     source_cycle, source_work_id, source_action,
+                     experiment_job_id, spec_digest, digest)
+                values (%(finding_id)s, %(project_id)s, %(kind)s, %(summary)s,
+                        %(source_run_id)s, %(source_cycle)s, %(source_work_id)s,
+                        %(source_action)s, %(experiment_job_id)s, %(spec_digest)s,
+                        %(digest)s)
+                on conflict (project_id, digest) do nothing
+                returning {FINDING_COLUMNS}
+                """,
+                {
+                    "finding_id": new_finding_id(),
+                    "project_id": finding.project_id,
+                    "kind": str(finding.kind),
+                    "summary": finding.summary,
+                    "source_run_id": finding.source_run_id,
+                    "source_cycle": finding.source_cycle,
+                    "source_work_id": finding.source_work_id,
+                    "source_action": finding.source_action,
+                    "experiment_job_id": finding.experiment_job_id,
+                    "spec_digest": finding.spec_digest,
+                    "digest": digest,
+                },
+            ).fetchone()
+            if inserted is None:
+                row = conn.execute(
+                    f"select {FINDING_COLUMNS} from runtime_findings "
+                    f"where project_id = %s and digest = %s",
+                    (finding.project_id, digest),
+                ).fetchone()
+                if row is None:  # pragma: no cover - the conflict implies a row
+                    raise RuntimeStateError(
+                        f"could not record or retrieve finding {digest[:12]}"
+                    )
+                return _finding_from(row), False
+            finding_id = str(inserted["finding_id"])
+            for kind, ref in finding.references():
+                conn.execute(
+                    "insert into runtime_finding_refs (finding_id, kind, ref) "
+                    "values (%s, %s, %s) on conflict do nothing",
+                    (finding_id, kind, ref),
+                )
+        return _finding_from(inserted), True
+
+    def get_finding(self, finding_id: str) -> RuntimeFinding | None:
+        with self._db.tx() as conn:
+            row = conn.execute(
+                f"select {FINDING_COLUMNS} from runtime_findings where finding_id = %s",
+                (finding_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            refs = conn.execute(
+                "select kind, ref from runtime_finding_refs where finding_id = %s "
+                "order by kind, ref",
+                (finding_id,),
+            ).fetchall()
+        return _finding_from(row, refs)
+
+    def list_findings(
+        self,
+        *,
+        project_id: str | None = None,
+        run_id: str | None = None,
+        limit: int = 100,
+    ) -> tuple[RuntimeFinding, ...]:
+        with self._db.tx() as conn:
+            rows = conn.execute(
+                f"""
+                select {FINDING_COLUMNS} from runtime_findings
+                where (%(project_id)s::text is null or project_id = %(project_id)s)
+                  and (%(run_id)s::text is null or source_run_id = %(run_id)s)
+                order by created_at desc, finding_id
+                limit %(limit)s
+                """,
+                {"project_id": project_id, "run_id": run_id, "limit": limit},
+            ).fetchall()
+            found = []
+            for row in rows:
+                refs = conn.execute(
+                    "select kind, ref from runtime_finding_refs "
+                    "where finding_id = %s order by kind, ref",
+                    (row["finding_id"],),
+                ).fetchall()
+                found.append(_finding_from(row, refs))
+        return tuple(found)
+
+    def resolve_findings(
+        self, finding_ids: tuple[str, ...], *, project_id: str
+    ) -> tuple[RuntimeFinding, ...]:
+        """Load exactly these findings, refusing any that this project lacks.
+
+        Project-scoped and fail-closed. A finding id from another project is
+        refused rather than skipped, because a grounding allowlist assembled by
+        silently dropping what it could not find is an allowlist that permits a
+        proposal to rest on nothing.
+        """
+
+        found = {
+            item.finding_id: item
+            for item in (self.get_finding(value) for value in finding_ids)
+            if item is not None and item.project_id == project_id
+        }
+        missing = [value for value in finding_ids if value not in found]
+        if missing:
+            raise RuntimeStateError(
+                f"{project_id} has no runtime finding(s) " + ", ".join(sorted(missing))
+            )
+        return tuple(found[value] for value in finding_ids)
+
+    def link_proposal_findings(
+        self,
+        *,
+        proposal_id: str,
+        finding_ids: tuple[str, ...],
+        run_id: str | None = None,
+        work_id: str | None = None,
+    ) -> int:
+        """Record, immutably, which findings one proposal was grounded in."""
+
+        if not finding_ids:
+            return 0
+        with self._db.tx() as conn:
+            for finding_id in finding_ids:
+                conn.execute(
+                    """
+                    insert into runtime_proposal_links
+                        (proposal_id, finding_id, run_id, work_id)
+                    values (%s, %s, %s, %s)
+                    on conflict (proposal_id, finding_id) do nothing
+                    """,
+                    (proposal_id, finding_id, run_id, work_id),
+                )
+        return len(finding_ids)
+
+    def link_nomination_findings(
+        self,
+        *,
+        nomination_id: str,
+        finding_ids: tuple[str, ...],
+        project_id: str,
+        run_id: str | None = None,
+        work_id: str | None = None,
+    ) -> int:
+        """Record which findings one cross-project nomination rests on.
+
+        Invariant 15's audit trail. A promoted insight reaches another project's
+        prompt behind a fence saying whose findings it was, and these rows are
+        what make that traceable back to the artifact a cycle produced rather
+        than to a sentence somebody wrote.
+        """
+
+        if not finding_ids:
+            return 0
+        with self._db.tx() as conn:
+            for finding_id in finding_ids:
+                conn.execute(
+                    """
+                    insert into runtime_nomination_links
+                        (nomination_id, finding_id, project_id, run_id, work_id)
+                    values (%s, %s, %s, %s, %s)
+                    on conflict (nomination_id, finding_id) do nothing
+                    """,
+                    (nomination_id, finding_id, project_id, run_id, work_id),
+                )
+        return len(finding_ids)
+
+    def nomination_findings(self, nomination_id: str) -> tuple[RuntimeFinding, ...]:
+        with self._db.tx() as conn:
+            rows = conn.execute(
+                "select finding_id from runtime_nomination_links "
+                "where nomination_id = %s order by finding_id",
+                (nomination_id,),
+            ).fetchall()
+        resolved = [self.get_finding(str(row["finding_id"])) for row in rows]
+        return tuple(item for item in resolved if item is not None)
+
+    def proposal_findings(self, proposal_id: str) -> tuple[RuntimeFinding, ...]:
+        with self._db.tx() as conn:
+            rows = conn.execute(
+                "select finding_id from runtime_proposal_links "
+                "where proposal_id = %s order by finding_id",
+                (proposal_id,),
+            ).fetchall()
+        resolved = [self.get_finding(str(row["finding_id"])) for row in rows]
+        return tuple(item for item in resolved if item is not None)
+
+    # --------------------------------------------- proposal reservations ----
+    def reserve_proposal(
+        self,
+        *,
+        reservation_key: str,
+        proposal_id: str,
+        project_id: str,
+        run_id: str | None = None,
+        work_id: str | None = None,
+    ) -> tuple[str, str, bool]:
+        """Reserve one proposal identity. Returns ``(proposal_id, status, created)``.
+
+        Written *before* the v1 ``ProposalController`` is called, so a crash
+        between "the proposal store has a directory" and "the runtime knows
+        about it" leaves the id to reconcile against rather than an orphan that
+        a retry would duplicate.
+
+        ``reservation_key`` is the action's stable identity -- run, cycle,
+        action, grounding digest -- and never the attempt. A retry passes the
+        same key, gets ``created=False`` and the *same* ``proposal_id`` back,
+        and the reconciler then asks the proposal store whether that directory
+        exists.
+        """
+
+        with self._db.tx() as conn:
+            inserted = conn.execute(
+                """
+                insert into runtime_proposal_reservations
+                    (reservation_key, proposal_id, project_id, run_id, work_id)
+                values (%s, %s, %s, %s, %s)
+                on conflict (reservation_key) do nothing
+                returning proposal_id, status
+                """,
+                (reservation_key, proposal_id, project_id, run_id, work_id),
+            ).fetchone()
+            if inserted is not None:
+                return str(inserted["proposal_id"]), str(inserted["status"]), True
+            row = conn.execute(
+                "select proposal_id, status from runtime_proposal_reservations "
+                "where reservation_key = %s",
+                (reservation_key,),
+            ).fetchone()
+        if row is None:  # pragma: no cover - the conflict implies a row exists
+            raise RuntimeStateError(
+                f"could not reserve a proposal for {reservation_key}"
+            )
+        return str(row["proposal_id"]), str(row["status"]), False
+
+    def settle_proposal_reservation(
+        self, reservation_key: str, *, status: str, detail: str | None = None
+    ) -> None:
+        """Mark a reservation ``CREATED`` or ``FAILED``, once.
+
+        Guarded on ``RESERVED`` so a slow worker cannot reopen a settled
+        reservation, and so a ``FAILED`` record of a proposal that did reach the
+        store cannot overwrite the ``CREATED`` one.
+        """
+
+        if status not in {"CREATED", "FAILED"}:
+            raise RuntimeStateError(f"not a settlement status: {status!r}")
+        with self._db.tx() as conn:
+            conn.execute(
+                """
+                update runtime_proposal_reservations
+                set status = %(status)s,
+                    detail = coalesce(%(detail)s, detail),
+                    settled_at = now()
+                where reservation_key = %(key)s and status = 'RESERVED'
+                """,
+                {"key": reservation_key, "status": status, "detail": detail},
+            )
+
+    def parked_objectives(
+        self, *, project_id: str, limit: int = 20
+    ) -> tuple[ResearchRun, ...]:
+        """The latest cycle of each objective that finished waiting for a person.
+
+        "Parked" means three things, and each excludes something that must not
+        be woken by a scientific change:
+
+        - **finished**, so a cycle still holding a live LangGraph interrupt is
+          not given a sibling. Those are resumed by the recorded decision that
+          answers them.
+        - **the latest in its lineage** -- no run has it as ``parent_run_id`` --
+          so one objective gets one successor however many of its ancestors are
+          also terminal.
+        - concluded ``DONE_FOR_NOW`` or ``WAITING_FOR_SCIENTIFIC_DECISION``, the
+          two terminal states that mean "the runtime did everything it was
+          allowed to". ``BUDGET_EXHAUSTED`` is deliberately absent: the science
+          moving does not create budget, and opening a cycle that cannot finish
+          would turn one exhausted objective into a stream of them.
+
+        Grouped by objective rather than by run, because two runs of the same
+        objective are one objective, and the successor belongs to the newest.
+        """
+
+        with self._db.tx() as conn:
+            rows = conn.execute(
+                f"""
+                select {RUN_COLUMNS} from research_runs r
+                where r.project_id = %(project_id)s
+                  and r.status in ('SUCCEEDED','FAILED')
+                  and r.terminal_state in (
+                      'DONE_FOR_NOW','WAITING_FOR_SCIENTIFIC_DECISION')
+                  and not exists (
+                      select 1 from research_runs child
+                      where child.parent_run_id = r.run_id
+                  )
+                  and r.created_at = (
+                      select max(peer.created_at) from research_runs peer
+                      where peer.project_id = r.project_id
+                        and peer.objective = r.objective
+                  )
+                order by r.created_at desc
+                limit %(limit)s
+                """,
+                {"project_id": project_id, "limit": limit},
+            ).fetchall()
+        return tuple(ResearchRun.model_validate(row) for row in rows)
+
+    # ------------------------------------------- capsule observations ------
+    def observe_capsule(
+        self, *, project_id: str, capsule_digest: str, frontier_digest: str
+    ) -> tuple[bool, str | None, str | None]:
+        """Compare-and-set one project's observed scientific digest.
+
+        Returns ``(changed, previous_capsule_digest, previous_frontier_digest)``.
+
+        ``changed`` is false on the *first* observation as well as on an
+        unchanged one, and that is deliberate: the first time the runtime sees a
+        project it has no idea whether what it is looking at is new, and
+        treating "I have never looked before" as "a person just changed
+        something" would open a successor cycle on every fresh database.
+
+        Serialised by ``select ... for update`` on the project's own row. Two
+        daemons observing together would otherwise both read the old digest,
+        both see a change, and both emit -- and while the event's dedup key
+        collapses those into one event, ``changes_seen`` is what a person reads
+        to answer "has this actually been noticing anything", and
+        double-counting it would make the answer wrong in the direction of
+        reassurance.
+
+        ``observed_at`` advances only when something moved, so it means "when
+        this project's science last changed" rather than "when the daemon last
+        looked". The second is in the tick report; the first is the one worth
+        keeping.
+        """
+
+        with self._db.tx() as conn:
+            existing = conn.execute(
+                "select capsule_digest, frontier_digest from capsule_observations "
+                "where project_id = %s for update",
+                (project_id,),
+            ).fetchone()
+            if existing is None:
+                conn.execute(
+                    """
+                    insert into capsule_observations
+                        (project_id, capsule_digest, frontier_digest)
+                    values (%s, %s, %s)
+                    on conflict (project_id) do nothing
+                    """,
+                    (project_id, capsule_digest, frontier_digest),
+                )
+                # Whether this insert or a concurrent one won, the state now
+                # recorded is the state just observed, and neither daemon saw a
+                # change.
+                return False, None, None
+
+            previous_capsule = str(existing["capsule_digest"])
+            previous_frontier = str(existing["frontier_digest"])
+            changed = previous_capsule != capsule_digest
+            if changed or previous_frontier != frontier_digest:
+                conn.execute(
+                    """
+                    update capsule_observations
+                    set capsule_digest = %(capsule)s,
+                        frontier_digest = %(frontier)s,
+                        observed_at = now(),
+                        changes_seen = changes_seen + %(increment)s
+                    where project_id = %(project_id)s
+                    """,
+                    {
+                        "project_id": project_id,
+                        "capsule": capsule_digest,
+                        "frontier": frontier_digest,
+                        "increment": 1 if changed else 0,
+                    },
+                )
+        return changed, previous_capsule, previous_frontier
+
+    def observed_capsule(self, project_id: str) -> tuple[str, str, int] | None:
+        """What the runtime last saw, or ``None`` if it has never looked."""
+
+        with self._db.tx() as conn:
+            row = conn.execute(
+                "select capsule_digest, frontier_digest, changes_seen "
+                "from capsule_observations where project_id = %s",
+                (project_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return (
+            str(row["capsule_digest"]),
+            str(row["frontier_digest"]),
+            int(row["changes_seen"]),
+        )
+
     # ----------------------------------------------------------- schedules --
     def create_schedule(
         self,
@@ -977,3 +1614,38 @@ class RuntimeStore:
             ).fetchall()
         cooling = {str(row["provider"]) for row in rows}
         return tuple(name for name in candidates if name not in cooling)
+
+
+def _finding_from(row: Any, refs: Any = ()) -> RuntimeFinding:
+    """Rebuild a finding from its row and, when loaded, its reference edges.
+
+    ``refs`` is optional because the list and dedupe paths do not need the
+    edges and loading them per row would be a query per finding. A finding
+    returned without edges reports empty tuples, which is honest -- it says
+    "not loaded" the same way it would say "none" -- and every caller that
+    needs the provenance uses :meth:`RuntimeStore.get_finding`, which loads it.
+    """
+
+    by_kind: dict[str, list[str]] = {
+        "artifact": [],
+        "capsule_object": [],
+        "literature_key": [],
+    }
+    for ref in refs or ():
+        by_kind.setdefault(str(ref["kind"]), []).append(str(ref["ref"]))
+    return RuntimeFinding(
+        finding_id=str(row["finding_id"]),
+        project_id=str(row["project_id"]),
+        kind=FindingKind(str(row["kind"])),
+        summary=str(row["summary"]),
+        source_run_id=row["source_run_id"],
+        source_cycle=row["source_cycle"],
+        source_work_id=row["source_work_id"],
+        source_action=row["source_action"],
+        artifact_ids=tuple(by_kind["artifact"]),
+        capsule_refs=tuple(by_kind["capsule_object"]),
+        literature_keys=tuple(by_kind["literature_key"]),
+        experiment_job_id=row["experiment_job_id"],
+        spec_digest=row["spec_digest"],
+        created_at=str(row["created_at"]),
+    )

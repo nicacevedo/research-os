@@ -41,6 +41,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 
 from research_os.automation.models import Role as AutomationRole
+from research_os.automation.models import RoleSetting
 from research_os.automation.providers import (
     InvocationRequest,
     ProviderAdapter,
@@ -77,6 +78,23 @@ class CriticalCapabilityUnavailableError(RoutingError):
     """
 
 
+class IndependenceUnavailableError(RoutingError):
+    """Raised when required review independence cannot be obtained.
+
+    A distinct class because the remedy is distinct and external: no amount of
+    retrying, waiting or repairing produces a second provider family. The
+    correct terminal state for a run that hits this is
+    ``WAITING_FOR_EXTERNAL_DEPENDENCY`` -- the runtime did everything it could
+    and what is missing is a thing the researcher installs.
+
+    Only raised under ``review_independence: require``. The default reports the
+    degradation instead, because on a one-family machine failing closed would
+    mean no scientific review ever happens, and a recorded
+    ``DEGRADED ... This is not independent review`` is more useful than a
+    refusal.
+    """
+
+
 #: How the runtime's roles map onto the v1 adapter's five roles. The adapters
 #: were written for the coding pipeline and take one of those; the runtime has
 #: eleven roles and needs them all recorded, so the mapping is here and the
@@ -93,17 +111,31 @@ _ADAPTER_ROLE: dict[ModelRole, AutomationRole] = {
     ModelRole.REFEREE: AutomationRole.REVIEWER,
     ModelRole.EXTRACTOR: AutomationRole.LITERATURE,
     ModelRole.FRONTIER: AutomationRole.PLANNER,
+    ModelRole.NOMINATOR: AutomationRole.REVIEWER,
 }
 
 
 @dataclass(frozen=True, slots=True)
 class ProviderProfile:
-    """What one configured provider can do, and what it costs.
+    """What one configured provider is *declared* to do, and what it costs.
 
-    ``tier`` is an ordering, not a score: higher means "use this for harder
-    work". It is set by configuration rather than measured, because measuring
-    model quality is a research project and this only has to be good enough to
-    stop a routine extraction going to the most expensive model available.
+    **``tier`` is configured priority, not measured performance, and the name
+    has misled a reader.** Higher means "prefer this for harder work". Nothing
+    in this system has ever benchmarked a model to produce it: every available
+    provider is assumed tier 3 by :func:`profiles_from_adapters`, and a
+    researcher who knows better sets it. So a report saying "answered at tier 3"
+    means "the configuration said this provider is suitable for critical work",
+    and it does not mean anyone established that it is.
+
+    That distinction is stated here, in ``docs/RUNTIME.md`` §11 and by
+    ``researchctl runtime doctor``, rather than fixed by building a benchmark.
+    A generalised model-benchmarking platform is a research project of its own,
+    and the integration brief was explicit that it should not be built until
+    actual routing failures demonstrate the need. What the tier has to be good
+    enough for is stopping a routine extraction from going to the most
+    expensive model available, and configuration is good enough for that.
+
+    ``capabilities`` is declared the same way and carries the same caveat.
     """
 
     name: str
@@ -121,8 +153,14 @@ class ProviderProfile:
     estimated_cost_usd: float = 0.05
 
 
-#: The minimum tier that may answer each criticality. A `CRITICAL` request will
-#: not be served below tier 3, whatever else is available.
+#: The minimum *configured* tier that may answer each criticality.
+#:
+#: A `CRITICAL` request will not be served below tier 3, whatever else is
+#: available. What that enforces is a configuration statement rather than a
+#: measurement -- see :class:`ProviderProfile` -- and the floor is still worth
+#: having: it makes "this provider is not for critical work" expressible and
+#: binding, which is the property a researcher with two providers of different
+#: quality actually needs.
 MINIMUM_TIER: dict[Criticality, int] = {
     Criticality.ROUTINE: 1,
     Criticality.NORMAL: 2,
@@ -151,6 +189,8 @@ class ModelRouter:
         "_loaded_groups",
         "_profiles",
         "_project_id",
+        "_require_independence",
+        "_role_settings",
         "_run_id",
         "_store",
         "_used_families",
@@ -168,8 +208,17 @@ class ModelRouter:
         run_id: str,
         project_id: str,
         work_id: str | None = None,
+        role_settings: Mapping[str, RoleSetting] | None = None,
+        require_independence: bool = False,
     ) -> None:
         self._adapters = dict(adapters)
+        #: The researcher's ``automation.yaml`` role settings, keyed by the v1
+        #: role name. Consulted for the model and the effort of each call; the
+        #: *provider* is still the router's choice, because criticality and
+        #: independence are properties of the request and not of the config.
+        self._role_settings = dict(role_settings or {})
+        #: Whether critical work that asked for a different family must get one.
+        self._require_independence = bool(require_independence)
         self._profiles = tuple(profiles)
         self._store = store
         self._artifacts = artifacts
@@ -185,6 +234,45 @@ class ModelRouter:
         #: family and recorded as a fresh context rather than a degradation.
         self._used_families: dict[str, set[str]] = {}
         self._loaded_groups: set[str] = set()
+
+    def _model_and_effort(
+        self, request: ModelRequest, profile: ProviderProfile
+    ) -> tuple[str | None, str | None]:
+        """Which model answers, and at what effort.
+
+        The researcher's configuration decides this and the router decides the
+        *provider*, and the two have to be combined carefully because a model
+        alias is provider-specific.
+
+        So the configured model is applied only when the provider the router
+        chose is the provider that role names. Otherwise the alias is dropped
+        and the provider's own default answers -- which is precisely what
+        ``automation.config.resolve_roles`` does when a role's provider is not
+        installed, and for the same reason: ``opus`` means nothing to a
+        different vendor's CLI, and passing it would fail the call rather than
+        downgrade it.
+
+        This exists because the runtime was passing neither. Every runtime model
+        call went out with no ``--model`` and no ``--effort``, so the provider
+        CLI's own default answered -- including for the three roles that map onto
+        the v1 planner, whose default v1.1 changed from ``sonnet`` to ``opus``
+        on thirty measured calls, recorded in ``docs/V1_BUILD_RECORD.md`` §32,
+        because every structured-output exhaustion and every placeholder plan in
+        that benchmark came from the smaller model. Those three roles --
+        ``PLANNER``, ``EXPERIMENTALIST``, ``FRONTIER`` -- are exactly the ones
+        that issue schema-constrained requests here.
+        """
+
+        adapter_role = _ADAPTER_ROLE[request.role]
+        setting = self._role_settings.get(str(adapter_role))
+        if setting is None:
+            return profile.model, None
+        if setting.provider != profile.name:
+            # A different provider answered than the one this role names. The
+            # alias does not travel; the effort does, because effort is a
+            # provider-independent notion in the adapter contract.
+            return profile.model, setting.effort
+        return setting.model or profile.model, setting.effort
 
     # --------------------------------------------------------------- routing --
     def _candidates(self, request: ModelRequest) -> tuple[ProviderProfile, ...]:
@@ -253,6 +341,24 @@ class ModelRouter:
                 )
                 return Routed(profile=chosen, independence=achieved, note=note)
             chosen = candidates[0]
+            if (
+                self._require_independence
+                and request.criticality is Criticality.CRITICAL
+            ):
+                # Fail closed into an external dependency. Not a retry and not a
+                # downgrade: no second provider family will appear because we
+                # asked again, and a critical scientific review performed by the
+                # producer's own family is the one degradation this mode exists
+                # to refuse.
+                raise IndependenceUnavailableError(
+                    f"{request.role} is critical work that requires "
+                    f"{request.independence}, and every healthy provider is in a "
+                    f"family that has already answered in group {group!r} "
+                    f"({sorted(already)}). Refusing rather than recording a "
+                    f"same-family review as independent. Install a second "
+                    f"provider family, or set `review_independence: prefer` in "
+                    f"runtime.yaml to accept a recorded degradation."
+                )
             return Routed(
                 profile=chosen,
                 independence=Independence.DIFFERENT_CONTEXT,
@@ -349,6 +455,7 @@ class ModelRouter:
             raise
 
         started = time.monotonic()
+        model, effort = self._model_and_effort(request, profile)
         try:
             result = adapter.invoke(
                 InvocationRequest(
@@ -357,7 +464,8 @@ class ModelRouter:
                     cwd=self._artifacts.root,
                     read_only=True,
                     timeout_seconds=request.timeout_seconds,
-                    model=profile.model,
+                    model=model,
+                    effort=effort,
                     json_schema=dict(request.json_schema)
                     if request.json_schema
                     else None,

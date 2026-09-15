@@ -37,7 +37,12 @@ from typing import Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from research_os.automation.models import Confidence, Importance, utc_now
+from research_os.automation.models import (
+    FINDING_ID_RE,
+    Confidence,
+    Importance,
+    utc_now,
+)
 from research_os.models import NonBlankStr
 
 PROPOSAL_ID_RE = re.compile(r"^PROP-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$")
@@ -147,6 +152,110 @@ class ProposalGrounding(BaseModel):
     capsule_ids: list[str] = Field(default_factory=list)
     literature_keys: list[str] = Field(default_factory=list)
     finding_ids: list[str] = Field(default_factory=list)
+
+
+class SuppliedFinding(BaseModel):
+    """One finding a *caller* supplied as grounding for a proposal.
+
+    Not something a worker produced. This is the v1-level representation of
+    "here is an observation, here is its identifier, cite it by that
+    identifier", and it exists so that the autonomous runtime's results can
+    ground a proposal auditably rather than being concatenated into the
+    natural-language goal.
+
+    Deliberately declared here rather than imported from
+    :mod:`research_os.runtime.findings`. The dependency direction is
+    ``runtime -> v1``, never the reverse, and ``tests/test_runtime_layering.py``
+    asserts it; a proposal layer that imported the runtime would make the
+    scientific layers depend on PostgreSQL. So the runtime converts its own
+    finding record into this, and any other caller -- a person, a script, a
+    later subsystem -- can supply one without the runtime existing.
+
+    What it deliberately does **not** carry: importance, confidence, or any
+    other judgement of its own significance. A caller that could label its
+    finding "high importance" would be grading the evidence it is asking a
+    person to act on.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    finding_id: NonBlankStr
+    kind: NonBlankStr
+    statement: NonBlankStr
+    """What was observed. Rendered as fenced, untrusted data, never as prose."""
+
+    rests_on: list[str] = Field(default_factory=list)
+    """Artifact ids, capsule object ids or literature keys, for the audit trail."""
+
+    @field_validator("finding_id")
+    @classmethod
+    def _citable_id_shape(cls, value: str) -> str:
+        """Refuse an id that cannot safely be an allowlist entry.
+
+        The same shape the analyst's own finding ids are held to. An id
+        containing whitespace or a control character is one the grounding
+        allowlist and the prompt catalogue would disagree about, and a
+        disagreement between those two is how an unsupplied citation passes.
+        """
+
+        if FINDING_ID_RE.fullmatch(value) is None:
+            raise ValueError(
+                "a supplied finding id must be 1-32 characters of letters, "
+                f"digits, '-', '_', or '.'; got {value!r}"
+            )
+        return value
+
+
+class ScientificBasisSnapshot(BaseModel):
+    """What the canonical science looked like when a proposal was made.
+
+    Recomputed before a human is offered the promotion, so a proposal that has
+    been waiting while the project moved on fails closed rather than being
+    promoted onto a basis that no longer holds.
+
+    **Why not the repository HEAD.** ``base_commit`` is already on the
+    proposal, and comparing it to the current HEAD was the obvious freshness
+    check and the wrong one: a proposal is about scientific objects, and
+    invalidating it because someone fixed a typo in the README would train a
+    researcher to ignore the warning. So this snapshots the *objects the
+    proposal actually relied on* and nothing else.
+
+    **Optional, for backward compatibility.** A proposal written before this
+    existed has ``None`` here, and
+    :func:`research_os.proposal.promote.basis_status` reports that honestly --
+    "this proposal records no scientific basis, so staleness cannot be
+    checked" -- rather than either failing it or passing it silently.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: int = 1
+    project_id: str | None = None
+    capsule_schema_versions: dict[str, int] = Field(default_factory=dict)
+    """Each referenced object's ``schema_version``, so a schema migration shows."""
+
+    referenced_object_statuses: dict[str, str] = Field(default_factory=dict)
+    """Each referenced object's lifecycle status when the proposal was made.
+
+    Recorded separately from the combined digest so a staleness report can name
+    what moved -- "Q-0001 (open -> answered)" -- rather than saying that
+    something did.
+    """
+
+    referenced_object_ids: list[str] = Field(default_factory=list)
+    """Exactly the capsule objects the proposal's items cite, sorted."""
+
+    referenced_object_digest: str = ""
+    """A hash over ``(id, project-scoped subject digest)`` for each of them."""
+
+    charter_digest: str | None = None
+    """The project charter, when the proposal's context included one."""
+
+    finding_packet_digest: str | None = None
+    """The supplied findings, so superseded grounding is detectable."""
+
+    literature_keys: list[str] = Field(default_factory=list)
+    """Stable identifiers, sorted. Retrieval is append-only, so presence is the test."""
 
 
 class ProposedItem(BaseModel):
@@ -284,6 +393,19 @@ class ResearchProposal(BaseModel):
     created_at: str = Field(default_factory=utc_now)
     summary: NonBlankStr
     grounding: ProposalGrounding = Field(default_factory=ProposalGrounding)
+    supplied_findings: list[SuppliedFinding] = Field(default_factory=list)
+    """The findings the caller grounded this proposal in, quoted for audit.
+
+    The *allowlist* is ``grounding.finding_ids``; this is the text behind
+    each id, kept so a person reading the proposal months later does not
+    have to go to the operational database to find out what ``FIND-...``
+    said. A validator below requires the two to agree, because a proposal
+    that cites an id whose text it does not carry is unauditable.
+    """
+
+    scientific_basis: ScientificBasisSnapshot | None = None
+    """What the canonical science looked like. ``None`` on older proposals."""
+
     items: list[ProposedItem] = Field(default_factory=list)
     uncertainties: list[OpenUncertainty] = Field(default_factory=list)
     next_actions: list[NextAction] = Field(default_factory=list)
@@ -319,6 +441,23 @@ class ResearchProposal(BaseModel):
         capsule = set(self.grounding.capsule_ids)
         literature = set(self.grounding.literature_keys)
         findings = set(self.grounding.finding_ids)
+
+        # A quoted finding must be one the allowlist permits. One direction
+        # only, deliberately: a caller may also ground a proposal through
+        # ``analysis_data``, where the finding *text* travels in its own fenced
+        # block and only the ids reach ``grounding.finding_ids``. So "cited but
+        # not quoted here" is a legitimate shape, and "quoted but not allowed"
+        # is not -- the second means the prompt showed a worker more than the
+        # validator would accept, which is how an unsupplied citation gets
+        # written in the first place.
+        quoted = {item.finding_id for item in self.supplied_findings}
+        if len(quoted) != len(self.supplied_findings):
+            raise ValueError("a proposal quotes the same supplied finding twice")
+        if quoted - findings:
+            raise ValueError(
+                "a proposal quotes finding(s) that are not in its grounding "
+                "allowlist: " + ", ".join(sorted(quoted - findings))
+            )
         for item in self.items:
             _reject_unsupplied(item.item_id, "capsule object", item.addresses, capsule)
             _reject_unsupplied(

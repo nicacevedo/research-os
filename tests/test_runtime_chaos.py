@@ -931,10 +931,17 @@ def test_a_coding_run_that_reaches_the_canonical_checkout_is_caught(
     SECURITY.md has always said so. What R5 changes is that nobody decides to
     run it.
 
-    A sandbox is the fix and this deployment has none. So the guard detects: the
-    canonical capsule and every Git ref are hashed before and after, and a
-    difference fails the action as POLICY_REFUSED with the paths named -- which
-    turns a silent escape into a loud one. It does not prevent the write.
+    A sandbox is the fix, and `research_os/sandbox.py` now provides one where the
+    host allows it -- which this host does not, so on this machine the detection
+    below is still the only thing standing. The guard detects: the canonical
+    capsule and every Git ref are hashed before and after, and a difference
+    fails the action as POLICY_REFUSED with the paths named, which turns a
+    silent escape into a loud one. It does not prevent the write.
+
+    Run at `medium` autonomy deliberately. At `high` the pipeline would not run
+    at all here -- containment is required and unavailable, which is asserted
+    separately in `tests/test_sandbox.py` -- and the property under test is the
+    fingerprint guard, which is what protects the path a person can still take.
     """
 
     from research_os.runtime.actions import coding
@@ -990,7 +997,9 @@ def test_a_coding_run_that_reaches_the_canonical_checkout_is_caught(
         def total_cost_usd(self) -> float:
             return 0.0
 
-    monkeypatch.setattr(coding, "_controller", lambda _context: EscapingController())
+    monkeypatch.setattr(
+        coding, "_controller", lambda _context, autonomy: EscapingController()
+    )
 
     from tests.runtime_graph_helpers import make_context
 
@@ -1009,6 +1018,7 @@ def test_a_coding_run_that_reaches_the_canonical_checkout_is_caught(
             "project_id": "alpha-project",
             "repo_path": str(repo),
             "cycle_index": 0,
+            "autonomy": "medium",
         },
         context,
         {"rationale": "do something"},

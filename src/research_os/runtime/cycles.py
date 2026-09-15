@@ -37,6 +37,7 @@ from research_os.runtime.checkpoints import DURABILITY, checkpointer
 from research_os.runtime.config import RuntimeConfig
 from research_os.runtime.context import CycleContext
 from research_os.runtime.db import Database
+from research_os.runtime.executors import build_executors
 from research_os.runtime.graphs import build_cycle_graph
 from research_os.runtime.idempotency import InvocationLedger
 from research_os.runtime.ids import thread_id_for
@@ -118,8 +119,28 @@ def build_context(
     models: ModelProvider,
     autonomy: str,
     executors: dict[str, Any] | None = None,
+    project_id: str | None = None,
 ) -> CycleContext:
+    """Assemble the live services one cycle runs against.
+
+    ``executors`` defaults to whatever this machine can actually run work on,
+    rather than to nothing. It used to default to ``{}``, and nothing in the
+    control plane ever supplied one -- so a daemon-driven cycle that planned
+    ``run_local_experiment`` was refused with "no local executor is available on
+    this machine", on a machine that can obviously run a local command. The
+    experiment path was reachable only from a test that built the executor
+    itself.
+
+    Building them here also applies the containment policy in one place:
+    ``build_executors`` reads the autonomy setting and gives a high-autonomy
+    cycle a local executor that *requires* a sandbox.
+    """
+
     store = RuntimeStore(db)
+    if executors is None:
+        executors = dict(
+            build_executors(config, project_id=project_id, autonomy=autonomy)
+        )
     return CycleContext(
         config=config,
         db=db,
@@ -354,6 +375,7 @@ def _execute(
         models=models,
         autonomy=str(run.autonomy),
         executors=executors,
+        project_id=run.project_id,
     )
     thread = run.thread_id or thread_id_for(run.run_id)
     graph_config = {"configurable": {"thread_id": thread}}

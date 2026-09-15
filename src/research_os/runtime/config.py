@@ -109,6 +109,35 @@ class RuntimeSettings(BaseModel):
     provider_failure_threshold: int = Field(default=3, ge=1, le=100)
     #: How long an unhealthy provider is left alone before being tried again.
     provider_cooldown_seconds: int = Field(default=300, ge=1, le=86_400)
+    #: Whether critical scientific review must be genuinely independent.
+    #:
+    #: ``prefer`` is the default and the honest one for a single-provider
+    #: machine: the router gives the strongest separation available and records
+    #: what it *achieved*, so a review that had to run on the producer's own
+    #: family is marked ``DEGRADED ... This is not independent review`` and the
+    #: note reaches the run report.
+    #:
+    #: ``require`` fails the call instead. For a deployment that has configured
+    #: two provider families and wants a missing one to be an outage rather than
+    #: a silent downgrade -- because a scientific review quietly performed by
+    #: the producer's own family is worse than one that did not happen: the
+    #: first looks like it happened.
+    #:
+    #: It applies to ``CRITICAL`` work only. Making it bind on routine calls
+    #: would stop a literature extraction because no second vendor is installed,
+    #: which has nothing to do with review independence.
+    review_independence: str = Field(default="prefer", pattern="^(prefer|require)$")
+    #: How often the daemon re-hashes each project's canonical capsule to notice
+    #: that a person changed the science.
+    #:
+    #: Thirty seconds, which is a deliberate compromise. Hashing a capsule is a
+    #: validation pass over a few dozen small YAML files -- cheap, but not free,
+    #: and it happens per project on every interval forever. Half a minute is
+    #: below the threshold at which a researcher who has just promoted
+    #: something and is watching `runtime status` would conclude it had not
+    #: worked, and high enough that an idle daemon with five projects is doing
+    #: nothing measurable.
+    capsule_observe_seconds: float = Field(default=30.0, ge=1.0, le=3_600.0)
 
 
 class ConfigDocument(BaseModel):

@@ -75,6 +75,14 @@ class ModelRole(StrEnum):
     REFEREE = "referee"
     EXTRACTOR = "extractor"
     FRONTIER = "frontier"
+    NOMINATOR = "nominator"
+    """Judges whether one project's finding is candidate knowledge for others.
+
+    Its own role rather than a second use of the skeptic, because provenance
+    has to be able to say which question was asked. "A skeptic said this
+    transfers" and "a nominator said this is worth a person's attention" are
+    different claims, and only the second was made.
+    """
 
 
 class Capability(StrEnum):
@@ -242,6 +250,17 @@ class ExecutionHandle:
     finished: bool = False
     exit_code: int | None = None
     detail: str = ""
+    contained: bool = False
+    """Whether OS-level containment was in force for this execution.
+
+    Its own field rather than a sentence appended to ``detail``. ``detail``
+    carries the executor's or the scheduler's own word for what happened -- it
+    is asserted exactly by several tests and read by a person -- and mixing a
+    second fact into it makes both harder to use.
+    """
+
+    containment: str = ""
+    """The technology, or the reason there was none."""
 
 
 @runtime_checkable

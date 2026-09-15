@@ -111,6 +111,21 @@ crash. You are asked about the small number of things that are actually
 scientific decisions — and of the eight such actions, all eight are ones *you*
 perform: the runtime prepares the decision and hands you the command.
 
+**The loop closes.** A cycle's findings become a grounded, noncanonical
+proposal; the cycle concludes `WAITING_FOR_SCIENTIFIC_DECISION`; you promote
+what you agree with using the ordinary scientific command; and `researchd`
+notices that the canonical science changed and opens the successor cycle itself.
+No continue command, and no notification from the scientific kernel — the
+runtime *observes* the capsule rather than being told, because a kernel that
+depended on a database being up would be a kernel you could not use when it was
+down.
+
+What a proposal cites is auditable rather than asserted: a proposed change names
+a runtime finding, which names the artifacts, capsule objects, literature keys
+or experiment job it came from, all the way down to bytes by content hash. A
+proposal that cites something this cycle did not have is refused by the same
+deterministic check that refuses an unavailable capsule id.
+
 `docs/CAPSULE.md` is the live specification and is authoritative on anything
 scientific. Canonical Git-tracked YAML and Markdown under `.research/` are the
 only project scientific state: there is no materialized project index, and the

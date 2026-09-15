@@ -110,6 +110,7 @@ from research_os.errors import (
     SymlinkScopeError,
 )
 from research_os.runlock import run_lock
+from research_os.sandbox import SandboxMode
 
 PLANNER_TIMEOUT_SECONDS = 600
 REVIEWER_TIMEOUT_SECONDS = 600
@@ -246,9 +247,19 @@ class AutomationController:
         *,
         providers: dict[str, ProviderAdapter],
         config: AutomationConfig,
+        sandbox_mode: SandboxMode | None = None,
     ) -> None:
         self.providers = providers
         self.config = config
+        #: Overrides ``config.sandbox.mode`` for this controller only.
+        #:
+        #: Exists for the autonomous runtime, which runs this pipeline with
+        #: nobody watching and therefore cannot accept the configured default:
+        #: high-autonomy execution of model-written code requires containment.
+        #: A parameter rather than a mutation of the config, because the
+        #: researcher's configuration is theirs and a caller that rewrote it
+        #: would be changing what every other run does.
+        self.sandbox_mode = sandbox_mode
 
     # -- run creation ----------------------------------------------------
 
@@ -1323,6 +1334,11 @@ class AutomationController:
                     ),
                     uv_project_environment=uv_environment,
                     uv_frozen=lock.frozen if lock is not None else False,
+                    sandbox_mode=self.sandbox_mode or self.config.sandbox.mode,
+                    sandbox_readable=tuple(
+                        Path(item) for item in self.config.sandbox.extra_readable
+                    ),
+                    sandbox_network=self.config.sandbox.network,
                 )
                 results.append(result)
                 store.append_event(

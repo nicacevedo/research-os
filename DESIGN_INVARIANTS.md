@@ -136,3 +136,31 @@ The one thing R5 deliberately does **not** acquire is epistemic authority:
 ```text
 near-100% operational autonomy  !=  100% epistemic authority
 ```
+
+## Change control record: R5 integration
+
+Per the change-control section above, a dedicated record. **No invariant
+changed.** What changed is that two of them are now enforced by mechanism where
+they were previously enforced by absence, and one adoption was added to the
+permitted-technology list in `ARCHITECTURE.md` §12b.
+
+| # | invariant | what the integration changed |
+|---|---|---|
+| 6 | Git-tracked files are truth | unchanged, and now *harder* to violate: nothing under `research_os/runtime` imports `research_os.proposal.promote`, and `tests/test_runtime_authority.py` asserts it by parsing the package. The runtime can create a proposal; only `researchctl propose promote` can make one a capsule object, and it requires an interactive terminal |
+| 8 | no agent approves its own work | unchanged. `review_independence: require` adds a mode where a critical review that cannot get a different provider family **fails** instead of being recorded as degraded. `prefer` remains the default, because on a one-family machine failing closed would mean no scientific review ever happens |
+| 11 | experiments traceable | strengthened. An interpretation is now bound durably to one `(job, spec digest, interpreter version)` rather than to whichever job finished most recently. Association by temporal coincidence was not traceability |
+| 12 | paid use has budgets | unchanged |
+| 14 | finite stop conditions | unchanged, and the new continuation path is bounded by the same three: `should_continue` consults the cycle's recommendation, the lineage depth measured in SQL, and the budget. A capsule change makes a parked objective *eligible*; it does not exempt it |
+| 15 | explicit cross-project transfer | unchanged. `nominate_insight` writes a nomination and leaves `scope`, `assumptions` and `applicability` empty — those three fields *are* the judgement that a finding transfers, and `missing_for_promotion` tells the researcher they are what is missing. The runtime cannot express the scoping, let alone the promotion |
+
+The one thing worth stating as a new property rather than a preserved one:
+
+```text
+a runtime that can ASK for a scientific change  !=  a runtime that can MAKE one
+```
+
+Before this integration the runtime could not ask, which is why it stopped on an
+unchanged frontier. It can ask now, and everything about how that ask reaches a
+person — a separate type, a separate store, a deterministic grounding check, an
+independent assessment, an interactive confirmation, a draft and nothing
+stronger — exists so that asking never becomes making.

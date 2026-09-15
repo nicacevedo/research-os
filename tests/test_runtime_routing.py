@@ -19,6 +19,7 @@ from pathlib import Path
 
 import pytest
 
+from research_os.automation.models import Access, RoleSetting
 from research_os.runtime.artifacts import FilesystemArtifactStore
 from research_os.runtime.budgets import BudgetExhaustedError, BudgetLedger, Dimension
 from research_os.runtime.db import Database
@@ -49,6 +50,8 @@ def _router(
     project_id: str,
     adapters: dict[str, FakeProvider],
     profiles: tuple[ProviderProfile, ...],
+    role_settings: dict[str, object] | None = None,
+    require_independence: bool = False,
 ) -> ModelRouter:
     store = RuntimeStore(db)
     return ModelRouter(
@@ -59,6 +62,8 @@ def _router(
         budgets=BudgetLedger(db),
         run_id=run_id,
         project_id=project_id,
+        role_settings=role_settings,  # type: ignore[arg-type]
+        require_independence=require_independence,
     )
 
 
@@ -618,3 +623,323 @@ def test_a_rebuilt_router_reports_degradation_rather_than_fresh_context(
         if c.role == str(ModelRole.SKEPTIC)
     )
     assert call.independence_note and call.independence_note.startswith("DEGRADED")
+
+
+# ------------------------------------------------ the researcher's models ----
+def _role_setting(
+    *, provider: str, model: str | None, effort: str | None
+) -> RoleSetting:
+    return RoleSetting(
+        provider=provider,
+        model=model,
+        effort=effort,
+        read_only=True,
+        access=Access.CONTEXT_ONLY,
+        tools=(),
+    )
+
+
+def test_the_configured_role_model_and_effort_reach_the_provider(
+    runtime_db: Database, runtime_project: str, tmp_path: Path
+) -> None:
+    """Every runtime call used to go out with no ``--model`` and no ``--effort``.
+
+    So the provider CLI's own default answered -- including for the three
+    runtime roles that map onto the v1 planner, whose default v1.1 changed from
+    ``sonnet`` to ``opus`` on thirty measured calls because every
+    structured-output exhaustion and every placeholder plan in that benchmark
+    came from the smaller model. Those three roles are exactly the ones that
+    issue schema-constrained requests.
+    """
+
+    store = RuntimeStore(runtime_db)
+    run = store.create_run(project_id=runtime_project, objective="o")
+    adapter = _provider("claude", "anthropic")
+    router = _router(
+        runtime_db,
+        tmp_path,
+        run_id=run.run_id,
+        project_id=runtime_project,
+        adapters={"claude": adapter},
+        profiles=(ProviderProfile(name="claude", family="anthropic", tier=3),),
+        role_settings={
+            "planner": _role_setting(provider="claude", model="opus", effort="high")
+        },
+    )
+    router.complete(
+        ModelRequest(
+            role=ModelRole.PLANNER,
+            capability=Capability.PLANNING,
+            prompt="what next",
+            prompt_version="planner@1",
+            criticality=Criticality.NORMAL,
+        )
+    )
+    assert adapter.calls[-1].model == "opus"
+    assert adapter.calls[-1].effort == "high"
+
+
+def test_a_configured_model_is_dropped_when_another_provider_answers(
+    runtime_db: Database, runtime_project: str, tmp_path: Path
+) -> None:
+    """A model alias is provider-specific, so it must not travel.
+
+    ``resolve_roles`` already drops the model when it re-homes a role onto a
+    different provider, for the same reason: ``opus`` means nothing to another
+    vendor's CLI, and passing it would fail the call rather than downgrade it.
+    The router chooses the provider -- criticality and independence are
+    properties of the request -- so it has to make the same decision.
+    """
+
+    store = RuntimeStore(runtime_db)
+    run = store.create_run(project_id=runtime_project, objective="o")
+    adapter = _provider("codex", "openai")
+    router = _router(
+        runtime_db,
+        tmp_path,
+        run_id=run.run_id,
+        project_id=runtime_project,
+        adapters={"codex": adapter},
+        profiles=(ProviderProfile(name="codex", family="openai", tier=3),),
+        role_settings={
+            "planner": _role_setting(provider="claude", model="opus", effort="high")
+        },
+    )
+    router.complete(
+        ModelRequest(
+            role=ModelRole.PLANNER,
+            capability=Capability.PLANNING,
+            prompt="what next",
+            prompt_version="planner@1",
+            criticality=Criticality.NORMAL,
+        )
+    )
+    assert adapter.calls[-1].model is None, (
+        "a provider-specific alias reached a different provider"
+    )
+    # Effort is provider-independent in the adapter contract, so it survives.
+    assert adapter.calls[-1].effort == "high"
+
+
+def test_a_role_with_no_configuration_uses_the_profile_model(
+    runtime_db: Database, runtime_project: str, tmp_path: Path
+) -> None:
+    store = RuntimeStore(runtime_db)
+    run = store.create_run(project_id=runtime_project, objective="o")
+    adapter = _provider("claude", "anthropic")
+    router = _router(
+        runtime_db,
+        tmp_path,
+        run_id=run.run_id,
+        project_id=runtime_project,
+        adapters={"claude": adapter},
+        profiles=(
+            ProviderProfile(
+                name="claude", family="anthropic", model="profile-default", tier=3
+            ),
+        ),
+        role_settings={},
+    )
+    router.complete(
+        ModelRequest(
+            role=ModelRole.PLANNER,
+            capability=Capability.PLANNING,
+            prompt="what next",
+            prompt_version="planner@1",
+            criticality=Criticality.NORMAL,
+        )
+    )
+    assert adapter.calls[-1].model == "profile-default"
+    assert adapter.calls[-1].effort is None
+
+
+# ------------------------------------------- required review independence ----
+def test_prefer_records_the_degradation_and_runs(
+    runtime_db: Database, runtime_project: str, tmp_path: Path
+) -> None:
+    """The default, and the right one for a one-family machine.
+
+    Failing closed here would mean no scientific review ever happens, and a
+    recorded ``DEGRADED ... This is not independent review`` is more useful than
+    a refusal.
+    """
+
+    store = RuntimeStore(runtime_db)
+    run = store.create_run(project_id=runtime_project, objective="o")
+    adapter = _provider("claude", "anthropic")
+    router = _router(
+        runtime_db,
+        tmp_path,
+        run_id=run.run_id,
+        project_id=runtime_project,
+        adapters={"claude": adapter},
+        profiles=(ProviderProfile(name="claude", family="anthropic", tier=3),),
+    )
+    group = f"review:{run.run_id}"
+    # The producer answers first, so its family has already been used.
+    router.complete(
+        ModelRequest(
+            role=ModelRole.AUTHOR,
+            capability=Capability.SYNTHESIS,
+            prompt="draft",
+            prompt_version="author@1",
+            criticality=Criticality.NORMAL,
+            independence_group=group,
+        )
+    )
+    response = router.complete(
+        ModelRequest(
+            role=ModelRole.SCIENTIFIC_REVIEWER,
+            capability=Capability.CRITIQUE,
+            prompt="review",
+            prompt_version="scientific_reviewer@1",
+            criticality=Criticality.CRITICAL,
+            independence=Independence.DIFFERENT_FAMILY,
+            independence_group=group,
+        )
+    )
+    assert response.ok
+    assert "not independent review" in response.independence_note
+
+
+def test_require_refuses_a_same_family_critical_review(
+    runtime_db: Database, runtime_project: str, tmp_path: Path
+) -> None:
+    """Fails closed into an external dependency, and says what to install.
+
+    A scientific review quietly performed by the producer's own family is worse
+    than one that did not happen: the first looks like it happened.
+    """
+
+    from research_os.runtime.routing import IndependenceUnavailableError
+
+    store = RuntimeStore(runtime_db)
+    run = store.create_run(project_id=runtime_project, objective="o")
+    adapter = _provider("claude", "anthropic")
+    router = _router(
+        runtime_db,
+        tmp_path,
+        run_id=run.run_id,
+        project_id=runtime_project,
+        adapters={"claude": adapter},
+        profiles=(ProviderProfile(name="claude", family="anthropic", tier=3),),
+        require_independence=True,
+    )
+    group = f"review:{run.run_id}"
+    router.complete(
+        ModelRequest(
+            role=ModelRole.AUTHOR,
+            capability=Capability.SYNTHESIS,
+            prompt="draft",
+            prompt_version="author@1",
+            criticality=Criticality.NORMAL,
+            independence_group=group,
+        )
+    )
+    with pytest.raises(IndependenceUnavailableError) as raised:
+        router.complete(
+            ModelRequest(
+                role=ModelRole.SCIENTIFIC_REVIEWER,
+                capability=Capability.CRITIQUE,
+                prompt="review",
+                prompt_version="scientific_reviewer@1",
+                criticality=Criticality.CRITICAL,
+                independence=Independence.DIFFERENT_FAMILY,
+                independence_group=group,
+            )
+        )
+    message = str(raised.value)
+    assert "Install a second provider family" in message
+    assert "review_independence: prefer" in message
+
+
+def test_require_does_not_bind_on_routine_work(
+    runtime_db: Database, runtime_project: str, tmp_path: Path
+) -> None:
+    """Otherwise a literature extraction stops because no second vendor exists.
+
+    Which has nothing to do with review independence, and would make the mode
+    unusable for the deployments that want it.
+    """
+
+    store = RuntimeStore(runtime_db)
+    run = store.create_run(project_id=runtime_project, objective="o")
+    adapter = _provider("claude", "anthropic")
+    router = _router(
+        runtime_db,
+        tmp_path,
+        run_id=run.run_id,
+        project_id=runtime_project,
+        adapters={"claude": adapter},
+        profiles=(ProviderProfile(name="claude", family="anthropic", tier=3),),
+        require_independence=True,
+    )
+    group = f"extract:{run.run_id}"
+    router.complete(
+        ModelRequest(
+            role=ModelRole.AUTHOR,
+            capability=Capability.SYNTHESIS,
+            prompt="draft",
+            prompt_version="author@1",
+            criticality=Criticality.NORMAL,
+            independence_group=group,
+        )
+    )
+    response = router.complete(
+        ModelRequest(
+            role=ModelRole.EXTRACTOR,
+            capability=Capability.STRUCTURED_EXTRACTION,
+            prompt="extract",
+            prompt_version="extractor@1",
+            criticality=Criticality.ROUTINE,
+            independence=Independence.DIFFERENT_FAMILY,
+            independence_group=group,
+        )
+    )
+    assert response.ok
+
+
+def test_require_is_satisfied_when_a_second_family_exists(
+    runtime_db: Database, runtime_project: str, tmp_path: Path
+) -> None:
+    store = RuntimeStore(runtime_db)
+    run = store.create_run(project_id=runtime_project, objective="o")
+    claude = _provider("claude", "anthropic")
+    codex = _provider("codex", "openai")
+    router = _router(
+        runtime_db,
+        tmp_path,
+        run_id=run.run_id,
+        project_id=runtime_project,
+        adapters={"claude": claude, "codex": codex},
+        profiles=(
+            ProviderProfile(name="claude", family="anthropic", tier=3),
+            ProviderProfile(name="codex", family="openai", tier=3),
+        ),
+        require_independence=True,
+    )
+    group = f"review:{run.run_id}"
+    producer = router.complete(
+        ModelRequest(
+            role=ModelRole.AUTHOR,
+            capability=Capability.SYNTHESIS,
+            prompt="draft",
+            prompt_version="author@1",
+            criticality=Criticality.NORMAL,
+            independence_group=group,
+        )
+    )
+    reviewer = router.complete(
+        ModelRequest(
+            role=ModelRole.SCIENTIFIC_REVIEWER,
+            capability=Capability.CRITIQUE,
+            prompt="review",
+            prompt_version="scientific_reviewer@1",
+            criticality=Criticality.CRITICAL,
+            independence=Independence.DIFFERENT_FAMILY,
+            independence_group=group,
+        )
+    )
+    assert reviewer.ok
+    assert reviewer.provider != producer.provider
+    assert reviewer.independence is Independence.DIFFERENT_FAMILY

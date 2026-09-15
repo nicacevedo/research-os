@@ -50,6 +50,7 @@ from research_os.runtime.actions.experiments import (
     submit_cluster_experiment,
 )
 from research_os.runtime.actions.explore import critique_hypotheses, propose_hypotheses
+from research_os.runtime.actions.insights import nominate_insight
 from research_os.runtime.actions.inspect import (
     inspect_repository,
     validate_capsule,
@@ -61,6 +62,7 @@ from research_os.runtime.actions.literature import (
     reconcile_fetched_literature,
     search_literature,
 )
+from research_os.runtime.actions.proposals import propose_capsule_change
 from research_os.runtime.actions.review import assess_frontier_ranked, review_science
 from research_os.runtime.context import CycleContext
 from research_os.runtime.policy import ACTIONS, ActionKind
@@ -98,6 +100,38 @@ class RegisteredAction:
             )
 
 
+def _reconcile_proposal_effect(
+    state: Mapping[str, Any], context: CycleContext, plan: Mapping[str, Any]
+) -> dict[str, Any] | None:
+    """Recompute the reserved proposal id and ask the store whether it exists.
+
+    The registry's reconciler is handed the *planner's* plan, which carries no
+    private field, so it re-derives the reservation key from the same durable
+    inputs the handler used: the run, the cycle, the goal and the grounding
+    digest. Re-derivation rather than a stashed value is the point -- a
+    reconciler that depended on state the crashed attempt was supposed to have
+    left behind is a reconciler that does not work after a crash.
+
+    An earlier version of the coding action's reconciler read
+    ``plan["_reserved_run_id"]``, which nothing ever set, so it returned
+    ``None`` unconditionally and the crash window it existed to close was open.
+    """
+
+    from research_os.runtime.actions.proposals import reconcile_reserved_proposal
+
+    return reconcile_reserved_proposal(state, context, plan)
+
+
+def _reconcile_nomination_effect(
+    state: Mapping[str, Any], context: CycleContext, plan: Mapping[str, Any]
+) -> dict[str, Any] | None:
+    """Re-derive this cycle's reserved nomination id and ask the store."""
+
+    from research_os.runtime.actions.insights import reconcile_reserved_nomination
+
+    return reconcile_reserved_nomination(state, context, plan)
+
+
 ACTION_HANDLERS: dict[ActionKind, RegisteredAction] = {
     # --- read-only inspection -------------------------------------------
     ActionKind.INSPECT_REPOSITORY: RegisteredAction(
@@ -131,8 +165,20 @@ ACTION_HANDLERS: dict[ActionKind, RegisteredAction] = {
     ActionKind.REVIEW_SCIENCE: RegisteredAction(review_science, replay_safe=True),
     # --- experiments ------------------------------------------------------
     ActionKind.DESIGN_EXPERIMENT: RegisteredAction(design_experiment, replay_safe=True),
-    # Reads a finished job and the criteria fixed before it. Changes nothing,
-    # and structurally cannot move the criteria.
+    # Replay-safe, and it is worth saying why, because this handler *does*
+    # create durable state: an `experiment_interpretations` claim and an
+    # artifact.
+    #
+    # Both are keyed by content rather than by attempt. The claim is unique per
+    # `(job_id, interpreter_version)`, so a replay adopts the existing row; the
+    # artifact's bytes are derived only from the job row, the stored
+    # preregistration and the claim's own id, all immutable, so a replay hashes
+    # to the same address and the content-addressed store skips the write. Which
+    # makes running it again produce no *additional* visible effect -- the
+    # definition `replay_safe` actually uses.
+    #
+    # It structurally cannot move the criteria: they are read from the stored
+    # preregistration by spec digest, and nothing here writes one.
     ActionKind.INTERPRET_RESULTS: RegisteredAction(interpret_results, replay_safe=True),
     # The submitting handlers own their own ledger entries, keyed by spec
     # digest, and reconcile against `external_jobs`. Declared replay-safe *at
@@ -149,6 +195,30 @@ ACTION_HANDLERS: dict[ActionKind, RegisteredAction] = {
     # Same: `run_coding_task` holds its own ledger entry keyed by base commit
     # and goal, and reconciles by asking the automation run store.
     ActionKind.EDIT_IN_WORKTREE: RegisteredAction(run_coding_task, replay_safe=True),
+    # --- cross-project nomination -----------------------------------------
+    # Writes a nomination file, so the same reasoning as the proposal action:
+    # declared unsafe, with a reconciler that re-derives the reserved id and
+    # asks the nomination store whether the file is there.
+    ActionKind.NOMINATE_INSIGHT: RegisteredAction(
+        nominate_insight,
+        replay_safe=False,
+        reconcile=_reconcile_nomination_effect,
+    ),
+    # --- proposing a scientific change ------------------------------------
+    # The one action with an externally visible effect that is *not* covered by
+    # an inner ledger: creating a proposal directory. So it is declared unsafe
+    # here and supplies a reconciler, which asks the proposal store on disk
+    # whether the reserved id already names a proposal.
+    #
+    # The reserved id is what makes that question answerable. `make_proposal_id`
+    # is deterministic in project, goal and *second*, and a retry does not
+    # reproduce the second -- so before this, a crash between "the directory
+    # exists" and "the runtime knows" produced two proposals for one decision.
+    ActionKind.PROPOSE_CAPSULE_CHANGE: RegisteredAction(
+        propose_capsule_change,
+        replay_safe=False,
+        reconcile=_reconcile_proposal_effect,
+    ),
     # --- authoring --------------------------------------------------------
     ActionKind.DRAFT_MANUSCRIPT: RegisteredAction(draft_manuscript, replay_safe=True),
     ActionKind.AUDIT_CITATIONS: RegisteredAction(audit_citations, replay_safe=True),

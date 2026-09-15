@@ -18,6 +18,7 @@ import argparse
 from pathlib import Path
 
 from research_os.errors import EXIT_ERROR, EXIT_OK, PromotionRefusedError
+from research_os.proposal.basis import basis_status
 from research_os.proposal.models import ResearchProposal
 from research_os.proposal.promote import prepare_promotion, write_promotion
 from research_os.proposal.report import (
@@ -82,6 +83,14 @@ def add_propose_parser(subparsers: argparse._SubParsersAction) -> None:
         nargs="?",
         default=None,
         help="Project path. Defaults to the project the proposal was made for.",
+    )
+    promote.add_argument(
+        "--accept-stale-basis",
+        action="store_true",
+        help=(
+            "Promote even though a scientific object this proposal cited has "
+            "changed since it was written. Only after reading what changed."
+        ),
     )
 
     events = actions.add_parser("events", help="Print one proposal's event ledger.")
@@ -185,10 +194,26 @@ def _promote(args: argparse.Namespace) -> int:
     store = ProposalStore.open(args.proposal_id)
     proposal = store.load()
     assessment = store.load_assessment()
+    root = Path(args.path).expanduser() if args.path else None
+
+    # Checked and *reported* before the preview, whether or not it blocks. A
+    # researcher deciding whether to promote needs to know that the science
+    # moved even when they are about to override it, and a proposal too old to
+    # record a basis at all is a third answer rather than a silent pass.
+    basis = basis_status(proposal, project_path=root)
+    if basis.stale:
+        print(f"STALE BASIS: {basis.reason}")
+        if basis.changed_objects:
+            print("  affected: " + ", ".join(basis.changed_objects))
+        print()
+    elif not basis.checkable:
+        print(f"BASIS NOT CHECKED: {basis.reason}\n")
+
     prepared = prepare_promotion(
         proposal,
         args.item,
-        project_path=Path(args.path).expanduser() if args.path else None,
+        project_path=root,
+        allow_stale_basis=bool(getattr(args, "accept_stale_basis", False)),
     )
 
     print(render_promotion_preview(prepared), end="")

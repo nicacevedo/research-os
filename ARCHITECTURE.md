@@ -446,6 +446,39 @@ removes a bottleneck this deployment has — one researcher, one workstation, on
 optional cluster — and each adds operational surface that must then be kept
 alive for the science to run.
 
+### 12b. One item left the list in the R5 integration: OS-level containment
+
+Not a container *runtime*. What was adopted is
+`research_os/sandbox.py`, an abstraction over whatever containment the host
+already provides, with a bubblewrap backend. The requirement that forced it is
+recorded in `docs/RUNTIME.md` §16 and was measured rather than argued: the
+coding pipeline runs a project's acceptance commands *after* a write-enabled
+worker has edited files in scope, so `pytest` imports and executes Python a
+model wrote one step earlier, with the researcher's environment, SSH agent, Git
+credentials and provider keys. R5 made that happen without a person deciding to
+run it. The existing fingerprint check detects a canonical capsule or Git-ref
+change afterwards; it prevents nothing and sees nothing outside the repository.
+
+Why bubblewrap and not Podman, Docker or Apptainer, all three of which remain on
+the postponed list: the requirement is *process confinement*, not image
+distribution or reproducible environments. Bubblewrap is one small setuid-less
+binary that does exactly the mount, network and environment isolation this
+needs, adds no daemon, no registry, no image build step and no root, and is
+already present on most Linux hosts. A container runtime would bring all of
+that in exchange for confinement this already has, which is the shape of
+adoption §12 exists to prevent. Podman and Docker are probed and reported so
+that a host which has one is a recorded fact and the next release has an obvious
+place to start; neither is implemented.
+
+The honest part: **on the host this release was built on, nothing works.** The
+kernel refuses the unprivileged user namespaces every available mechanism needs
+(`kernel.apparmor_restrict_unprivileged_userns=1`, and bubblewrap is not
+setuid), and `systemd-run --user`'s sandboxing directives are accepted and
+silently ineffective. So the mode `required` — which high-autonomy execution of
+model-written code uses — *refuses to run* here rather than running
+uncontained. That is the correct behaviour and it is a release blocker for
+high-autonomy local execution on this machine, not a property of the design.
+
 ## 13. Human versus agent authority
 
 Humans retain authority over architectural invariants, schema freeze, scientific

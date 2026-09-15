@@ -33,6 +33,7 @@ from pathlib import Path
 
 from research_os.automation.models import AcceptanceCommand, CommandResult, utc_now
 from research_os.automation.uvlock import UV_FROZEN
+from research_os.sandbox import SandboxMode, SandboxSpec, contain
 
 MAX_CAPTURE_CHARS = 200_000
 
@@ -78,6 +79,35 @@ def check_environment(
     return environment
 
 
+def check_overrides(
+    argv: Sequence[str],
+    *,
+    uv_project_environment: Path | None,
+    uv_frozen: bool = False,
+) -> dict[str, str]:
+    """Return only the variables the *controller decided*, not the environment.
+
+    The difference from :func:`check_environment` matters exactly once, and it
+    is the difference between a sandbox and a decoration.
+    ``check_environment`` returns ``dict(os.environ)`` plus the controller's
+    settings, because the uncontained path needs a complete environment to hand
+    to ``subprocess.run``. Handing that same dictionary to the sandbox would put
+    the researcher's entire environment -- their provider keys, their SSH agent
+    socket, their tokens -- *inside* the sandbox, which is the one thing it
+    exists to prevent.
+
+    So the contained path uses this: the deltas alone, added to the sandbox's
+    own allowlist.
+    """
+
+    if uv_project_environment is None or not argv or argv[0] != UV_PROGRAM:
+        return {}
+    overrides = {UV_PROJECT_ENVIRONMENT: str(uv_project_environment)}
+    if uv_frozen:
+        overrides[UV_FROZEN] = "1"
+    return overrides
+
+
 def run_acceptance_command(
     command: AcceptanceCommand,
     *,
@@ -87,12 +117,33 @@ def run_acceptance_command(
     stderr_path: Path | None = None,
     uv_project_environment: Path | None = None,
     uv_frozen: bool = False,
+    sandbox_mode: SandboxMode = SandboxMode.OFF,
+    sandbox_readable: Sequence[Path] = (),
+    sandbox_network: bool = False,
 ) -> CommandResult:
     """Run one acceptance command and record exactly what happened.
 
     ``uv_project_environment`` is where a ``uv`` command must materialise the
     project environment, and ``uv_frozen`` says whether it may resolve a new
     dependency lock. Both are ignored by every other program.
+
+    ``sandbox_mode`` decides whether this runs inside OS-level containment. This
+    is the choke point for it, and that is the whole reason it exists here
+    rather than in the controller: **this function is where code the system did
+    not write gets executed.** The command runs after a write-enabled worker has
+    edited files in scope, so ``pytest`` imports Python a model wrote one step
+    earlier. Everything above this call decides *whether* to run it; this is
+    where it happens, so this is where containment belongs.
+
+    ``sandbox_readable`` are paths the command needs to *read* and the sandbox
+    would otherwise deny -- a shared dependency cache, an input artifact. The
+    worktree and the uv project environment are writable and are derived here,
+    because getting either wrong turns every check into a failure that looks
+    like the project's.
+
+    Under ``required`` a host that cannot contain raises
+    :class:`~research_os.sandbox.SandboxError`, which the caller reports rather
+    than running the command anyway.
     """
 
     started = utc_now()
@@ -118,20 +169,50 @@ def run_acceptance_command(
     stdout = ""
     stderr = ""
     exit_code: int | None = None
+
+    inner_environment = check_environment(
+        argv,
+        uv_project_environment=uv_project_environment,
+        uv_frozen=uv_frozen,
+    )
+    writable = [cwd]
+    if uv_project_environment is not None:
+        # uv materialises the project environment here, so it has to be
+        # writable. It is outside every worktree on purpose -- see this module's
+        # docstring -- which means the sandbox would deny it by default and
+        # every `uv run` check would fail for a reason that has nothing to do
+        # with the project.
+        writable.append(uv_project_environment)
+    spec = SandboxSpec(
+        workdir=cwd,
+        writable=tuple(writable),
+        readable=tuple(sandbox_readable),
+        network=sandbox_network,
+        wall_seconds=timeout_seconds,
+        # The controller's *decisions*, not the researcher's environment.
+        # `check_environment` returns `dict(os.environ)` plus those decisions
+        # because the uncontained path needs a complete environment to hand to
+        # `subprocess.run`; handing the same dictionary to the sandbox would put
+        # the researcher's provider keys and SSH agent socket inside it, which
+        # is the one thing it exists to prevent. See `check_overrides`.
+        environment=check_overrides(
+            argv,
+            uv_project_environment=uv_project_environment,
+            uv_frozen=uv_frozen,
+        ),
+    )
+    prepared = contain(argv, spec=spec, mode=sandbox_mode)
+
     try:
         completed = subprocess.run(
-            argv,
+            list(prepared.argv),
             cwd=str(cwd),
             check=False,
             capture_output=True,
             text=True,
             stdin=subprocess.DEVNULL,
             timeout=timeout_seconds,
-            env=check_environment(
-                argv,
-                uv_project_environment=uv_project_environment,
-                uv_frozen=uv_frozen,
-            ),
+            env=prepared.environment if prepared.contained else inner_environment,
         )
         exit_code = completed.returncode
         stdout = completed.stdout or ""
@@ -149,6 +230,10 @@ def run_acceptance_command(
     stored_stderr = _store(stderr_path, stderr)
 
     return CommandResult(
+        # The command as the *project* declared it, not the sandbox wrapper.
+        # A researcher reading a run wants to see `uv run pytest -q`; the
+        # containment is reported in its own field rather than smuggled into
+        # the one that says what was run.
         argv=argv,
         cwd=str(cwd),
         required=command.required,
@@ -161,6 +246,8 @@ def run_acceptance_command(
         stdout_path=stored_stdout,
         stderr_path=stored_stderr,
         error=error,
+        contained=prepared.contained,
+        containment=f"{prepared.technology}: {prepared.detail}",
     )
 
 

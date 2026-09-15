@@ -57,6 +57,42 @@ def make_proposal_id(*, project_path: str, goal: str, created_at: str) -> str:
     return f"PROP-{stamp}-{digest}"
 
 
+def reserved_proposal_id(*, reservation_key: str, moment: str | None = None) -> str:
+    """Return the proposal id one caller-reserved identity always produces.
+
+    For a caller that runs inside a crash-resuming runtime. ``make_proposal_id``
+    is deterministic in project, goal and *second*, and the second is exactly
+    what a retry does not reproduce -- so a retried proposal got a new id, a new
+    directory, and the store had no way to tell that two directories held one
+    logical decision.
+
+    This derives the whole id, timestamp included, from the reservation key. The
+    key is the action's stable identity -- the run, the cycle, the action, the
+    grounding digest -- and never the attempt, so the retry computes the same id,
+    finds the directory the interrupted attempt created, and adopts it.
+
+    The timestamp in the id is therefore not when the proposal was made. That is
+    a real cost and it is the right trade: ``created_at`` on the proposal itself
+    records the time, and an id that sorts by attempt time is an id that cannot
+    be recomputed. ``moment`` exists so a caller that wants the id to *sort*
+    near its creation can supply a stamp it will also be able to reproduce.
+    """
+
+    digest = hashlib.sha256(
+        f"reserved-proposal-v1\n{reservation_key}".encode()
+    ).hexdigest()
+    # A fixed, obviously-not-a-real-time stamp when the caller supplies none.
+    # The id has to match PROPOSAL_ID_RE, and any plausible timestamp here
+    # would be read as "when this was proposed" -- which it is not, because the
+    # id must be recomputable by a retry that happens later.
+    stamp = (
+        "19700101T000000Z"
+        if moment is None
+        else moment.replace("-", "").replace(":", "")
+    )
+    return f"PROP-{stamp}-{digest[:8]}"
+
+
 class ProposalStore:
     """Filesystem access to one proposal directory."""
 
@@ -82,6 +118,29 @@ class ProposalStore:
     @property
     def events_file(self) -> Path:
         return self.directory / EVENTS_FILENAME
+
+    @classmethod
+    def adopt_or_create(cls, proposal: ResearchProposal) -> tuple[ProposalStore, bool]:
+        """Open the proposal this id already names, or create it. ``(store, created)``.
+
+        For a caller with a reserved id whose previous attempt may have got as
+        far as writing the directory. Adoption is deliberately narrow: the
+        directory must already hold a *complete, valid* ``proposal.json``, and
+        then the existing proposal is returned unchanged rather than
+        overwritten, because the stored one is what a person may already have
+        read.
+
+        A directory that exists but holds no valid proposal is a half-written
+        one, and :meth:`create` still refuses it -- silently completing it would
+        mean guessing which of two attempts' content belongs there.
+        """
+
+        directory = proposals_root() / proposal.proposal_id
+        if (directory / PROPOSAL_FILENAME).is_file():
+            store = cls(directory)
+            store.load()
+            return store, False
+        return cls.create(proposal), True
 
     @classmethod
     def create(cls, proposal: ResearchProposal) -> ProposalStore:

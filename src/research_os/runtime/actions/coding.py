@@ -78,6 +78,7 @@ from research_os.runtime.context import CycleContext
 from research_os.runtime.failures import FailureClass
 from research_os.runtime.idempotency import idempotency_key
 from research_os.runtime.locks import RepositoryBusyError, repository_lock
+from research_os.sandbox import SandboxError, SandboxMode
 
 LOG = logging.getLogger("research_os.runtime.actions.coding")
 
@@ -125,14 +126,32 @@ def _describe_drift(before: dict[str, str], after: dict[str, str]) -> str:
     return ", ".join(changed[:12]) + ("..." if len(changed) > 12 else "")
 
 
-def _controller(context: CycleContext) -> Any:
-    """Build a v1 automation controller with this machine's providers."""
+def _controller(context: CycleContext, *, autonomy: str) -> Any:
+    """Build a v1 automation controller with this machine's providers.
+
+    The one thing the runtime overrides is containment. At high autonomy
+    nobody is watching, and the pipeline runs a project's acceptance commands
+    after a write-enabled worker has edited files in scope -- so pytest
+    executes Python a model wrote one step earlier. Running that with the
+    researcher's environment, unattended, is the exposure docs/RUNTIME.md
+    §16 describes; requiring containment is the answer, and refusing to run when
+    containment is unavailable is what "requiring" has to mean.
+
+    At low and medium the researcher's own sandbox.mode decides,
+    because there a person is at the keyboard and "contain where possible,
+    record the absence otherwise" is a legitimate position.
+    """
 
     from research_os.automation.commands import provider_registry
     from research_os.automation.config import load_config
     from research_os.automation.controller import AutomationController
 
-    return AutomationController(providers=provider_registry(), config=load_config())
+    del context
+    return AutomationController(
+        providers=provider_registry(),
+        config=load_config(),
+        sandbox_mode=SandboxMode.REQUIRED if autonomy == "high" else None,
+    )
 
 
 def failure_class_for(reason: str | None) -> FailureClass:
@@ -160,21 +179,64 @@ def failure_class_for(reason: str | None) -> FailureClass:
     return FailureClass.CODE_EXCEPTION
 
 
+def reserved_automation_run_id(*, reservation_key: str) -> str:
+    """The automation run id one reservation key always produces.
+
+    ``make_run_id`` is deterministic in project, goal, *second* and attempt, and
+    the second is exactly what a retry does not reproduce. So the timestamp is
+    derived from the key instead -- a fixed, obviously-not-a-real-time stamp,
+    because an id that looks like it records when the run started but is
+    recomputable later would be worse than one that plainly does not. The run's
+    own record carries the real time.
+    """
+
+    import hashlib
+
+    digest = hashlib.sha256(
+        f"reserved-automation-run-v1\n{reservation_key}".encode()
+    ).hexdigest()
+    return f"RUN-19700101T000000Z-{digest[:8]}"
+
+
 def _reconcile_worktree(
     state: Mapping[str, Any], context: CycleContext, plan: Mapping[str, Any]
 ) -> dict[str, Any] | None:
-    """Ask Git whether a previous attempt's automation run already exists.
+    """Ask the automation run store whether a previous attempt already ran.
 
-    This is what makes the coding action safe to interrupt: the branch name is
-    derived from the run and task ids, so its presence is evidence the worktree
-    was created. Returning ``None`` means it was not, and the action may proceed.
+    This is what makes the coding action safe to interrupt. The reserved run id
+    is re-derived here from the same durable inputs the handler used -- the run,
+    the cycle, the base commit and the goal -- rather than read out of the plan.
+
+    Re-derivation is the point. An earlier version read
+    ``plan["_reserved_run_id"]``, which nothing ever set, so this returned
+    ``None`` unconditionally and the crash window it existed to close was open:
+    a crash between the worktree being created and the ledger recording it left
+    an orphan branch, and the retry created a second automation run for one
+    logical task. A reconciler that depends on state the crashed attempt was
+    supposed to have left behind is a reconciler that does not work after a
+    crash.
+
+    ``None`` means the run directory is not there, so the effect did not take
+    hold and the action may proceed.
     """
 
     from research_os.automation.store import RunStore
 
-    reserved = str(plan.get("_reserved_run_id") or "")
-    if not reserved:
+    del context
+    repo = Path(state["repo_path"])
+    goal = str(
+        plan.get("rationale") or plan.get("parameters", {}).get("goal") or ""
+    ).strip()
+    if not goal:
         return None
+    try:
+        base_commit = gitutil.head_commit(repo)
+    except ResearchOSError:
+        return None
+    key = idempotency_key(
+        "coding.run", state["run_id"], state["cycle_index"], base_commit, goal
+    )
+    reserved = reserved_automation_run_id(reservation_key=key)
     try:
         store = RunStore.open(reserved)
         run = store.load()
@@ -184,6 +246,8 @@ def _reconcile_worktree(
         "ok": run.state is RunState.READY_FOR_HUMAN,
         "detail": f"recovered automation run {reserved} in state {run.state}",
         "data": _run_payload(run, store),
+        "_store_directory": str(store.directory),
+        "_failure_reason": run.failure_reason,
     }
 
 
@@ -280,7 +344,11 @@ def run_coding_task(
             failure_class=FailureClass.POLICY_REFUSED,
         )
 
-    controller = _controller(context)
+    # Defaults to "high" when the state does not say. Fail closed: an absent
+    # autonomy setting must not be the thing that quietly stops containment
+    # being required, and every production path seeds it -- `cycles._execute`
+    # puts the run's own setting into the initial state.
+    controller = _controller(context, autonomy=str(state.get("autonomy") or "high"))
     budget = Budget(
         max_model_calls=int(plan.get("parameters", {}).get("max_model_calls", 8)),
         max_write_work_orders=1,
@@ -297,6 +365,21 @@ def run_coding_task(
     key = idempotency_key(
         "coding.run", state["run_id"], state["cycle_index"], base_commit, goal
     )
+    # The automation run's identity, decided *before* the controller is called.
+    #
+    # `AutomationController.start` has taken `reserved_run_id` since v1.0.0,
+    # precisely to close this window, and this handler was not passing it. The
+    # consequence was that `_reconcile_worktree` read
+    # `plan["_reserved_run_id"]`, which nothing ever set, so it returned None
+    # unconditionally -- and the crash window the reconciler existed to close
+    # was open. A crash between the worktree being created and the ledger
+    # recording it left an orphan branch and a retry that created a second
+    # automation run for one logical task.
+    #
+    # Derived from the idempotency key, which contains the run, the cycle, the
+    # base commit and the goal and nothing per-attempt, so a retry computes the
+    # same id.
+    reserved_run_id = reserved_automation_run_id(reservation_key=key)
 
     def perform() -> dict[str, Any]:
         # What the canonical checkout looks like before anything runs. Compared
@@ -310,7 +393,11 @@ def run_coding_task(
         # would serialise every other cycle on this repository behind it.
         with repository_lock(context.db, str(repo)):
             store, _run = controller.start(
-                project_path=repo, goal=goal, budget=budget, attempt=key[-8:]
+                project_path=repo,
+                goal=goal,
+                budget=budget,
+                attempt=key[-8:],
+                reserved_run_id=reserved_run_id,
             )
         final = controller.execute(store)
 
@@ -354,6 +441,15 @@ def run_coding_task(
             request={"goal": goal, "base_commit": base_commit},
             perform=perform,
             reconcile=lambda _invocation: _reconcile_worktree(state, context, plan),
+        )
+    except SandboxError as exc:
+        # The policy required containment and this host cannot provide it. A
+        # policy refusal rather than a code failure, because there is nothing
+        # to repair and retrying would ask the same question of the same
+        # kernel. The message names the blocker and the one-line change that
+        # would let the run proceed.
+        return ActionOutcome.failed(
+            str(exc), failure_class=FailureClass.CAPABILITY_DENIED
         )
     except RepositoryBusyError as exc:
         # Not a failure: another cycle is mutating this repository. The work item

@@ -80,6 +80,51 @@ def _queries_for(state: Mapping[str, Any], plan: Mapping[str, Any]) -> list[str]
     return [state["objective"]]
 
 
+class LiteratureDeferredError(ResearchOSError):
+    """Raised when the pacer refused every provider, so nothing was asked.
+
+    A distinct class rather than a generic failure, because the distinction it
+    draws is the one that matters here: this is not "the providers are down",
+    it is "we are not allowed to ask yet, and we know when we may". Retrying
+    after the backoff is exactly right; recording an empty result is exactly
+    wrong.
+    """
+
+
+def _entirely_deferred(report: Any) -> bool:
+    """Whether this retrieval consulted nothing at all.
+
+    Three states have to be told apart and only one of them is a deferral:
+
+    - some provider was **asked** (``attempted``): a real search, however it
+      turned out. A 429 the provider actually answered is in this group -- it
+      spent quota and it is a fact about the provider.
+    - some provider was served **from cache**: also a real answer, and the
+      cache is the pacer's own, so a cached result is the system working as
+      designed rather than a gap.
+    - **neither**, for every provider: nothing was consulted, and the empty
+      result means "we did not look".
+
+    An empty ``outcomes`` tuple is *not* a deferral: it means no provider is
+    enabled, which is a configuration fact and a legitimate empty search.
+    """
+
+    outcomes = tuple(report.outcomes)
+    if not outcomes:
+        return False
+    return not any(item.attempted or item.from_cache for item in outcomes)
+
+
+def _deferral_detail(report: Any) -> str:
+    return (
+        ", ".join(
+            f"{item.provider} until {item.next_allowed_at or 'unknown'}"
+            for item in report.outcomes
+        )
+        or "no providers are enabled"
+    )
+
+
 def search_literature(
     state: Mapping[str, Any], context: CycleContext, plan: Mapping[str, Any]
 ) -> ActionOutcome:
@@ -108,6 +153,9 @@ def search_literature(
         )
 
     consulted: dict[str, str] = {}
+    deferred: dict[str, str] = {}
+    cached: list[str] = []
+    network_calls = 0
     work_keys: list[str] = []
     try:
         service = _service(context)
@@ -116,6 +164,29 @@ def search_literature(
 
             def perform(query: str = query) -> dict[str, Any]:
                 report = service.retrieve(query)
+                if _entirely_deferred(report):
+                    # Nothing was asked. The v1 pacer refused every provider's
+                    # reservation, which it reports as RATE_LIMITED with
+                    # `attempted=False` -- and its own docstring says why that
+                    # matters: "we did not ask" and "there is nothing" are
+                    # different facts about a literature review.
+                    #
+                    # Returning here would record that non-search in the
+                    # idempotency ledger as COMPLETED, and the ledger is keyed
+                    # per (run, query) -- so every later cycle of this run would
+                    # short-circuit on the same key and never ask that provider
+                    # again. A review that was never performed would be recorded
+                    # as one that found nothing, for the life of the run, and
+                    # the planner would read it as a fact about the literature.
+                    #
+                    # So it raises. The ledger records FAILED, which means "the
+                    # effect provably did not happen" -- true here, since no
+                    # request was issued -- and the queue retries after the
+                    # backoff the failure class carries.
+                    raise LiteratureDeferredError(
+                        "no literature provider could be asked for "
+                        f"{query!r}: " + _deferral_detail(report)
+                    )
                 return {
                     "query": query,
                     "work_keys": list(report.work_keys),
@@ -123,6 +194,22 @@ def search_literature(
                         outcome.provider: str(outcome.status)
                         for outcome in report.outcomes
                     },
+                    # `attempted` and `next_allowed_at` reach the record, so a
+                    # partial search says which providers were actually
+                    # consulted. Without them a deferred provider and a broken
+                    # one are indistinguishable downstream, which is the whole
+                    # distinction v1.1 added the field for.
+                    "deferred": {
+                        outcome.provider: outcome.next_allowed_at or "unknown"
+                        for outcome in report.outcomes
+                        if not outcome.attempted and not outcome.from_cache
+                    },
+                    "from_cache": sorted(
+                        outcome.provider
+                        for outcome in report.outcomes
+                        if outcome.from_cache
+                    ),
+                    "network_calls": report.network_calls,
                 }
 
             # Searching is replay-safe: asking a provider the same question
@@ -138,6 +225,22 @@ def search_literature(
             )
             work_keys.extend(outcome.result.get("work_keys", []))
             consulted.update(outcome.result.get("outcomes", {}))
+            deferred.update(outcome.result.get("deferred", {}))
+            cached.extend(outcome.result.get("from_cache", ()))
+            network_calls += int(outcome.result.get("network_calls", 0) or 0)
+    except LiteratureDeferredError as exc:
+        context.budgets.release_all(grants)
+        return ActionOutcome.failed(
+            str(exc),
+            # PROVIDER_RATE_LIMIT rather than PROVIDER_UNAVAILABLE: both retry
+            # after a backoff, and the rate-limit backoff is a minute rather
+            # than thirty seconds, which is closer to what a pacer that just
+            # refused us is asking for. The class is also the honest one -- a
+            # deferral is a rate limit we were told about before spending the
+            # request rather than after.
+            failure_class=FailureClass.PROVIDER_RATE_LIMIT,
+            data={"deferred": True},
+        )
     except ResearchOSError as exc:
         context.budgets.release_all(grants)
         return ActionOutcome.failed(
@@ -181,6 +284,13 @@ def search_literature(
         "sources_unavailable": sorted(
             name for name, status in consulted.items() if status != "ok"
         ),
+        # Separate from `sources_unavailable`, because they are separate facts
+        # and conflating them is what made a paced review look like an empty
+        # one: a deferred provider has told us when to come back, an
+        # unavailable one has not.
+        "sources_deferred": deferred,
+        "sources_from_cache": sorted(dict.fromkeys(cached)),
+        "network_calls": network_calls,
         "ingested": len(dict.fromkeys(work_keys)),
         "ranked": ranked,
     }

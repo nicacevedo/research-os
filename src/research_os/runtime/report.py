@@ -38,10 +38,12 @@ from typing import Any
 
 from research_os.runtime.checkpoints import checkpoint_sizes
 from research_os.runtime.db import Database
+from research_os.runtime.findings import RuntimeFinding
 from research_os.runtime.models import (
     Approval,
     BudgetRecord,
     Event,
+    ExperimentInterpretation,
     ExternalJob,
     ModelCall,
     ResearchRun,
@@ -369,6 +371,8 @@ def render_run_detail(
     jobs: tuple[ExternalJob, ...],
     calls: tuple[ModelCall, ...],
     budgets: tuple[BudgetRecord, ...],
+    findings: tuple[RuntimeFinding, ...] = (),
+    interpretations: tuple[ExperimentInterpretation, ...] = (),
 ) -> str:
     parts = [
         f"RUN {run.run_id}\n",
@@ -485,6 +489,54 @@ def render_run_detail(
                         str(budget.available),
                     )
                     for budget in budgets
+                ],
+            )
+        )
+
+    if findings:
+        # The chain a person traverses to answer "what is this resting on".
+        # Rendered before the events, because a reader looking at a proposal
+        # wants the grounding first and the operational log second.
+        parts.append("\nFINDINGS (noncanonical; nothing here is accepted science)\n")
+        parts.append(
+            _table(
+                ("finding", "kind", "summary", "rests on"),
+                [
+                    (
+                        finding.finding_id,
+                        str(finding.kind),
+                        _safe(finding.summary, limit=64),
+                        _safe(
+                            ", ".join(
+                                (
+                                    *finding.capsule_refs,
+                                    *finding.literature_keys,
+                                    *(item[:12] for item in finding.artifact_ids),
+                                )
+                            )
+                            or "-",
+                            limit=40,
+                        ),
+                    )
+                    for finding in findings
+                ],
+            )
+        )
+
+    if interpretations:
+        parts.append("\nINTERPRETATIONS\n")
+        parts.append(
+            _table(
+                ("interpretation", "job", "spec", "reader", "status"),
+                [
+                    (
+                        entry.interpretation_id,
+                        entry.job_id,
+                        entry.spec_digest[:12],
+                        _safe(entry.interpreter_version, limit=28),
+                        str(entry.status),
+                    )
+                    for entry in interpretations
                 ],
             )
         )
@@ -608,6 +660,51 @@ def render_costs(
             )
         )
     return "".join(parts)
+
+
+def render_findings(findings: tuple[RuntimeFinding, ...]) -> str:
+    """The findings a person traces a proposal back through.
+
+    The heading states what they are not, every time, because the one thing a
+    reader must not conclude from a table of scientific-sounding observations
+    with identifiers is that they are part of the project's record.
+    """
+
+    if not findings:
+        return "No runtime findings recorded.\n"
+    header = (
+        "RUNTIME FINDINGS -- noncanonical. Produced by autonomous cycles, "
+        "reviewed by nobody,\nand part of no project's scientific record. "
+        "They exist so a proposal can cite\nsomething auditable.\n\n"
+    )
+    return header + _table(
+        ("finding", "kind", "cycle", "summary", "rests on"),
+        [
+            (
+                finding.finding_id,
+                str(finding.kind),
+                "-" if finding.source_cycle is None else str(finding.source_cycle),
+                _safe(finding.summary, limit=60),
+                _safe(
+                    ", ".join(
+                        (
+                            *finding.capsule_refs,
+                            *finding.literature_keys,
+                            *(item[:12] for item in finding.artifact_ids),
+                            *(
+                                (finding.experiment_job_id,)
+                                if finding.experiment_job_id
+                                else ()
+                            ),
+                        )
+                    )
+                    or "-",
+                    limit=44,
+                ),
+            )
+            for finding in findings
+        ],
+    )
 
 
 def render_events(events: tuple[Event, ...]) -> str:

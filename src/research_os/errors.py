@@ -286,6 +286,20 @@ class ProposalNotFoundError(ProposalError):
     """Raised when a proposal id names no proposal directory."""
 
 
+class StaleProposalError(ProposalError):
+    """Raised when a proposal's scientific basis has changed since it was made.
+
+    A distinct class rather than a validation error, because the remedy is
+    different and a researcher reading the message needs to know which it is. A
+    validation error means the proposal is not a well-formed proposal. This
+    means it *was* one, about a state of the science that no longer obtains --
+    so the response is to regenerate it and let it be reassessed, not to fix it.
+
+    Never raised because the repository changed. Unrelated commits are not
+    staleness; only a change to the scientific objects the proposal cited is.
+    """
+
+
 class PromotionRefusedError(ProposalError):
     """Raised when a promotion would cross a boundary only a human may cross.
 

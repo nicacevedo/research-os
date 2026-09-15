@@ -42,9 +42,15 @@ from pathlib import Path
 from types import FrameType
 from typing import Any
 
-from research_os.errors import EXIT_ERROR, EXIT_OK, ResearchOSError
+from research_os.errors import (
+    EXIT_ERROR,
+    EXIT_OK,
+    CapsuleError,
+    ResearchOSError,
+)
 from research_os.runtime import checkpoints
 from research_os.runtime.budgets import BudgetLedger
+from research_os.runtime.capsulewatch import observed_digests
 from research_os.runtime.clock import Clock, SystemClock
 from research_os.runtime.config import RuntimeConfig, load_config, redact_dsn
 from research_os.runtime.cycles import (
@@ -91,6 +97,7 @@ class WorkKind:
     RUN_CYCLE = "run_cycle"
     RESUME_CYCLE = "resume_cycle"
     CONTINUE_OBJECTIVE = "continue_objective"
+    ADVANCE_OBJECTIVE = "advance_objective"
     POLL_EXTERNAL_JOBS = "poll_external_jobs"
     PRUNE_CHECKPOINTS = "prune_checkpoints"
     INTEGRITY_AUDIT = "integrity_audit"
@@ -103,6 +110,10 @@ EVENT_WORK: dict[str, str] = {
     "SCIENTIFIC_DECISION_RECORDED": WorkKind.RESUME_CYCLE,
     "EXTERNAL_JOB_FINISHED": WorkKind.RESUME_CYCLE,
     "RESEARCH_CYCLE_FINISHED": WorkKind.CONTINUE_OBJECTIVE,
+    # A person changed the canonical science. Not a resume -- the thread that
+    # was waiting has finished, and reviving it would be turning a bounded
+    # cycle into an immortal one. A *successor* cycle, with recorded lineage.
+    "CAPSULE_CHANGED": WorkKind.ADVANCE_OBJECTIVE,
 }
 
 #: Deliberately absent above: ``WORKER_RECOVERED``.
@@ -116,6 +127,24 @@ EVENT_WORK: dict[str, str] = {
 #: real resume events, which is the failure recorded in ``_dedup_key``. Removing
 #: the mapping fixes both: there is nothing to bound, and the key can go back to
 #: being per event.
+
+
+#: Which work kind runs which handler, by method name.
+#:
+#: Method *names* rather than bound methods so the table is a module constant a
+#: test can read. The previous version built the same mapping inside
+#: ``_run_item`` and a separate test listed the runnable kinds by hand -- so
+#: adding a kind meant editing two places, and forgetting the second one made a
+#: test fail for a reason unrelated to the defect it was written to catch.
+WORK_HANDLERS: dict[str, str] = {
+    WorkKind.RUN_CYCLE: "_work_run_cycle",
+    WorkKind.RESUME_CYCLE: "_work_resume_cycle",
+    WorkKind.CONTINUE_OBJECTIVE: "_work_continue_objective",
+    WorkKind.ADVANCE_OBJECTIVE: "_work_advance_objective",
+    WorkKind.POLL_EXTERNAL_JOBS: "_work_poll_jobs",
+    WorkKind.PRUNE_CHECKPOINTS: "_work_prune_checkpoints",
+    WorkKind.INTEGRITY_AUDIT: "_work_integrity_audit",
+}
 
 
 @dataclass
@@ -133,11 +162,14 @@ class TickReport:
     work_failed: int = 0
     leases_reclaimed: int = 0
     invocations_abandoned: int = 0
+    interpretations_abandoned: int = 0
     reservations_released: int = 0
     jobs_polled: int = 0
     schedules_fired: int = 0
     checkpoints_pruned: int = 0
     approvals_surfaced: int = 0
+    capsules_observed: int = 0
+    capsule_changes: int = 0
     notes: list[str] = field(default_factory=list)
 
     @property
@@ -149,11 +181,13 @@ class TickReport:
                 self.work_claimed,
                 self.leases_reclaimed,
                 self.invocations_abandoned,
+                self.interpretations_abandoned,
                 self.reservations_released,
                 self.jobs_polled,
                 self.schedules_fired,
                 self.checkpoints_pruned,
                 self.approvals_surfaced,
+                self.capsule_changes,
             )
         )
 
@@ -166,11 +200,14 @@ class TickReport:
             "work_failed": self.work_failed,
             "leases_reclaimed": self.leases_reclaimed,
             "invocations_abandoned": self.invocations_abandoned,
+            "interpretations_abandoned": self.interpretations_abandoned,
             "reservations_released": self.reservations_released,
             "jobs_polled": self.jobs_polled,
             "schedules_fired": self.schedules_fired,
             "checkpoints_pruned": self.checkpoints_pruned,
             "approvals_surfaced": self.approvals_surfaced,
+            "capsules_observed": self.capsules_observed,
+            "capsule_changes": self.capsule_changes,
             "notes": list(self.notes),
         }
 
@@ -197,6 +234,7 @@ class Daemon:
         "_maintenance_stamp",
         "_models",
         "_notifier",
+        "_observation_stamp",
         "_owner",
         "_queue",
         "_repo_for",
@@ -228,6 +266,7 @@ class Daemon:
         self._owner = owner or worker_identity()
         self._stopping = False
         self._maintenance_stamp: datetime | None = None
+        self._observation_stamp: datetime | None = None
 
     @property
     def owner(self) -> str:
@@ -246,10 +285,18 @@ class Daemon:
         claimed, or a restarting daemon picks up new work while old work sits
         stranded. Claiming comes last, so every pass leaves the system in a
         recovered state even if the worker then crashes.
+
+        Capsule observation comes second, before ingest, so that a scientific
+        change a person made becomes an event in the *same* pass that notices
+        it. Observing after ingest would mean every change waited a full tick
+        before anything looked at it, which is the kind of one-tick lag that is
+        invisible in tests and looks like "it did not work" to a researcher who
+        has just promoted something.
         """
 
         report = TickReport()
         self._recover(report)
+        self._observe_capsules(report)
         self._ingest_events(report)
         self._fire_schedules(report)
         self._poll_external_jobs(report)
@@ -362,6 +409,94 @@ class Daemon:
             older_than_seconds=max(3600, lease_grace)
         )
 
+        # A fourth orphan, with a fourth treatment: an interpretation whose
+        # reader stopped reporting. Marked ABANDONED and deliberately *not*
+        # deleted or re-claimed here. The row is the only thing that still holds
+        # "an interpretation of this experiment was begun", and the next
+        # attempt needs it to reconnect the artifact the dead reader may already
+        # have written. Deleting it would turn one interrupted reading into two
+        # scientific interpretations of one experiment.
+        stale = self._store.abandon_stale_interpretations(
+            older_than_seconds=lease_grace
+        )
+        report.interpretations_abandoned = len(stale)
+        for interpretation in stale:
+            report.notes.append(
+                f"interpretation {interpretation.interpretation_id} of "
+                f"{interpretation.job_id} was abandoned; the next cycle will "
+                f"resume it rather than start a second one"
+            )
+
+    # --------------------------------------------- capsule observation ----
+    def _observe_capsules(self, report: TickReport) -> None:
+        """Notice that a person changed the canonical science, and say so once.
+
+        This is the pass that removes the last piece of routine human
+        choreography. A researcher promotes a proposal with ``researchctl
+        propose promote``; nothing tells the runtime, by design, because the
+        alternative is a scientific kernel that depends on PostgreSQL and on a
+        daemon being up. So the runtime looks.
+
+        Paced by an in-process timestamp rather than a schedule row, exactly as
+        ``_maintain`` is and for the same reason: it works on a fresh database
+        with no seeding, and a first tick always observes.
+
+        A project whose repository has gone -- moved, deleted, on an unmounted
+        disk -- is noted and skipped rather than failing the pass. One
+        unreachable project must not stop the control plane observing the
+        others.
+        """
+
+        now = self._clock.now()
+        if (
+            self._observation_stamp is not None
+            and (now - self._observation_stamp).total_seconds()
+            < self._config.settings.capsule_observe_seconds
+        ):
+            return
+        self._observation_stamp = now
+
+        for project in self._store.list_projects():
+            try:
+                repo = self._repo_for(project.project_id)
+            except ResearchOSError as exc:
+                report.notes.append(
+                    f"cannot locate {project.project_id} to observe its capsule: {exc}"
+                )
+                continue
+            capsule, frontier = observed_digests(repo)
+            report.capsules_observed += 1
+            changed, previous_capsule, previous_frontier = self._store.observe_capsule(
+                project_id=project.project_id,
+                capsule_digest=capsule,
+                frontier_digest=frontier,
+            )
+            if not changed:
+                continue
+            report.capsule_changes += 1
+            # Exactly one event per (project, new digest). The dedup key is the
+            # mechanism; recording the previous digest in the payload is what
+            # makes "what changed" answerable afterwards from the event log
+            # alone.
+            self._store.record_event(
+                kind="CAPSULE_CHANGED",
+                project_id=project.project_id,
+                payload={
+                    "capsule_digest": capsule,
+                    "previous_capsule_digest": previous_capsule,
+                    "frontier_digest": frontier,
+                    "previous_frontier_digest": previous_frontier,
+                    "frontier_changed": frontier != (previous_frontier or ""),
+                },
+                dedup_key=f"capsule-changed:{project.project_id}:{capsule}",
+            )
+            LOG.info(
+                "%s: canonical scientific state changed (%s -> %s)",
+                project.project_id,
+                (previous_capsule or "none")[:12],
+                capsule[:12],
+            )
+
     # -------------------------------------------------------------- events --
     def _ingest_events(self, report: TickReport) -> None:
         """Turn unconsumed events into queued work.
@@ -458,6 +593,15 @@ class Daemon:
             # Per run: a run may have at most one successor, however many events
             # claim it finished -- and two once did.
             return f"{kind}:{event.run_id}"
+        if kind == WorkKind.ADVANCE_OBJECTIVE:
+            # Per project *and observed digest*. One scientific change produces
+            # at most one advance, however many times it is observed -- two
+            # daemons, or one daemon restarted between the observation and the
+            # ingest. Keyed on the digest rather than the project so that a
+            # *second*, later change is a second advance rather than being
+            # swallowed by the first one's key.
+            digest = str(event.payload.get("capsule_digest") or event.event_id)
+            return f"{kind}:{event.project_id}:{digest}"
         return f"{kind}:{event.event_id}"
 
     def _fire_schedules(self, report: TickReport) -> None:
@@ -587,14 +731,8 @@ class Daemon:
             self._run_item(item, report)
 
     def _run_item(self, item: WorkItem, report: TickReport) -> None:
-        handler = {
-            WorkKind.RUN_CYCLE: self._work_run_cycle,
-            WorkKind.RESUME_CYCLE: self._work_resume_cycle,
-            WorkKind.CONTINUE_OBJECTIVE: self._work_continue_objective,
-            WorkKind.POLL_EXTERNAL_JOBS: self._work_poll_jobs,
-            WorkKind.PRUNE_CHECKPOINTS: self._work_prune_checkpoints,
-            WorkKind.INTEGRITY_AUDIT: self._work_integrity_audit,
-        }.get(item.kind)
+        method = WORK_HANDLERS.get(item.kind)
+        handler = getattr(self, method) if method is not None else None
 
         if handler is None:
             self._queue.fail(
@@ -705,6 +843,22 @@ class Daemon:
             (ArtifactMissingError, FailureClass.ARTIFACT_MISSING),
             (UnreconciledInvocationError, FailureClass.WORKER_CRASH),
             (RoutingError, FailureClass.PROVIDER_UNAVAILABLE),
+            # Last, because several of the classes above are `CapsuleError`
+            # siblings rather than subclasses and the order of this tuple is
+            # first-match. A capsule that cannot be read is the most common
+            # genuinely-unclassified failure in this system: `kernel.frontier()`
+            # raises it, and the frontier is consulted at the start of every
+            # cycle. Without this it failed as UNKNOWN -- terminal, correctly,
+            # but reported as "something we have not classified" rather than
+            # "your capsule does not parse", which is a message a researcher can
+            # act on in a second.
+            #
+            # MISSING_SCIENTIFIC_AUTHORITY rather than a new class: the response
+            # is INTERRUPT_FOR_HUMAN, which is exactly right. A broken capsule is
+            # not something the runtime may repair -- that would be writing
+            # canonical scientific state -- so the only correct response is to
+            # stop and tell the person.
+            (CapsuleError, FailureClass.MISSING_SCIENTIFIC_AUTHORITY),
         )
         for kind, failure_class in mapping:
             if isinstance(exc, kind):
@@ -821,6 +975,116 @@ class Daemon:
             **self._cycle_result_payload(successor),
         }
 
+    def _work_advance_objective(self, item: WorkItem) -> dict[str, Any]:
+        """Continue a parked objective after a person changed the science.
+
+        The other half of §8, and the half that has to be careful. Its job is to
+        answer "does this scientific change give a parked objective something
+        new to do", and to answer it *no* whenever it can, because every yes
+        costs model calls.
+
+        Eligibility, all of which must hold:
+
+        1. the objective's latest cycle has **finished**. A cycle that is still
+           waiting on an approval is waiting for a different answer, and its
+           thread has a live interrupt in it -- opening a successor would leave
+           two threads for one objective. Those are woken by
+           ``SCIENTIFIC_DECISION_RECORDED``, not by this.
+        2. it has **no successor already**. Two observations of one change
+           cannot produce two cycles; the work item's dedup key makes that
+           unlikely and this makes it impossible.
+        3. the **frontier actually moved**. A capsule change that leaves the
+           unresolved work identical -- a charter rewrite, a sharpened
+           statement -- is recorded as an event and does not open a cycle,
+           because a successor over an identical frontier is the seven-cycle
+           pilot in ``docs/RUNTIME.md`` §16 all over again.
+        4. ``should_continue``'s own bounds permit it: lineage depth against
+           ``max_cycles_per_objective``, and the project budget.
+
+        A refusal returns why. "Nothing happened and the log says nothing" is
+        how the missing continuation looked from the outside before this
+        existed, and it is not an improvement to reproduce that with a
+        different cause.
+        """
+
+        project_id = item.project_id
+        digest = str(item.payload.get("capsule_digest") or "")
+        frontier = str(item.payload.get("frontier_digest") or "")
+        parked = self._store.parked_objectives(project_id=project_id)
+        if not parked:
+            return {
+                "advanced": False,
+                "reason": (
+                    "no objective for this project is parked waiting for a "
+                    "scientific decision"
+                ),
+                "capsule_digest": digest,
+            }
+
+        advanced: list[dict[str, Any]] = []
+        skipped: list[dict[str, str]] = []
+        for run in parked:
+            if frontier and run.frontier_digest and frontier == run.frontier_digest:
+                skipped.append(
+                    {
+                        "run_id": run.run_id,
+                        "reason": (
+                            "the canonical science changed but the unresolved "
+                            "frontier did not, so a successor cycle would "
+                            "recompute the same work and add no information"
+                        ),
+                    }
+                )
+                continue
+            previous = CycleResult(
+                run=run,
+                status=run.status,
+                terminal_state=run.terminal_state,
+                pending_approval_id=None,
+                # The recommendation `should_continue` needs. Supplied by this
+                # handler rather than read from the parked run, because the
+                # parked run's own recommendation was "stop, a person is
+                # needed" -- and a person has now acted. That is the whole
+                # point of this pass, and it is the one place the runtime
+                # overrides a previous cycle's conclusion. It is allowed to,
+                # because the thing the conclusion was waiting for happened.
+                recommendation="START_NEXT_CYCLE",
+                notes=(),
+                state={},
+            )
+            proceed, why = should_continue(
+                db=self._db, config=self._config, result=previous
+            )
+            if not proceed:
+                skipped.append({"run_id": run.run_id, "reason": why})
+                continue
+            successor = start_cycle(
+                config=self._config,
+                db=self._db,
+                project_id=project_id,
+                repo_path=self._repo_for(project_id),
+                objective=run.objective,
+                models=lambda successor_id: self._models(
+                    successor_id, project_id, item.work_id
+                ),
+                autonomy=Autonomy(str(run.autonomy)),
+                parent_run_id=run.run_id,
+                cycle_index=run.cycle_index + 1,
+            )
+            advanced.append(
+                {
+                    "parent_run_id": run.run_id,
+                    "successor_run_id": successor.run.run_id,
+                    **self._cycle_result_payload(successor),
+                }
+            )
+        return {
+            "advanced": bool(advanced),
+            "capsule_digest": digest,
+            "successors": advanced,
+            "skipped": skipped,
+        }
+
     def _work_poll_jobs(self, item: WorkItem) -> dict[str, Any]:
         report = TickReport()
         self._poll_external_jobs(report)
@@ -923,11 +1187,14 @@ def _accumulate(total: TickReport, report: TickReport) -> None:
         "work_failed",
         "leases_reclaimed",
         "invocations_abandoned",
+        "interpretations_abandoned",
         "reservations_released",
         "jobs_polled",
         "schedules_fired",
         "checkpoints_pruned",
         "approvals_surfaced",
+        "capsules_observed",
+        "capsule_changes",
     ):
         setattr(total, name, getattr(total, name) + getattr(report, name))
     total.notes.extend(report.notes)
@@ -961,12 +1228,46 @@ def default_model_factory(
     """Build a router per run, with whatever providers this machine has."""
 
     from research_os.automation.commands import provider_registry
+    from research_os.automation.config import load_config as load_automation_config
+    from research_os.automation.config import resolve_roles
+    from research_os.automation.providers import probe_registry
     from research_os.runtime.artifacts import FilesystemArtifactStore
     from research_os.runtime.routing import ModelRouter, profiles_from_adapters
 
     registry = dict(adapters) if adapters is not None else provider_registry()
     profiles = profiles_from_adapters(registry)
     store = RuntimeStore(db)
+
+    # The researcher's `automation.yaml` roles, resolved against the providers
+    # this machine actually has. Without this the runtime passed no `--model`
+    # and no `--effort` on any call, so the provider CLI's own default answered
+    # -- including for the three roles that map onto the v1 planner, whose
+    # default v1.1 changed from `sonnet` to `opus` on measured evidence.
+    #
+    # Failing softly is deliberate. `resolve_roles` raises when no provider is
+    # available at all, and a daemon that could not start because of it would be
+    # worse than one that runs with provider defaults: `runtime doctor` is where
+    # "you have no provider" belongs, and every model call will fail with its own
+    # clear message anyway.
+    role_settings: dict[str, Any] = {}
+    substitutions: tuple[str, ...] = ()
+    try:
+        automation_config = load_automation_config()
+        resolved = resolve_roles(automation_config, probe_registry(registry))
+        role_settings = dict(resolved.roles)
+        substitutions = resolved.substitutions
+    except ResearchOSError as exc:
+        LOG.warning(
+            "could not resolve the configured model roles, so every call will "
+            "use its provider's default model: %s",
+            exc,
+        )
+    for note in substitutions:
+        # Surfaced rather than swallowed: a researcher who configured a planner
+        # model on a provider this machine does not have gets the substitution
+        # said out loud, because the run report records the model that answered
+        # and not the alias that was asked for.
+        LOG.warning("model role substitution: %s", note)
 
     def build(run_id: str, project_id: str, work_id: str | None) -> ModelProvider:
         return ModelRouter(
@@ -978,6 +1279,8 @@ def default_model_factory(
             run_id=run_id,
             project_id=project_id,
             work_id=work_id,
+            role_settings=role_settings,
+            require_independence=config.settings.review_independence == "require",
         )
 
     return build

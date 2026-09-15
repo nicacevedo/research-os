@@ -38,6 +38,13 @@ from research_os.runtime.migrations import migrate
 RUNTIME_TABLES = (
     "artifact_links",
     "artifacts",
+    "capsule_observations",
+    "experiment_interpretations",
+    "runtime_nomination_links",
+    "runtime_proposal_links",
+    "runtime_proposal_reservations",
+    "runtime_finding_refs",
+    "runtime_findings",
     "approvals",
     "budget_reservations",
     "budgets",

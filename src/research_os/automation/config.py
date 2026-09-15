@@ -29,6 +29,7 @@ from research_os.errors import (
     ProviderUnavailableError,
 )
 from research_os.paths import config_home
+from research_os.sandbox import SandboxMode
 
 CONFIG_FILENAME = "automation.yaml"
 
@@ -165,6 +166,60 @@ def _default_roles() -> dict[str, RoleSetting]:
     }
 
 
+class SandboxSettings(BaseModel):
+    """Whether commands this system did not write run under OS containment.
+
+    Lives in ``automation.yaml`` rather than in ``runtime.yaml`` because the
+    exposure is the v1 coding pipeline's as much as the runtime's: ``researchctl
+    auto`` runs a project's acceptance commands after a write-enabled worker has
+    edited files in scope, and has always done so. The runtime's contribution is
+    that nobody decides to run it any more.
+
+    The default is ``preferred``: contain where the host can, run uncontained
+    and *record the absence* where it cannot. Not ``required``, because a
+    researcher at the keyboard on a host with no mechanism should get a run and
+    a clear note rather than a refusal -- and not ``off``, because the default
+    must be the safe one wherever safety is available.
+
+    High-autonomy runtime execution overrides this to ``required`` regardless.
+    That is the case the mode cannot be trusted to a default: nobody is
+    watching, and ``preferred`` there would mean model-written code running with
+    the researcher's credentials unattended.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: SandboxMode = SandboxMode.PREFERRED
+    network: bool = False
+    """Whether contained commands may reach the network.
+
+    A capability rather than a default. Most acceptance commands need no
+    network, a lock file exists so that dependency resolution does not, and a
+    command that silently fetches something is a command whose result is not
+    reproducible.
+    """
+
+    extra_readable: list[str] = Field(default_factory=list)
+    """Absolute paths a contained command may read, beyond the OS and its inputs.
+
+    For the shared caches a build needs -- a wheel cache, a dataset directory.
+    Declared by the researcher, in the config home, which is outside every
+    worktree: a write-enabled worker cannot reach this file to grant itself a
+    path.
+    """
+
+    @field_validator("extra_readable")
+    @classmethod
+    def _absolute_paths(cls, value: list[str]) -> list[str]:
+        relative = [item for item in value if not item.startswith("/")]
+        if relative:
+            raise ValueError(
+                "sandbox.extra_readable entries must be absolute paths; got "
+                + ", ".join(relative)
+            )
+        return value
+
+
 class ProjectSettings(BaseModel):
     """What a researcher has declared about one of their own projects.
 
@@ -211,6 +266,7 @@ class ConfigDocument(BaseModel):
     budget: Budget | None = None
     allowed_check_programs: list[str] | None = None
     projects: dict[str, ProjectSettings] = Field(default_factory=dict)
+    sandbox: SandboxSettings | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -223,6 +279,7 @@ class AutomationConfig:
     source: Path | None
     explicit_roles: frozenset[str]
     projects: dict[str, ProjectSettings] = dataclasses.field(default_factory=dict)
+    sandbox: SandboxSettings = dataclasses.field(default_factory=SandboxSettings)
 
     def role(self, name: str) -> RoleSetting:
         return self.roles[name]
@@ -248,6 +305,7 @@ def default_config() -> AutomationConfig:
         source=None,
         explicit_roles=frozenset(),
         projects={},
+        sandbox=SandboxSettings(),
     )
 
 
@@ -313,6 +371,7 @@ def load_config(path: Path | None = None) -> AutomationConfig:
         source=target,
         explicit_roles=frozenset(explicit),
         projects=dict(document.projects),
+        sandbox=document.sandbox or SandboxSettings(),
     )
 
 

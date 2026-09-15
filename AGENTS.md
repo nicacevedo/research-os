@@ -41,6 +41,20 @@ is policy, and it binds agents regardless of what the terminal permits. An agent
 may prepare evidence, draft findings text for a person to review and edit, and
 run every read-only command; it may not record the approval.
 
+The same boundary covers the two other places something can cross into science
+or into another project's reasoning:
+
+> Automated agents must not invoke `researchctl propose promote` or
+> `researchctl insight promote`, and must not respond to their confirmation
+> prompts on behalf of the researcher. An agent may *create* a proposal and a
+> nomination -- the autonomous runtime does both, constantly -- and neither is
+> scientific state. Promotion is what makes a proposal a capsule object and a
+> nomination knowledge other projects read, and both are human acts.
+
+Nothing under `research_os/runtime` imports `research_os.proposal.promote`, and
+`tests/test_runtime_authority.py` asserts that by parsing the package rather
+than by trusting this paragraph.
+
 ## Operating rules
 
 6. Git-tracked YAML and Markdown under a project's `.research/` directory are

@@ -29,6 +29,17 @@ the system lets it happen silently.
 An experiment that ran correctly and answered "no" has succeeded; nothing in
 this module can express it as a failure, because
 :class:`~research_os.runtime.failures.FailureClass` has no member for it.
+
+**An interpretation names the experiment it is of, durably.** Not "the job that
+finished most recently" -- which is what this module used to do, and which is
+association by temporal coincidence. Two jobs that finish while a cycle is
+planning gave the interpretation to whichever the scheduler reaped second; a
+job interpreted in one cycle was interpreted again in the next; and a reading
+could be compared against a preregistration belonging to a different
+experiment. :data:`INTERPRETER_VERSION` and the ``experiment_interpretations``
+relation replace all of that: the claim is durable, it is unique per
+``(job, interpreter version)``, and it carries the ``spec_digest`` so the
+binding to one frozen specification is a property of the row.
 """
 
 from __future__ import annotations
@@ -54,11 +65,26 @@ from research_os.runtime.failures import FailureClass
 from research_os.runtime.idempotency import idempotency_key
 from research_os.runtime.ids import new_external_job_id
 from research_os.runtime.interfaces import ExecutionSpec, ModelRequest
-from research_os.runtime.models import ExternalJobStatus
+from research_os.runtime.models import ExternalJobStatus, InterpretationStatus
 from research_os.runtime.prompts import EXPERIMENTALIST
 from research_os.runtime.routing import RoutingError
 
 LOG = logging.getLogger("research_os.runtime.actions.experiments")
+
+#: Which reader produced an interpretation, and therefore what counts as
+#: already-read.
+#:
+#: In the interpretation identity key rather than outside it, because
+#: changing how a result is read is a legitimate reason to read the same
+#: experiment again -- and the second reading is a *different*
+#: interpretation rather than a correction of the first. Both are kept, and
+#: a person can see that two readers disagreed.
+#:
+#: Bump this when the *comparison* changes: which criteria are consulted,
+#: how "ran correctly" is decided, what is written into the artifact. Do not
+#: bump it for a message, a log line or a refactor, because every bump
+#: re-reads every terminal job in every project.
+INTERPRETER_VERSION = "interpret_results@1"
 
 
 def declared_commands(context: CycleContext, project_id: str) -> dict[str, Any]:
@@ -700,26 +726,64 @@ def _preregistered_criteria(
     return None
 
 
-def _latest_finished_job(context: CycleContext, *, project_id: str) -> Any | None:
-    """The most recently finished job for this project, if any.
+def _eligible_job(context: CycleContext, *, project_id: str) -> Any | None:
+    """The terminal job this reader version still owes an interpretation.
 
-    Deliberately simple: "finished and most recent". A per-job interpreted flag
-    would be better bookkeeping and is the obvious next step; what matters here
-    is that the handler has a reachable input at all.
+    Oldest eligible first, and eligibility is "no *completed* interpretation at
+    :data:`INTERPRETER_VERSION`". Both halves matter and both replace something
+    that was wrong:
+
+    - the old query took ``order by finished_at desc limit 1``, so which
+      experiment was interpreted depended on the order two jobs happened to be
+      reaped in, and the same job was re-interpreted on every later cycle;
+    - excluding a job because *any* interpretation row exists would strand a job
+      whose reader crashed mid-reading, since that leaves ``IN_PROGRESS``.
+
+    The query lives in the store so the ordering and the ``not exists`` clause
+    are testable without a graph.
     """
 
-    with context.db.tx() as conn:
-        row = conn.execute(
-            """
-            select job_id from external_jobs
-            where project_id = %s
-              and status in ('COMPLETED','FAILED','TIMED_OUT','CANCELLED')
-            order by finished_at desc nulls last
-            limit 1
-            """,
-            (project_id,),
-        ).fetchone()
-    return context.store.get_external_job(str(row["job_id"])) if row else None
+    job = context.store.eligible_job_for_interpretation(
+        project_id=project_id, interpreter_version=INTERPRETER_VERSION
+    )
+    return job
+
+
+def _interpretation_record(
+    *,
+    job: Any,
+    criteria: Mapping[str, Any],
+    ran_correctly: bool,
+    interpretation_id: str,
+) -> dict[str, Any]:
+    """The bytes that constitute the interpretation.
+
+    Written to the artifact store before the interpretation is marked complete,
+    so a crash in that window leaves an artifact the recovery path can find and
+    reconnect rather than a claim with nothing behind it.
+
+    Deliberately contains no verdict sentence of its own. It records what ran,
+    what the criteria were, and whether the execution was valid. Whether the
+    criteria were *met* is what a person and the reviewer read the numbers for;
+    a machine-authored "the hypothesis is supported" in a durable artifact is
+    exactly the sentence that gets quoted later as though someone had checked
+    it.
+    """
+
+    return {
+        "interpretation_id": interpretation_id,
+        "interpreter_version": INTERPRETER_VERSION,
+        "job_id": job.job_id,
+        "executor": job.executor,
+        "scheduler_job_id": job.scheduler_job_id,
+        "spec_digest": job.spec_digest,
+        "run_dir": job.run_dir,
+        "status": str(job.status),
+        "exit_code": job.exit_code,
+        "ran_correctly": ran_correctly,
+        "criteria_were_fixed_before_results": True,
+        "criteria": dict(criteria),
+    }
 
 
 def interpret_results(
@@ -727,40 +791,66 @@ def interpret_results(
 ) -> ActionOutcome:
     """Compare the results to the criteria that were fixed before them.
 
-    Deterministic where it can be: whether the job completed, whether the
-    declared outputs exist, and what the prespecified criteria were. The
-    *reading* of a result is scientific judgement and goes through the reviewer
-    and then a person; what this does is establish the facts and refuse to let
-    the criteria move.
+    Deterministic where it can be: which experiment this is about, whether it
+    completed, and what the prespecified criteria were. The *reading* of a
+    result is scientific judgement and goes through the reviewer and then a
+    person; what this does is establish the facts, bind them to one experiment,
+    and refuse to let the criteria move.
 
     Both outcomes are ``ok=True``. An experiment that ran correctly and refuted
     its hypothesis has succeeded.
+
+    Crash-safety, in order, because the order is the property:
+
+    1. resolve *which* job -- explicit ``job_id`` beats selection;
+    2. claim ``(job, interpreter version)`` durably, before reading anything;
+    3. if that claim already exists and is ``COMPLETED``, return its artifact
+       and read nothing again;
+    4. retrieve the criteria from the stored preregistration, by spec digest;
+    5. write the artifact;
+    6. mark the claim complete.
+
+    A process that dies between 5 and 6 leaves an ``IN_PROGRESS`` claim and an
+    artifact. The next attempt re-derives the *same* artifact bytes -- the
+    inputs are the job row and the stored preregistration, both immutable -- so
+    the content-addressed store returns the same id, and step 6 attaches it to
+    the existing claim. One logical interpretation, one artifact, whatever the
+    process did.
     """
 
     previous = dict(state.get("action_result", {}).get("data") or {})
-    job_id = str(
+    project_id = str(state["project_id"])
+    requested = str(
         plan.get("parameters", {}).get("job_id") or previous.get("job_id") or ""
     )
-    if not job_id:
-        # Graph state does not cross a cycle boundary -- a successor is a new
-        # thread seeded only with identity -- and an experiment is almost always
-        # submitted in one cycle and finished by the time of the next. So the
-        # durable record answers "which job is there to interpret". Without
-        # this the handler was unreachable, and an independent review found that
-        # the pipeline could therefore write up results it had never compared
-        # against the criteria.
-        job = _latest_finished_job(context, project_id=str(state["project_id"]))
+
+    if requested:
+        # An explicitly named job takes precedence over any selection, and a
+        # name that does not resolve is an error rather than an invitation to
+        # pick something else. Interpreting a different experiment than the one
+        # the planner asked about is the failure this whole relation exists to
+        # prevent.
+        job = context.store.get_external_job(requested)
+        if job is None:
+            return ActionOutcome.failed(
+                f"no such job: {requested}",
+                failure_class=FailureClass.ARTIFACT_MISSING,
+            )
+        if str(job.project_id) != project_id:
+            return ActionOutcome.failed(
+                f"{requested} belongs to project {job.project_id}, not "
+                f"{project_id}; an experiment is never interpreted across a "
+                f"project boundary",
+                failure_class=FailureClass.POLICY_REFUSED,
+            )
+    else:
+        job = _eligible_job(context, project_id=project_id)
         if job is None:
             return ActionOutcome.succeeded(
                 "no finished experiment is waiting to be interpreted",
                 data={"interpreted": False},
             )
-    else:
-        job = context.store.get_external_job(job_id)
-        if job is None:
-            return ActionOutcome.failed(
-                f"no such job: {job_id}", failure_class=FailureClass.ARTIFACT_MISSING
-            )
+
     if job.status not in {
         ExternalJobStatus.COMPLETED,
         ExternalJobStatus.FAILED,
@@ -770,6 +860,33 @@ def interpret_results(
         return ActionOutcome.failed(
             f"{job.job_id} is {job.status}; there is nothing to interpret yet",
             failure_class=FailureClass.SCHEDULER_UNAVAILABLE,
+        )
+
+    claim, created = context.store.claim_interpretation(
+        job_id=job.job_id,
+        project_id=project_id,
+        spec_digest=job.spec_digest,
+        interpreter_version=INTERPRETER_VERSION,
+        run_id=str(state["run_id"]),
+    )
+    if not created and claim.status is InterpretationStatus.COMPLETED:
+        # Already read, by this reader version. Return what was concluded
+        # rather than concluding it again: a second reading of one experiment
+        # is a second scientific interpretation, and two of them is how a
+        # project ends up with a result it can quote twice.
+        return ActionOutcome.succeeded(
+            f"{job.job_id} was already interpreted as {claim.interpretation_id}",
+            data={
+                "interpreted": True,
+                "reused": True,
+                "interpretation_id": claim.interpretation_id,
+                "job_id": claim.job_id,
+                "spec_digest": claim.spec_digest,
+                "interpreter_version": claim.interpreter_version,
+                "artifact_id": claim.artifact_id,
+                "status": str(job.status),
+                "exit_code": job.exit_code,
+            },
         )
 
     ran_correctly = (
@@ -782,7 +899,7 @@ def interpret_results(
     # `criteria_were_fixed_before_results: True` while reporting none of them,
     # which is the one claim in this handler that must never be made loosely.
     criteria = _preregistered_criteria(
-        context, digest=job.spec_digest, project_id=str(state["project_id"])
+        context, digest=job.spec_digest, project_id=project_id
     )
     if criteria is None and previous.get("success_criteria"):
         criteria = {
@@ -797,13 +914,39 @@ def interpret_results(
         # interpretation problem to paper over: without the criteria there is
         # nothing to compare against, and claiming they were fixed beforehand
         # would be asserting exactly what cannot be shown.
+        #
+        # The claim row is left `IN_PROGRESS` rather than completed. This job is
+        # still owed an interpretation -- the missing preregistration is the
+        # thing to fix -- and marking it read would hide that permanently.
         return ActionOutcome.failed(
             f"no preregistration found for {job.job_id} (spec "
             f"{job.spec_digest[:12]}), so there are no prespecified criteria to "
             f"compare the result against",
             failure_class=FailureClass.ARTIFACT_MISSING,
-            data={"interpreted": False, "job_id": job.job_id},
+            data={
+                "interpreted": False,
+                "job_id": job.job_id,
+                "interpretation_id": claim.interpretation_id,
+            },
         )
+
+    record = _interpretation_record(
+        job=job,
+        criteria=criteria,
+        ran_correctly=ran_correctly,
+        interpretation_id=claim.interpretation_id,
+    )
+    ref = context.artifacts.put_text(
+        json.dumps(record, indent=2, sort_keys=True, ensure_ascii=False),
+        media_type="application/json",
+        role=f"interpretation:{job.job_id}",
+        producer=INTERPRETER_VERSION,
+    )
+    completed = context.store.complete_interpretation(
+        claim.interpretation_id,
+        artifact_id=ref.artifact_id,
+        detail=f"{job.status}, exit {job.exit_code}",
+    )
 
     return ActionOutcome.succeeded(
         (
@@ -814,6 +957,10 @@ def interpret_results(
         ),
         data={
             "interpreted": True,
+            "reused": False,
+            "interpretation_id": completed.interpretation_id,
+            "interpreter_version": INTERPRETER_VERSION,
+            "artifact_id": completed.artifact_id,
             "job_id": job.job_id,
             "status": str(job.status),
             "exit_code": job.exit_code,
@@ -825,4 +972,5 @@ def interpret_results(
             **criteria,
             "criteria_were_fixed_before_results": True,
         },
+        artifacts=(ref,),
     )

@@ -135,3 +135,78 @@ suite keeps off your machine:
 
 Experiment commands live in `~/.config/research-os/experiments.yaml`,
 deliberately outside every worktree, so no model-written file can add one.
+
+## The autonomous runtime
+
+`docs/RUNTIME.md` is the specification. What an operator needs day to day:
+
+```bash
+# is this host able to run the runtime, and what is it missing?
+researchctl runtime doctor
+
+# a disposable local PostgreSQL, no root and no container runtime
+researchctl runtime dev-db start
+researchctl runtime migrate          # idempotent; safe at every startup
+
+# one pass of the control plane, which is what a test or a cron entry wants
+researchd --once
+
+# the loop
+researchd                            # or `researchctl runtime daemon`
+```
+
+`deploy/researchd.service` is a systemd **user** unit. It ships as a file and
+nothing in this repository enables it; installing it is a decision an operator
+makes.
+
+### Migrations
+
+Forward-only numbered SQL under `research_os/runtime/sql/`, applied under an
+advisory lock, with each applied file's checksum stored. All pending files run
+in one transaction, so a failure in the third leaves the database at the version
+it started from. `migrate()` is called at every startup and finds nothing to do
+when there is nothing to do.
+
+Editing a migration that has already been applied is an error at startup rather
+than a difference between two machines nobody notices. Add a new one.
+
+```bash
+researchctl runtime migrate          # apply what is pending
+researchctl runtime doctor           # reports the applied version and any gap
+```
+
+`tests/test_runtime_schema.py` asserts that the migrations compose from an
+*empty* database as well as applying as upgrades, that the declared
+`RUNTIME_SCHEMA_VERSION` matches the highest file, and that every status
+constraint in SQL agrees with its Python enum.
+
+### What doctor tells you that status does not
+
+`runtime status` is about work: what is running, waiting and failed. `runtime
+doctor` is about *capability*, and it exits zero for an absent one:
+
+```text
+database        configured, reachable, and at which schema version
+actions         how many policy actions have no handler in this build
+tiers           that provider tiers are configured, not measured
+roles           which model actually answers each role, and any substitution
+independence    whether a second provider family exists at all
+sandbox         whether model-written code can be contained here, and why not
+checks          whether a declared check profile is being ignored by a runtime cycle
+```
+
+### After a crash
+
+Nothing to do. The next pass of the control plane recovers expired leases,
+flags stale invocations for reconciliation, releases stale budget reservations
+and abandons stale experiment interpretations, and it does that *before* it
+claims anything new. If the daemon was not running, start it; recovery is the
+first thing a pass does.
+
+What is worth looking at afterwards:
+
+```bash
+researchctl runtime status            # anything stuck in WAITING or FAILED
+researchctl runtime events            # the operational log, newest first
+researchctl runtime run <RRUN-...>    # one cycle: work, findings, jobs, spend
+```

@@ -71,6 +71,79 @@ def test_no_runtime_module_writes_a_human_review() -> None:
     )
 
 
+def test_no_runtime_module_promotes_a_proposal() -> None:
+    """The runtime may *create* a proposal. It may never promote one.
+
+    This is the boundary ``propose_capsule_change`` is built around and the one
+    a future convenience would erode first, because promoting the proposal the
+    runtime just wrote is the obvious next step and it is the step that would
+    give the runtime scientific authority.
+
+    ``research_os.proposal.promote`` is the one door between proposed work and a
+    project's scientific record. Nothing under ``research_os/runtime`` may
+    import it or call either of its two functions.
+    """
+
+    forbidden = {"write_promotion", "prepare_promotion"}
+    offenders: list[str] = []
+    for path in _runtime_sources():
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.ImportFrom)
+                and node.module == "research_os.proposal.promote"
+            ):
+                offenders.append(
+                    f"{path.name}:{node.lineno}: imports research_os.proposal.promote"
+                )
+            if isinstance(node, ast.Call):
+                name = getattr(node.func, "id", None) or getattr(
+                    node.func, "attr", None
+                )
+                if name in forbidden:
+                    offenders.append(f"{path.name}:{node.lineno}: calls {name}()")
+    assert offenders == [], (
+        "the runtime must never promote a proposal into a capsule: "
+        + "; ".join(offenders)
+    )
+
+
+def test_the_proposal_action_writes_no_capsule_file() -> None:
+    """Asserted structurally, because the handler's whole job is near the line.
+
+    ``propose_capsule_change`` reads a capsule through the kernel adapter and
+    writes a proposal outside every project. What it must not contain is any
+    path that opens a file for writing under a project, so the AST is checked
+    for a write-mode ``open`` and for the kernel writers, rather than trusting
+    that the current implementation happens not to.
+    """
+
+    path = RUNTIME_DIR / "actions" / "proposals.py"
+    assert path.is_file(), "the proposal action module has moved"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        # The builtin, by bare name only. `ProposalStore.open` is an attribute
+        # call with the same spelling and is exactly what this module *should*
+        # be doing, so matching on the name alone would flag the reconciler.
+        if isinstance(node.func, ast.Name) and node.func.id == "open":
+            offenders.append(f"{node.lineno}: calls the builtin open()")
+        if isinstance(node.func, ast.Attribute) and node.func.attr in {
+            "write_text",
+            "write_bytes",
+            "mkdir",
+            "unlink",
+            "rmtree",
+        }:
+            offenders.append(f"{node.lineno}: calls {node.func.attr}()")
+    assert offenders == [], (
+        "the proposal action must not touch the filesystem itself; every write "
+        "belongs to the v1 proposal store: " + "; ".join(offenders)
+    )
+
+
 def test_no_runtime_module_reimplements_the_acceptance_rule() -> None:
     """There must be exactly one definition of what "accepted" means.
 

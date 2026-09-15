@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import json
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -65,11 +65,13 @@ from research_os.proposal.assessor import (
     build_assessment_prompt,
     parse_assessment,
 )
+from research_os.proposal.basis import referenced_object_ids, scientific_basis
 from research_os.proposal.context import build_science_context, render_science_context
 from research_os.proposal.models import (
     ProposalAssessment,
     ProposalGrounding,
     ResearchProposal,
+    SuppliedFinding,
 )
 from research_os.proposal.planner import (
     PROPOSAL_SCHEMA,
@@ -78,9 +80,15 @@ from research_os.proposal.planner import (
     build_proposal_prompt,
     grounding_violations,
     parse_proposal,
+    render_supplied_findings,
+    supplied_findings_digest,
     validate_proposal,
 )
-from research_os.proposal.store import ProposalStore, make_proposal_id
+from research_os.proposal.store import (
+    PROPOSAL_ID_RE,
+    ProposalStore,
+    make_proposal_id,
+)
 
 PROPOSAL_TIMEOUT_SECONDS = 900
 ASSESSMENT_TIMEOUT_SECONDS = 600
@@ -107,6 +115,14 @@ MAX_MODEL_CALLS = 4
 #: repeatedly until it happens to produce something that passes, which is how a
 #: gate stops meaning anything.
 MAX_GROUNDING_CORRECTIONS = 1
+
+#: The most findings one caller may supply as grounding for one proposal.
+#:
+#: Twelve, matching :data:`research_os.proposal.planner.MAX_ITEMS`, for the
+#: reason that constant gives: a list a researcher cannot read in one sitting
+#: is a list they will skim, and a skimmed grounding allowlist is how an
+#: ungrounded proposal gets promoted.
+MAX_SUPPLIED_FINDINGS = 12
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,6 +151,13 @@ class ProposalOutcome:
     literature_keys: tuple[str, ...] = ()
     invocations: list[ModelInvocation] = field(default_factory=list)
     grounding_correction: GroundingCorrection | None = None
+    adopted: bool = False
+    """True when a reserved id already named a proposal and it was reused.
+
+    Reported rather than hidden, because "a proposal was produced" and "a
+    proposal produced by an earlier attempt was found" are different facts and
+    the model calls this run spent differ between them.
+    """
 
     @property
     def model_calls(self) -> int:
@@ -159,6 +182,8 @@ class ProposalController:
         retrieve: bool = False,
         assess: bool = True,
         max_model_calls: int | None = None,
+        findings: Sequence[SuppliedFinding] = (),
+        proposal_id: str = "",
     ) -> ProposalOutcome:
         """Produce one proposal, and make every failure say what it cost.
 
@@ -180,6 +205,8 @@ class ProposalController:
                 assess=assess,
                 max_model_calls=max_model_calls,
                 invocations=spent,
+                findings=tuple(findings),
+                proposal_id=proposal_id,
             )
         except (ProposalError, ProviderInvocationError) as failure:
             failure.model_calls = len(spent)
@@ -195,6 +222,8 @@ class ProposalController:
         assess: bool,
         max_model_calls: int | None,
         invocations: list[ModelInvocation],
+        findings: tuple[SuppliedFinding, ...] = (),
+        proposal_id: str = "",
     ) -> ProposalOutcome:
         """Produce one proposal for ``goal`` against ``project_path``.
 
@@ -208,6 +237,27 @@ class ProposalController:
         correction is an ordinary model call, so whether one can be afforded is
         the caller's question, not this controller's. ``None`` means only this
         controller's own :data:`MAX_MODEL_CALLS` applies.
+
+        ``findings`` are observations the caller supplies as grounding. They
+        become three things at once, and it has to be all three or none: the
+        contents of a fenced data block in the prompt, the ``finding_ids`` half
+        of the grounding allowlist the validator checks every citation against,
+        and ``supplied_findings`` on the stored proposal so a reader months
+        later can see what each cited id said. Supplying the block without the
+        allowlist would show a worker identifiers it is then refused for citing;
+        supplying the allowlist without the block would permit citations to
+        text nobody can read. Bounded by
+        :data:`MAX_SUPPLIED_FINDINGS`.
+
+        ``proposal_id`` lets a caller decide this proposal's identity *before*
+        calling, which is what closes the crash window for a caller that runs
+        inside a resuming runtime. Creating the proposal directory is an
+        externally visible effect, so a caller that learns the id only from the
+        return value has an interval -- the whole of this method -- in which a
+        crash leaves a directory it cannot find again, and a retry mints a
+        second proposal for one logical decision. With a reserved id the retry
+        computes the same id, and the caller's reconciler finds the directory.
+        The default is the derived id, unchanged.
         """
 
         if max_model_calls is not None:
@@ -224,11 +274,38 @@ class ProposalController:
         base_commit = head_commit(root) if has_commits(root) else None
         resolved = self._resolve_roles()
 
+        if len(findings) > MAX_SUPPLIED_FINDINGS:
+            raise ProposalValidationError(
+                f"a proposal may be grounded in at most {MAX_SUPPLIED_FINDINGS} "
+                f"supplied findings; this one was given {len(findings)}. More "
+                f"than that is not grounding, it is a corpus, and a worker "
+                f"handed a corpus of identifiers cites from it decoratively"
+            )
+        supplied_ids = [item.finding_id for item in findings]
+        if len(set(supplied_ids)) != len(supplied_ids):
+            raise ProposalValidationError(
+                "the same finding was supplied twice: "
+                + ", ".join(
+                    sorted({x for x in supplied_ids if supplied_ids.count(x) > 1})
+                )
+            )
+
+        findings_digest = supplied_findings_digest(findings)
+
         context = build_science_context(root)
         created_at = utc_now()
-        proposal_id = make_proposal_id(
-            project_path=str(root), goal=goal, created_at=created_at
-        )
+        reserved = bool(proposal_id)
+        if proposal_id:
+            if PROPOSAL_ID_RE.fullmatch(proposal_id) is None:
+                raise ProposalValidationError(
+                    f"reserved proposal id {proposal_id!r} is not a proposal id; a "
+                    f"caller reserving one must mint it with "
+                    f"`proposal.store.reserved_proposal_id`"
+                )
+        else:
+            proposal_id = make_proposal_id(
+                project_path=str(root), goal=goal, created_at=created_at
+            )
 
         pending: list[tuple[str, str]] = []
         literature_data: str | None = None
@@ -246,11 +323,19 @@ class ProposalController:
         grounding = ProposalGrounding(
             capsule_ids=list(context.object_ids),
             literature_keys=list(literature_keys),
-            finding_ids=[],
+            # Exactly what was supplied, and nothing else. The allowlist is
+            # computed here rather than taken from the worker, which is the
+            # property that makes a citation to an unavailable finding fail
+            # validation in precisely the way one to an unavailable capsule
+            # object or literature key does.
+            finding_ids=list(supplied_ids),
         )
         setting = self._setting(resolved, "planner", Role.PLANNER)
         prompt = build_proposal_prompt(
-            goal=goal, context=context, literature_data=literature_data
+            goal=goal,
+            context=context,
+            literature_data=literature_data,
+            findings_data=render_supplied_findings(findings) or None,
         )
         self._assert_affordable(invocations, max_model_calls, "the proposal worker")
         invocation, result = self._invoke(
@@ -271,7 +356,7 @@ class ProposalController:
             payload = extract_json_object(result.text)
 
         def _parse(candidate: dict | None, source: ModelInvocation) -> ResearchProposal:
-            return parse_proposal(
+            parsed = parse_proposal(
                 structured=candidate,
                 text=result.text if candidate is payload else None,
                 proposal_id=proposal_id,
@@ -283,6 +368,27 @@ class ProposalController:
                 provider=setting.provider,
                 model=source.model or setting.model,
                 invocation_id=source.invocation_id,
+                supplied_findings=findings,
+            )
+            # The basis is snapshotted *after* parsing, because what it
+            # snapshots is the objects the proposal's items turned out to cite,
+            # not the whole set the worker was shown. Snapshotting the offered
+            # set would make any change anywhere in the capsule invalidate
+            # every waiting proposal, which is the over-broad check this
+            # replaces. Recorded by reconstructing the proposal rather than
+            # mutating it: the model is frozen, and a basis attached after
+            # validation is a basis the validator never saw.
+            return parsed.model_copy(
+                update={
+                    "scientific_basis": scientific_basis(
+                        referenced_object_ids(parsed),
+                        root=root,
+                        project_id=context.project_id,
+                        literature_keys=literature_keys,
+                        finding_packet_digest=findings_digest,
+                        include_charter=bool(context.charter),
+                    )
+                }
             )
 
         correction: GroundingCorrection | None = None
@@ -318,7 +424,32 @@ class ProposalController:
                 )
             )
 
-        store = ProposalStore.create(proposal)
+        # A reserved id may already name a directory a previous attempt created
+        # before it crashed. Adoption returns that proposal unchanged rather
+        # than a second one; a derived id is new by construction and still
+        # refuses an existing directory.
+        if reserved:
+            store, created = ProposalStore.adopt_or_create(proposal)
+            if not created:
+                adopted = store.load()
+                store.append_event(
+                    "proposal_adopted",
+                    reason=(
+                        "a previous attempt had already created this reserved "
+                        "proposal; returning it rather than creating a second"
+                    ),
+                )
+                return ProposalOutcome(
+                    store=store,
+                    proposal=adopted,
+                    assessment=store.load_assessment(),
+                    literature_keys=literature_keys,
+                    invocations=invocations,
+                    grounding_correction=correction,
+                    adopted=True,
+                )
+        else:
+            store = ProposalStore.create(proposal)
         store.append_event(
             "proposal_created",
             project_path=str(root),

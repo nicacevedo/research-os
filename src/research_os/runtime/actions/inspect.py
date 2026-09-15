@@ -1,10 +1,19 @@
-"""Read-only actions: inspection, validation, frontier assessment, index repair.
+"""Read-only actions: inspection, validation and frontier assessment.
 
 Every action here is `A0`: it changes nothing a person would have to undo, and
 none of it calls a model. That last part is invariant 1 in practice -- the
 frontier is the single most consulted piece of derived state in the system, and
 it is computed by ordinary Python from Git-tracked files, so it costs nothing
 and two cycles that disagree about it are disagreeing about the files.
+
+The literature index rebuild deliberately does **not** live here, although
+``FailureClass.DERIVED_INDEX_CORRUPT`` is an inspection-shaped problem. It lives
+in :mod:`research_os.runtime.actions.literature`, beside the store it rebuilds and
+the only module that knows how to open one. A copy did exist here, was never
+registered, called ``LiteratureStore()`` -- whose constructor requires a
+connection -- and would therefore have raised ``TypeError`` past the
+``except ResearchOSError`` that was meant to catch it. It was removed rather than
+repaired.
 """
 
 from __future__ import annotations
@@ -20,7 +29,6 @@ from research_os.errors import ResearchOSError
 from research_os.runtime.actions.base import ActionOutcome
 from research_os.runtime.context import CycleContext
 from research_os.runtime.failures import FailureClass
-from research_os.runtime.locks import derived_index_lock
 
 LOG = logging.getLogger("research_os.runtime.actions.inspect")
 
@@ -136,37 +144,4 @@ def assess_frontier(
         "the frontier is empty" if frontier.empty else f"{total} open items",
         data=payload,
         artifacts=(ref,),
-    )
-
-
-def rebuild_derived_index(
-    state: Mapping[str, Any], context: CycleContext, plan: Mapping[str, Any]
-) -> ActionOutcome:
-    """Rebuild the literature index from the store it is derived from.
-
-    The response to ``FailureClass.DERIVED_INDEX_CORRUPT``, and safe precisely
-    because the index is derived: losing it loses no science, and rebuilding it
-    cannot damage any. Serialised by an advisory lock so two workers do not
-    rebuild it at once.
-    """
-
-    try:
-        from research_os.literature.store import LiteratureStore
-    except ResearchOSError as exc:  # pragma: no cover - import-time only
-        return ActionOutcome.failed(
-            f"literature layer unavailable: {exc}",
-            failure_class=FailureClass.CODE_EXCEPTION,
-        )
-    try:
-        with derived_index_lock(context.db, "literature"):
-            store = LiteratureStore()
-            rebuilt = store.reindex() if hasattr(store, "reindex") else None
-    except ResearchOSError as exc:
-        return ActionOutcome.failed(
-            f"could not rebuild the literature index: {exc}",
-            failure_class=FailureClass.DERIVED_INDEX_CORRUPT,
-        )
-    return ActionOutcome.succeeded(
-        "literature index rebuilt",
-        data={"rebuilt": rebuilt if rebuilt is not None else True},
     )

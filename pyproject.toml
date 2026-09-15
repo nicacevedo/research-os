@@ -32,6 +32,11 @@ build-backend = "uv_build"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Registered so an unknown-marker warning never hides a real one, and declared
+# here rather than in a conftest so `pytest --markers` lists it.
+markers = [
+    "slurm_live: runs against a real Slurm cluster. Deselected by default; enable with RESEARCH_OS_SLURM_LIVE=1 and `-m slurm_live`.",
+]
 
 [tool.ruff]
 target-version = "py312"

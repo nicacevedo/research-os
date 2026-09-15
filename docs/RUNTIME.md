@@ -71,7 +71,24 @@ research_os/runtime/
   idempotency.py    the invocation ledger
   locks.py          advisory locks for repository/capsule/index mutation
   failures.py       the failure taxonomy and its retry policy
+  findings.py       typed, citable, noncanonical runtime findings
+  capsulewatch.py   noticing that a person changed the canonical science
 ```
+
+Two modules that are *not* here and belong to the v1 layers on purpose:
+
+```text
+research_os/sandbox.py          OS-level containment for commands we did not write
+research_os/proposal/basis.py   what a proposal rested on, and whether it still holds
+```
+
+The sandbox is a command runner's concern, and both the v1 coding pipeline and
+the runtime's local executor go through it; putting it under
+``research_os/runtime`` would have contained the autonomous path and left
+``researchctl auto`` -- which has always run a project's acceptance commands --
+uncontained. The proposal basis is scientific-object reasoning, and keeping it
+out of ``promote.py`` preserves "nothing imports the one door except the command
+a person runs".
 
 Dependency direction, enforced by `tests/test_runtime_layering.py`:
 
@@ -247,7 +264,9 @@ sleeps only when a pass found nothing to do.
 The pass order is deliberate:
 
 ```text
-recover   expired leases, stale invocations, stale reservations
+recover   expired leases, stale invocations, stale reservations,
+          stale experiment interpretations
+observe   each project's capsule digest -> CAPSULE_CHANGED when it moved
 ingest    unconsumed events -> queued work
 schedule  due schedules -> events (never work directly)
 poll      external jobs -> reconciled status, and an event when finished
@@ -259,13 +278,25 @@ Recovery comes first so a restarting daemon cannot pick up new work while old
 work sits stranded. Claiming comes last so every pass leaves the system
 recovered even if the worker then dies.
 
+Observation comes second, before ingest, so a scientific change a person just
+made becomes an event in the *same* pass that notices it. Observing after
+ingest would make every change wait a full tick -- invisible in a test, and
+indistinguishable from "it did not work" to a researcher who has just promoted
+something. It is paced by ``capsule_observe_seconds`` (30 by default) rather
+than run on every pass, because hashing a capsule is cheap and not free.
+
 **It calls no model.** That is how invariant 2 survives a background process
 existing, and `tests/test_runtime_daemon.py` asserts it by parsing `daemon.py`
 for a `complete` call. Frontier reasoning happens inside a claimed work item
 against a reserved budget, never in the scheduler.
 
-**The event-to-work table** is twelve lines in `daemon.py`, so "why did this
-run" is answerable by reading it. One subtlety: the continuation work item's
+**The event-to-work table** is a handful of lines in `daemon.py`, so "why did
+this run" is answerable by reading it. The dispatch from a work *kind* to the
+method that runs it is a module constant beside it, for a reason worth
+recording: the two used to be separate -- a mapping built inside ``_run_item``
+and a test listing the runnable kinds by hand -- so adding a kind meant editing
+two places, and forgetting the second made a test fail for a reason unrelated to
+the defect it was written to catch. One subtlety: the continuation work item's
 dedup key is per *run*, not per event, because a run may have at most one
 successor however many events claim it finished — and during the first real
 end-to-end run, two did.
@@ -314,6 +345,34 @@ records what it *achieved*. On a machine with one provider family, a review is
 recorded as `DEGRADED ... This is not independent review.` and the note reaches
 the run report.
 
+**And it can be required.** `review_independence` in `runtime.yaml`:
+
+| value | behaviour |
+|---|---|
+| `prefer` | the default. Strongest separation available, degradation recorded |
+| `require` | a `CRITICAL` request that cannot get a different family **fails** |
+
+`require` fails closed into `WAITING_FOR_EXTERNAL_DEPENDENCY`, not into an
+error: no amount of retrying produces a second provider family, so the honest
+terminal state is "the runtime did everything it could and what is missing is
+something you install". It binds on `CRITICAL` work only -- making it bind on a
+literature extraction would stop a run for a reason that has nothing to do with
+review independence.
+
+`prefer` is right for a one-family machine and `require` is right for a
+deployment that has configured two and wants a missing one to be an outage
+rather than a silent downgrade. **This build has one family**, so under the
+final high-autonomy profile `require` would refuse every critical review here;
+that is a genuine external prerequisite and `runtime doctor` says so.
+
+**Tier is configured priority, not measured performance.** Every available
+provider is assumed tier 3; a researcher who knows better sets one. So "answered
+at tier 3" means the configuration permitted it, and not that anyone
+benchmarked it. The distinction is stated by `runtime doctor` as well as here,
+rather than fixed by building a benchmark: a generalised model-benchmarking
+platform is a research project of its own, and nothing has yet demonstrated a
+routing failure that would justify it.
+
 Every call is recorded: provider, the model that actually answered, role,
 criticality, independence group, prompt version, the hash of the prompt, the
 hash of the raw output, tokens, cost, latency, status — for failures too.
@@ -345,6 +404,7 @@ researchctl runtime approve <id>  / decline <id>
 researchctl runtime jobs          external jobs
 researchctl runtime costs         what has been spent, and what is left
 researchctl runtime events        the operational event log
+researchctl runtime findings      what the runtime observed, and what each rests on
 researchctl runtime doctor        whether the runtime can run here
 ```
 
@@ -353,11 +413,24 @@ a model or a fetched document passes through `research_os.textsafe` on the way
 to a terminal, with newlines and tabs stripped too — a table cell is not a place
 for either.
 
+`runtime findings` prints a heading saying what a finding is *not*, every time
+it renders. A table of scientific-sounding statements with identifiers is
+exactly what a reader might mistake for a project's record, and the identifiers
+make that mistake easier rather than harder.
+
 `runtime doctor` follows `researchctl doctor`'s contract: an absent capability
-is a WARN and exits zero. It also reports how many policy actions have no
-handler in this build, so the gap between "the authority rules know about this"
-and "this build can do it" is visible rather than discovered when a planner
-picks one.
+is a WARN and exits zero. It reports:
+
+- how many policy actions have no handler in this build -- currently none, so
+  the gap between "the authority rules know about this" and "this build can do
+  it" is closed and the line says so rather than disappearing;
+- which model actually answers each role, and any substitution, because the
+  provenance records the model the *provider* named rather than the alias that
+  was asked for, so a substitution cannot be spotted from the ledger alone;
+- that tiers are configured rather than measured;
+- whether containment works here, with the probe's own reason and the remedy;
+- whether any project declares `check_profiles` that a runtime coding cycle
+  does not yet honour (§17).
 
 ## 14. Getting a database
 
@@ -373,6 +446,326 @@ researchctl runtime doctor
 
 `dev-db` is `pgserver`, a dev-group wheel containing a PostgreSQL binary
 distribution. The runtime only ever sees a DSN and never imports it.
+
+## 14a. Closing the loop: finding -> proposal -> person -> successor cycle
+
+The property this release exists for, and the one the first pilot did not have.
+R5 shipped with the frontier-unchanged stop, and `docs/R5_BUILD_RECORD.md` §8
+was explicit that it was a mitigation rather than a solution: the runtime could
+not change the frontier its own planning was derived from, because it could not
+write a capsule and had no way to *ask* for one to be written.
+
+It now has one, and the loop has five links.
+
+```text
+1. a runtime finding          FIND-...   typed, digested, noncanonical
+2. a grounded proposal        PROP-...   cites finding ids; validated against them
+3. WAITING_FOR_SCIENTIFIC_DECISION       the cycle concludes; nobody is blocked
+4. the researcher promotes               `researchctl propose promote` -- interactive
+5. researchd observes, and a successor cycle opens
+```
+
+### 1. Runtime findings
+
+`research_os/runtime/findings.py`. A finding is "this runtime observed this,
+produced by this action, in this cycle, resting on these artifacts". It has no
+status a person could accept, no acceptance rule, never reaches `.research/`,
+and participates in no scientific digest.
+
+What it buys is auditable grounding. The v1 proposal grounding allowlist has
+always had a `finding_ids` field and has always refused a citation to an id it
+was not given -- and nothing ever supplied one, so an autonomous result reached
+the proposal layer as prose concatenated into the natural-language `goal`. "What
+is this proposal resting on" was answerable only by reading a model's sentence.
+Now:
+
+```text
+proposed scientific change
+  -> proposal item        cites finding_id, checked against the allowlist
+  -> runtime finding       runtime_findings
+  -> artifact / capsule object / literature key / experiment job
+  -> bytes, by content hash
+```
+
+Findings are **immutable and deduplicated by content**. The digest excludes the
+run and the cycle deliberately: the runtime recomputes an unchanged frontier on
+every cycle, and a cycle index in the digest would mint seven citable
+identifiers for one fact -- the seven-cycle pilot in §16, one layer down.
+
+A finding's `summary` is untrusted text. It reaches a prompt behind
+`RUNTIME_FINDING_FENCE` and a terminal through `research_os.textsafe`, and
+`tests/test_runtime_proposals.py` attempts the obvious attack: a finding that
+closes its own fence and declares a new citable identifier. The delimiters are
+inert, and the allowlist is controller-authored text outside every fence, so a
+worker that obeys the injected instruction is refused by the validator.
+
+### 2. `propose_capsule_change`, and why it is thin
+
+It delegates to the v1 `ProposalController`. That controller already does the
+authority-preserving path -- deterministic grounding validation, one bounded
+grounding correction that is a constant rather than a parameter, one independent
+assessment, a store outside every project, and a human promotion that produces a
+*draft* and nothing stronger. A second proposal engine behind a nicer interface
+would be a second set of grounding bugs.
+
+What the runtime adds is what the v1 layer cannot know about:
+
+| addition | why |
+|---|---|
+| grounding in runtime findings | the allowlist had the field and nothing supplied it |
+| a reserved proposal identity | `make_proposal_id` is deterministic in project, goal and *second*, and a retry does not reproduce the second |
+| immutable links to the findings | so the chain above is traversable from the database rather than from prose |
+
+The handler writes no capsule file, does not import
+`research_os.proposal.promote`, authors no Review, accepts no Claim, and changes
+no scientific status. `tests/test_runtime_authority.py` asserts all of that by
+parsing the package, including that the module makes no filesystem write of its
+own.
+
+### 3. Replay safety, and the key that makes it work
+
+The reservation key is `propose_capsule_change:<run>:<cycle>` and nothing else.
+Two things about that are deliberate, and the second was a bug in the first
+version.
+
+**Nothing per-attempt**, because keying on anything a retry does not reproduce
+yields a ledger that records every duplicate faithfully and prevents none.
+
+**Nothing that can change between attempts either.** The first version included
+the grounding digest. A crashed attempt is retried after the daemon has ticked,
+a tick can record new findings, the digest would differ, the key would differ,
+the reserved id would differ, and the reconciler would find no proposal and
+create a second one for the same decision. The grounding digest belongs in the
+proposal's *basis snapshot*, where changing it is supposed to be detected.
+
+`tests/test_runtime_proposals.py` kills a real process between the proposal
+being written and the ledger recording it, asserts that a retry *before*
+recovery refuses -- an `IN_FLIGHT` row means "someone may still be doing this"
+-- and then runs the daemon's own recovery pass and asserts the retry adopts the
+existing proposal and asks no model.
+
+### 4. Stale scientific basis
+
+A proposal is asynchronous: written by one bounded run, promoted by a person,
+possibly much later. In between, the canonical science can move.
+
+`research_os/proposal/basis.py` snapshots what the proposal actually cited: the
+project identity, each referenced object's status and project-scoped
+`subject_digest`, each one's schema version, the charter when the proposal was
+grounded in it, and the digest of the supplied findings. Before a promotion is
+offered or executed, it is recomputed.
+
+Two decisions worth stating:
+
+**Not the repository HEAD.** `base_commit` is on the proposal and comparing it
+was the obvious check and the wrong one. A proposal is about scientific objects,
+and failing it because somebody fixed a typo in the README would teach a
+researcher to click past the warning. `tests/test_runtime_proposals.py` commits
+an unrelated README change and asserts the basis is still fresh.
+
+**Status is in the basis, and the kernel's semantic digest excludes it.** Both
+are right and they answer different questions. `semantic_projection` leaves
+`status` out so a Review does not go stale when an object is moved
+administratively -- the science it reviewed is unchanged. A *proposal's* premise
+is the opposite: "this project has an open question about X" stops being true
+the moment that Question is answered, and the Question's statement does not move
+when it is.
+
+A stale basis raises `StaleProposalError`, names what changed, and points at
+regeneration. `--accept-stale-basis` exists for the researcher who has read the
+change and decided it does not affect the item; it is reachable only from the
+interactive command, and the CLI prints what changed before offering it.
+
+A proposal written before basis snapshots existed reports `checkable=False`
+rather than `fresh`, because reporting it as fresh would assert a check that
+never ran.
+
+### 5. Automatic continuation
+
+Human scientific *authority* is intentional and stays. Human *choreography* is
+not, and was the last piece of routine orchestration in the system. Before this,
+the researcher promoted a proposal and then had to type a continue command,
+because nothing told the runtime.
+
+**The direction of the dependency is the design.** The obvious fix is for the
+promotion command to notify the runtime, and that would make the scientific
+kernel depend on PostgreSQL and on a daemon being up -- which invariant 7 and §2
+both forbid, and which would mean a researcher could not promote anything while
+the database was down. So the kernel is not changed at all. The runtime
+*observes*.
+
+`research_os/runtime/capsulewatch.py` computes two digests from one read:
+
+| digest | over | answers |
+|---|---|---|
+| `capsule_digest` | every object's id, status and `subject_digest`, plus the charter and state documents | did the canonical science change at all |
+| `frontier_digest` | the unresolved work, the existing function | is there different work to do |
+
+The first decides whether to **emit**; the second decides whether to **act**. A
+charter rewrite is recorded and opens no cycle, because a successor over an
+identical frontier is the seven-cycle pilot again.
+
+`capsule_observations` is a compare-and-set target, serialised by `select ...
+for update` on the project's own row. The first observation is deliberately not
+a change: the runtime has no idea whether what it is looking at is new, and
+treating "I have never looked" as "a person just changed something" would open a
+successor cycle on every fresh database.
+
+`CAPSULE_CHANGED` is deduplicated per `(project, new digest)` -- per digest
+rather than per project, so a *second* change is a second advance rather than
+being swallowed by the first one's key.
+
+The successor is a **new cycle with recorded lineage**, never a revival of the
+parked thread. Eligibility requires all of:
+
+1. the objective's latest cycle has **finished**. One still holding a live
+   interrupt is waiting for a different answer and is woken by
+   `SCIENTIFIC_DECISION_RECORDED`;
+2. it has **no successor already**;
+3. the **frontier actually moved**;
+4. `should_continue`'s own bounds permit it -- lineage depth against
+   `max_cycles_per_objective`, and the project budget. `BUDGET_EXHAUSTED` is
+   deliberately not eligible: the science moving does not create budget.
+
+A refusal records why. "Nothing happened and the log says nothing" is how the
+missing continuation looked from the outside, and reproducing that with a
+different cause would not be an improvement.
+
+## 14b. Which experiment an interpretation is of
+
+`interpret_results` used to answer "which experiment" with `order by finished_at
+desc limit 1`. That is association by temporal coincidence, and invariant 11 --
+every experiment traceable to code, configuration, data and version -- is not
+satisfied by a scientific reading attached to whichever job the scheduler
+happened to reap last. Three things went wrong with it, and all three were
+reachable:
+
+- two jobs finishing while a cycle plans gave the interpretation to whichever
+  row came back first;
+- a job interpreted in cycle 3 was interpreted again in cycle 4, because nothing
+  recorded that it had been;
+- a result could be compared against a preregistration belonging to a different
+  experiment.
+
+`experiment_interpretations` replaces it:
+
+```text
+interpretation_id  job_id  project_id  run_id  work_id
+spec_digest        interpreter_version  artifact_id
+status             detail  created_at   completed_at
+UNIQUE (job_id, interpreter_version)
+```
+
+`interpreter_version` is *inside* the identity key, because changing how a
+result is read is a legitimate reason to read the same experiment again -- and
+the second reading is a different interpretation rather than a correction of the
+first. Both are kept, so a person can see that two readers disagreed.
+
+Selection is **oldest eligible first**, where eligible means "terminal, and no
+*completed* interpretation at this reader version". Oldest-first is a stable
+total order (ties broken by `job_id`) over a set that only grows at one end, so
+two workers asking at the same time get the same answer and a backlog drains in
+the order it formed. Excluding a job because *any* row exists would strand one
+whose reader crashed mid-reading.
+
+The order of operations is the crash-safety property:
+
+```text
+1. resolve which job      an explicit job_id beats selection, and a name that
+                          does not resolve is an error, not an invitation to
+                          pick something else
+2. claim (job, version)   durably, before reading anything
+3. if already COMPLETED   return its artifact; read nothing again
+4. criteria                from the stored preregistration, by spec digest
+5. write the artifact
+6. mark the claim complete
+```
+
+A process that dies between 5 and 6 leaves an `IN_PROGRESS` claim and an
+artifact. The next attempt re-derives the *same* artifact bytes -- the inputs
+are the job row, the stored preregistration and the claim's own id, all
+immutable -- so the content-addressed store returns the same id and step 6
+attaches it to the existing claim. One logical interpretation, one artifact,
+whatever the process did.
+`tests/test_runtime_interpretation.py` proves it with a real process killed by
+`os._exit` inside that window.
+
+A missing preregistration leaves the claim `IN_PROGRESS` rather than completing
+it. The job is still owed a reading; marking it read would hide the missing
+preregistration permanently.
+
+The daemon's recovery pass marks long-running claims `ABANDONED` and
+deliberately does not delete or re-claim them: the row is the only record that a
+reading of this experiment was begun, and the next attempt needs it to reconnect
+the artifact.
+
+## 14c. Containment
+
+`SECURITY.md` and §16 have always said the coding pipeline is not an OS sandbox.
+`research_os/sandbox.py` is the abstraction that fixes that where a host allows
+it, and reports honestly where it does not.
+
+**One place, two questions.** `probe()` says which technology this host can
+actually provide; `contain(argv, spec=..., mode=...)` returns the argv that runs
+a command inside it. No sandbox-specific flag appears anywhere else, which is
+what makes it replaceable -- the day rootless Podman is available, a backend is
+added there and no handler changes.
+
+**Deny by default.** A contained command gets its worktree read-write, the
+explicit inputs it was given read-only, an isolated `/tmp` with a throwaway
+`HOME`, and a read-only operating system. It gets no home directory, no SSH
+keys, no SSH agent, no Git credentials, no provider credentials, no unrelated
+environment and no network. Network is a capability the caller asks for.
+
+**Three modes, and the third one is not a courtesy.**
+
+| mode | behaviour |
+|---|---|
+| `required` | contained or not run |
+| `preferred` | contained where possible; the absence recorded on every command result |
+| `off` | not contained, by a deliberate configured choice |
+
+`sandbox.mode` in `automation.yaml` sets it, default `preferred`.
+**High-autonomy runtime execution overrides it to `required`** -- for the
+coding pipeline and for local experiments -- because there nobody is watching,
+and `preferred` there would mean model-written code running with the
+researcher's credentials unattended.
+
+**Both command runners go through it.** `automation/checks.py`'s
+`run_acceptance_command` is the choke point for the coding pipeline, and it is
+shared with `researchctl auto`, so containment lands on the path a person has
+always been able to run as well as the autonomous one. `runtime/executors.py`'s
+`LocalExecutor` contains declared experiment commands. Every `CommandResult`
+carries `contained` and `containment`: "the tests passed" and "the tests passed
+inside a sandbox" are different facts about a run.
+
+**It refuses to pretend, and that is the load-bearing property.** Two
+measurements from this build's host:
+
+- `bwrap` is installed and **cannot contain anything here**. Ubuntu 24.04 ships
+  `kernel.apparmor_restrict_unprivileged_userns=1`, so a non-setuid `bwrap` gets
+  a user namespace it has no capabilities in and fails at the uid map. The
+  binary is present, `--version` works, and it isolates nothing. So the probe
+  *runs* the technology rather than looking for its file.
+- `systemd-run --user -P -p ProtectHome=tmpfs -p PrivateNetwork=yes` starts the
+  unit successfully and the contained process **sees the real home directory and
+  the real network**. The user manager's namespacing needs the same user
+  namespaces the kernel is refusing, and it does not fail the unit when it
+  cannot get them. That backend is therefore never selected. It is probed and
+  reported so that nobody wires it up believing the directives bind.
+
+`bwrap --unshare-user-try` is exactly the same shape and is deliberately not
+used: a containment that reports success without containing is worse than none,
+because the second is a known risk and the first is a wrong belief that
+decisions get made on.
+
+So on this host, containment is **unavailable**, high-autonomy execution of
+model-written code is **refused**, and the canonical-state fingerprint from §16
+remains as defence in depth -- it still detects a capsule or Git-ref change
+after the fact, it still prevents nothing, and it still sees nothing that
+happens outside the repository. `tests/test_sandbox.py` runs the policy and
+argv tests everywhere and skips the ten escape attempts with the probe's exact
+reason, which is the release evidence rather than a coverage gap.
 
 ## 15. What the runtime cannot do
 

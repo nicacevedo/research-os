@@ -16,7 +16,12 @@ from typing import Any
 import pytest
 
 from research_os.runtime.clock import FrozenClock
-from research_os.runtime.daemon import EVENT_WORK, Daemon, WorkKind
+from research_os.runtime.daemon import (
+    EVENT_WORK,
+    WORK_HANDLERS,
+    Daemon,
+    WorkKind,
+)
 from research_os.runtime.db import Database
 from research_os.runtime.failures import FailureClass
 from research_os.runtime.models import (
@@ -103,15 +108,23 @@ def plane(runtime_db: Database, pg_dsn: str, tmp_path: Path) -> dict[str, Any]:
 def test_every_mapped_event_names_a_work_kind_the_daemon_can_run() -> None:
     """A mapping to a kind with no handler would queue work nobody can do."""
 
-    known = {
-        WorkKind.RUN_CYCLE,
-        WorkKind.RESUME_CYCLE,
-        WorkKind.CONTINUE_OBJECTIVE,
-        WorkKind.POLL_EXTERNAL_JOBS,
-        WorkKind.PRUNE_CHECKPOINTS,
-        WorkKind.INTEGRITY_AUDIT,
-    }
-    assert set(EVENT_WORK.values()) <= known
+    assert set(EVENT_WORK.values()) <= set(WORK_HANDLERS)
+
+
+def test_every_runnable_work_kind_has_a_method_that_exists() -> None:
+    """The dispatch table names methods; a typo in one is a work item nobody runs.
+
+    Read from the module constant rather than from a hand-written list, so
+    adding a work kind cannot make this test fail for a reason unrelated to the
+    defect it catches -- which is what the previous version of it did.
+    """
+
+    missing = [
+        f"{kind} -> {method}"
+        for kind, method in WORK_HANDLERS.items()
+        if not hasattr(Daemon, method)
+    ]
+    assert missing == [], "; ".join(missing)
 
 
 def test_an_unconsumed_event_becomes_queued_work(plane: dict[str, Any]) -> None:

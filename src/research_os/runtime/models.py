@@ -21,6 +21,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from research_os.runtime.findings import FindingKind
+
 
 class RunStatus(StrEnum):
     """Where a bounded research cycle is.
@@ -136,6 +138,25 @@ TERMINAL_JOB_STATUSES: frozenset[ExternalJobStatus] = frozenset(
         ExternalJobStatus.TIMED_OUT,
     }
 )
+
+
+class InterpretationStatus(StrEnum):
+    """Where one experiment interpretation is.
+
+    ``ABANDONED`` rather than ``FAILED``, deliberately, and for the same reason
+    the invocation ledger draws that distinction: a reading whose worker died
+    leaves a row whose *outcome* is unknown, and the recovery for that is to
+    look at what was actually produced -- the artifact -- rather than to assume
+    nothing happened and read the experiment a second time.
+
+    There is no status here for "the experiment refuted its hypothesis". An
+    experiment that ran correctly and answered no has been interpreted
+    successfully; the answer is in the artifact, not in this column.
+    """
+
+    IN_PROGRESS = "IN_PROGRESS"
+    COMPLETED = "COMPLETED"
+    ABANDONED = "ABANDONED"
 
 
 class BudgetScope(StrEnum):
@@ -309,6 +330,34 @@ class ExternalJob(_Record):
     finished_at: datetime | None
 
 
+class ExperimentInterpretation(_Record):
+    """One reading of one experiment, bound to the exact spec that produced it.
+
+    ``spec_digest`` is copied here at claim time rather than read through
+    ``job_id`` when needed. That is not denormalisation for speed: it is what
+    makes "this interpretation is of *that* frozen specification" a fact about
+    this row, so a later correction to the job record cannot silently re-point
+    a scientific reading at a different experiment.
+    """
+
+    interpretation_id: str
+    job_id: str
+    project_id: str
+    run_id: str | None = None
+    work_id: str | None = None
+    spec_digest: str
+    interpreter_version: str
+    artifact_id: str | None = None
+    status: InterpretationStatus
+    detail: str | None = None
+    created_at: datetime
+    completed_at: datetime | None = None
+
+    @property
+    def complete(self) -> bool:
+        return self.status is InterpretationStatus.COMPLETED
+
+
 class ArtifactRecord(_Record):
     artifact_id: str
     size_bytes: int
@@ -384,4 +433,8 @@ ENUM_CONSTRAINTS: dict[str, frozenset[str]] = {
     "external_jobs_status_ck": frozenset(s.value for s in ExternalJobStatus),
     "budgets_scope_ck": frozenset(s.value for s in BudgetScope),
     "budget_reservations_status_ck": frozenset(s.value for s in ReservationStatus),
+    "experiment_interpretations_status_ck": frozenset(
+        s.value for s in InterpretationStatus
+    ),
+    "runtime_findings_kind_ck": frozenset(s.value for s in FindingKind),
 }

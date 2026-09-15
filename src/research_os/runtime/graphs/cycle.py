@@ -63,7 +63,7 @@ from research_os.runtime.idempotency import (
     UnreconciledInvocationError,
     idempotency_key,
 )
-from research_os.runtime.interfaces import ArtifactRef, ModelRequest
+from research_os.runtime.interfaces import ArtifactRef, Independence, ModelRequest
 from research_os.runtime.kernel import Frontier, ScientificAuthorityError
 from research_os.runtime.models import TerminalState
 from research_os.runtime.policy import (
@@ -77,6 +77,7 @@ from research_os.runtime.policy import (
 )
 from research_os.runtime.prompts import PLANNER, SCIENTIFIC_REVIEWER
 from research_os.runtime.registry import ACTION_HANDLERS, ActionOutcome
+from research_os.runtime.routing import IndependenceUnavailableError
 
 LOG = logging.getLogger("research_os.runtime.graphs.cycle")
 
@@ -438,6 +439,23 @@ def review(state: CycleState, runtime: Runtime[CycleContext]) -> dict[str, Any]:
                 json_schema=SCIENTIFIC_REVIEWER.output_schema,
             )
         )
+    except IndependenceUnavailableError as exc:
+        # Required independence could not be obtained. Not a skipped review and
+        # not a failure of this cycle's work: the runtime did everything it
+        # could and what is missing is a provider family the researcher
+        # installs. That is precisely
+        # WAITING_FOR_EXTERNAL_DEPENDENCY, and recording it as anything else
+        # would send the researcher looking for a defect.
+        return {
+            "terminal_state": str(TerminalState.WAITING_FOR_EXTERNAL_DEPENDENCY),
+            "next_recommendation": "BLOCKED",
+            "review": {
+                "verdict": "cannot_assess",
+                "error": str(exc),
+                "independence": str(Independence.NONE),
+            },
+            "notes": note(state, f"review requires independence it cannot get: {exc}"),
+        }
     except BudgetExhaustedError as exc:
         return {"notes": note(state, f"review skipped: {exc}")}
 
@@ -755,7 +773,34 @@ def conclude(state: CycleState, runtime: Runtime[CycleContext]) -> dict[str, Any
 
     frontier = context.kernel.frontier()
     digest = frontier_digest(frontier)
+    result = state.get("action_result") or {}
+    data = dict(result.get("data") or {})
     check = state.get("check_result") or {}
+
+    if data.get("requires_human_promotion"):
+        # This cycle produced a proposal. The honest terminal state is not
+        # DONE_FOR_NOW: the runtime has done everything it is allowed to do and
+        # what remains is a person's scientific decision about what it wrote.
+        #
+        # It matters operationally as well as descriptively. `DONE_FOR_NOW`
+        # would put this run among the ones a capsule change may advance --
+        # which is correct -- but it would say "finished" to a researcher
+        # reading `runtime status`, when the accurate word is "waiting for you".
+        # The recommendation is WAIT_HUMAN, so `should_continue` opens no
+        # successor: the frontier cannot have changed, because a proposal is not
+        # canonical science. What moves this objective forward is the person
+        # promoting it, and `_observe_capsules` noticing that they did.
+        return {
+            "frontier_digest": digest,
+            "terminal_state": str(TerminalState.WAITING_FOR_SCIENTIFIC_DECISION),
+            "next_recommendation": "WAIT_HUMAN",
+            "notes": note(
+                state,
+                "concluded: a proposal is waiting for your decision -- "
+                + str(data.get("follow_up") or "see `researchctl propose list`"),
+            ),
+        }
+
     if not check.get("passed", True):
         return {
             "frontier_digest": digest,

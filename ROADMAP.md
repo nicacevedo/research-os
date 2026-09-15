@@ -88,6 +88,29 @@ person performs; the runtime prepares the decision and hands over the command.
 
 Still not started, and not part of R5: MCP, a UI, containers.
 
+### R5 integration — in progress
+
+`integration/autonomous-runtime-vnext` converges the v1.1 autonomy line with
+R5, which were siblings on v1.0.0 rather than a chain, and closes the loop R5
+shipped without: runtime findings, a grounded `propose_capsule_change`, a
+durable experiment-interpretation identity, protection against promoting onto a
+stale scientific basis, automatic continuation after a human scientific change,
+and `nominate_insight`. Every action in the policy table now has a handler or is
+one a person performs. `docs/INTEGRATION_BUILD_RECORD.md` is the record and
+`docs/RUNTIME.md` §14a–§14c the specification.
+
+Two things it could not verify here, both genuine external prerequisites rather
+than defects:
+
+- **no Slurm.** No `sbatch`, `squeue`, `sacct`, config or `munge` on this host,
+  so the submission path has still never met a scheduler. The live harness is
+  `tests/test_experiment_slurm_live.py`, behind `-m slurm_live`.
+- **no OS containment.** `research_os/sandbox.py` implements it and this
+  kernel refuses the unprivileged user namespaces every available mechanism
+  needs, so high-autonomy execution of model-written code is *refused* here
+  rather than run uncontained. `runtime doctor` reports the probe and the
+  remedy.
+
 ## Postponed until a later release proves them necessary
 
 Docker, Podman, Apptainer, vector databases, MCP, PaperQA, local LLMs, Ollama,

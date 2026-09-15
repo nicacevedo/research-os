@@ -360,6 +360,10 @@ ROLE_PERMISSIONS: dict[ModelRole, frozenset[Permission]] = {
     ModelRole.REFEREE: frozenset(),
     ModelRole.EXTRACTOR: frozenset(),
     ModelRole.FRONTIER: frozenset({Permission.READ_REPO}),
+    # Nothing. It reads findings that were handed to it and answers one
+    # question about them; it has no business reaching a repository, and
+    # the knowledge it judges is about to be offered to *other* projects.
+    ModelRole.NOMINATOR: frozenset(),
 }
 
 #: What the runtime may hold at each configured autonomy setting. The *setting*

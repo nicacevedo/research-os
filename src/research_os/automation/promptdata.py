@@ -235,6 +235,24 @@ RESULT_FENCE = DataFence(
     end="----- END EXPERIMENT RESULT (QUOTED OUTPUT) -----",
 )
 
+#: What the autonomous runtime observed, quoted into a proposal prompt.
+#:
+#: Distinct from :data:`ANALYST_FENCE`, which says "another worker in this
+#: system said this about your code". This one says "an autonomous cycle
+#: observed this, here is its id, cite it by that id". The distinction matters
+#: at the boundary because the proposal worker is being invited to *rest a
+#: scientific proposal on* the contents -- which is the strongest thing any
+#: fenced block in this system is used for, and therefore the one where a
+#: forged section would do the most damage.
+#:
+#: What a finding's text may not do is change what may be cited. The allowlist
+#: of citable identifiers is controller-authored text outside every fence, for
+#: the same reason the grounding-correction prompt keeps it there.
+RUNTIME_FINDING_FENCE = DataFence(
+    begin="----- BEGIN RUNTIME FINDINGS (UNTRUSTED AUTONOMOUS OUTPUT) -----",
+    end="----- END RUNTIME FINDINGS (UNTRUSTED AUTONOMOUS OUTPUT) -----",
+)
+
 #: Every fence the controller generates.
 #:
 #: One tuple, because :data:`ALL_DELIMITERS` is derived from it and that is what
@@ -257,6 +275,7 @@ FENCES: tuple[DataFence, ...] = (
     FRONTIER_FENCE,
     PROPOSAL_FENCE,
     RESULT_FENCE,
+    RUNTIME_FINDING_FENCE,
 )
 
 #: Every delimiter, longest first, so a delimiter that contains another is

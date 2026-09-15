@@ -24,6 +24,37 @@ invocation. That protects the scientific record from an ordinary mistake. It
 does not confine a process: the worktree is an ordinary directory on the same
 filesystem, with the same user, the same network, and the same environment.
 
+**There is now an OS sandbox, and whether it works is a property of your host.**
+`research_os/sandbox.py` runs commands this repository did not write inside
+OS-level containment: the worktree read-write, declared inputs read-only, an
+isolated `/tmp` with a throwaway `HOME`, a read-only operating system, and no
+home directory, SSH keys, SSH agent, Git credentials, provider credentials,
+unrelated environment or network. Network is a capability, not a default.
+
+Three modes, set by `sandbox.mode` in `automation.yaml`:
+
+| mode | behaviour |
+|---|---|
+| `required` | contained or not run |
+| `preferred` | *default.* Contained where possible; the absence recorded on every command result |
+| `off` | not contained, by a deliberate configured choice |
+
+**High-autonomy runtime execution overrides this to `required`.** Unattended
+execution of model-written code with the researcher's credentials is the
+exposure this exists for, and `preferred` there would be a default that quietly
+permits it.
+
+**And it refuses to claim containment it does not have.** The probe *runs* each
+technology rather than looking for its binary, because the interesting failure
+is invisible to `which`: on Ubuntu 24.04 and later,
+`kernel.apparmor_restrict_unprivileged_userns` is 1 by default, so a non-setuid
+`bwrap` gets a user namespace it has no capabilities in and isolates nothing --
+and `systemd-run --user` accepts `ProtectHome` and `PrivateNetwork`, starts the
+unit, and lets the process see the real home directory and the real network.
+Neither is used on such a host. `researchctl runtime doctor` reports what was
+probed, what happened, and the remedy. Where nothing works, high-autonomy
+execution is refused and the fingerprint check below is all that remains.
+
 **Project code executes with your Unix permissions.** Two paths run code this
 repository did not write:
 

@@ -127,6 +127,18 @@ def add_runtime_parser(subparsers: argparse._SubParsersAction) -> None:
     costs.add_argument("--run", dest="run_id", default=None)
     costs.add_argument("--json", action="store_true")
 
+    findings = actions.add_parser(
+        "findings",
+        help=(
+            "Noncanonical runtime findings, and what each one rests on. "
+            "Nothing here is accepted science."
+        ),
+    )
+    findings.add_argument("--project", help="Only this project.")
+    findings.add_argument("--run", dest="run", help="Only this cycle.")
+    findings.add_argument("--limit", type=int, default=40)
+    findings.add_argument("--json", action="store_true")
+
     events = actions.add_parser("events", help="The operational event log.")
     events.add_argument("--run", dest="run_id", default=None)
     events.add_argument("--project", default=None)
@@ -168,6 +180,7 @@ def dispatch(args: argparse.Namespace) -> int:
         "decline": _decline,
         "jobs": _jobs,
         "costs": _costs,
+        "findings": _findings,
         "events": _events,
         "cancel": _cancel,
         "doctor": _doctor,
@@ -330,6 +343,8 @@ def _run_show(args: argparse.Namespace) -> int:
         jobs = store.list_external_jobs(run_id=run.run_id)
         calls = store.list_model_calls(run_id=run.run_id)
         budgets = BudgetLedger(db).list_for(scope=BudgetScope.RUN, scope_id=run.run_id)
+        findings = store.list_findings(run_id=run.run_id, limit=40)
+        interpretations = store.list_interpretations(run_id=run.run_id, limit=40)
     payload = {
         "run": run.model_dump(mode="json"),
         "work": [item.model_dump(mode="json") for item in work],
@@ -338,6 +353,8 @@ def _run_show(args: argparse.Namespace) -> int:
         "jobs": [job.model_dump(mode="json") for job in jobs],
         "model_calls": [call.model_dump(mode="json") for call in calls],
         "budgets": [budget.model_dump(mode="json") for budget in budgets],
+        "findings": [entry.model_dump(mode="json") for entry in findings],
+        "interpretations": [entry.model_dump(mode="json") for entry in interpretations],
     }
     rendered = views.render_run_detail(
         run,
@@ -347,6 +364,8 @@ def _run_show(args: argparse.Namespace) -> int:
         jobs=jobs,
         calls=calls,
         budgets=budgets,
+        findings=findings,
+        interpretations=interpretations,
     )
     return _emit(payload, rendered, as_json=args.json)
 
@@ -466,6 +485,32 @@ def _costs(args: argparse.Namespace) -> int:
     return _emit(payload, views.render_costs(calls, budgets), as_json=args.json)
 
 
+def _findings(args: argparse.Namespace) -> int:
+    """What the runtime observed, and what each observation rests on.
+
+    A separate view rather than a section of ``status`` because the question it
+    answers is a tracing question -- "this proposal cites FIND-x; what is
+    FIND-x" -- and that is asked from a proposal, not from a dashboard.
+    """
+
+    config = load_config()
+    with _database(config) as db:
+        store = RuntimeStore(db)
+        found = store.list_findings(
+            project_id=args.project, run_id=args.run, limit=args.limit
+        )
+        # Loaded one by one so the reference edges come with them. `list_findings`
+        # deliberately does not join them -- it is used on paths where the edges
+        # are not needed and a join per row would be a query per row.
+        detailed = tuple(
+            entry
+            for entry in (store.get_finding(item.finding_id) for item in found)
+            if entry is not None
+        )
+    payload = [entry.model_dump(mode="json") for entry in detailed]
+    return _emit(payload, views.render_findings(detailed), as_json=args.json)
+
+
 def _events(args: argparse.Namespace) -> int:
     config = load_config()
     with _database(config) as db:
@@ -577,8 +622,147 @@ def _doctor(args: argparse.Namespace) -> int:
     else:
         lines.append("  OK    actions       every policy action has a handler\n")
 
+    lines.extend(_role_lines())
+    lines.extend(_sandbox_lines())
+    lines.extend(_coding_profile_lines())
+
     print("".join(lines), end="")
     return EXIT_OK if ok else EXIT_ERROR
+
+
+def _role_lines() -> list[str]:
+    """Which model actually answers each role, and whether it is the configured one.
+
+    Reported because the run report records the model the *provider* named, not
+    the alias that was asked for -- so a substitution cannot be spotted from the
+    ledger alone. A researcher who configured a planner model on a provider this
+    machine does not have should learn that here rather than by comparing a
+    config file with a provenance row.
+    """
+
+    from research_os.automation.commands import provider_registry
+    from research_os.automation.config import load_config as load_automation_config
+    from research_os.automation.config import resolve_roles
+    from research_os.automation.providers import probe_registry
+
+    try:
+        registry = provider_registry()
+        resolved = resolve_roles(load_automation_config(), probe_registry(registry))
+    except ResearchOSError as exc:
+        return [
+            (
+                f"  WARN  roles         cannot resolve configured model roles: "
+                f"{exc}. Every call would use its provider's default model.\n"
+            )
+        ]
+    lines = [
+        (
+            "  OK    tiers         provider tiers are CONFIGURED priority, not "
+            "measured performance: every available provider is assumed tier 3 "
+            "unless you set one. A report saying a call was answered at tier 3 "
+            "means the configuration permitted it, not that anyone benchmarked "
+            "it.\n"
+        ),
+        "  OK    roles         "
+        + ", ".join(
+            f"{name}={setting.provider}/{setting.model or 'provider default'}"
+            for name, setting in sorted(resolved.roles.items())
+        )
+        + "\n",
+    ]
+    for note in resolved.substitutions:
+        lines.append(f"  WARN  roles         {note}\n")
+    if resolved.degraded:
+        lines.append(
+            f"  WARN  independence  {resolved.independence}: {resolved.note}\n"
+        )
+    else:
+        lines.append(f"  OK    independence  {resolved.independence}\n")
+    return lines
+
+
+def _sandbox_lines() -> list[str]:
+    """Whether model-written code can actually be contained on this host.
+
+    A ``WARN`` rather than a ``FAIL``, following ``researchctl doctor``'s
+    contract that an absent capability exits zero -- but the message says
+    exactly what it means for this deployment, because "no sandbox" and "no
+    cluster" are not equally consequential and a line that read the same for
+    both would be misleading.
+    """
+
+    from research_os.automation.config import load_config as load_automation_config
+    from research_os.sandbox import SandboxMode, available_backend, probe
+
+    backend = available_backend()
+    try:
+        configured = load_automation_config().sandbox.mode
+    except ResearchOSError:
+        configured = SandboxMode.PREFERRED
+
+    if backend is not None:
+        return [
+            (
+                f"  OK    sandbox       {backend.technology}: {backend.detail}; "
+                f"configured mode {configured}\n"
+            )
+        ]
+    lines = [
+        (
+            "  WARN  sandbox       no containment technology works here, so "
+            "high-autonomy execution of model-written code will be REFUSED "
+            f"(configured mode {configured}). The canonical-state fingerprint "
+            "still detects a capsule or Git-ref change afterwards; it prevents "
+            "nothing and sees nothing outside the repository.\n"
+        )
+    ]
+    for candidate in probe():
+        detail = candidate.detail
+        if candidate.remedy:
+            detail += f" -- {candidate.remedy}"
+        lines.append(f"  WARN  sandbox       {candidate.technology}: {detail}\n")
+    return lines
+
+
+def _coding_profile_lines() -> list[str]:
+    """State a known divergence rather than leave it to be discovered.
+
+    v1.1 moved validation-check resolution into the controller: a research run
+    resolves ``projects.<id>.check_profiles`` from ``automation.yaml`` and runs
+    the argv the *researcher* declared. The runtime's coding action dispatches
+    through ``AutomationController`` without a plan, so its acceptance commands
+    come from the automation planner instead.
+
+    Same project, same goal, two different gates. It is not a correctness or
+    authority defect -- every resolved argv still passes the same command policy,
+    and nothing merges or pushes either way -- but a researcher who has declared
+    check profiles should not have to find out by reading two run directories
+    that one path ignored them. Closing it means threading the project profile
+    through ``AutomationController``, which is v1 work this integration
+    deliberately did not take on; ``docs/INTEGRATION_BUILD_RECORD.md`` records
+    the seam.
+    """
+
+    from research_os.automation.config import load_config as load_automation_config
+
+    try:
+        configured = sorted(load_automation_config().projects)
+    except ResearchOSError:
+        return []
+    if not configured:
+        return [
+            (
+                "  OK    checks        no project declares check_profiles, so "
+                "discovery decides everywhere\n"
+            )
+        ]
+    return [
+        f"  WARN  checks        {len(configured)} project(s) declare "
+        f"check_profiles ({', '.join(configured[:4])}"
+        + ("..." if len(configured) > 4 else "")
+        + "). `researchctl research run` honours them; a `runtime` cycle's "
+        "coding action does not yet and uses planner-authored commands.\n"
+    ]
 
 
 def _migrate(args: argparse.Namespace) -> int:

@@ -285,6 +285,17 @@ class CommandResult(BaseModel):
     stdout_path: str | None = None
     stderr_path: str | None = None
     error: str | None = None
+    contained: bool = False
+    """Whether OS-level containment was actually in force for this command.
+
+    Recorded on every result, because "the tests passed" and "the tests passed
+    inside a sandbox" are different facts about a run and the difference is what
+    a reader needs in order to judge the exposure. Defaults to ``False`` so an
+    older stored result is read as uncontained, which is what it was.
+    """
+
+    containment: str = ""
+    """The technology, or the reason there was none. Never empty when it matters."""
 
     @property
     def ok(self) -> bool:

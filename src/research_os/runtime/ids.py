@@ -28,6 +28,8 @@ EXTERNAL_JOB_ID_RE = re.compile(r"^XJOB-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$")
 BUDGET_ID_RE = re.compile(r"^BDGT-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$")
 RESERVATION_ID_RE = re.compile(r"^RSV-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$")
 SCHEDULE_ID_RE = re.compile(r"^SCHED-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$")
+INTERPRETATION_ID_RE = re.compile(r"^XINT-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$")
+FINDING_ID_RE = re.compile(r"^FIND-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$")
 
 
 def _stamp(moment: datetime | None = None) -> str:
@@ -85,6 +87,14 @@ def new_reservation_id(*, moment: datetime | None = None) -> str:
 
 def new_schedule_id(*, moment: datetime | None = None) -> str:
     return new_id("SCHED", moment=moment)
+
+
+def new_interpretation_id(*, moment: datetime | None = None) -> str:
+    return new_id("XINT", moment=moment)
+
+
+def new_finding_id(*, moment: datetime | None = None) -> str:
+    return new_id("FIND", moment=moment)
 
 
 def thread_id_for(run_id: str) -> str:
