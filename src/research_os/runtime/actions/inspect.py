@@ -32,11 +32,27 @@ def inspect_repository(
 
     repo = Path(state["repo_path"])
     try:
+        # A repository with no commits has no HEAD, and `git diff HEAD` fails
+        # with a usage error rather than an empty diff. An unborn branch is a
+        # real state -- a freshly initialised project, a capsule written but not
+        # yet committed -- and reporting it is more useful than failing on it.
+        if not gitutil.has_commits(repo):
+            return ActionOutcome.succeeded(
+                f"{repo} is a repository with no commits yet",
+                data={
+                    "head": None,
+                    "branch": gitutil.current_branch(repo),
+                    "dirty": True,
+                    "changed_paths": [],
+                    "unborn": True,
+                },
+            )
         data = {
             "head": gitutil.head_commit(repo),
             "branch": gitutil.current_branch(repo),
             "dirty": gitutil.is_dirty(repo),
             "changed_paths": list(gitutil.changed_paths(repo))[:200],
+            "unborn": False,
         }
     except ResearchOSError as exc:
         return ActionOutcome.failed(

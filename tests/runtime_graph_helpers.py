@@ -23,6 +23,7 @@ from research_os.runtime.interfaces import Independence, ModelRequest, ModelResp
 from research_os.runtime.kernel import ScientificKernelAdapter
 from research_os.runtime.queue import WorkQueue
 from research_os.runtime.store import RuntimeStore
+from tests.automation_helpers import commit_all
 from tests.fs_helpers import (
     claim_data,
     evidence_data,
@@ -105,6 +106,7 @@ def make_capsule(
     repo = make_git_repo(root)
     write_minimal_capsule(repo, project_id=project_id)
     if empty:
+        commit_all(repo, "capsule")
         return repo
     research = repo / ".research"
     for name in ("questions", "hypotheses", "claims", "evidence"):
@@ -119,6 +121,10 @@ def make_capsule(
         research / "claims" / "CLAIM-0001.yaml",
         claim_data(status="evidence_linked", supporting_evidence=["EVI-0001"]),
     )
+    # Committed, because that is what a real project looks like and because an
+    # uncommitted capsule has no HEAD for the repository-inspection action to
+    # report on.
+    commit_all(repo, "capsule")
     return repo
 
 

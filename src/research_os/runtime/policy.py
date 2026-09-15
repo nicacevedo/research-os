@@ -89,15 +89,19 @@ class ActionKind(StrEnum):
     CRITIQUE_HYPOTHESES = "critique_hypotheses"
     DESIGN_EXPERIMENT = "design_experiment"
     REVIEW_SCIENCE = "review_science"
-    REVIEW_CODE = "review_code"
+    REFEREE_MANUSCRIPT = "referee_manuscript"
     AUDIT_CITATIONS = "audit_citations"
     REBUILD_DERIVED_INDEX = "rebuild_derived_index"
 
     # --- A1: isolated, bounded side effects -------------------------------
-    CREATE_WORKTREE = "create_worktree"
+    #
+    # Note what is *not* here: create_worktree, run_checks, commit_candidate and
+    # a standalone code review. Those are phases of one coding pipeline, not
+    # things a planner chooses between, and listing them made `runtime doctor`
+    # report three gaps that were not gaps -- the pipeline performs all of them
+    # and records the reviewer's verdict. `edit_in_worktree` is the whole
+    # lifecycle, dispatched once.
     EDIT_IN_WORKTREE = "edit_in_worktree"
-    RUN_CHECKS = "run_checks"
-    COMMIT_CANDIDATE = "commit_candidate"
     RUN_LOCAL_EXPERIMENT = "run_local_experiment"
     SUBMIT_CLUSTER_EXPERIMENT = "submit_cluster_experiment"
     DRAFT_MANUSCRIPT = "draft_manuscript"
@@ -191,10 +195,10 @@ ACTIONS: dict[ActionKind, ActionPolicy] = {
         frozenset(),
         "Reads a frozen packet and returns a structured verdict; records no approval.",
     ),
-    ActionKind.REVIEW_CODE: ActionPolicy(
+    ActionKind.REFEREE_MANUSCRIPT: ActionPolicy(
         AutonomyLevel.A0,
-        frozenset({Permission.READ_REPO}),
-        "Reads a diff; changes nothing.",
+        frozenset(),
+        "Reads a draft and its evidence and returns findings; approves nothing.",
     ),
     ActionKind.AUDIT_CITATIONS: ActionPolicy(
         AutonomyLevel.A0,
@@ -206,25 +210,15 @@ ACTIONS: dict[ActionKind, ActionPolicy] = {
         frozenset(),
         "The index is rebuildable by definition; losing it loses no science.",
     ),
-    ActionKind.CREATE_WORKTREE: ActionPolicy(
-        AutonomyLevel.A1,
-        frozenset({Permission.READ_REPO, Permission.WRITE_WORKTREE}),
-        "Isolated checkout off a frozen base commit; the canonical checkout is untouched.",
-    ),
     ActionKind.EDIT_IN_WORKTREE: ActionPolicy(
         AutonomyLevel.A1,
-        frozenset({Permission.WRITE_WORKTREE}),
-        "Bounded to declared paths inside one worktree.",
-    ),
-    ActionKind.RUN_CHECKS: ActionPolicy(
-        AutonomyLevel.A1,
-        frozenset({Permission.RUN_LOCAL}),
-        "Runs the project's own acceptance commands, which runs the project's code.",
-    ),
-    ActionKind.COMMIT_CANDIDATE: ActionPolicy(
-        AutonomyLevel.A1,
-        frozenset({Permission.WRITE_WORKTREE}),
-        "Commits on the isolated branch only. Never on a canonical branch.",
+        frozenset(
+            {Permission.READ_REPO, Permission.WRITE_WORKTREE, Permission.RUN_LOCAL}
+        ),
+        "The whole coding lifecycle in one isolated worktree: build, check, "
+        "independently review, one bounded repair, candidate commit. Bounded to "
+        "declared paths, and it never merges or pushes. RUN_LOCAL because running "
+        "a project's acceptance commands runs that project's code.",
     ),
     ActionKind.RUN_LOCAL_EXPERIMENT: ActionPolicy(
         AutonomyLevel.A1,

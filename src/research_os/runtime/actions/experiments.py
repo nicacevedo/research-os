@@ -1,0 +1,523 @@
+"""Designing and running experiments, with the specification frozen first.
+
+The separation this module exists to enforce:
+
+```text
+design      -> a specification, digested, written down, nothing run
+execute     -> the specification, unchanged, submitted to an executor
+interpret   -> the results, against the criteria that were fixed before them
+```
+
+**The primary endpoint is fixed before any result exists.** The experimentalist
+prompt says so and the schema requires ``primary_endpoint``,
+``success_criteria`` and ``failure_criteria`` as a condition of being a valid
+design. The digest of the frozen spec goes on the job row, so "was this the test
+we said we would run" is answerable by comparing two hashes rather than by
+reading a diff of a manifest.
+
+**Changing the primary endpoint after seeing results is an `A2` action.** Not a
+runtime mutation, not a quiet edit, and not something approval lets the runtime
+do -- it is
+:data:`~research_os.runtime.policy.ActionKind.CHANGE_PRIMARY_ENDPOINT`, which
+the person performs and which becomes a recorded Decision. This is the single
+most important gate in the system, because a post-hoc endpoint change is how a
+null result becomes a positive one, and it is the change that leaves no trace if
+the system lets it happen silently.
+
+**A refutation is a success.** :func:`interpret_results` returns
+``ok=True`` whether the prespecified criteria were met or not, and records which.
+An experiment that ran correctly and answered "no" has succeeded; nothing in
+this module can express it as a failure, because
+:class:`~research_os.runtime.failures.FailureClass` has no member for it.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from collections.abc import Mapping
+from pathlib import Path
+from typing import Any
+
+from research_os.errors import ResearchOSError
+from research_os.runtime.actions.base import ActionOutcome
+from research_os.runtime.budgets import BudgetExhaustedError, Dimension
+from research_os.runtime.context import CycleContext
+from research_os.runtime.executors import (
+    LOCAL,
+    SLURM,
+    ExecutorError,
+    prepare_run_dir,
+    spec_digest,
+)
+from research_os.runtime.failures import FailureClass
+from research_os.runtime.idempotency import idempotency_key
+from research_os.runtime.ids import new_external_job_id
+from research_os.runtime.interfaces import ExecutionSpec, ModelRequest
+from research_os.runtime.models import ExternalJobStatus
+from research_os.runtime.prompts import EXPERIMENTALIST
+from research_os.runtime.routing import RoutingError
+
+LOG = logging.getLogger("research_os.runtime.actions.experiments")
+
+
+def design_experiment(
+    state: Mapping[str, Any], context: CycleContext, plan: Mapping[str, Any]
+) -> ActionOutcome:
+    """Produce a preregistered specification. Runs nothing.
+
+    ``A0``: writing down what you intend to test changes nothing. Whether it is
+    then *run* is a separate action with its own authority, which is what makes
+    "we designed it and then decided not to" an expressible outcome rather than
+    a wasted submission.
+    """
+
+    frontier = state.get("frontier", {})
+    hypothesis_ids = tuple(
+        plan.get("addresses", ())
+        or frontier.get("hypotheses_without_tests", ())
+        or frontier.get("actionable_hypotheses", ())
+    )
+    if not hypothesis_ids:
+        return ActionOutcome.succeeded(
+            "no untested hypothesis to design for", data={"hypotheses": []}
+        )
+
+    target = str(hypothesis_ids[0])
+    try:
+        obj = context.kernel.object(target)
+        statement = getattr(obj, "statement", "") or getattr(obj, "title", target)
+    except ResearchOSError as exc:
+        return ActionOutcome.failed(
+            f"could not read {target}: {exc}", failure_class=FailureClass.CODE_EXCEPTION
+        )
+
+    available = ", ".join(sorted(context.executors)) or "local"
+    prompt = EXPERIMENTALIST.render(
+        fields={
+            "hypothesis": f"{target}: {statement}",
+            "data_description": str(
+                plan.get("parameters", {}).get("data_description")
+                or "the project repository; no external dataset declared"
+            ),
+            "available_executors": available,
+        },
+        blocks={"repository": [state["repo_path"]]},
+    )
+    try:
+        response = context.models.complete(
+            ModelRequest(
+                role=EXPERIMENTALIST.role,
+                capability=EXPERIMENTALIST.capability,
+                prompt=prompt,
+                prompt_version=EXPERIMENTALIST.identity,
+                criticality=EXPERIMENTALIST.criticality,
+                independence=EXPERIMENTALIST.independence,
+                independence_group=f"design:{state['run_id']}:{target}",
+                json_schema=EXPERIMENTALIST.output_schema,
+            )
+        )
+    except (BudgetExhaustedError, RoutingError) as exc:
+        return ActionOutcome.failed(
+            f"the experimentalist did not run: {exc}",
+            failure_class=FailureClass.PROVIDER_UNAVAILABLE,
+        )
+    if not response.ok or response.structured is None:
+        return ActionOutcome.failed(
+            f"the experimentalist returned nothing usable: {response.error}",
+            failure_class=FailureClass.MODEL_OUTPUT_INVALID,
+        )
+
+    design = dict(response.structured)
+    if not design.get("testable", False):
+        # A valid and useful answer. Saying "this cannot be tested with the data
+        # described" is better science than specifying something else and
+        # calling it a test of the hypothesis.
+        return ActionOutcome.succeeded(
+            f"{target} is not testable with the data described",
+            data={
+                "hypothesis": target,
+                "testable": False,
+                "reason": design.get("untestable_reason", ""),
+            },
+        )
+
+    spec = _spec_from_design(design, state=state, name=f"{target.lower()}-test")
+    digest = spec_digest(spec)
+    record = {
+        "hypothesis": target,
+        "testable": True,
+        "spec_digest": digest,
+        "primary_endpoint": design.get("primary_endpoint", ""),
+        "secondary_endpoints": design.get("secondary_endpoints", []),
+        "success_criteria": design.get("success_criteria", ""),
+        "failure_criteria": design.get("failure_criteria", ""),
+        "dataset_identity": design.get("dataset_identity", ""),
+        # The frozen spec itself, in full, so the submitting step reconstructs
+        # exactly this and not its own reading of the model's design. The first
+        # version re-derived the spec at submission and named it differently --
+        # "hyp-0001" instead of "hyp-0001-test" -- so the digests disagreed and
+        # the preregistration guard rejected every legitimate experiment. Found
+        # by the test that submits a design it had just produced.
+        "spec": _spec_record(spec),
+    }
+    ref = context.artifacts.put_text(
+        json.dumps(record, indent=2, sort_keys=True),
+        media_type="application/json",
+        role="preregistration",
+        producer=f"{response.provider}:{EXPERIMENTALIST.identity}",
+    )
+    return ActionOutcome.succeeded(
+        f"preregistered a test of {target} ({digest[:12]})",
+        data=record,
+        artifacts=(ref,),
+    )
+
+
+def _spec_record(spec: ExecutionSpec) -> dict[str, Any]:
+    """The frozen spec as plain JSON, for the preregistration record."""
+
+    return {
+        "name": spec.name,
+        "argv": list(spec.argv),
+        "cwd": spec.cwd,
+        "environment": dict(spec.environment),
+        "resources": dict(spec.resources),
+        "env": dict(spec.env),
+        "timeout_seconds": spec.timeout_seconds,
+        "outputs": list(spec.outputs),
+        "seeds": list(spec.seeds),
+    }
+
+
+def _spec_from_record(record: Mapping[str, Any]) -> ExecutionSpec:
+    """Rebuild the exact spec that was preregistered.
+
+    Field for field, with no re-derivation and no defaults: anything missing is
+    a record this build did not write, and a spec assembled from a partial
+    record would hash differently and be refused -- correctly, but confusingly.
+    """
+
+    return ExecutionSpec(
+        name=str(record["name"]),
+        argv=tuple(str(token) for token in record["argv"]),
+        cwd=str(record["cwd"]),
+        environment={str(k): str(v) for k, v in dict(record["environment"]).items()},
+        resources={str(k): str(v) for k, v in dict(record["resources"]).items()},
+        env={str(k): str(v) for k, v in dict(record["env"]).items()},
+        timeout_seconds=int(record["timeout_seconds"]),
+        outputs=tuple(str(item) for item in record["outputs"]),
+        seeds=tuple(int(seed) for seed in record["seeds"]),
+    )
+
+
+def _spec_from_design(
+    design: Mapping[str, Any], *, state: Mapping[str, Any], name: str
+) -> ExecutionSpec:
+    """Turn a model's design into a frozen specification.
+
+    Every field is taken from the design or defaulted deterministically. Seeds
+    default to one fixed value rather than a random one: an experiment whose seed
+    is chosen at submission is an experiment nobody can rerun.
+    """
+
+    resources = {
+        str(key): str(value)
+        for key, value in dict(design.get("resources") or {}).items()
+    }
+    seeds = tuple(int(seed) for seed in design.get("seeds") or (20260915,))
+    return ExecutionSpec(
+        name=name,
+        argv=tuple(str(token) for token in design.get("argv") or ("true",)),
+        cwd=str(state["repo_path"]),
+        environment={"kind": "uv", "project": str(state["repo_path"])},
+        resources=resources,
+        env={
+            f"RESEARCH_OS_SEED_{index}": str(seed) for index, seed in enumerate(seeds)
+        },
+        timeout_seconds=int(resources.pop("timeout_seconds", 3600) or 3600),
+        outputs=tuple(str(item) for item in design.get("outputs") or ()),
+        seeds=seeds,
+    )
+
+
+def _submit(
+    state: Mapping[str, Any],
+    context: CycleContext,
+    plan: Mapping[str, Any],
+    *,
+    executor_name: str,
+) -> ActionOutcome:
+    """Submit the frozen spec, recording the job before the executor is told."""
+
+    design = dict(plan.get("parameters", {}).get("design") or {})
+    if not design:
+        previous = dict(state.get("action_result", {}).get("data") or {})
+        design = previous if previous.get("testable") else {}
+    if not design:
+        return ActionOutcome.failed(
+            "no preregistered design to run; design_experiment must come first",
+            failure_class=FailureClass.POLICY_REFUSED,
+        )
+
+    executor = context.executors.get(executor_name)
+    if executor is None:
+        return ActionOutcome.failed(
+            f"no {executor_name} executor is available on this machine",
+            failure_class=FailureClass.SCHEDULER_UNAVAILABLE,
+        )
+
+    frozen = design.get("spec")
+    if not frozen:
+        return ActionOutcome.failed(
+            "the design carries no frozen specification; it was not produced by "
+            "design_experiment in this build",
+            failure_class=FailureClass.POLICY_REFUSED,
+        )
+    try:
+        spec = _spec_from_record(frozen)
+    except (KeyError, TypeError, ValueError) as exc:
+        return ActionOutcome.failed(
+            f"the frozen specification is unreadable: {exc}",
+            failure_class=FailureClass.POLICY_REFUSED,
+        )
+    digest = spec_digest(spec)
+    declared = str(design.get("spec_digest") or "")
+    if declared and declared != digest:
+        # The thing about to run is not the thing that was preregistered.
+        return ActionOutcome.failed(
+            f"the specification changed after preregistration "
+            f"({declared[:12]} -> {digest[:12]}). Running a different test under a "
+            f"preregistration is not a runtime decision; it needs "
+            f"change_preregistration, which a person performs.",
+            failure_class=FailureClass.MISSING_SCIENTIFIC_AUTHORITY,
+        )
+
+    dimension = (
+        Dimension.EXTERNAL_JOBS if executor_name == SLURM else Dimension.WORK_ITEMS
+    )
+    try:
+        grants = context.budgets.reserve_all(
+            dimension=dimension,
+            amount=1,
+            run_id=state["run_id"],
+            project_id=state["project_id"],
+        )
+    except BudgetExhaustedError as exc:
+        return ActionOutcome.failed(
+            str(exc), failure_class=FailureClass.BUDGET_EXHAUSTED
+        )
+
+    key = idempotency_key(f"experiment.submit.{executor_name}", state["run_id"], digest)
+    job_id = new_external_job_id()
+
+    def reconcile(_invocation: Any) -> dict[str, Any] | None:
+        """Has a job for this exact spec already been submitted?
+
+        Answered from our own ``external_jobs`` table by spec digest, which is
+        the only reliable question available: the scheduler cannot be asked
+        about a job whose id was never recorded.
+        """
+
+        with context.db.tx() as conn:
+            row = conn.execute(
+                "select job_id, scheduler_job_id, status from external_jobs "
+                "where run_id = %s and spec_digest = %s and executor = %s "
+                "order by submitted_at limit 1",
+                (state["run_id"], digest, executor_name),
+            ).fetchone()
+        if row is None or not row["scheduler_job_id"]:
+            return None
+        return {
+            "ok": True,
+            "detail": f"recovered submission {row['scheduler_job_id']}",
+            "data": {
+                "job_id": row["job_id"],
+                "scheduler_job_id": row["scheduler_job_id"],
+                "status": str(row["status"]),
+                "spec_digest": digest,
+            },
+        }
+
+    def perform() -> dict[str, Any]:
+        run_dir = prepare_run_dir(spec, job_id=job_id)
+        # The row first, in SUBMITTING, so a crash in the window between this and
+        # the executor returning leaves something to reconcile rather than a job
+        # nobody knows about.
+        context.store.create_external_job(
+            job_id=job_id,
+            project_id=state["project_id"],
+            run_id=state["run_id"],
+            executor=executor_name,
+            spec_digest=digest,
+            run_dir=str(run_dir),
+        )
+        handle = executor.submit(spec, run_dir=run_dir)
+        status = (
+            ExternalJobStatus.COMPLETED
+            if handle.finished and handle.exit_code == 0
+            else ExternalJobStatus.FAILED
+            if handle.finished
+            else ExternalJobStatus.SUBMITTED
+        )
+        context.store.update_external_job(
+            job_id,
+            status=status,
+            scheduler_job_id=handle.scheduler_job_id,
+            exit_code=handle.exit_code,
+            detail=handle.detail,
+        )
+        return {
+            "ok": True,
+            "detail": handle.detail or "submitted",
+            "data": {
+                "job_id": job_id,
+                "scheduler_job_id": handle.scheduler_job_id,
+                "status": str(status),
+                "spec_digest": digest,
+                "run_dir": str(run_dir),
+                "finished": handle.finished,
+                "exit_code": handle.exit_code,
+                "primary_endpoint": design.get("primary_endpoint", ""),
+                "success_criteria": design.get("success_criteria", ""),
+                "failure_criteria": design.get("failure_criteria", ""),
+            },
+        }
+
+    try:
+        outcome = context.ledger.run(
+            key=key,
+            kind=f"experiment.submit.{executor_name}",
+            run_id=state["run_id"],
+            request={"spec_digest": digest, "executor": executor_name},
+            perform=perform,
+            reconcile=reconcile,
+        )
+    except ExecutorError as exc:
+        context.budgets.release_all(grants)
+        return ActionOutcome.failed(
+            str(exc), failure_class=FailureClass.EXECUTOR_FAILED
+        )
+    except ResearchOSError as exc:
+        context.budgets.release_all(grants)
+        return ActionOutcome.failed(
+            f"could not submit: {exc}", failure_class=FailureClass.EXECUTOR_FAILED
+        )
+
+    context.budgets.settle_all(grants)
+    data = dict(outcome.result.get("data") or {})
+    artifacts = _collect_outputs(context, spec, data)
+    return ActionOutcome.succeeded(
+        str(outcome.result.get("detail") or "submitted"),
+        data=data,
+        artifacts=artifacts,
+    )
+
+
+def _collect_outputs(
+    context: CycleContext, spec: ExecutionSpec, data: Mapping[str, Any]
+) -> tuple[Any, ...]:
+    """Put whatever the run produced into the artifact store, by content hash.
+
+    Only for a run that has finished. A Slurm job that is still queued has no
+    outputs yet, and the control plane collects them when it reconciles.
+    """
+
+    if not data.get("finished"):
+        return ()
+    run_dir = Path(str(data.get("run_dir") or ""))
+    if not run_dir.is_dir():
+        return ()
+    refs = []
+    for relative in (*spec.outputs, "logs/stdout.txt", "logs/stderr.txt"):
+        candidate = run_dir / relative
+        if candidate.is_file() and candidate.stat().st_size:
+            refs.append(
+                context.artifacts.put_file(
+                    candidate, role=f"result:{relative}", producer="executor"
+                )
+            )
+    return tuple(refs)
+
+
+def run_local_experiment(
+    state: Mapping[str, Any], context: CycleContext, plan: Mapping[str, Any]
+) -> ActionOutcome:
+    return _submit(state, context, plan, executor_name=LOCAL)
+
+
+def submit_cluster_experiment(
+    state: Mapping[str, Any], context: CycleContext, plan: Mapping[str, Any]
+) -> ActionOutcome:
+    return _submit(state, context, plan, executor_name=SLURM)
+
+
+def interpret_results(
+    state: Mapping[str, Any], context: CycleContext, plan: Mapping[str, Any]
+) -> ActionOutcome:
+    """Compare the results to the criteria that were fixed before them.
+
+    Deterministic where it can be: whether the job completed, whether the
+    declared outputs exist, and what the prespecified criteria were. The
+    *reading* of a result is scientific judgement and goes through the reviewer
+    and then a person; what this does is establish the facts and refuse to let
+    the criteria move.
+
+    Both outcomes are ``ok=True``. An experiment that ran correctly and refuted
+    its hypothesis has succeeded.
+    """
+
+    previous = dict(state.get("action_result", {}).get("data") or {})
+    job_id = str(
+        plan.get("parameters", {}).get("job_id") or previous.get("job_id") or ""
+    )
+    if not job_id:
+        return ActionOutcome.failed(
+            "no job to interpret", failure_class=FailureClass.POLICY_REFUSED
+        )
+
+    jobs = {
+        job.job_id: job
+        for job in context.store.list_external_jobs(run_id=state["run_id"])
+    }
+    job = jobs.get(job_id)
+    if job is None:
+        return ActionOutcome.failed(
+            f"no such job on this run: {job_id}",
+            failure_class=FailureClass.ARTIFACT_MISSING,
+        )
+    if job.status not in {
+        ExternalJobStatus.COMPLETED,
+        ExternalJobStatus.FAILED,
+        ExternalJobStatus.TIMED_OUT,
+        ExternalJobStatus.CANCELLED,
+    }:
+        return ActionOutcome.failed(
+            f"{job_id} is {job.status}; there is nothing to interpret yet",
+            failure_class=FailureClass.SCHEDULER_UNAVAILABLE,
+        )
+
+    ran_correctly = (
+        job.status is ExternalJobStatus.COMPLETED and (job.exit_code or 0) == 0
+    )
+    return ActionOutcome.succeeded(
+        (
+            "the experiment ran; the prespecified criteria decide the result"
+            if ran_correctly
+            else f"the experiment did not run correctly ({job.status}); no scientific "
+            f"conclusion follows from it"
+        ),
+        data={
+            "job_id": job_id,
+            "status": str(job.status),
+            "exit_code": job.exit_code,
+            "ran_correctly": ran_correctly,
+            "spec_digest": job.spec_digest,
+            # Quoted back unchanged. If a later step wants different criteria,
+            # that is change_primary_endpoint, which a person performs.
+            "primary_endpoint": previous.get("primary_endpoint", ""),
+            "success_criteria": previous.get("success_criteria", ""),
+            "failure_criteria": previous.get("failure_criteria", ""),
+            "criteria_were_fixed_before_results": True,
+        },
+    )
