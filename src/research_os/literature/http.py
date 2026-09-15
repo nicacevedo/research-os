@@ -333,6 +333,22 @@ def retry_after_seconds(response: HttpResponse) -> float | None:
     return max((moment - datetime.now(UTC)).total_seconds(), 0.0)
 
 
+def retry_after_when_throttled(response: HttpResponse) -> float | None:
+    """Return ``Retry-After`` only when the status means "come back later".
+
+    A 429 or a 5xx saying how long to wait is a statement about *us* asking
+    again. A 400, 403 or 404 saying the same thing is a statement about the
+    request, and a CDN error page that happens to carry the header would
+    otherwise take a whole provider offline for its stated duration -- and
+    record a permanent error as throttling. Found by a recheck of the repair
+    that started reading the header on every status.
+    """
+
+    if response.status not in RETRYABLE_STATUSES:
+        return None
+    return retry_after_seconds(response)
+
+
 def read_bounded(stream: IO[bytes], max_bytes: int) -> tuple[bytes, bool]:
     """Read at most ``max_bytes`` from ``stream``, saying whether more remained.
 

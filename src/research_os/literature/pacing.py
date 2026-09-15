@@ -36,6 +36,7 @@ import contextlib
 import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from functools import wraps
 
 from research_os.errors import LiteratureStoreError
 from research_os.literature.models import SourceStatus
@@ -54,6 +55,15 @@ MIN_INTERVAL_SECONDS: dict[str, float] = {
 
 #: The interval used for a source with no published figure of its own.
 DEFAULT_MIN_INTERVAL_SECONDS = 1.0
+
+#: The longest a provider may put itself out of reach, however long it asks for.
+#:
+#: A day. Honouring ``Retry-After`` is the point of this module, and a provider
+#: asking for an hour gets an hour -- but the value is provider-controlled text,
+#: and one malformed or hostile header should not disable a source until the
+#: researcher notices. Past this bound the request is refused for a day and the
+#: next run asks again.
+MAX_RATE_LIMIT_SECONDS = 86_400
 
 #: How long a successful search stays fresh enough to answer from the store.
 #:
@@ -150,6 +160,30 @@ class Reservation:
     status: SourceStatus = SourceStatus.OK
 
 
+def _wrapping_store_errors(what: str):
+    """Turn a raw ``sqlite3.Error`` into this subsystem's own error.
+
+    The read paths were wrapped and the write paths were not, which matters
+    because a raw ``sqlite3.OperationalError`` is not in the research
+    controller's ``WORKER_ERRORS``: it escapes dispatch unhandled and leaves the
+    task ``RUNNING`` rather than ``FAILED``. Found by a recheck.
+    """
+
+    def decorate(method):
+        @wraps(method)
+        def guarded(*args, **kwargs):
+            try:
+                return method(*args, **kwargs)
+            except LiteratureStoreError:
+                raise
+            except sqlite3.Error as exc:
+                raise LiteratureStoreError(f"{what}: {exc}") from exc
+
+        return guarded
+
+    return decorate
+
+
 class SourcePacer:
     """Persistent per-source pacing over one literature store connection."""
 
@@ -184,6 +218,7 @@ class SourcePacer:
 
     # -- reserving -------------------------------------------------------
 
+    @_wrapping_store_errors("cannot reserve a literature provider slot")
     def reserve(
         self,
         source: str,
@@ -251,6 +286,7 @@ class SourcePacer:
 
     # -- recording -------------------------------------------------------
 
+    @_wrapping_store_errors("cannot record a literature provider success")
     def record_success(
         self,
         source: str,
@@ -284,6 +320,7 @@ class SourcePacer:
                 **learned,
             )
 
+    @_wrapping_store_errors("cannot record a literature provider rate limit")
     def record_rate_limited(
         self,
         source: str,
@@ -302,10 +339,11 @@ class SourcePacer:
         stop.
         """
 
+        ceiling = now + timedelta(seconds=MAX_RATE_LIMIT_SECONDS)
         if reset_at is not None:
-            until = reset_at
+            until = min(reset_at, ceiling)
         elif retry_after_seconds is not None:
-            until = now + timedelta(seconds=max(retry_after_seconds, 0.0))
+            until = min(now + timedelta(seconds=max(retry_after_seconds, 0.0)), ceiling)
         else:
             until = now + timedelta(
                 seconds=_whole_seconds(
@@ -328,6 +366,7 @@ class SourcePacer:
             )
         return stamp
 
+    @_wrapping_store_errors("cannot record a literature provider failure")
     def record_failure(
         self,
         source: str,

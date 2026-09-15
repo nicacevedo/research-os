@@ -15,9 +15,10 @@ configuration. Four properties make it worth having rather than merely
 convenient.
 
 **Nothing here executes repository code.** Profiling reads ``git ls-files``,
-checks whether named files are tracked, and parses ``pyproject.toml`` with
-``tomllib``. A repository that would like to be profiled differently has no way
-to say so.
+checks whether named files are tracked, parses ``pyproject.toml`` with
+``tomllib``, and asks the kernel's own ``validate_project`` whether there is a
+readable capsule -- which parses the capsule's YAML and nothing else. A
+repository that would like to be profiled differently has no way to say so.
 
 **Nothing a model says can change it.** The profile is built before the planner
 is invoked and is never rebuilt from worker output. It reaches a prompt as
@@ -247,7 +248,7 @@ def inspect_repository(project_path: Path) -> RepositoryFacts:
     if metadata_error:
         errors.append(metadata_error)
     metadata_readable = metadata_error is None
-    capsule_present, capsule_unreadable, capsule_error = _capsule_state(root, tracked)
+    capsule_present, capsule_unreadable, capsule_error = _capsule_state(root)
     if capsule_error:
         errors.append(capsule_error)
     return RepositoryFacts(
@@ -265,55 +266,51 @@ def inspect_repository(project_path: Path) -> RepositoryFacts:
     )
 
 
-def _capsule_state(
-    root: Path, tracked: frozenset[str]
-) -> tuple[bool, bool, str | None]:
-    """Decide whether this project has a Research Capsule, the way the rest of the system does.
+def _capsule_state(root: Path) -> tuple[bool, bool, str | None]:
+    """Decide whether this project has a Research Capsule.
 
-    Two rules, and the second is the one an independent review of this release
-    found missing.
+    By asking the question the rest of the system asks, in the one way it asks
+    it: does ``validate_project`` return a parsed project? That is exactly
+    :func:`build_science_context`'s test, and agreement with it is the whole
+    property -- because the two answers end up in the *same prompt*, one listing
+    citable scientific objects and the other saying there are none, under a
+    heading that says these are facts.
 
-    **Tracked, not on disk.** The old test also accepted an on-disk
-    ``.research/`` directory, which meant a crashed ``init-project``, a manually
-    created directory, or a symlink flipped the single most consequential
-    capability in the profile -- in a module whose whole premise is that a file
-    somebody left in the working tree cannot change what kind of project this
-    is.
+    Both of this release's attempts at a cleverer rule were wrong, in opposite
+    directions, and each was caught by a review.
 
-    **Readable, not merely present.** :func:`build_science_context` decides the
-    same fact by asking whether ``validate_project`` returns a parsed project,
-    and the two answers could disagree. When they did, the prompt carried two
-    controller-authored blocks contradicting each other -- one saying scientific
-    objects exist and may be cited, the other saying the project holds no
-    scientific state -- and the worker's only available citations were invented
-    ones. That is precisely the capsule-less failure this release exists to
-    close, reached from the other side.
+    The first accepted ``(root / ".research").is_dir()``, so a crashed
+    ``init-project`` or an empty directory made a repository into a scientific
+    project whose only available citations were invented ones.
 
-    So the profile asks the same question the science context asks. A capsule
-    that is tracked and unreadable is reported as a discovery error and the
-    project reasons over its repository, which is the only grounded universe it
-    has left.
+    The second required the capsule to be *tracked*, which closed that and
+    opened the mirror image: ``init-project`` creates ``.research/`` and does
+    not stage it, so between initialising a project and its first ``git add``
+    the profile said capsule-less while the science context read the capsule off
+    disk and listed its objects.
+
+    There is no third clever rule. Asking the same question is the answer, and
+    an unreadable capsule -- present but not parsing -- is reported as a
+    discovery error so the contradiction cannot come back as silence.
     """
 
-    if ".research/project.yaml" not in tracked:
-        return False, False, None
     from research_os.capsule import validate_project
 
+    if not (root / ".research").exists():
+        return False, False, None
     try:
         report = validate_project(root)
     except Exception as exc:  # noqa: BLE001 - a broken capsule must not crash profiling
-        return (
-            False,
-            True,
-            f"a .research/project.yaml is tracked but could not be read: {exc}",
-        )
+        return False, True, f"a .research/ capsule is present but unreadable: {exc}"
+    if report.capsule is None:
+        return False, False, None
     if report.project is None:
         return (
             False,
             True,
             (
-                "a .research/project.yaml is tracked but does not parse into a "
-                "project, so this run has no scientific objects to reason over"
+                "a .research/ capsule is present but its project.yaml does not "
+                "parse, so this run has no scientific objects to reason over"
             ),
         )
     return True, False, None
@@ -381,7 +378,7 @@ def build_project_profile(
             continue
         capabilities.append(discovered[name])
 
-    manuscripts = _manuscripts(tracked)
+    manuscripts = _manuscripts(tracked) if facts.tracked_known else []
     if capabilities[list(CapabilityName).index(CapabilityName.CAPSULE)].present:
         capsule_present = True
     elif CapabilityName.CAPSULE.value in declared:
@@ -466,25 +463,29 @@ def _discover(
 
     unavailable = CapabilityOrigin.UNAVAILABLE
     if not tracked_known:
-        return {
-            name: (
-                _configured_capability(name, declared_experiments, check_profile_ids)
-                if name
-                in (
-                    CapabilityName.EXPERIMENT_REGISTRY,
-                    CapabilityName.VALIDATION_PROFILES,
+        found: dict[CapabilityName, Capability] = {}
+        for name in CapabilityName:
+            if name is CapabilityName.CAPSULE:
+                # Read from ``.research/`` rather than from the file list, so a
+                # list that had to be cut says nothing about it either way.
+                found[name] = _capsule_capability(
+                    present=capsule_present,
+                    unreadable=capsule_unreadable,
                 )
-                and check_profiles_explicit
-                or name is CapabilityName.EXPERIMENT_REGISTRY
-                else Capability(
+            elif name is CapabilityName.EXPERIMENT_REGISTRY or (
+                name is CapabilityName.VALIDATION_PROFILES and check_profiles_explicit
+            ):
+                found[name] = _configured_capability(
+                    name, declared_experiments, check_profile_ids
+                )
+            else:
+                found[name] = Capability(
                     name=name,
                     present=False,
                     origin=unavailable,
                     detail="the tracked file list could not be read in full",
                 )
-            )
-            for name in CapabilityName
-        }
+        return found
     structure = CapabilityOrigin.DETERMINISTIC_STRUCTURE
     repo_metadata = CapabilityOrigin.REPOSITORY_METADATA
 
@@ -546,9 +547,7 @@ def _discover(
 
     found: dict[CapabilityName, Capability] = {
         CapabilityName.CAPSULE: _capsule_capability(
-            present=capsule_present,
-            unreadable=capsule_unreadable,
-            tracked_known=tracked_known,
+            present=capsule_present, unreadable=capsule_unreadable
         ),
         CapabilityName.PYPROJECT_TOML: structural(
             CapabilityName.PYPROJECT_TOML,
@@ -668,9 +667,7 @@ def _configured_capability(
     )
 
 
-def _capsule_capability(
-    *, present: bool, unreadable: bool, tracked_known: bool
-) -> Capability:
+def _capsule_capability(*, present: bool, unreadable: bool) -> Capability:
     """Return the capsule capability, which decides the whole provenance mode.
 
     Its own function because it is the one capability with three answers rather
@@ -679,13 +676,6 @@ def _capsule_capability(
     facts a plan may be built on.
     """
 
-    if not tracked_known:
-        return Capability(
-            name=CapabilityName.CAPSULE,
-            present=False,
-            origin=CapabilityOrigin.UNAVAILABLE,
-            detail="the tracked file list could not be read",
-        )
     if present:
         return Capability(
             name=CapabilityName.CAPSULE,
@@ -699,8 +689,8 @@ def _capsule_capability(
             present=False,
             origin=CapabilityOrigin.REPOSITORY_METADATA,
             detail=(
-                "not a usable capsule: a .research/project.yaml is tracked but "
-                "does not parse into a project, so there are no scientific objects"
+                "not a usable capsule: a .research/ directory is present but its "
+                "project.yaml does not parse, so there are no scientific objects"
             ),
         )
     return Capability(

@@ -33,6 +33,7 @@ from research_os.literature.http import (
     HttpClient,
     encode_query,
     retry_after_seconds,
+    retry_after_when_throttled,
 )
 from research_os.literature.identity import normalize_doi
 from research_os.literature.models import SourceProbe, SourceStatus
@@ -173,7 +174,7 @@ class OpenAlexSource:
             )
         if response.status != 200:
             return SourceResult(
-                retry_after_seconds=retry_after_seconds(response),
+                retry_after_seconds=retry_after_when_throttled(response),
                 provider=self.name,
                 status=SourceStatus.FAILED,
                 request_url=url,

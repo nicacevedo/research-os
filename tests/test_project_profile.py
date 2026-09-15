@@ -375,10 +375,46 @@ def test_a_tracked_but_unreadable_capsule_is_not_a_capsule_project(
     assert profile.provenance_mode is ProvenanceMode.REPOSITORY_ASSESSMENT
     capability = profile.capability(CapabilityName.CAPSULE)
     assert capability.present is False
-    assert "does not parse into a project" in capability.detail
+    assert "does not parse" in capability.detail
     assert any(
         "could not be read" in item or "does not parse" in item
         for item in profile.discovery_errors
+    )
+
+
+def test_an_initialised_but_unstaged_capsule_is_a_capsule_project(
+    tmp_path: Path,
+) -> None:
+    """Found by the recheck of the first repair.
+
+    ``init-project`` creates ``.research/`` and does not stage it, so a rule
+    requiring the capsule to be *tracked* said capsule-less for every project
+    between initialisation and its first ``git add`` -- while the science
+    context read the capsule off disk and listed its objects into the same
+    prompt. That is the contradiction the first repair closed, re-entered from
+    the other side.
+    """
+
+    from research_os.capsule import init_project
+
+    root = _repository(tmp_path / "fresh", {"run.py": "print('hi')\n"})
+    init_project(root, project_id="fresh-project", title="Fresh")
+    assert ".research/project.yaml" not in _tracked(root)
+
+    profile = build_project_profile(project_path=root)
+    assert profile.capsule_present is True
+    assert profile.provenance_mode is ProvenanceMode.SCIENTIFIC_PROJECT
+
+
+def _tracked(root: Path) -> set[str]:
+    return set(
+        subprocess.run(
+            ["git", "ls-files"],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.split()
     )
 
 
@@ -387,6 +423,7 @@ def test_the_profile_and_the_science_context_agree_about_the_capsule(
 ) -> None:
     """One question, one answer, whatever the repository looks like."""
 
+    from research_os.capsule import init_project
     from research_os.proposal.context import build_science_context
 
     cases = [
@@ -400,6 +437,9 @@ def test_the_profile_and_the_science_context_agree_about_the_capsule(
     stray = _flat_python(tmp_path / "stray")
     (stray / ".research").mkdir()
     cases.append(stray)
+    fresh = _repository(tmp_path / "fresh2", {"x.py": "pass\n"})
+    init_project(fresh, project_id="fresh-two", title="Fresh two")
+    cases.append(fresh)  # initialised, not yet staged
 
     for root in cases:
         profile = build_project_profile(project_path=root)
@@ -452,8 +492,11 @@ def test_a_truncated_file_list_makes_capabilities_unavailable_not_absent(
     monkeypatch.setattr(profile_module, "MAX_TRACKED_PATHS", 1)
     built = build_project_profile(project_path=root)
     for capability in built.capabilities:
-        if capability.name is CapabilityName.EXPERIMENT_REGISTRY:
-            continue  # declared in configuration, not read from the tree
+        if capability.name in (
+            CapabilityName.EXPERIMENT_REGISTRY,  # declared in configuration
+            CapabilityName.CAPSULE,  # read from .research/, not from the list
+        ):
+            continue
         assert capability.known is False, capability
     assert built.has(CapabilityName.PYPROJECT_TOML) is False
     assert any("cut" in item for item in built.discovery_errors)

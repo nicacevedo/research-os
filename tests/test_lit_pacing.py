@@ -845,3 +845,95 @@ def test_a_failed_commit_does_not_leave_the_transaction_open() -> None:
 
     assert store.connection.in_transaction is False, "the transaction was left open"
     assert store.pacer().reserve("arxiv", now=START).granted is True
+
+
+# -- what the recheck of the repairs found -------------------------------
+
+
+def test_a_permanent_error_carrying_retry_after_is_not_a_rate_limit() -> None:
+    """Found by the recheck of the repair that read the header on every status.
+
+    A 429 or a 5xx saying how long to wait is a statement about us asking again.
+    A 403 saying it is a statement about the request, and a CDN error page that
+    happens to carry the header would otherwise take a whole provider offline
+    for its stated duration -- and record a permanent error as throttling.
+
+    403 rather than 404 on purpose: every adapter handles 404 in a branch of its
+    own that never reads the header, so a 404 fixture would pass whatever the
+    header-reading code did. The first version of this test used one, and
+    mutating the guard did not move it.
+    """
+
+    clock = Clock()
+    store = LiteratureStore.open_memory()
+    built, _ = service(
+        store,
+        [
+            ScriptedResponse(
+                match="api.openalex.org",
+                status=403,
+                headers={"retry-after": "3600"},
+                body=b"{}",
+            )
+        ],
+        clock=clock,
+    )
+    outcome = built.retrieve("widgets").outcomes[0]
+    assert outcome.status is SourceStatus.FAILED, (
+        "the fixture must reach the generic non-200 branch"
+    )
+    health = store.pacer().health("openalex")
+    assert health.rate_limited_until is None
+    assert health.availability(clock.now) != "RATE_LIMITED"
+    assert (
+        store.pacer().reserve("openalex", now=clock.now + timedelta(seconds=5)).granted
+    )
+
+
+def test_a_provider_cannot_put_itself_out_of_reach_indefinitely() -> None:
+    """``Retry-After`` is provider-controlled text; one hostile header must not
+    disable a source until the researcher notices."""
+
+    from research_os.literature.pacing import MAX_RATE_LIMIT_SECONDS
+
+    pacer = LiteratureStore.open_memory().pacer()
+    until = pacer.record_rate_limited(
+        "openalex", now=START, retry_after_seconds=365 * 24 * 3600, detail="429"
+    )
+    assert until == utc_stamp(START + timedelta(seconds=MAX_RATE_LIMIT_SECONDS))
+    assert pacer.reserve(
+        "openalex", now=START + timedelta(seconds=MAX_RATE_LIMIT_SECONDS + 1)
+    ).granted
+
+
+def test_an_explicit_reset_far_in_the_future_is_capped_too() -> None:
+    from research_os.literature.pacing import MAX_RATE_LIMIT_SECONDS
+
+    pacer = LiteratureStore.open_memory().pacer()
+    until = pacer.record_rate_limited(
+        "crossref", now=START, reset_at=START + timedelta(days=400), detail="429"
+    )
+    assert until == utc_stamp(START + timedelta(seconds=MAX_RATE_LIMIT_SECONDS))
+
+
+def test_every_pacer_write_reports_a_broken_store_as_its_own_error() -> None:
+    """The read paths were wrapped and the write paths were not.
+
+    A raw `sqlite3.OperationalError` is not in the research controller's
+    WORKER_ERRORS, so it escapes dispatch unhandled and leaves the task RUNNING
+    rather than FAILED. Found by the recheck.
+    """
+
+    store = LiteratureStore.open_memory()
+    pacer = store.pacer()
+    store.connection.execute("DROP TABLE source_health")
+    for call in (
+        lambda: pacer.reserve("arxiv", now=START),
+        lambda: pacer.record_success("arxiv", now=START, detail="ok"),
+        lambda: pacer.record_rate_limited("arxiv", now=START, detail="429"),
+        lambda: pacer.record_failure(
+            "arxiv", now=START, status=SourceStatus.FAILED, detail="500"
+        ),
+    ):
+        with pytest.raises(LiteratureStoreError):
+            call()

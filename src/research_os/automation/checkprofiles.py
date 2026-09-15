@@ -124,11 +124,7 @@ def resolve_check_profiles(
             authorize_planner_argv(profile.argv, allowed_programs=allowed_programs)
         return profiles, True
 
-    discovered = _discover(
-        tracked=tracked,
-        dependencies=dependencies,
-        tool_sections=tool_sections,
-    )
+    discovered = _discover(tracked=tracked, dependencies=dependencies)
     usable: list[CheckProfile] = []
     for profile in discovered:
         try:
@@ -143,10 +139,7 @@ def resolve_check_profiles(
 
 
 def _discover(
-    *,
-    tracked: frozenset[str],
-    dependencies: frozenset[str],
-    tool_sections: frozenset[str],
+    *, tracked: frozenset[str], dependencies: frozenset[str]
 ) -> tuple[CheckProfile, ...]:
     """Return the profiles a Python/uv project's own metadata justifies.
 
