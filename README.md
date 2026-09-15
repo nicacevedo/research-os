@@ -91,10 +91,32 @@ validation checks are actually invoked, which interruptions are a person's
 decision rather than a preference, and how long a literature provider asked us
 to wait. None of it changes what a human still decides.
 
+**R5 — the autonomous runtime** adds the durable operational layer: an
+operational PostgreSQL database, a work queue with leases, an idempotency
+ledger, a content-addressed artifact store, bounded resumable reasoning cycles,
+and `researchd` — a control-plane daemon that ingests events, claims due work,
+recovers what dead workers were holding, polls the cluster, enforces budgets and
+surfaces the decisions that are genuinely yours. In progress;
+`docs/RUNTIME.md` is its live specification.
+
+The point of R5 is one sentence:
+
+```text
+near-100% operational autonomy  !=  100% epistemic authority
+```
+
+You record an objective and walk away. You do not copy one agent's output into
+another, decide which step runs next, check Slurm, or restart a workflow after a
+crash. You are asked about the small number of things that are actually
+scientific decisions — and of the eight such actions, all eight are ones *you*
+perform: the runtime prepares the decision and hands you the command.
+
 `docs/CAPSULE.md` is the live specification and is authoritative on anything
 scientific. Canonical Git-tracked YAML and Markdown under `.research/` are the
 only project scientific state: there is no materialized project index, and the
-kernel needs no database.
+scientific kernel needs no database. The runtime's PostgreSQL holds operational
+state only — deleting it loses the queue, the leases and the spend counters, and
+no science.
 
 `~/.config/research-os/config.toml` is reserved for later releases and is not
 read in R0. Path locations can be overridden with:
@@ -154,6 +176,13 @@ uv run researchctl lit sources|retrieve|fetch|search|show|index|status
 uv run researchctl propose start|list|show|promote|events
 uv run researchctl experiment commands|scheduler|run|show|poll|cancel|runs|cleanup
 uv run researchctl insight list|show|nominate|promote|search
+uv run researchctl runtime start PROJECT --objective "..." [--autonomy low|medium|high]
+uv run researchctl runtime status|runs|approvals|jobs|costs|events
+uv run researchctl runtime run RUN_ID
+uv run researchctl runtime approve|decline APPROVAL_ID
+uv run researchctl runtime doctor|migrate|daemon
+uv run researchctl runtime dev-db start|stop|status
+uv run researchd                     # the control plane, in the foreground
 uv run researchctl paper sources|write|show|list|cleanup
 uv run researchctl storage [--reclaim]
 ```

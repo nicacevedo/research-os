@@ -54,6 +54,8 @@ from research_os.review import (
     build_review_packet,
     write_review,
 )
+from research_os.runtime.commands import add_runtime_parser
+from research_os.runtime.commands import dispatch as runtime_dispatch
 
 
 def _doctor(args: argparse.Namespace) -> int:
@@ -528,6 +530,7 @@ def _build_parser() -> argparse.ArgumentParser:
     review_parser.add_argument("path", nargs="?", default=".")
 
     add_research_parser(subparsers)
+    add_runtime_parser(subparsers)
     add_auto_parser(subparsers)
     add_lit_parser(subparsers)
     add_propose_parser(subparsers)
@@ -570,6 +573,8 @@ def main() -> None:
             code = _review(args)
         elif args.command == "research":
             code = research_dispatch(args)
+        elif args.command == "runtime":
+            code = runtime_dispatch(args)
         elif args.command == "auto":
             code = auto_dispatch(args)
         elif args.command == "lit":

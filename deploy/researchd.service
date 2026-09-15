@@ -1,0 +1,72 @@
+# A systemd *user* unit for the Research OS control plane.
+#
+# This file is shipped, not installed. Nothing in this repository copies it,
+# enables it, or reloads systemd: AGENTS.md rule 13 reserves enabling a
+# persistent service to the researcher, and a tool that quietly installs a
+# background service on your machine has made a decision that was yours.
+#
+# To use it, deliberately:
+#
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/researchd.service ~/.config/systemd/user/
+#   # put the DSN somewhere only you can read:
+#   install -m 600 /dev/null ~/.config/research-os/researchd.env
+#   printf 'RESEARCH_OS_RUNTIME_DSN=%s\n' '<your dsn>' >> ~/.config/research-os/researchd.env
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now researchd
+#   journalctl --user -u researchd -f
+#
+# A *user* unit rather than a system one, because everything the runtime touches
+# belongs to one person: their repositories, their XDG directories, their
+# provider credentials. A system service would run as root over a researcher's
+# home directory, which is a worse answer to every question.
+#
+# `loginctl enable-linger <user>` if you want it to keep running while you are
+# logged out. That is also your decision.
+
+[Unit]
+Description=Research OS autonomous-runtime control plane
+Documentation=file://%h/research/research-os/docs/RUNTIME.md
+# The daemon degrades gracefully when the database is absent -- it retries --
+# so this is a preference, not a hard requirement.
+After=network-online.target
+
+[Service]
+Type=simple
+
+# The DSN may contain a password, so it is read from a file the researcher owns
+# rather than written here. A unit file is world-readable; this is not.
+EnvironmentFile=%h/.config/research-os/researchd.env
+
+# uv run, so the daemon uses the project environment the tests ran against
+# rather than whatever happens to be on PATH.
+WorkingDirectory=%h/research/research-os
+ExecStart=/usr/bin/env uv run --extra runtime researchd --log-level INFO
+
+# SIGTERM asks the loop to finish its current pass. A pass is short, and the
+# work it was running keeps its lease, which expires and is recovered -- so a
+# hard kill loses nothing either. 90s is generous.
+KillSignal=SIGTERM
+TimeoutStopSec=90
+
+Restart=on-failure
+RestartSec=10s
+
+# Hardening. The daemon reads and writes the researcher's repositories and XDG
+# directories and nothing else, so most of the filesystem can be hidden from it.
+# Note what is NOT locked down: it runs project acceptance commands, which means
+# running project code, so this is defence in depth and not a sandbox.
+# docs/RUNTIME.md and SECURITY.md state that boundary in full.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/state/research-os %h/.local/share/research-os %h/.cache/research-os
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RemoveIPC=true
+
+[Install]
+WantedBy=default.target

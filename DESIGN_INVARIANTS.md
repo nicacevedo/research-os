@@ -102,3 +102,37 @@ search for it.
 | 13 | no unofficial automation | three documented HTTP APIs and the provider CLIs' own non-interactive modes; nothing is scraped |
 | 14 | finite stop conditions | one bounded repair, capped by the budget field itself; a forward-only task DAG; no retry loop anywhere |
 | 15 | explicit cross-project transfer | an insight is nominated, then promoted by a person, and arrives in a prompt behind a fence that says whose findings it is |
+
+## Change control record: R5 autonomous runtime
+
+Per the change-control section above, a dedicated record. **No invariant above
+changed.** What changed is the set of technologies permitted to satisfy them,
+recorded in `ARCHITECTURE.md` §12a with the requirement that forced each.
+
+Rationale, invariant by invariant, for the three adoptions (PostgreSQL for
+operational state, LangGraph for bounded resumable workflows, one local
+`researchd` control process):
+
+| # | invariant | how R5 holds it |
+|---|---|---|
+| 1 | local before LLM | the frontier, the queue, leases, budgets, digests, failure classification, retry policy and job reconciliation are ordinary Python and SQL; no model is consulted for any of them |
+| 2 | no continuously thinking agents | `researchd` is deterministic and inexpensive — ingest, claim, renew, reclaim, poll, reconcile, enforce. It calls no model. A background *process* is not a background *agent* |
+| 3 | expensive reasoning is event-triggered | a model call happens only inside a claimed work item, against a reserved budget, dispatched from an event or a schedule; nothing polls a model |
+| 4 | project-isolated science | every runtime row carries `project_id`; the kernel adapter is constructed per repository and reads only that capsule |
+| 5 | shared literature | unchanged; the SQLite literature index remains the shared, rebuildable store |
+| 6 | Git-tracked files are truth | `runtime/kernel.py` is the only module that reads a capsule and has no method that writes one; `tests/test_runtime_authority.py` asserts this by inspecting the package, not by convention |
+| 7 | rebuildable indexes | PostgreSQL holds operational state only. Deleting it loses the queue, the leases, the spend counters and the checkpoints; it loses no science |
+| 8 | no agent approves its own work | independence is *requested* and then *reported*: a review that had to run on the producer's own family is recorded as degraded rather than claimed as independent |
+| 9 | reviewers start from clean context | review inputs are artifact references to frozen packets; a producer's scratch reasoning is never an input to its reviewer |
+| 10 | claims traceable to evidence | unchanged; acceptance is still `validate.claim_approval()`, called and never reimplemented |
+| 11 | experiments traceable | an `ExecutionSpec` is frozen and digested before submission, and the digest is stored on the job row |
+| 12 | paid use has budgets | reserve → execute → reconcile against `budgets`, checked before the spend, in SQL, so two concurrent workers cannot both be told there is room for the last call |
+| 13 | no unofficial automation | unchanged; provider CLIs' documented non-interactive modes and documented HTTP APIs only |
+| 14 | finite stop conditions | three independent bounds: per-item `max_attempts`, per-class retry policy (several classes never retry), and `max_cycles_per_objective` on the continuation chain. A cycle cannot extend itself; it can only open a successor, and the chain depth is measured in SQL |
+| 15 | explicit cross-project transfer | unchanged; `insight` nomination and human promotion remain the only path |
+
+The one thing R5 deliberately does **not** acquire is epistemic authority:
+
+```text
+near-100% operational autonomy  !=  100% epistemic authority
+```

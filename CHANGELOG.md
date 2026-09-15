@@ -2,7 +2,16 @@
 
 All notable changes to Research OS. Dates are release dates.
 
-## [Unreleased] — release candidate `release/v1.1.0-autonomy`
+## [Unreleased] — integration/autonomous-runtime-vnext
+
+**Not released.** Not merged, not tagged. The package version is deliberately
+not advanced here. This entry converges two lines that were developed in
+parallel on top of v1.0.0 and had never met: the v1.1 autonomy release
+candidate (`release/v1.1.0-autonomy`) and the R5 autonomous runtime
+(`r5/autonomous-runtime`). Both sets of changes are below, unedited except for
+heading depth, followed by what the convergence itself changed.
+
+### From the v1.1 autonomy line
 
 **Not released.** Not merged, not tagged. The package still reports version
 `1.0.0`, deliberately: changing it would imply a release that has not happened.
@@ -11,7 +20,7 @@ This entry describes the candidate awaiting external cross-family review.
 Five things a model was being asked to judge became things the controller
 knows. Nothing a human decides changed.
 
-### Added
+#### Added
 
 - **Deterministic project profiles.** Before a model is asked anything, the
   controller reads the repository and the researcher's configuration and records
@@ -53,7 +62,7 @@ knows. Nothing a human decides changed.
   `cache_ttl_seconds` in `literature.yaml`, a day by default, `0` to ask every
   time.
 
-### Fixed
+#### Fixed
 
 - A plan whose every field was structural filler, or under three characters,
   could validate and execute. A live run searched two providers for the query
@@ -67,7 +76,7 @@ knows. Nothing a human decides changed.
 - A project profile could state a capability's absence with a sentence
   asserting its presence.
 
-### Fixed after the independent delta review
+#### Fixed after the independent delta review
 
 An independent read-only review of the candidate returned PASS WITH BOUNDED
 REPAIR and twelve findings. All twelve were repaired before the candidate was
@@ -93,7 +102,7 @@ pushed.
 - The budget entry gate stated a requirement that is false for a capsule-less
   proposal task; a symbol could not be written `solve()`.
 
-### Changed
+#### Changed
 
 - **The shipped default planner model is now `opus`, was `sonnet`.** Decided by
   measurement, not principle: thirty real planner calls over five archived
@@ -117,7 +126,7 @@ pushed.
   machine does not have still re-homes the role and drops the model with it,
   which is unchanged and documented.
 
-### Fixed after the planner delta review
+#### Fixed after the planner delta review
 
 - `ClaudeCodeProvider._resolved_model` could record the requested model alias
   when a different model answered — when the provider billed the reply only to
@@ -133,13 +142,89 @@ pushed.
   double reports them identically. All three now fail under the mutations they
   were written to catch.
 
-### Unchanged
+#### Unchanged
 
 R0 kernel semantics, scientific object schemas, digests, stale-review detection,
 Claim acceptance, worktree isolation, argv-based execution with no shell, the
 prompt/data boundary, and the one-repair bound everywhere it already applied.
 Also unchanged by the planner default: `PLAN_SCHEMA`, the degenerate-plan guard,
 the planner's two-attempt bound, and how a model call is charged.
+
+### From the R5 autonomous runtime
+
+On `r5/autonomous-runtime`. The scientific kernel is unchanged; this is the
+durable operational layer around it. `docs/RUNTIME.md` is the specification and
+`docs/R5_BUILD_RECORD.md` the build record.
+
+#### Added
+
+- **An operational database, and the boundary that keeps it operational.**
+  PostgreSQL holds runs, work items, events, approvals, invocations, model-call
+  provenance, external jobs, artifact references, budgets, schedules and
+  provider health. It holds no science. `research_os.runtime.kernel` is the only
+  module that reads a capsule and has no method that writes one;
+  `tests/test_runtime_authority.py` asserts that by parsing the package.
+- **A durable work queue.** `for update skip locked`, renewable leases with
+  server-computed deadlines, and reclamation when a holder stops reporting.
+  Claiming charges the attempt, so work that kills its worker runs out of
+  attempts rather than out of workers.
+- **An idempotency ledger.** Every externally visible side effect is claimed
+  durably before it happens, keyed by the action's stable identity. A retry
+  reuses a completed one; an outcome nothing can establish is refused rather
+  than guessed at.
+- **Bounded resumable cycles.** One LangGraph thread per cycle, persistent
+  PostgreSQL checkpoints, `durability="sync"`, and checkpoint retention that is
+  implemented rather than aspirational. A human gate is three nodes — prepare,
+  interrupt, apply — because a side effect before `interrupt()` is replayed when
+  the interrupt is answered. That was measured, not read.
+- **`researchd`**, a control-plane daemon whose loop is one testable function.
+  It ingests events, claims due work, renews and reclaims leases, polls external
+  jobs, enforces budgets, tracks provider health and surfaces approvals. It
+  calls no model.
+- **Provider routing with honest independence.** A graph node asks for a
+  capability and a criticality, never a vendor. Critical work is never silently
+  downgraded. Independence is *reported*, so a review that had to run on the
+  producer's own family is recorded as degraded rather than claimed as
+  independent.
+- **`researchctl runtime`** — status, runs, run, approvals, approve, decline,
+  jobs, costs, events, cancel, doctor, migrate, daemon, dev-db — each with a
+  deterministic `--json` counterpart.
+- **A disposable local PostgreSQL** (`runtime dev-db`) for a machine with no
+  system service, no container runtime and no root.
+- **`deploy/researchd.service`**, a systemd *user* unit, shipped and never
+  installed.
+- **`pilots/run_pilot.sh`**, one command against a real project, which hashes
+  the project before and after and fails if it moved.
+
+#### Changed
+
+- `ARCHITECTURE.md` §12: PostgreSQL, LangGraph and a background service left the
+  postponed list, each with the requirement that forced it recorded in §12a.
+  `DESIGN_INVARIANTS.md` gains a change-control record; no invariant changed.
+- Three new fences in `automation/promptdata.FENCES` for frontier state,
+  hypothesis proposals and experiment results.
+
+#### Fixed
+
+Two adversarial reviews and a real pilot found these; `docs/RUNTIME.md` §16
+records them in full, including one reported finding that was wrong and one
+suggested fix that was wrong.
+
+- The attempt cap was defeated by the recovery code meant to honour it.
+- The invocation ledger's `FAILED` path deleted its row without consulting the
+  reconciler — but `perform` routinely raises *after* the effect lands, so this
+  submitted the same experiment twice.
+- Events were consumed and enqueued in separate transactions, and nothing
+  re-emits them, so a crash between lost a run permanently.
+- Nothing serialised two workers entering one LangGraph thread.
+- Every lock was taken with an unbounded wait, so one stuck holder froze the
+  control plane and every contention handler was unreachable.
+- The preregistration guard was skipped by omitting the digest, and the
+  experimentalist authored its own `argv`. It now selects a command the
+  *researcher* declared.
+- `runtime approve` had no interactive guard and recorded a fabricated actor.
+- Continuation assumed progress. A real pilot chained seven cycles over an
+  identical frontier; it now hashes the frontier and stops.
 
 ## [1.0.0] — 2026-09-13
 
