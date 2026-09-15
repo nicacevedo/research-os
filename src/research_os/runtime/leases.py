@@ -15,9 +15,18 @@ failure mode worse than losing the lease.
 **Losing the lease is reported, not retried.** When
 :meth:`~research_os.runtime.queue.WorkQueue.renew` refuses -- because the
 deadline passed and someone else may now own the item -- the keeper records it
-and stops. The worker checks :attr:`LeaseKeeper.lost` at each step it can
-usefully abandon, and the idempotency ledger makes whatever it already did
-reusable by whoever took over.
+and stops.
+
+What happens next is worth being precise about, because an earlier version of
+this docstring was not. :attr:`LeaseKeeper.lost` is checked in exactly one
+place: by the daemon, *after* the handler has returned. So a worker that loses
+its lease mid-cycle runs the cycle to completion in parallel with whoever took
+over, and only then discovers it no longer owns the item and discards its
+result. That is safe rather than correct-by-design: every externally visible
+effect goes through the idempotency ledger, so the two workers cannot both emit
+one, and the new owner reuses whatever the old one completed. It is wasted work,
+not duplicated effect. Checking ``lost`` between graph nodes would make it
+cheaper, and is the obvious improvement.
 
 **It renews well before the deadline.** Default is every 30 seconds on a
 120-second lease, so three consecutive failures are needed before expiry. A

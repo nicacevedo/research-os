@@ -63,7 +63,7 @@ from research_os.runtime.idempotency import (
     UnreconciledInvocationError,
     idempotency_key,
 )
-from research_os.runtime.interfaces import ModelRequest
+from research_os.runtime.interfaces import ArtifactRef, ModelRequest
 from research_os.runtime.kernel import Frontier, ScientificAuthorityError
 from research_os.runtime.models import TerminalState
 from research_os.runtime.policy import (
@@ -239,6 +239,14 @@ def validate_plan(state: CycleState, runtime: Runtime[CycleContext]) -> dict[str
             "notes": note(state, f"plan refused: {action} unimplemented"),
         }
     try:
+        # Autonomy alone, deliberately. An independent review suggested passing
+        # the role here so `ROLE_PERMISSIONS` would be "live", and trying it
+        # showed why the original code did not: an action's permissions describe
+        # what the *runtime* needs to perform it (NETWORK_READ, RUN_LOCAL) while
+        # a role's describe what a *model* may hold (tools). Intersecting them
+        # refused literature search and every coding task. The two are different
+        # kinds of thing; see `policy.ROLE_PERMISSIONS` for where role limits
+        # are actually enforced.
         authorize(action, autonomy=state["autonomy"])
     except ScientificGateError:
         # Not a refusal. This is the path to the human gate.
@@ -330,7 +338,25 @@ def perform_action(state: CycleState, runtime: Runtime[CycleContext]) -> dict[st
 
     result = outcome.result
     artifacts = list(state.get("artifacts", []))
-    artifacts.extend(result.get("artifacts", []))
+    produced = list(result.get("artifacts", []))
+    artifacts.extend(produced)
+
+    # Linked to the run, not merely stored. Graph state does not cross a cycle
+    # boundary -- a successor is a new thread seeded only with identity -- so an
+    # artifact that exists only in state is invisible to every later cycle.
+    # That made the citation audit and the results interpretation unreachable in
+    # practice: both looked for their input in `action_result`, which is always
+    # empty at the start of a cycle. An independent review found it.
+    for ref in produced:
+        context.artifacts.link(
+            ArtifactRef(
+                artifact_id=str(ref["artifact_id"]),
+                media_type=str(ref.get("media_type") or ""),
+                role=ref.get("role"),
+            ),
+            role=str(ref.get("role") or "output"),
+            run_id=state["run_id"],
+        )
     return {
         "action_result": result,
         "action_reused": outcome.reused,
@@ -566,7 +592,9 @@ def await_decision(state: CycleState, runtime: Runtime[CycleContext]) -> dict[st
         }
     decision = dict(recorded.decision or {})
     decision["status"] = str(recorded.status)
-    decision["granted"] = str(recorded.status) in {"GRANTED", "APPLIED"}
+    # GRANTED only. `applied_at` records that it was acted on; the status keeps
+    # saying what the researcher actually decided.
+    decision["granted"] = str(recorded.status) == "GRANTED"
     decision["decided_by"] = recorded.decided_by
     return {"decision": decision}
 

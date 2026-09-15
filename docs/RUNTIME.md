@@ -360,3 +360,88 @@ publish_externally              -> submit it yourself
 
 `tests/test_runtime_registry.py` asserts that no `A2` action has a handler. That
 is the property, stated as a test rather than as a promise.
+
+## 16. What two adversarial reviews and a real pilot changed
+
+Recorded here because the findings are more useful than the fixes, and because
+several were things the documentation asserted and the code did not do.
+
+### The pilot's finding: seven cycles, one cycle's worth of information
+
+The first real pilot ran against a live capsule and chained **seven** cycles,
+each recomputing an identical frontier and concluding `START_NEXT_CYCLE`,
+stopping only at `max_cycles_per_objective`. Fifteen model calls, 2.65 USD.
+
+The cause is structural and worth internalising: **the runtime cannot change the
+frontier its own planning is derived from.** It cannot write a capsule, so it
+cannot retire a hypothesis, record an experiment, or move a claim. So "is there
+still work outstanding?" is always yes, and a continuation policy that reads
+only that will run until a ceiling stops it.
+
+Continuation now hashes the frontier at conclusion and refuses a successor when
+it is unchanged, saying that what remains needs a person. `frontier_digest` is
+on the run row, so the reason is inspectable afterwards.
+
+### Authority findings
+
+| finding | what it was |
+|---|---|
+| preregistration skippable | `if declared and declared != digest` — omitting `spec_digest` skipped the check, and the design came from plan parameters, so the planner supplied both halves of the comparison. Now required, and must match a preregistration this runtime stored. |
+| model-authored `argv` | the experimentalist wrote the command and it ran with `cwd` set to the canonical checkout. Now it selects one of the commands the *researcher* declared in `experiments.yaml`, with parameter values the v1 resolver validates. |
+| `approve` had no guard | no TTY check and `decided_by="researcher"` hard-coded — a fabricated attribution on a scientific-authority record. Now refuses a non-TTY unless `--i-am-a-person`, and records the real user and host. |
+| prose from an invalid capsule | `quotable_claims` checked only for a readable project identity, not `report.ok`. |
+| a resume could assert a verdict | the approvals table is now the only verdict; an unrecorded decision is not granted. |
+| `APPLIED` overwrote the verdict | applying a decision replaced `GRANTED`/`DECLINED` with `APPLIED`, so a replayed node read a *declined* gate back as granted. `applied_at` carries it now. |
+
+One reported finding was **wrong**: `apply_decision` does check `human_executes`.
+
+### The escape this runtime detects and cannot prevent
+
+The coding pipeline runs the project's acceptance commands *after* the builder
+has written files in scope, so `pytest` executes Python a model wrote one step
+earlier, with the researcher's environment. Worktree isolation protects the
+canonical checkout from the *builder*; it is not an OS sandbox, and
+`SECURITY.md` has always said so. What R5 changes is that nobody decides to run
+it.
+
+A sandbox is the fix and this deployment has none. So `actions/coding.py` hashes
+the canonical capsule and every Git ref before the pipeline and again after, and
+a difference fails the action as `POLICY_REFUSED` with the paths named — and as
+a policy refusal rather than a code failure, so it is not repaired and retried,
+because repairing it would run the same escaping code again.
+
+**This detects; it does not prevent.** It sees nothing that happens outside the
+repository.
+
+### Concurrency findings
+
+| finding | what it was |
+|---|---|
+| the attempt cap was self-defeating | `_recover` emitted `WORKER_RECOVERED` for items it had just marked `FAILED`, and that event created a *new* work item with a *fresh* attempt budget. An item that killed three workers was replaced by one that would kill three more. |
+| the ledger had no ownership guard | a slow worker could overwrite the record of whoever took over — and a late `mark_failed` over a completed action becomes permission to do it again. |
+| `FAILED` bypassed the reconciler | but `perform` routinely raises *after* the effect lands (an `sbatch` that succeeded, then a database blip), so this submitted the same experiment twice. The exact failure the ledger exists to prevent. |
+| events were lost on a crash | consumed in one transaction, enqueued in another, and nothing re-emits them. Events are leased now, like work items. |
+| two workers, one thread | nothing serialised entry to one LangGraph thread; `RUNNING -> RUNNING` is not a guard. Added `LockClass.RESEARCH_RUN`. |
+| every lock blocked forever | `wait=True` everywhere with no `lock_timeout`, and since `tick` runs work inline, one stuck holder froze the whole control plane. Every `RepositoryBusyError` handler was unreachable. `wait=False` is the default now. |
+| escaped locks outlived their holder | the pool never cleared session state, and a session-scoped advisory lock is session state. |
+| worker identity was not unique | host and pid, and it *is* the queue's only ownership guard. Pid reuse would have let a stale worker renew a lease it did not hold. Now includes a per-instance token. |
+| the wall clock double-charged | charged from `started_at`, which never advances, so each resume billed the whole run again; the `least()` clamp then hid the overrun. |
+| unreachable interpretation | `interpret_results` had no `ActionKind`, and the citation audit looked for its input in graph state, which does not cross a cycle boundary. Artifacts are linked to their run now, and both find their input in the durable record. |
+
+### A suggestion that was wrong, and why
+
+The review proposed passing `role=` to `authorize` so `ROLE_PERMISSIONS` would
+be enforced. Trying it refused literature search and every coding task.
+
+An *action's* permissions say what the runtime needs to perform it —
+`NETWORK_READ` to query OpenAlex, `RUN_LOCAL` to run a project's tests. A
+*role's* say what a model may be handed. The extractor does not "hold" the
+network and the author does not "hold" the test runner; the runtime does, on
+their behalf. Intersecting them is a category error.
+
+Role least privilege is enforced at the provider boundary instead, and more
+strongly than a permission check would: every model request this runtime builds
+is `read_only=True` with no `access`, which resolves to `CONTEXT_ONLY` and
+force-empties the tool set. Every runtime model call is tool-less — it cannot
+read a file, run a command, or reach the network, whatever its role says.
+`tests/test_runtime_routing.py` asserts it for five roles.

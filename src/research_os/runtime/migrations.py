@@ -14,11 +14,16 @@ in order and recorded in a table. That is roughly what Flyway is, it is eighty
 lines, and it is written out here rather than depended upon.
 
 **What it guarantees.** One migration at a time across every process, by
-``pg_advisory_lock`` taken before anything is read. Each file runs inside one
-transaction, so a failure leaves the database at the previous version rather
-than half-migrated. Each applied file's checksum is stored, so editing a
-migration that has already run is an error at startup rather than a difference
-between two machines nobody notices.
+``pg_advisory_xact_lock`` taken before anything is read. *All* pending files run
+inside one transaction -- not one each, as an earlier version of this paragraph
+claimed -- so a failure in the third leaves the database at the version it
+started from rather than part-way through. The trade is that one long DDL
+transaction holds the lock for the duration of every pending migration, which
+for this deployment is a second.
+
+Each applied file's checksum is stored, so editing a migration that has already
+run is an error at startup rather than a difference between two machines nobody
+notices.
 """
 
 from __future__ import annotations

@@ -566,13 +566,22 @@ class RuntimeStore:
         Returns ``True`` to exactly one caller. The node that applies an
         approved decision calls this first: if a resume replays that node, the
         second call returns ``False`` and the effect is not applied twice.
+
+        Stamps ``applied_at`` and leaves ``status`` intact. An earlier version
+        overwrote the status with ``APPLIED``, which destroyed the
+        granted/declined distinction -- so a replayed ``await_decision`` read a
+        *declined* gate back as granted. No authority was bypassed, because the
+        second ``mark_approval_applied`` returned False and stopped the action,
+        but the provenance said the opposite of what the researcher decided.
         """
 
         with self._db.tx() as conn:
             row = conn.execute(
                 """
-                update approvals set status = 'APPLIED', applied_at = now()
-                where approval_id = %s and status in ('GRANTED','DECLINED')
+                update approvals set applied_at = now()
+                where approval_id = %s
+                  and status in ('GRANTED','DECLINED')
+                  and applied_at is null
                 returning approval_id
                 """,
                 (approval_id,),
@@ -713,7 +722,19 @@ class RuntimeStore:
         exit_code: int | None = None,
         detail: str | None = None,
         polled: bool = False,
+        allow_terminal_override: bool = False,
     ) -> ExternalJob:
+        """Record what became of one job.
+
+        Refuses to move a job that has already finished, unless explicitly
+        overridden for a cancel. Two daemons polling one job is a real race --
+        `squeue` is slow and their answers can arrive out of order -- and
+        without the guard the slower answer reverted a COMPLETED job to RUNNING
+        while keeping its `finished_at`, producing a self-contradictory
+        provenance row that was then polled forever. Its finished event had
+        already been emitted and deduped, so the real completion was never
+        re-announced.
+        """
         terminal = status in {
             ExternalJobStatus.COMPLETED,
             ExternalJobStatus.FAILED,
@@ -732,6 +753,8 @@ class RuntimeStore:
                     last_polled_at = case when %(polled)s then now() else last_polled_at end,
                     finished_at = case when %(terminal)s then coalesce(finished_at, now()) else finished_at end
                 where job_id = %(job_id)s
+                  and (%(override)s
+                       or status not in ('COMPLETED','FAILED','CANCELLED','TIMED_OUT'))
                 returning {JOB_COLUMNS}
                 """,
                 {
@@ -743,22 +766,56 @@ class RuntimeStore:
                     "detail": detail,
                     "polled": polled,
                     "terminal": terminal,
+                    "override": allow_terminal_override,
                 },
             ).fetchone()
         if row is None:
-            raise RuntimeStateError(f"no such external job: {job_id}")
+            current = self.get_external_job(job_id)
+            if current is None:
+                raise RuntimeStateError(f"no such external job: {job_id}")
+            # Already finished. Not an error: a slower poll arriving after a
+            # faster one is ordinary, and the right response is to keep the
+            # finished record.
+            return current
         return ExternalJob.model_validate(row)
 
-    def active_external_jobs(self, *, limit: int = 100) -> tuple[ExternalJob, ...]:
+    def get_external_job(self, job_id: str) -> ExternalJob | None:
+        with self._db.tx() as conn:
+            row = conn.execute(
+                f"select {JOB_COLUMNS} from external_jobs where job_id = %s", (job_id,)
+            ).fetchone()
+        return ExternalJob.model_validate(row) if row else None
+
+    def active_external_jobs(
+        self, *, limit: int = 100, poll_interval_seconds: float = 0.0
+    ) -> tuple[ExternalJob, ...]:
+        """Claim active jobs for polling, stamping ``last_polled_at`` up front.
+
+        A claim rather than a read. Two daemons ticking together retrieved the
+        identical set and both ran `squeue` against every job; stamping the
+        timestamp inside the claim, under ``skip locked``, gives each job to one
+        of them. ``poll_interval_seconds`` is how long a job is left alone after
+        being polled, so the claim also paces the scheduler.
+        """
+
         with self._db.tx() as conn:
             rows = conn.execute(
                 f"""
-                select {JOB_COLUMNS} from external_jobs
-                where status in ('SUBMITTING','SUBMITTED','PENDING','RUNNING','UNKNOWN')
-                order by last_polled_at nulls first, submitted_at
-                limit %(limit)s
+                with due as (
+                    select job_id from external_jobs
+                    where status in ('SUBMITTING','SUBMITTED','PENDING','RUNNING','UNKNOWN')
+                      and (last_polled_at is null
+                           or last_polled_at < now()
+                              - make_interval(secs => %(interval)s))
+                    order by last_polled_at nulls first, submitted_at
+                    for update skip locked
+                    limit %(limit)s
+                )
+                update external_jobs j set last_polled_at = now()
+                from due d where j.job_id = d.job_id
+                returning {", ".join("j." + c.strip() for c in JOB_COLUMNS.split(","))}
                 """,
-                {"limit": limit},
+                {"limit": limit, "interval": float(poll_interval_seconds)},
             ).fetchall()
         return tuple(ExternalJob.model_validate(row) for row in rows)
 
@@ -902,21 +959,21 @@ class RuntimeStore:
         return tuple(ProviderHealth.model_validate(row) for row in rows)
 
     def usable_providers(self, candidates: tuple[str, ...]) -> tuple[str, ...]:
-        """Filter ``candidates`` down to those not in cooldown, preserving order."""
+        """Filter ``candidates`` to those not in cooldown, preserving order.
 
-        health = {h.provider: h for h in self.provider_health()}
-        usable = []
-        for name in candidates:
-            record = health.get(name)
-            if record is None:
-                usable.append(name)
-                continue
-            with self._db.tx() as conn:
-                row = conn.execute(
-                    "select (cooldown_until is null or cooldown_until <= now()) as ready "
-                    "from provider_status where provider = %s",
-                    (name,),
-                ).fetchone()
-            if row and row["ready"]:
-                usable.append(name)
-        return tuple(usable)
+        One query. The first version read every provider's health and then
+        opened a fresh transaction *per candidate* to ask the server whether a
+        timestamp it already held had passed -- a pool checkout and a round trip
+        each, on the model-routing hot path.
+        """
+
+        if not candidates:
+            return ()
+        with self._db.tx() as conn:
+            rows = conn.execute(
+                "select provider from provider_status "
+                "where provider = any(%s) and cooldown_until > now()",
+                (list(candidates),),
+            ).fetchall()
+        cooling = {str(row["provider"]) for row in rows}
+        return tuple(name for name in candidates if name not in cooling)

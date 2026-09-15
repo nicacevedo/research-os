@@ -7,8 +7,16 @@ reimplementing it.** That controller already does the whole lifecycle --
 
 ```text
 frozen base SHA -> isolated worktree -> builder -> format/lint/type checks
--> targeted tests -> independent review -> one bounded repair -> candidate commit
+-> targeted tests -> independent review -> one bounded repair
+-> an isolated branch with uncommitted changes, for a person to review
 ```
+
+The last step says "uncommitted" deliberately. There is no ``git commit``
+anywhere in this system -- ``gitutil`` has no commit helper -- so the run ends
+with a worktree on its own branch holding changes nobody has committed. An
+earlier version of this docstring and of the policy rationale said "candidate
+commit", which an independent review pointed out is not what happens, and which
+would have sent a researcher to look at a branch with nothing on it.
 
 -- with scope enforcement taken from the observed diff, a command policy that
 authorises whole argv vectors rather than program names, symlink containment,
@@ -33,6 +41,26 @@ coding task would serialise the whole runtime on one repository.
 **Nothing is integrated.** The v1 controller stops at ``READY_FOR_HUMAN`` and
 never merges or pushes. The runtime keeps that: integration is an `A2` action,
 and it is one the person performs.
+
+**And a boundary this module cannot move, stated plainly.** The pipeline runs
+the project's acceptance commands, and it runs them *after* the builder has
+written files in scope. So ``pytest`` imports and executes Python a model wrote
+one step earlier, with the researcher's environment and credentials. Worktree
+isolation protects the canonical checkout from the *builder*; it is not an OS
+sandbox, and `SECURITY.md` has always said so.
+
+What R5 changes is that this now happens without a person deciding to run it,
+which is a real escalation of the same risk. An independent review traced the
+consequence: executed test code could commit to the canonical `.research/`,
+push, or clear an approval gate.
+
+This module cannot fix that -- a sandbox is the fix, and it is
+infrastructure this deployment does not have. What it does instead is *detect*
+it: :func:`canonical_fingerprint` hashes the canonical capsule and every Git ref
+before the pipeline runs and again afterwards, and a difference fails the action
+as ``POLICY_REFUSED`` with the paths named. That turns a silent escape into a
+loud one. It does not prevent the write, and it detects nothing that happens
+outside the repository.
 """
 
 from __future__ import annotations
@@ -52,6 +80,43 @@ from research_os.runtime.idempotency import idempotency_key
 from research_os.runtime.locks import RepositoryBusyError, repository_lock
 
 LOG = logging.getLogger("research_os.runtime.actions.coding")
+
+
+def canonical_fingerprint(repo: Path) -> dict[str, str]:
+    """Hash the canonical capsule and every Git ref.
+
+    The two things a coding run must not touch. Refs rather than just HEAD,
+    because a push or a branch write is as much of an escape as a commit, and
+    ``show-ref`` lists all of them in one call.
+
+    Cheap: a capsule is a few dozen small YAML files.
+    """
+
+    import hashlib
+
+    found: dict[str, str] = {}
+    capsule = repo / ".research"
+    if capsule.is_dir():
+        for path in sorted(capsule.rglob("*")):
+            if path.is_file() and "runtime" not in path.relative_to(capsule).parts:
+                found[str(path.relative_to(repo))] = hashlib.sha256(
+                    path.read_bytes()
+                ).hexdigest()
+    try:
+        refs = gitutil.git(["show-ref"], cwd=repo, check=False)
+        found["<git-refs>"] = hashlib.sha256(
+            (refs.stdout or "").encode("utf-8")
+        ).hexdigest()
+    except ResearchOSError as exc:  # pragma: no cover - a repo with no refs
+        found["<git-refs>"] = f"unreadable: {exc}"
+    return found
+
+
+def _describe_drift(before: dict[str, str], after: dict[str, str]) -> str:
+    changed = sorted(
+        key for key in set(before) | set(after) if before.get(key) != after.get(key)
+    )
+    return ", ".join(changed[:12]) + ("..." if len(changed) > 12 else "")
 
 
 def _controller(context: CycleContext) -> Any:
@@ -193,8 +258,9 @@ def run_coding_task(
 ) -> ActionOutcome:
     """Plan, build, check and independently review one bounded code change.
 
-    The whole v1 pipeline, dispatched once. Returns the candidate branch and the
-    reviewer's verdict; integrates nothing.
+    The whole v1 pipeline, dispatched once. Returns the worktree path, the
+    branch, the observed diff as an artifact, and the reviewer's verdict.
+    Commits nothing and integrates nothing.
     """
 
     repo = Path(state["repo_path"])
@@ -227,6 +293,11 @@ def run_coding_task(
     )
 
     def perform() -> dict[str, Any]:
+        # What the canonical checkout looks like before anything runs. Compared
+        # afterwards, because the acceptance commands execute code the builder
+        # just wrote and nothing here can stop them reaching the repository.
+        before = canonical_fingerprint(repo)
+
         # The repository lock covers preflight and worktree creation -- the part
         # that touches the canonical checkout. It is released before the builder
         # runs, because a coding task can take many minutes and holding the lock
@@ -236,6 +307,27 @@ def run_coding_task(
                 project_path=repo, goal=goal, budget=budget, attempt=key[-8:]
             )
         final = controller.execute(store)
+
+        after = canonical_fingerprint(repo)
+        if after != before:
+            drift = _describe_drift(before, after)
+            LOG.error(
+                "a coding run changed the canonical checkout of %s: %s", repo, drift
+            )
+            return {
+                "ok": False,
+                "detail": (
+                    f"the coding run changed the canonical checkout, which it must "
+                    f"never do: {drift}. Something executed during the acceptance "
+                    f"commands reached outside the worktree. The candidate branch "
+                    f"is left in place for inspection and nothing here will act on "
+                    f"it."
+                ),
+                "data": {**_run_payload(final, store), "canonical_drift": drift},
+                "_store_directory": str(store.directory),
+                "_failure_reason": "canonical checkout modified",
+                "_escaped": True,
+            }
         return {
             "ok": final.state is RunState.READY_FOR_HUMAN,
             "detail": (
@@ -284,7 +376,14 @@ def run_coding_task(
         reason = str(result.get("_failure_reason") or result.get("detail") or "unknown")
         return ActionOutcome.failed(
             str(result.get("detail") or reason),
-            failure_class=failure_class_for(reason),
+            # An escape is a policy refusal, not a code failure: it must not be
+            # repaired and retried, because repairing it would run the same
+            # escaping code again.
+            failure_class=(
+                FailureClass.POLICY_REFUSED
+                if result.get("_escaped")
+                else failure_class_for(reason)
+            ),
             data=payload,
             artifacts=artifacts,
         )

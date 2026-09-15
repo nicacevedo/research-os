@@ -39,7 +39,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from research_os.errors import ResearchOSError
-from research_os.runtime.actions.base import ActionOutcome
+from research_os.runtime.actions.base import ActionOutcome, latest_artifact
 from research_os.runtime.budgets import BudgetExhaustedError
 from research_os.runtime.context import CycleContext
 from research_os.runtime.failures import FailureClass
@@ -201,6 +201,11 @@ def audit_citations(
     artifact_id = str(
         plan.get("parameters", {}).get("draft_artifact")
         or previous.get("draft_artifact")
+        # The durable record, because graph state does not cross a cycle
+        # boundary and the draft was almost certainly written in an earlier one.
+        or latest_artifact(
+            context, role_prefix="draft:", project_id=state["project_id"]
+        )
         or ""
     )
     if not artifact_id:
@@ -262,6 +267,9 @@ def referee_manuscript(
     artifact_id = str(
         plan.get("parameters", {}).get("draft_artifact")
         or previous.get("draft_artifact")
+        or latest_artifact(
+            context, role_prefix="draft:", project_id=state["project_id"]
+        )
         or ""
     )
     if not artifact_id:

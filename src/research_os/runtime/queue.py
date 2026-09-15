@@ -292,26 +292,49 @@ class WorkQueue:
         return _row_to_item(row)
 
     def wait_for_external(
-        self, work_id: str, *, owner: str, detail: str, retry_after_seconds: float
+        self,
+        work_id: str,
+        *,
+        owner: str,
+        detail: str,
+        retry_after_seconds: float,
+        max_parks: int = 240,
     ) -> WorkItem:
         """Park an item until an external dependency is expected to have moved.
 
         Distinct from failing: nothing went wrong, and the attempt is refunded
         so that waiting for a cluster does not consume the retry budget that
         exists for things that break.
+
+        Bounded, though. Refunding the attempt means ``attempts`` never
+        approaches ``max_attempts``, so an item that always parks would be
+        re-claimed forever -- an unbounded loop that invariant 14 forbids, and
+        which an independent review found before any caller existed to trigger
+        it. Parks are counted separately in the payload, and past ``max_parks``
+        the item fails as ``SCHEDULER_UNAVAILABLE`` so the wait ends in a named
+        state rather than in silence. At the default 60-second poll interval,
+        240 parks is four hours.
         """
 
         with self._db.tx() as conn:
             row = conn.execute(
                 f"""
                 update work_items
-                set status = 'PENDING',
+                set status = case
+                        when coalesce((payload ->> 'parks')::int, 0) + 1 > %(max_parks)s
+                        then 'FAILED' else 'PENDING' end,
                     scheduled_at = now() + make_interval(secs => %(delay)s),
                     attempts = greatest(attempts - 1, 0),
+                    payload = jsonb_set(
+                        payload, '{{parks}}',
+                        to_jsonb(coalesce((payload ->> 'parks')::int, 0) + 1)
+                    ),
+                    failure_class = case
+                        when coalesce((payload ->> 'parks')::int, 0) + 1 > %(max_parks)s
+                        then %(failure_class)s else null end,
                     lease_owner = null,
                     lease_expires_at = null,
                     last_error = %(detail)s,
-                    failure_class = null,
                     updated_at = now()
                 where work_id = %(work_id)s and status = 'LEASED' and lease_owner = %(owner)s
                 returning {WORK_COLUMNS}
@@ -321,6 +344,8 @@ class WorkQueue:
                     "owner": owner,
                     "delay": float(retry_after_seconds),
                     "detail": detail[:4000],
+                    "max_parks": max_parks,
+                    "failure_class": str(FailureClass.SCHEDULER_UNAVAILABLE),
                 },
             ).fetchone()
         if row is None:
@@ -354,7 +379,13 @@ class WorkQueue:
                     failure_class = case
                         when w.attempts >= w.max_attempts then %(failure_class)s
                         else w.failure_class end,
-                    last_error = %(error)s,
+                    -- Only overwrite the message when this *is* the diagnosis.
+                    -- Requeueing used to replace a diagnosed failure's text
+                    -- with "lease expired" while keeping its class, which reads
+                    -- as a contradiction in `runtime status`.
+                    last_error = case
+                        when w.attempts >= w.max_attempts or w.failure_class is null
+                        then %(error)s else w.last_error end,
                     updated_at = now()
                 from expired e
                 where w.work_id = e.work_id

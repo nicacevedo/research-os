@@ -131,12 +131,12 @@ def prune(db: Database, dsn: str, *, retention_days: int) -> tuple[str, ...]:
     stale = [str(row["thread_id"]) for row in rows]
     if not stale:
         return ()
-    live = set(thread_ids(db))
     deleted: list[str] = []
     with checkpointer(dsn) as saver:
         for thread in stale:
-            if thread not in live:
-                continue
+            # No `select distinct thread_id` first. That was a full scan of the
+            # largest table in the database, on every prune, to avoid
+            # `delete_thread` calls that are no-ops anyway.
             saver.delete_thread(thread)
             deleted.append(thread)
     if deleted:

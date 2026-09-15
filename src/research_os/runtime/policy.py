@@ -88,6 +88,7 @@ class ActionKind(StrEnum):
     PROPOSE_HYPOTHESES = "propose_hypotheses"
     CRITIQUE_HYPOTHESES = "critique_hypotheses"
     DESIGN_EXPERIMENT = "design_experiment"
+    INTERPRET_RESULTS = "interpret_results"
     REVIEW_SCIENCE = "review_science"
     REFEREE_MANUSCRIPT = "referee_manuscript"
     AUDIT_CITATIONS = "audit_citations"
@@ -190,6 +191,13 @@ ACTIONS: dict[ActionKind, ActionPolicy] = {
         frozenset({Permission.READ_REPO}),
         "Writes a specification, runs nothing.",
     ),
+    ActionKind.INTERPRET_RESULTS: ActionPolicy(
+        AutonomyLevel.A0,
+        frozenset(),
+        "Compares results to the criteria that were fixed before them. It "
+        "establishes the facts and cannot move the criteria: a post-hoc change "
+        "is change_primary_endpoint, which a person performs.",
+    ),
     ActionKind.REVIEW_SCIENCE: ActionPolicy(
         AutonomyLevel.A0,
         frozenset(),
@@ -216,9 +224,10 @@ ACTIONS: dict[ActionKind, ActionPolicy] = {
             {Permission.READ_REPO, Permission.WRITE_WORKTREE, Permission.RUN_LOCAL}
         ),
         "The whole coding lifecycle in one isolated worktree: build, check, "
-        "independently review, one bounded repair, candidate commit. Bounded to "
-        "declared paths, and it never merges or pushes. RUN_LOCAL because running "
-        "a project's acceptance commands runs that project's code.",
+        "independently review, one bounded repair. It leaves uncommitted changes "
+        "on an isolated branch -- nothing here commits, merges or pushes. "
+        "RUN_LOCAL because running a project's acceptance commands runs that "
+        "project's code, including code the builder just wrote.",
     ),
     ActionKind.RUN_LOCAL_EXPERIMENT: ActionPolicy(
         AutonomyLevel.A1,
@@ -287,7 +296,11 @@ ACTIONS: dict[ActionKind, ActionPolicy] = {
         frozenset({Permission.WRITE_WORKTREE}),
         "Merging is a human act in this repository, by policy and by habit.",
         human_executes=True,
-        follow_up="Review the candidate branch and merge it yourself; the runtime never pushes or merges.",
+        follow_up=(
+            "Inspect the worktree's branch (`researchctl runtime run <id>` names "
+            "it), commit what you want, and merge it yourself. The runtime "
+            "commits nothing."
+        ),
     ),
     ActionKind.PUBLISH_EXTERNALLY: ActionPolicy(
         AutonomyLevel.A2,
@@ -312,6 +325,29 @@ ACTIONS: dict[ActionKind, ActionPolicy] = {
 #: Note what the reviewers do *not* have. A scientific reviewer cannot write, run
 #: or fetch: it reads a frozen packet and returns a verdict, so no amount of
 #: prompt injection in the material it reviews can turn it into an actor.
+#:
+#: **Where this is enforced, and where it is not.** An independent review
+#: observed that :func:`authorize` accepts a ``role`` and no caller passes one,
+#: and suggested wiring it in. Trying that showed why it was not wired: an
+#: *action's* permissions say what the runtime needs in order to perform it
+#: (``NETWORK_READ`` to query OpenAlex, ``RUN_LOCAL`` to run a project's tests),
+#: while a *role's* say what a model may be handed. Intersecting them refused
+#: literature search and every coding task, because the extractor does not
+#: "hold" the network and the author does not "hold" the test runner -- the
+#: runtime does, on their behalf.
+#:
+#: The real enforcement of role limits is at the provider boundary, and it is
+#: stronger than a permission check: every model request this runtime builds is
+#: ``read_only=True`` with no ``access``, which
+#: :class:`research_os.automation.providers.InvocationRequest` resolves to
+#: ``Access.CONTEXT_ONLY`` and which force-empties the tool set. Every runtime
+#: model call is therefore tool-less -- it cannot read a file, run a command or
+#: reach the network whatever its role says. ``tests/test_runtime_routing.py``
+#: asserts it.
+#:
+#: So this table is the *specification* of least privilege, and the tool-less
+#: invocation is its enforcement. Both are documented here rather than one
+#: pretending to be the other.
 ROLE_PERMISSIONS: dict[ModelRole, frozenset[Permission]] = {
     ModelRole.PLANNER: frozenset({Permission.READ_REPO}),
     ModelRole.BLIND_EXPLORER: frozenset(),

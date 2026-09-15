@@ -404,7 +404,8 @@ def test_answering_the_gate_resumes_in_a_fresh_process_and_acts_once(
     assert effects.read_text().splitlines() == ["action"]
     applied = store.get_approval(approval_id)
     assert applied is not None
-    assert applied.status is ApprovalStatus.APPLIED
+    assert applied.status is ApprovalStatus.GRANTED
+    assert applied.applied_at is not None
 
 
 def test_a_declined_decision_ends_the_cycle_without_the_action(

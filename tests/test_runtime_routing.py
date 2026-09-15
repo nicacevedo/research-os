@@ -454,3 +454,47 @@ def test_unavailable_providers_get_no_routable_profile() -> None:
     }
     profiles = profiles_from_adapters(registry)
     assert [profile.name for profile in profiles] == ["present"]
+
+
+def test_every_runtime_model_call_is_read_only_and_tool_less(
+    runtime_db: Database, tmp_path: Path, run_id: str, runtime_project: str
+) -> None:
+    """The actual enforcement of role least privilege.
+
+    `policy.ROLE_PERMISSIONS` specifies what each role may hold; this is what
+    makes it true. Every request the router builds is `read_only=True` with no
+    `access`, which the v1 adapter contract resolves to `CONTEXT_ONLY` and which
+    force-empties the tool set. A model that cannot read a file, run a command
+    or reach the network cannot exceed its role whatever the role says -- and no
+    amount of prompt injection in the material under review can change that.
+    """
+
+    from research_os.automation.models import Access
+
+    provider = _provider("only", "a")
+    router = _router(
+        runtime_db,
+        tmp_path,
+        run_id=run_id,
+        project_id=runtime_project,
+        adapters={"only": provider},
+        profiles=(ProviderProfile(name="only", family="a", tier=3),),
+    )
+    for role, capability in (
+        (ModelRole.PLANNER, Capability.PLANNING),
+        (ModelRole.SKEPTIC, Capability.CRITIQUE),
+        (ModelRole.AUTHOR, Capability.SYNTHESIS),
+        (ModelRole.SCIENTIFIC_REVIEWER, Capability.CRITIQUE),
+        (ModelRole.EXTRACTOR, Capability.STRUCTURED_EXTRACTION),
+    ):
+        router.complete(
+            _request(role=role, capability=capability, criticality=Criticality.NORMAL)
+        )
+
+    assert provider.calls, "no request reached the adapter"
+    for request in provider.calls:
+        assert request.read_only is True, f"{request.role} was not read-only"
+        assert request.access is Access.CONTEXT_ONLY, (
+            f"{request.role} got {request.access}"
+        )
+        assert request.tools == (), f"{request.role} was handed tools: {request.tools}"

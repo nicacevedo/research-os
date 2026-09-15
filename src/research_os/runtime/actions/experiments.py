@@ -577,6 +577,28 @@ def submit_cluster_experiment(
     return _submit(state, context, plan, executor_name=SLURM)
 
 
+def _latest_finished_job(context: CycleContext, *, project_id: str) -> Any | None:
+    """The most recently finished job for this project, if any.
+
+    Deliberately simple: "finished and most recent". A per-job interpreted flag
+    would be better bookkeeping and is the obvious next step; what matters here
+    is that the handler has a reachable input at all.
+    """
+
+    with context.db.tx() as conn:
+        row = conn.execute(
+            """
+            select job_id from external_jobs
+            where project_id = %s
+              and status in ('COMPLETED','FAILED','TIMED_OUT','CANCELLED')
+            order by finished_at desc nulls last
+            limit 1
+            """,
+            (project_id,),
+        ).fetchone()
+    return context.store.get_external_job(str(row["job_id"])) if row else None
+
+
 def interpret_results(
     state: Mapping[str, Any], context: CycleContext, plan: Mapping[str, Any]
 ) -> ActionOutcome:
@@ -597,20 +619,25 @@ def interpret_results(
         plan.get("parameters", {}).get("job_id") or previous.get("job_id") or ""
     )
     if not job_id:
-        return ActionOutcome.failed(
-            "no job to interpret", failure_class=FailureClass.POLICY_REFUSED
-        )
-
-    jobs = {
-        job.job_id: job
-        for job in context.store.list_external_jobs(run_id=state["run_id"])
-    }
-    job = jobs.get(job_id)
-    if job is None:
-        return ActionOutcome.failed(
-            f"no such job on this run: {job_id}",
-            failure_class=FailureClass.ARTIFACT_MISSING,
-        )
+        # Graph state does not cross a cycle boundary -- a successor is a new
+        # thread seeded only with identity -- and an experiment is almost always
+        # submitted in one cycle and finished by the time of the next. So the
+        # durable record answers "which job is there to interpret". Without
+        # this the handler was unreachable, and an independent review found that
+        # the pipeline could therefore write up results it had never compared
+        # against the criteria.
+        job = _latest_finished_job(context, project_id=str(state["project_id"]))
+        if job is None:
+            return ActionOutcome.succeeded(
+                "no finished experiment is waiting to be interpreted",
+                data={"interpreted": False},
+            )
+    else:
+        job = context.store.get_external_job(job_id)
+        if job is None:
+            return ActionOutcome.failed(
+                f"no such job: {job_id}", failure_class=FailureClass.ARTIFACT_MISSING
+            )
     if job.status not in {
         ExternalJobStatus.COMPLETED,
         ExternalJobStatus.FAILED,
@@ -618,7 +645,7 @@ def interpret_results(
         ExternalJobStatus.CANCELLED,
     }:
         return ActionOutcome.failed(
-            f"{job_id} is {job.status}; there is nothing to interpret yet",
+            f"{job.job_id} is {job.status}; there is nothing to interpret yet",
             failure_class=FailureClass.SCHEDULER_UNAVAILABLE,
         )
 
@@ -633,7 +660,8 @@ def interpret_results(
             f"conclusion follows from it"
         ),
         data={
-            "job_id": job_id,
+            "interpreted": True,
+            "job_id": job.job_id,
             "status": str(job.status),
             "exit_code": job.exit_code,
             "ran_correctly": ran_correctly,

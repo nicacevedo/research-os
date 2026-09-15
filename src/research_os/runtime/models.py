@@ -74,13 +74,19 @@ class WorkStatus(StrEnum):
 
 
 class ApprovalStatus(StrEnum):
+    """What a person decided. Not whether it has been acted on.
+
+    There is deliberately no ``APPLIED``. An earlier version had one and wrote
+    it over ``GRANTED`` or ``DECLINED``, which destroyed the distinction the
+    status exists to record -- a replayed node read a *declined* gate back as
+    granted. ``Approval.applied_at`` carries "acted on" orthogonally, and
+    ``mark_approval_applied`` claims it exactly once.
+    """
+
     PENDING = "PENDING"
     GRANTED = "GRANTED"
     DECLINED = "DECLINED"
     EXPIRED = "EXPIRED"
-    #: The decision has been recorded *and* acted upon. Separate from GRANTED so
-    #: a resume that runs twice cannot apply one approval twice.
-    APPLIED = "APPLIED"
 
 
 class InvocationStatus(StrEnum):

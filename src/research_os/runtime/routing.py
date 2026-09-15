@@ -49,7 +49,7 @@ from research_os.automation.providers import (
 )
 from research_os.errors import ResearchOSError
 from research_os.runtime.artifacts import FilesystemArtifactStore
-from research_os.runtime.budgets import BudgetLedger, Dimension
+from research_os.runtime.budgets import BudgetLedger, Dimension, Grant
 from research_os.runtime.interfaces import (
     ArtifactRef,
     Capability,
@@ -148,6 +148,7 @@ class ModelRouter:
         "_adapters",
         "_artifacts",
         "_budgets",
+        "_loaded_groups",
         "_profiles",
         "_project_id",
         "_run_id",
@@ -177,8 +178,13 @@ class ModelRouter:
         self._project_id = project_id
         self._work_id = work_id
         #: Which family already answered for each independence group, so a
-        #: reviewer can be routed away from its producer.
+        #: reviewer can be routed away from its producer. Populated lazily from
+        #: the database rather than kept only in memory: a router is built per
+        #: work item, so an in-memory-only map reset on every process boundary
+        #: and a reviewer resumed after a crash was routed to the producer's own
+        #: family and recorded as a fresh context rather than a degradation.
         self._used_families: dict[str, set[str]] = {}
+        self._loaded_groups: set[str] = set()
 
     # --------------------------------------------------------------- routing --
     def _candidates(self, request: ModelRequest) -> tuple[ProviderProfile, ...]:
@@ -223,7 +229,7 @@ class ModelRouter:
             )
 
         group = request.independence_group
-        already = self._used_families.get(group or "", set())
+        already = self._families_for(group) if group else set()
         if (
             request.independence
             in {
@@ -267,6 +273,30 @@ class ModelRouter:
             note="fresh context",
         )
 
+    def _families_for(self, group: str) -> set[str]:
+        """Which provider families have already answered in this group.
+
+        Read from ``model_calls`` once per group per router, then kept in
+        memory. The database is the durable record, and it is what makes the
+        accounting correct across the crash-and-resume that a bounded cycle is
+        designed to survive.
+        """
+
+        if group in self._loaded_groups:
+            return self._used_families.setdefault(group, set())
+        families = {profile.name: profile.family for profile in self._profiles}
+        with self._store.db.tx() as conn:
+            rows = conn.execute(
+                "select distinct provider from model_calls "
+                "where independence_group = %s and status = 'OK'",
+                (group,),
+            ).fetchall()
+        seen = {
+            families.get(str(row["provider"]), str(row["provider"])) for row in rows
+        }
+        self._loaded_groups.add(group)
+        return self._used_families.setdefault(group, set()) | seen
+
     # --------------------------------------------------------------- calling --
     def complete(self, request: ModelRequest) -> ModelResponse:
         """Answer one typed request, recording provenance either way."""
@@ -275,25 +305,37 @@ class ModelRouter:
         profile = routed.profile
         adapter = self._adapters[profile.name]
 
-        prompt_ref = self._artifacts.put_text(
-            request.prompt,
-            role="prompt",
-            producer=f"{request.role}:{request.prompt_version}",
-        )
-        grants = self._budgets.reserve_all(
-            dimension=Dimension.MODEL_CALLS,
-            amount=1,
-            run_id=self._run_id,
-            project_id=self._project_id,
-            work_id=self._work_id,
-        )
-        cost_grants = self._budgets.reserve_all(
-            dimension=Dimension.MODEL_COST_USD,
-            amount=profile.estimated_cost_usd,
-            run_id=self._run_id,
-            project_id=self._project_id,
-            work_id=self._work_id,
-        )
+        # Reserve both dimensions or neither. The first version took them in
+        # two unguarded statements, so the *expected* outcome -- the cost budget
+        # refusing -- leaked up to three HELD call-budget rows with no handle on
+        # them, and a cost-exhausted run silently exhausted its call budget too
+        # and then misreported which one ran out.
+        grants: tuple[Grant, ...] = ()
+        cost_grants: tuple[Grant, ...] = ()
+        try:
+            grants = self._budgets.reserve_all(
+                dimension=Dimension.MODEL_CALLS,
+                amount=1,
+                run_id=self._run_id,
+                project_id=self._project_id,
+                work_id=self._work_id,
+            )
+            cost_grants = self._budgets.reserve_all(
+                dimension=Dimension.MODEL_COST_USD,
+                amount=profile.estimated_cost_usd,
+                run_id=self._run_id,
+                project_id=self._project_id,
+                work_id=self._work_id,
+            )
+            prompt_ref = self._artifacts.put_text(
+                request.prompt,
+                role="prompt",
+                producer=f"{request.role}:{request.prompt_version}",
+            )
+        except BaseException:
+            self._budgets.release_all(cost_grants)
+            self._budgets.release_all(grants)
+            raise
 
         started = time.monotonic()
         try:
@@ -394,6 +436,7 @@ class ModelRouter:
         self._budgets.settle_all(grants)
         self._store.record_provider_result(profile.name, ok=True)
         if request.independence_group:
+            self._loaded_groups.add(request.independence_group)
             self._used_families.setdefault(request.independence_group, set()).add(
                 profile.family
             )

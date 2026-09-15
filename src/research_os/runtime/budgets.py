@@ -190,6 +190,8 @@ class BudgetLedger:
         """
 
         wanted = Decimal(str(amount))
+        if wanted < 0:
+            raise BudgetError(f"cannot reserve a negative amount ({wanted})")
         with self._db.tx() as conn:
             budget = conn.execute(
                 f"select {BUDGET_COLUMNS} from budgets "
@@ -284,9 +286,21 @@ class BudgetLedger:
                         work_id=work_id,
                     )
                 )
-        except BudgetExhaustedError:
+        except BaseException:
+            # Any failure, not only exhaustion. Each `reserve` is its own
+            # transaction, so a transient database error or a constraint
+            # violation on the second or third leaked the grants already taken --
+            # and the docstring above promised the opposite. Release is
+            # best-effort so a failing release cannot mask the original error.
             for grant in taken:
-                self.release(grant)
+                try:
+                    self.release(grant)
+                except Exception as exc:  # noqa: BLE001 - must not mask the cause
+                    LOG.warning(
+                        "could not release %s while rolling back a reservation: %s",
+                        grant.reservation_id,
+                        exc,
+                    )
             raise
         return tuple(taken)
 
@@ -362,41 +376,57 @@ class BudgetLedger:
             self.release(grant)
 
     # ----------------------------------------------------------- reconciling --
-    def reconcile_stale(self, *, older_than_seconds: int) -> int:
+    def reconcile_stale(self, *, older_than_seconds: int, limit: int = 500) -> int:
         """Release reservations whose worker never came back.
 
         Called by the daemon. Deliberately releases rather than settles: the
-        spend is *unknown*, and the alternative -- assuming it happened --
-        would charge for work that may never have been done. The model-call
-        provenance table is the record of what was actually spent; this is only
-        the capacity reservation catching up.
+        spend is *unknown*, and assuming it happened would charge for work that
+        may never have been done. The model-call provenance table is the record
+        of what was actually spent; this is only the capacity reservation
+        catching up.
+
+        Aggregated in SQL, ordered by ``budget_id``, and bounded. The first
+        version issued one ``update budgets`` per stale row from a Python loop
+        in arbitrary order, which two daemons could deadlock against each other
+        -- and since this is the only thing that releases leaked capacity,
+        starving it starves the recovery.
         """
 
         with self._db.tx() as conn:
-            rows = conn.execute(
+            row = conn.execute(
                 """
                 with stale as (
                     select reservation_id, budget_id, amount
                     from budget_reservations
                     where status = 'HELD'
                       and created_at < now() - make_interval(secs => %(age)s)
+                    order by reservation_id
                     for update skip locked
+                    limit %(limit)s
+                ), released as (
+                    update budget_reservations r
+                    set status = 'RELEASED', settled_at = now()
+                    from stale s where r.reservation_id = s.reservation_id
+                    returning r.budget_id, r.amount
+                ), totals as (
+                    select budget_id, sum(amount) as amount
+                    from released group by budget_id
+                ), applied as (
+                    update budgets b
+                    set reserved = greatest(b.reserved - t.amount, 0),
+                        updated_at = now()
+                    from (select * from totals order by budget_id) t
+                    where b.budget_id = t.budget_id
+                    returning 1
                 )
-                update budget_reservations r set status = 'RELEASED', settled_at = now()
-                from stale s where r.reservation_id = s.reservation_id
-                returning r.budget_id, r.amount
+                select (select count(*) from released) as n
                 """,
-                {"age": float(older_than_seconds)},
-            ).fetchall()
-            for row in rows:
-                conn.execute(
-                    "update budgets set reserved = greatest(reserved - %s, 0), "
-                    "updated_at = now() where budget_id = %s",
-                    (Decimal(row["amount"]), row["budget_id"]),
-                )
-        if rows:
-            LOG.warning("released %d stale budget reservation(s)", len(rows))
-        return len(rows)
+                {"age": float(older_than_seconds), "limit": limit},
+            ).fetchone()
+        count = int(row["n"]) if row else 0
+        if count:
+            LOG.warning("released %d stale budget reservation(s)", count)
+        return count
 
     def held_reservations(self, *, budget_id: str) -> tuple[Reservation, ...]:
         with self._db.tx() as conn:

@@ -446,7 +446,8 @@ def test_recording_a_decision_resumes_the_cycle_without_being_asked(
     assert done.status is RunStatus.SUCCEEDED
     applied = store.get_approval(approvals[0].approval_id)
     assert applied is not None
-    assert applied.status is ApprovalStatus.APPLIED
+    assert applied.status is ApprovalStatus.GRANTED
+    assert applied.applied_at is not None
 
 
 # --------------------------------------------------------------- schedules --

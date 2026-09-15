@@ -187,6 +187,11 @@ def test_a_decision_can_be_applied_by_exactly_one_caller(
     )
     assert store.mark_approval_applied(approval.approval_id) is True
     assert store.mark_approval_applied(approval.approval_id) is False
+    # The status still says what was decided; `applied_at` says it was acted on.
+    acted = store.get_approval(approval.approval_id)
+    assert acted is not None
+    assert acted.status is ApprovalStatus.GRANTED
+    assert acted.applied_at is not None
 
 
 def test_a_submission_is_recorded_before_the_scheduler_is_told(
@@ -202,7 +207,9 @@ def test_a_submission_is_recorded_before_the_scheduler_is_told(
     )
     assert job.status is ExternalJobStatus.SUBMITTING
     assert job.scheduler_job_id is None
-    assert job in store.active_external_jobs()
+    # `active_external_jobs` is a claim: it stamps `last_polled_at`, so compare
+    # identities rather than whole records.
+    assert job.job_id in {claimed.job_id for claimed in store.active_external_jobs()}
 
     submitted = store.update_external_job(
         job.job_id, status=ExternalJobStatus.SUBMITTED, scheduler_job_id="4711"
@@ -214,7 +221,9 @@ def test_a_submission_is_recorded_before_the_scheduler_is_told(
         job.job_id, status=ExternalJobStatus.COMPLETED, exit_code=0, polled=True
     )
     assert done.finished_at is not None
-    assert done not in store.active_external_jobs()
+    assert done.job_id not in {
+        claimed.job_id for claimed in store.active_external_jobs()
+    }
 
 
 def test_model_call_provenance_records_the_independence_group(

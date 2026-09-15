@@ -42,6 +42,7 @@ import hashlib
 import json
 import logging
 import os
+import secrets
 import socket
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -82,15 +83,25 @@ class UnreconciledInvocationError(IdempotencyError):
     """
 
 
-def worker_identity() -> str:
-    """A stable-enough name for whoever is holding things.
+#: Distinguishes this process instance from any other that happens to share a
+#: pid. Generated once at import and never reused.
+_INSTANCE = secrets.token_hex(4)
 
-    Host and pid. Not globally unique across a reboot that reuses a pid, which
-    is fine: identity here is used to attribute and to debug, never as the sole
-    basis for safety. Safety comes from the database's uniqueness constraints.
+
+def worker_identity() -> str:
+    """A name for whoever is holding things, unique per process instance.
+
+    Host, pid, and a random instance token. The earlier version was host and pid
+    alone, with a docstring claiming identity here is "never the sole basis for
+    safety" -- which was false: ``renew``, ``succeed``, ``fail`` and
+    ``wait_for_external`` use ``lease_owner = %(owner)s`` as their *only*
+    ownership test. Two live processes sharing an owner string -- pid reuse
+    after a supervisor restart, two ``Daemon`` instances in one process -- would
+    let a stale worker renew a lease it did not hold and overwrite the current
+    owner's result. The token removes the coincidence.
     """
 
-    return f"{socket.gethostname()}/{os.getpid()}"
+    return f"{socket.gethostname()}/{os.getpid()}/{_INSTANCE}"
 
 
 def idempotency_key(kind: str, *parts: object) -> str:

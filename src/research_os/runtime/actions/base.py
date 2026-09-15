@@ -99,3 +99,39 @@ class ActionHandler(Protocol):
 
 
 Handler = Callable[[Mapping[str, Any], CycleContext, Mapping[str, Any]], ActionOutcome]
+
+
+def latest_artifact(
+    context: CycleContext,
+    *,
+    role_prefix: str,
+    project_id: str,
+) -> str | None:
+    """The most recent artifact of a kind, across every cycle of one project.
+
+    Handlers used to look for their input in ``state["action_result"]``, which
+    is always empty at the start of a cycle: one action runs per cycle, and a
+    successor cycle is a new LangGraph thread seeded only with identity. So the
+    citation audit and the results interpretation could never find a draft or a
+    job and always returned "nothing to do" -- which meant the pipeline could
+    write prose and never audit it.
+
+    The durable record is the answer. Artifacts are linked to their run when
+    produced, and runs belong to projects.
+    """
+
+    with context.db.tx() as conn:
+        row = conn.execute(
+            """
+            select l.artifact_id
+            from artifact_links l
+            join research_runs r on r.run_id = l.run_id
+            join artifacts a on a.artifact_id = l.artifact_id
+            where r.project_id = %(project_id)s
+              and a.role like %(prefix)s
+            order by l.created_at desc
+            limit 1
+            """,
+            {"project_id": project_id, "prefix": f"{role_prefix}%"},
+        ).fetchone()
+    return str(row["artifact_id"]) if row else None

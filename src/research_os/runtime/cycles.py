@@ -26,6 +26,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -328,6 +329,9 @@ def _execute(
     )
     thread = run.thread_id or thread_id_for(run.run_id)
     graph_config = {"configurable": {"thread_id": thread}}
+    # When *this* entry began, for the wall-clock charge. Not the run's
+    # `started_at`, which never advances.
+    entered_at = datetime.now(UTC)
 
     if (
         run.status is RunStatus.CREATED
@@ -411,7 +415,7 @@ def _execute(
             state=final,
         )
 
-    _settle_wall_clock(db, run)
+    _settle_wall_clock(db, run, entered_at=entered_at)
     digest = str(final.get("frontier_digest") or "")
     if digest:
         store.set_frontier_digest(run.run_id, digest)
@@ -447,20 +451,22 @@ def _execute(
     )
 
 
-def _settle_wall_clock(db: Database, run: ResearchRun) -> None:
-    """Charge the wall clock this cycle actually used.
+def _settle_wall_clock(db: Database, run: ResearchRun, *, entered_at: datetime) -> None:
+    """Charge the wall clock this *entry* used.
 
-    A declared budget that nothing ever spends is not a budget, and this one was
-    exactly that until the first real end-to-end run showed
-    ``wall_clock_seconds`` at zero after two and a half minutes of work. Charged
-    at the end rather than sampled during, because the number that matters is
-    how long the cycle took and that is only known when it stops.
+    ``entered_at`` rather than ``run.started_at``, because ``started_at`` is
+    stamped once and never advances -- so charging from it billed the full
+    elapsed time since the run first began, again, on every resume. A run
+    resumed three times charged roughly 1x + 2x + 3x the real time, and the
+    old ``least(limit_value, ...)`` clamp then guaranteed convergence to exactly
+    the limit, so ``wall_clock_seconds`` reported itself exhausted regardless of
+    time actually spent -- and ``should_continue`` reads that.
 
-    Settled directly rather than through a reservation: nothing else competes
-    for wall clock, so there is no capacity to hold in advance.
+    No clamp now either. A budget that cannot record an overrun cannot tell
+    "used exactly the budget" from "used ten times it", and the second is the
+    one worth knowing.
     """
 
-    started = run.started_at or run.created_at
     ledger = BudgetLedger(db)
     budget = ledger.get(
         scope=BudgetScope.RUN,
@@ -473,14 +479,12 @@ def _settle_wall_clock(db: Database, run: ResearchRun) -> None:
         conn.execute(
             """
             update budgets
-            set spent = least(
-                    limit_value,
-                    spent + greatest(extract(epoch from (now() - %(started)s)), 0)
-                ),
+            set spent = spent
+                + greatest(extract(epoch from (now() - %(entered)s)), 0),
                 updated_at = now()
             where budget_id = %(budget_id)s
             """,
-            {"budget_id": budget.budget_id, "started": started},
+            {"budget_id": budget.budget_id, "entered": entered_at},
         )
 
 

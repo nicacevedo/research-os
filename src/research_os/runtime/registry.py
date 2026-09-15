@@ -45,6 +45,7 @@ from research_os.runtime.actions.base import ActionOutcome, Handler
 from research_os.runtime.actions.coding import run_coding_task
 from research_os.runtime.actions.experiments import (
     design_experiment,
+    interpret_results,
     run_local_experiment,
     submit_cluster_experiment,
 )
@@ -129,6 +130,9 @@ ACTION_HANDLERS: dict[ActionKind, RegisteredAction] = {
     ActionKind.REVIEW_SCIENCE: RegisteredAction(review_science, replay_safe=True),
     # --- experiments ------------------------------------------------------
     ActionKind.DESIGN_EXPERIMENT: RegisteredAction(design_experiment, replay_safe=True),
+    # Reads a finished job and the criteria fixed before it. Changes nothing,
+    # and structurally cannot move the criteria.
+    ActionKind.INTERPRET_RESULTS: RegisteredAction(interpret_results, replay_safe=True),
     # The submitting handlers own their own ledger entries, keyed by spec
     # digest, and reconcile against `external_jobs`. Declared replay-safe *at
     # this level* because the inner ledger is the guard; declaring them unsafe
