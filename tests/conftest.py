@@ -50,3 +50,13 @@ def automation_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         path.mkdir(parents=True)
         monkeypatch.setenv(name, str(path))
     return mapping["RESEARCH_OS_STATE_HOME"]
+
+
+# --- autonomous runtime (R5) ------------------------------------------------
+# Imported rather than redefined so that a test module can also import them
+# directly; pytest only discovers fixtures that are named in a conftest.
+from tests.runtime_helpers import (  # noqa: F401
+    pg_dsn,
+    runtime_db,
+    runtime_project,
+)

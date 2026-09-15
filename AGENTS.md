@@ -14,6 +14,9 @@ Read these, in this order, before significant work:
 5. `ROADMAP.md` — release sequence and current implementation state.
 6. `docs/AUTOMATION_MVP.md` — the automation control plane: what it may do,
    what stays human, and the isolation and budget boundaries it enforces.
+7. `docs/RUNTIME.md` — the autonomous runtime (R5): the authority model, the
+   queue's guarantees, the idempotency ledger, locking, the failure taxonomy,
+   and the autonomy levels. Read it before touching `research_os.runtime`.
 
 `docs/CAPSULE.md` is authoritative on anything scientific. Where any other
 document disagrees with it, it wins.

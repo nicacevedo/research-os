@@ -242,7 +242,7 @@ in `AGENTS.md`.
 | **R2 — Co-Explorer** | read-only analyst, structured proposals, cross-project insights | in v1 (`propose`, `insight`) |
 | **R3 — Experimentalist** | declared commands, local and Slurm execution, evidence packets | in v1 (`experiment`) |
 | **R4 — Author / Referee** | source packets, grounded drafting, independent writing review | in v1 (`paper`) |
-| **R5 — Autonomous OS** | watchers, MCP, background services, optional UI | not started |
+| **R5 — Autonomous OS** | durable runtime, control-plane daemon, bounded resumable graphs | in progress (`researchctl runtime`, `researchd`) |
 
 Research OS v1 delivers the working core of R1 through R4, orchestrated by
 `researchctl research`. What it deliberately does not deliver is R5: there are
@@ -333,10 +333,9 @@ dangerous and differ only in what they do about them.
 
 Research OS does not include and must not opportunistically add:
 
-Docker, Podman, Apptainer, PostgreSQL, vector database servers, MCP, LangGraph,
-PaperQA, local LLMs, Ollama, web UI, background systemd services, embeddings,
-unofficial browser automation, firmware/Secure Boot/MOK automation, automatic
-merge, and automatic scientific acceptance.
+Docker, Podman, Apptainer, vector database servers, MCP, PaperQA, local LLMs,
+Ollama, web UI, embeddings, unofficial browser automation, firmware/Secure
+Boot/MOK automation, automatic merge, and automatic scientific acceptance.
 
 Two items left this list in v1, and how they arrived matters. **Literature
 APIs** are three plain HTTP clients over OpenAlex, Crossref and arXiv with a
@@ -345,6 +344,64 @@ SQLite FTS5 index — no embeddings, no vector store, no framework. **Slurm** is
 sitting, invoked over `ssh <alias>` with no credential handling of its own.
 Neither brought a dependency of any size, which was the condition for adding
 them at all.
+
+### 12a. Three items left the list in R5, and why
+
+R5 is the autonomous runtime, and it was authorised explicitly rather than
+arrived at opportunistically. Three postponed technologies were adopted. Each is
+recorded here with the requirement that forced it, because "we needed
+orchestration" is not a reason and would have justified any of them.
+
+**PostgreSQL** — adopted as the *operational* datastore only. The requirement is
+three properties SQLite does not have and cannot be given:
+
+1. a work queue several workers can claim from concurrently without
+   serialising, which is `for update skip locked`;
+2. lease deadlines computed by the server, so two workers with skewed clocks
+   cannot disagree about whether a lease is dead;
+3. a mutation lock held by a *session* and released by the server when that
+   session dies, so a worker killed mid-commit does not leave a repository
+   locked forever. `flock` releases on process exit, which is the same thing
+   only when the holder and the releaser are one process — and under lease
+   handover they are not.
+
+What did **not** move: scientific truth. Questions, hypotheses, experiments,
+evidence, claims, decisions, reviews and every status transition remain
+Git-tracked capsule files. `research_os.runtime.kernel` is the only module that
+reads them and it has no method that writes one. A runtime that could accept a
+Claim by updating a row would be a runtime that can manufacture scientific
+agreement, and provenance recorded afterwards would not undo it.
+
+**LangGraph** — adopted for bounded, resumable reasoning workflows, for one
+property: durable checkpointing with interrupt and resume across process death.
+That was measured on the pinned version rather than assumed, and the measurement
+changed the design twice:
+
+- a process killed *inside* a node re-runs that node on resume, so its side
+  effect is emitted a second time. That is why every side effect goes through
+  the invocation ledger (`docs/RUNTIME.md` §4) — not as a precaution, but
+  because it was reproduced;
+- a side effect placed *before* `interrupt()` in the same node is replayed when
+  the interrupt is answered. That is why a human gate is three nodes
+  (`prepare` / `interrupt` / `apply`) and never one.
+
+LangGraph is not the scientific database, not a long-lived process, and not the
+owner of a project. One thread is one bounded cycle, and a cycle ends.
+
+**A background service** — `researchd`, one local control-plane process.
+Invariant 2 ("no continuously thinking agents") is unchanged and is met: the
+daemon does deterministic, inexpensive work — ingest events, claim due work,
+renew leases, reclaim expired ones, poll external jobs, enforce budgets, track
+provider health, surface approvals. It calls no model itself. Frontier reasoning
+stays event-triggered, bounded and budgeted, as invariant 3 requires. A
+`systemd` **user** unit ships as a file; nothing enables it, and nothing in this
+repository modifies the host to install it.
+
+Considered and refused: Kubernetes, RabbitMQ, Redis, Celery, Temporal, a
+separate vector database, mandatory containerisation, a web dashboard. None
+removes a bottleneck this deployment has — one researcher, one workstation, one
+optional cluster — and each adds operational surface that must then be kept
+alive for the science to run.
 
 ## 13. Human versus agent authority
 
@@ -360,3 +417,36 @@ deterministic tests, and documentation **within an authorized milestone**.
 Agents must stop at the authorized milestone. They must not push, merge, enable
 services, or modify the host outside the repository except ordinary uv-managed
 project environment operations.
+
+## 14. The autonomous runtime
+
+`research_os.runtime` is the durable operational layer. `docs/RUNTIME.md` is its
+live specification.
+
+Five kinds of state, five owners:
+
+```text
+SCIENTIFIC TRUTH   ->  Git-tracked capsule files
+OPERATIONAL TRUTH  ->  PostgreSQL
+WORKFLOW STATE     ->  LangGraph checkpoints
+ARTIFACT BYTES     ->  content-addressed store under the data home
+DERIVED INDEX      ->  SQLite (the literature index), rebuildable
+```
+
+And the property the separation exists to hold:
+
+```text
+near-100% operational autonomy  !=  100% epistemic authority
+```
+
+The runtime owns queues, leases, budgets, retries, checkpoints, provider routing
+and continuation. It owns no verdict. Human authority over everything in section
+13 is unchanged by R5. What changed is that *reaching* those decision points no
+longer requires a person to carry one agent's output to another, check the
+cluster by hand, decide which step runs next, or restart a workflow after a
+recoverable crash.
+
+Deleting the operational database must lose no science. It loses the queue, the
+leases, the spend counters and the checkpoints — knowledge of what was in
+flight, which is a recoverable inconvenience — and it loses nothing under
+`.research/`.

@@ -12,8 +12,19 @@ dependencies = [
     "pyyaml>=6.0.3",
 ]
 
+[project.optional-dependencies]
+# The autonomous runtime (R5). Kept an extra, not a core dependency, so the R0
+# kernel and the v1 CLI still install and run with two dependencies. Nothing
+# under research_os.runtime is imported unless a runtime command is used.
+runtime = [
+    "psycopg[binary,pool]>=3.3.5,<4",
+    "langgraph>=1.2.11,<2",
+    "langgraph-checkpoint-postgres>=3.1.2,<4",
+]
+
 [project.scripts]
 researchctl = "research_os.cli:main"
+researchd = "research_os.runtime.daemon:main"
 
 [build-system]
 requires = ["uv_build>=0.12.10,<0.13.0"]
@@ -30,4 +41,8 @@ src = ["src", "tests"]
 dev = [
     "pytest>=9.1.1",
     "ruff>=0.16.6",
+    # A real PostgreSQL server as a wheel, for tests and for `researchd dev-db`.
+    # The runtime itself only ever sees a DSN; this is how a developer with no
+    # system PostgreSQL and no container runtime gets one. Never a runtime dep.
+    "pgserver>=0.1.4,<0.2",
 ]
