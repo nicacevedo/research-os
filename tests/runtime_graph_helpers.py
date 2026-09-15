@@ -157,3 +157,59 @@ def make_context(
         models=models,
         permitted_actions=permitted,
     )
+
+
+def make_router(
+    *,
+    db: Database,
+    artifacts_root: Path,
+    run_id: str,
+    project_id: str,
+    answers: dict[str, dict[str, Any]],
+    families: dict[str, str] | None = None,
+    work_id: str | None = None,
+) -> Any:
+    """The *real* :class:`ModelRouter`, over fake provider adapters.
+
+    Used where the property under test is provenance, routing or independence
+    rather than graph control flow. :class:`ScriptedRouter` replaces the router
+    and therefore records nothing, which is fine for asserting that a node ran
+    and wrong for asserting that a call was written down.
+
+    ``answers`` is keyed by the *automation* role the runtime role maps onto --
+    ``planner``, ``reviewer``, ``analyst``, ``coder``, ``literature`` -- because
+    that is what the v1 adapter contract takes.
+    """
+
+    from research_os.runtime.artifacts import FilesystemArtifactStore
+    from research_os.runtime.budgets import BudgetLedger
+    from research_os.runtime.routing import ModelRouter, ProviderProfile
+    from tests.fake_providers import FakeProvider, ScriptedResponse
+
+    family_for = families or {"fake": "fake-family"}
+    adapters = {
+        name: FakeProvider(
+            name=name,
+            family=family,
+            responses={
+                role: [ScriptedResponse(structured=payload)]
+                for role, payload in answers.items()
+            },
+        )
+        for name, family in family_for.items()
+    }
+    profiles = tuple(
+        ProviderProfile(name=name, family=family, model=f"{name}-1", tier=3)
+        for name, family in family_for.items()
+    )
+    store = RuntimeStore(db)
+    return ModelRouter(
+        adapters=adapters,
+        profiles=profiles,
+        store=store,
+        artifacts=FilesystemArtifactStore(artifacts_root, store=store),
+        budgets=BudgetLedger(db),
+        run_id=run_id,
+        project_id=project_id,
+        work_id=work_id,
+    )

@@ -163,21 +163,34 @@ def test_importing_the_runtime_package_does_not_import_the_heavy_dependency(
 
 
 def test_the_kernel_imports_without_the_runtime_extra_installed() -> None:
-    """A two-dependency install must still work.
+    """A two-dependency install must still import and build its parser.
 
-    Simulated by blocking the extra's modules at import time, which is what a
-    kernel-only environment looks like from Python's point of view.
+    The blocker uses ``find_spec``, not ``find_module``. The first version of
+    this test used ``find_module``, which Python 3.12 ignores entirely -- so it
+    blocked nothing, passed happily, and hid the fact that
+    ``research_os.cli`` had grown a hard dependency on psycopg through the
+    runtime command module. A test that cannot fail is worse than no test.
     """
 
     program = (
         "import sys\n"
-        "class Block:\n"
-        "    def find_module(self, name, path=None):\n"
-        "        if name.split('.')[0] in {'psycopg','psycopg_pool','langgraph'}:\n"
-        "            raise ModuleNotFoundError(name)\n"
+        "from importlib.abc import MetaPathFinder\n"
+        "BLOCKED = {'psycopg', 'psycopg_pool', 'langgraph', 'langchain_core'}\n"
+        "class Blocker(MetaPathFinder):\n"
+        "    def find_spec(self, name, path=None, target=None):\n"
+        "        if name.split('.')[0] in BLOCKED:\n"
+        "            raise ModuleNotFoundError(f'blocked for this test: {name}')\n"
         "        return None\n"
-        "sys.meta_path.insert(0, Block())\n"
+        "sys.meta_path.insert(0, Blocker())\n"
+        # Prove the blocker actually blocks, so this test cannot go vacuous again.
+        "try:\n"
+        "    import psycopg\n"
+        "except ModuleNotFoundError:\n"
+        "    pass\n"
+        "else:\n"
+        "    raise SystemExit('the blocker did not block')\n"
         "import research_os, research_os.cli, research_os.capsule, research_os.validate\n"
+        "research_os.cli._build_parser()\n"
         "print('ok')\n"
     )
     completed = subprocess.run(
@@ -189,3 +202,25 @@ def test_the_kernel_imports_without_the_runtime_extra_installed() -> None:
     )
     assert completed.returncode == 0, completed.stderr
     assert completed.stdout.strip().endswith("ok")
+
+
+def test_importing_the_cli_does_not_connect_to_anything() -> None:
+    """Registering the runtime commands must not open a database.
+
+    ``researchctl --help`` on a machine with no PostgreSQL has to work, and the
+    person most likely to run it is someone finding out what this thing is.
+    """
+
+    program = (
+        "import sys, research_os.cli\n"
+        "research_os.cli._build_parser()\n"
+        "print('psycopg' in sys.modules, 'langgraph' in sys.modules)\n"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", program],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=120,
+    )
+    assert completed.stdout.strip() == "False False", completed.stdout

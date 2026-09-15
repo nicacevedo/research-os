@@ -196,3 +196,167 @@ uv run pytest -q tests/test_runtime_*.py
 
 Set `RESEARCH_OS_SKIP_PG_TESTS=1` to skip them; they skip themselves with a
 reason if `pgserver` is not installed.
+
+## 9. researchd, the control plane
+
+One local process, one loop, deterministic work. `deploy/researchd.service` is a
+systemd **user** unit, shipped and not installed.
+
+```text
+researchd --once          one pass, for tests and cron
+researchd                 the loop
+researchctl runtime daemon  the same thing, through the CLI
+```
+
+`Daemon.tick()` is one pass of everything and returns a report, which is what
+makes the control plane testable without threads. `run_forever` calls it and
+sleeps only when a pass found nothing to do.
+
+The pass order is deliberate:
+
+```text
+recover   expired leases, stale invocations, stale reservations
+ingest    unconsumed events -> queued work
+schedule  due schedules -> events (never work directly)
+poll      external jobs -> reconciled status, and an event when finished
+surface   pending approvals -> one notification each, ever
+claim     one due work item -> run it under a renewing lease
+```
+
+Recovery comes first so a restarting daemon cannot pick up new work while old
+work sits stranded. Claiming comes last so every pass leaves the system
+recovered even if the worker then dies.
+
+**It calls no model.** That is how invariant 2 survives a background process
+existing, and `tests/test_runtime_daemon.py` asserts it by parsing `daemon.py`
+for a `complete` call. Frontier reasoning happens inside a claimed work item
+against a reserved budget, never in the scheduler.
+
+**The event-to-work table** is twelve lines in `daemon.py`, so "why did this
+run" is answerable by reading it. One subtlety: the continuation work item's
+dedup key is per *run*, not per event, because a run may have at most one
+successor however many events claim it finished — and during the first real
+end-to-end run, two did.
+
+## 10. Executors
+
+A graph node submits an `ExecutionSpec` and never a shell command.
+
+| executor | behaviour |
+|---|---|
+| `LocalExecutor` | runs it now, returns a finished handle; nothing to reconcile |
+| `SlurmExecutor` | freezes the spec, writes an immutable run directory and manifest, writes the batch script, submits, returns a job id |
+
+Submission never blocks. The `external_jobs` row is created in `SUBMITTING`
+*before* `sbatch` is invoked, so a crash in that window leaves a row with no
+scheduler id to investigate rather than a job nobody knows about. Such a row is
+marked `UNKNOWN` and **not resubmitted**: the submission may well have
+succeeded.
+
+Slurm's raw states are mapped to a `FailureClass` as well as a status, because
+the v1 `ExecutionState` mapping collapses distinctions the retry policy needs:
+
+| raw state | status | failure class | what happens |
+|---|---|---|---|
+| `COMPLETED` | COMPLETED | none | done, whatever the science said |
+| `PREEMPTED` | CANCELLED | `slurm_preempted` | resubmit unchanged |
+| `NODE_FAIL` | FAILED | `slurm_node_failure` | resubmit unchanged |
+| `OUT_OF_MEMORY` | FAILED | `slurm_out_of_memory` | needs more resources |
+| `TIMEOUT` | TIMED_OUT | `slurm_timeout` | needs more resources |
+| `CANCELLED` | CANCELLED | none | a person did that; do nothing |
+| anything unlisted | UNKNOWN | none | keep polling; form no opinion |
+
+## 11. Provider routing
+
+A graph node asks for a capability and a criticality. It never names a vendor;
+`tests/test_runtime_layering.py` reads the graph package to check.
+
+**Criticality is a floor.** `CRITICAL` work is never silently answered by a
+weaker model — the request fails and names what it wanted. A scientific review
+quietly performed by a cheaper model is worse than one that did not happen,
+because the first looks like it happened.
+
+**Independence is reported, never assumed.** A caller asks for
+`DIFFERENT_FAMILY`; the router gives the strongest separation available and
+records what it *achieved*. On a machine with one provider family, a review is
+recorded as `DEGRADED ... This is not independent review.` and the note reaches
+the run report.
+
+Every call is recorded: provider, the model that actually answered, role,
+criticality, independence group, prompt version, the hash of the prompt, the
+hash of the raw output, tokens, cost, latency, status — for failures too.
+
+## 12. Prompts
+
+Versioned artifacts with identities that reach provenance
+(`scientific_reviewer@1`). One module rather than a directory of files, because
+the *material* travels as fenced data rather than interpolated prose.
+
+The blind explorer's template is defined by what it omits: it declares only
+`question` and `data_description`, and `render` refuses any field it did not
+declare. Passing it the project's current hypothesis is an error, not a quiet
+loss of independence.
+
+Three fences were added to `automation/promptdata.FENCES` for the runtime —
+frontier state, hypothesis proposals, experiment results. Adding to that tuple
+is what makes a delimiter inert inside *every* block, and the existing property
+tests grew to cover them automatically.
+
+## 13. Observability
+
+```text
+researchctl runtime status        what is running, waiting, failed
+researchctl runtime runs          the cycles, newest first
+researchctl runtime run <id>      one cycle: work, decisions, jobs, model calls, budget, events
+researchctl runtime approvals     the prepared decision packets
+researchctl runtime approve <id>  / decline <id>
+researchctl runtime jobs          external jobs
+researchctl runtime costs         what has been spent, and what is left
+researchctl runtime events        the operational event log
+researchctl runtime doctor        whether the runtime can run here
+```
+
+Every view has a deterministic `--json` counterpart. Every string that came from
+a model or a fetched document passes through `research_os.textsafe` on the way
+to a terminal, with newlines and tabs stripped too — a table cell is not a place
+for either.
+
+`runtime doctor` follows `researchctl doctor`'s contract: an absent capability
+is a WARN and exits zero. It also reports how many policy actions have no
+handler in this build, so the gap between "the authority rules know about this"
+and "this build can do it" is visible rather than discovered when a planner
+picks one.
+
+## 14. Getting a database
+
+```bash
+# a real one
+export RESEARCH_OS_RUNTIME_DSN='postgresql://...'
+
+# or a disposable local one, no root and no container runtime
+researchctl runtime dev-db start
+researchctl runtime migrate
+researchctl runtime doctor
+```
+
+`dev-db` is `pgserver`, a dev-group wheel containing a PostgreSQL binary
+distribution. The runtime only ever sees a DSN and never imports it.
+
+## 15. What the runtime cannot do
+
+All eight `A2` actions turn out to be ones the *person* performs, because
+performing them means writing canonical scientific state, merging to a canonical
+branch, or publishing — and the runtime has no method for any of those.
+
+So approval does not unlock execution. It unlocks a recorded decision and the
+exact command to run:
+
+```text
+accept_claim                    -> researchctl review <CLAIM-ID>
+change_primary_endpoint         -> edit the manifest, record a Decision
+integrate_to_canonical_branch   -> review the candidate branch and merge it yourself
+publish_externally              -> submit it yourself
+```
+
+`tests/test_runtime_registry.py` asserts that no `A2` action has a handler. That
+is the property, stated as a test rather than as a promise.

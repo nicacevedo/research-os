@@ -47,10 +47,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from psycopg.types.json import Jsonb
-
 from research_os.errors import ResearchOSError
-from research_os.runtime.db import Database
+from research_os.runtime.db import Database, jsonb
 from research_os.runtime.ids import new_invocation_id
 from research_os.runtime.models import InvocationStatus, ToolInvocation
 
@@ -161,7 +159,7 @@ class InvocationLedger:
                     "run_id": run_id,
                     "work_id": work_id,
                     "kind": kind,
-                    "request": Jsonb(request),
+                    "request": jsonb(request),
                     "owner": owner,
                 },
             ).fetchone()
@@ -213,7 +211,7 @@ class InvocationLedger:
                 where invocation_id = %(invocation_id)s
                 returning {INVOCATION_COLUMNS}
                 """,
-                {"invocation_id": invocation_id, "result": Jsonb(result)},
+                {"invocation_id": invocation_id, "result": jsonb(result)},
             ).fetchone()
         if row is None:
             raise IdempotencyError(f"no such invocation: {invocation_id}")

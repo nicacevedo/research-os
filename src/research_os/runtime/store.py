@@ -27,10 +27,8 @@ import logging
 from decimal import Decimal
 from typing import Any
 
-from psycopg.types.json import Jsonb
-
 from research_os.errors import ResearchOSError
-from research_os.runtime.db import Database
+from research_os.runtime.db import Database, jsonb
 from research_os.runtime.ids import (
     new_approval_id,
     new_event_id,
@@ -314,7 +312,7 @@ class RuntimeStore:
                     "run_id": run_id,
                     "work_id": work_id,
                     "kind": kind,
-                    "payload": Jsonb(payload or {}),
+                    "payload": jsonb(payload or {}),
                     "dedup_key": dedup_key,
                 },
             ).fetchone()
@@ -406,7 +404,7 @@ class RuntimeStore:
                     "project_id": project_id,
                     "kind": kind,
                     "question": question,
-                    "packet": Jsonb(packet),
+                    "packet": jsonb(packet),
                     "thread_id": thread_id,
                     "interrupt_key": interrupt_key,
                 },
@@ -469,7 +467,7 @@ class RuntimeStore:
                 {
                     "approval_id": approval_id,
                     "status": str(status),
-                    "decision": Jsonb(decision),
+                    "decision": jsonb(decision),
                     "decided_by": decided_by,
                 },
             ).fetchone()
@@ -712,7 +710,7 @@ class RuntimeStore:
                     "schedule_id": new_schedule_id(),
                     "project_id": project_id,
                     "kind": kind,
-                    "payload": Jsonb(payload or {}),
+                    "payload": jsonb(payload or {}),
                     "interval": interval_seconds,
                 },
             ).fetchone()

@@ -38,10 +38,8 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
-from psycopg.types.json import Jsonb
-
 from research_os.errors import ResearchOSError
-from research_os.runtime.db import Database
+from research_os.runtime.db import Database, jsonb
 from research_os.runtime.failures import FailureClass, is_retryable, retry_delay_seconds
 from research_os.runtime.ids import new_work_id
 from research_os.runtime.models import WorkItem, WorkStatus
@@ -127,7 +125,7 @@ class WorkQueue:
                     "run_id": run_id,
                     "project_id": project_id,
                     "kind": kind,
-                    "payload": Jsonb(payload or {}),
+                    "payload": jsonb(payload or {}),
                     "priority": priority,
                     "delay": float(delay_seconds),
                     "max_attempts": max_attempts,
@@ -236,7 +234,7 @@ class WorkQueue:
                 where work_id = %(work_id)s and status = 'LEASED' and lease_owner = %(owner)s
                 returning {WORK_COLUMNS}
                 """,
-                {"work_id": work_id, "owner": owner, "result": Jsonb(result or {})},
+                {"work_id": work_id, "owner": owner, "result": jsonb(result or {})},
             ).fetchone()
         if row is None:
             raise LeaseLostError(f"cannot complete {work_id}: not held by {owner}")

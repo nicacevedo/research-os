@@ -53,12 +53,31 @@ class TransientDatabaseError(RuntimeDatabaseError):
 def _require_psycopg() -> Any:
     try:
         import psycopg
+        import psycopg.types.json
     except ModuleNotFoundError as exc:  # pragma: no cover - install-time path
         raise RuntimeDatabaseError(
             "The autonomous runtime needs psycopg. Install the runtime extra: "
             "`uv sync --extra runtime`."
         ) from exc
     return psycopg
+
+
+def jsonb(value: Any) -> Any:
+    """Wrap a value as PostgreSQL ``jsonb``, importing the driver on use.
+
+    A module-level ``from psycopg.types.json import Jsonb`` would make importing
+    ``research_os.runtime.store`` -- and therefore ``research_os.cli``, which
+    registers the runtime commands -- require psycopg. That would quietly break
+    the promise in ``runtime/__init__.py`` that a kernel-only install still
+    works with two dependencies, and it did: the test that was supposed to catch
+    it used the ``find_module`` import hook, which Python 3.12 ignores, so it
+    passed while blocking nothing.
+
+    The import is a dict lookup in ``sys.modules`` after the first call.
+    """
+
+    psycopg = _require_psycopg()
+    return psycopg.types.json.Jsonb(value)
 
 
 def classify_db_error(exc: BaseException) -> RuntimeDatabaseError:

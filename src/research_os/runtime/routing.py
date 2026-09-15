@@ -44,6 +44,7 @@ from research_os.automation.models import Role as AutomationRole
 from research_os.automation.providers import (
     InvocationRequest,
     ProviderAdapter,
+    probe_registry,
     provider_family,
 )
 from research_os.errors import ResearchOSError
@@ -108,7 +109,12 @@ class ProviderProfile:
     name: str
     family: str
     model: str | None = None
-    tier: int = 1
+    #: Default 3, matching :func:`profiles_from_adapters`, and optimistic on
+    #: purpose. The two disagreed at first -- the factory said 3 and this said 1
+    #: -- so a hand-constructed profile could serve only ROUTINE work and
+    #: everything else failed with "no healthy provider offers planning at tier
+    #: >= 2", which reads like a configuration problem and is not one.
+    tier: int = 3
     capabilities: frozenset[Capability] = field(
         default_factory=lambda: frozenset(Capability)
     )
@@ -343,6 +349,7 @@ class ModelRouter:
                 output_ref=output_ref,
                 latency_ms=latency,
                 error=result.error or f"exit {result.exit_code}",
+                resolved_model=result.resolved_model,
             )
             return ModelResponse(
                 provider=profile.name,
@@ -368,6 +375,7 @@ class ModelRouter:
                 tokens_in=result.input_tokens,
                 tokens_out=result.output_tokens,
                 cost=result.total_cost_usd,
+                resolved_model=result.resolved_model,
             )
             return ModelResponse(
                 provider=profile.name,
@@ -400,6 +408,7 @@ class ModelRouter:
             tokens_in=result.input_tokens,
             tokens_out=result.output_tokens,
             cost=result.total_cost_usd,
+            resolved_model=result.resolved_model,
         )
         return ModelResponse(
             provider=profile.name,
@@ -427,12 +436,17 @@ class ModelRouter:
         tokens_in: int | None = None,
         tokens_out: int | None = None,
         cost: float | None = None,
+        resolved_model: str | None = None,
     ) -> None:
         self._store.record_model_call(
             run_id=self._run_id,
             work_id=self._work_id,
             provider=routed.profile.name,
-            model=routed.profile.model,
+            # What answered, not what was asked for. A profile's `model` is a
+            # configuration hint and is usually empty; the adapter reports the
+            # model the provider actually used, and that is what provenance
+            # needs. "Reviewed by claude" is not an auditable statement.
+            model=resolved_model or routed.profile.model,
             role=str(request.role),
             status=status,
             criticality=str(request.criticality),
@@ -454,21 +468,34 @@ def profiles_from_adapters(
     adapters: Mapping[str, ProviderAdapter],
     *,
     tiers: Mapping[str, int] | None = None,
+    probe: bool = True,
 ) -> tuple[ProviderProfile, ...]:
-    """Build default profiles for whatever providers this machine actually has.
+    """Build profiles for the providers this machine actually has.
 
-    Every configured provider is assumed capable of everything at tier 3 unless
-    told otherwise. That is deliberately optimistic: the alternative is a
-    hard-coded table of vendor abilities that is wrong within a month, and the
-    researcher who configured a provider is better placed to tier it than this
-    module is.
+    ``probe=True`` is the important default, and it was not the original one.
+    The v1 registry always contains an entry for every *known* provider --
+    ``MissingProvider`` placeholders for the ones that are not installed -- so
+    building a profile per registry key produced routable candidates whose
+    ``invoke`` raises ``NotImplementedError``. On a machine with one provider
+    installed, two thirds of the routing table pointed at nothing.
+
+    Every available provider is assumed capable of everything at tier 3 unless
+    told otherwise. That is deliberately optimistic: a hard-coded table of
+    vendor abilities is wrong within a month, and the researcher who configured
+    a provider is better placed to tier it than this module is.
     """
 
+    names = sorted(adapters)
+    if probe:
+        probes = probe_registry(dict(adapters))
+        names = [
+            name for name in names if getattr(probes.get(name), "available", False)
+        ]
     return tuple(
         ProviderProfile(
             name=name,
             family=provider_family(name) or name,
             tier=(tiers or {}).get(name, 3),
         )
-        for name in sorted(adapters)
+        for name in names
     )
