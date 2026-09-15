@@ -67,6 +67,32 @@ knows. Nothing a human decides changed.
 - A project profile could state a capability's absence with a sentence
   asserting its presence.
 
+### Fixed after the independent delta review
+
+An independent read-only review of the candidate returned PASS WITH BOUNDED
+REPAIR and twelve findings. All twelve were repaired before the candidate was
+pushed.
+
+- `capsule_present` accepted an on-disk `.research/` directory and never asked
+  whether the capsule parsed, so it could disagree with the science context and
+  put two contradictory controller-authored blocks in one prompt.
+- `cross_project_promotion` was eligible in any project with a capsule, which
+  made it a label that could stop an unattended run for any reason at all;
+  `costly_authorization` was eligible in runs that could spend nothing.
+- Check discovery offered `uv run pytest` to projects declaring no pytest,
+  reintroducing the v1.0.0 `src`-layout trap through the profile.
+- A truncated tracked-file list was reported as a deterministic absence rather
+  than as unavailable.
+- A cache-served retrieval wrote no `SearchRecord`; `network_calls` counted a
+  real 429 as though no request had been made; a long `Retry-After` on a 5xx
+  was not persisted; a successful search erased a recorded quota reset.
+- The pacer leaked raw `sqlite3` errors, and a failed `COMMIT` left the
+  transaction open under a restored isolation level.
+- The placeholder guard, over-corrected earlier in this release, wrongly refused
+  ordinary fields such as "Query the data" and "Results summary".
+- The budget entry gate stated a requirement that is false for a capsule-less
+  proposal task; a symbol could not be written `solve()`.
+
 ### Unchanged
 
 R0 kernel semantics, scientific object schemas, digests, stale-review detection,
