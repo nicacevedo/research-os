@@ -130,6 +130,20 @@ The runtime suites and roughly what each pins:
 Where a crash is claimed, a real process dies. A simulated exception runs the
 `finally` blocks whose absence is the failure mode.
 
+**Order-independent**, and that was not free. The migration tests tamper with
+`schema_migrations`, which `runtime_db` deliberately does not truncate —
+re-migrating per test would cost seconds — so the tamper leaked into every later
+test that called `migrate()`. In the default alphabetical order the CLI tests
+run before the schema tests, so the suite passed by luck; running the runtime
+suites in any other order broke five of them. Those tests now take a throwaway
+database, and both the forward and reverse orderings pass:
+
+```text
+uv run --extra runtime pytest -q tests/test_runtime_*.py   359 passed
+same files, reverse order                                  359 passed
+uv run --extra runtime pytest -q                          3006 passed
+```
+
 ## 7. Pilots
 
 `pilots/run_pilot.sh <project> "<objective>" [cycles] [autonomy]`. Everything

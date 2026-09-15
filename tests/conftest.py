@@ -60,4 +60,5 @@ from tests.runtime_helpers import (  # noqa: F401
     runtime_db,
     runtime_project,
     runtime_xdg,
+    throwaway_dsn,
 )

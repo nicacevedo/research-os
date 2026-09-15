@@ -36,14 +36,24 @@ def test_migrating_twice_applies_nothing_the_second_time(runtime_db: Database) -
     assert current_version(runtime_db) == max(m.version for m in discover())
 
 
-def test_an_edited_applied_migration_is_refused(runtime_db: Database) -> None:
-    with runtime_db.tx() as conn:
-        conn.execute(
-            "update schema_migrations set checksum = 'tampered' where version = %s",
-            (max(m.version for m in discover()),),
-        )
-    with pytest.raises(RuntimeDatabaseError, match="different checksum"):
-        migrate(runtime_db)
+def test_an_edited_applied_migration_is_refused(throwaway_dsn: str) -> None:
+    """An applied migration must never be edited: two machines would diverge.
+
+    On a throwaway database, because tampering with ``schema_migrations`` on the
+    shared one leaks into every later test that calls ``migrate()`` -- the
+    fixture truncates the runtime tables and deliberately not that one. It broke
+    five CLI tests, visible only once the suites ran in a different order.
+    """
+
+    with Database(throwaway_dsn) as db:
+        migrate(db)
+        with db.tx() as conn:
+            conn.execute(
+                "update schema_migrations set checksum = 'tampered' where version = %s",
+                (max(m.version for m in discover()),),
+            )
+        with pytest.raises(RuntimeDatabaseError, match="different checksum"):
+            migrate(db)
 
 
 def _constraint_values(runtime_db: Database, name: str) -> frozenset[str]:
@@ -84,32 +94,20 @@ def test_the_declared_schema_version_matches_the_highest_migration() -> None:
     assert RUNTIME_SCHEMA_VERSION == max(m.version for m in discover())
 
 
-def test_migrations_compose_from_an_empty_database(pg_dsn: str) -> None:
-    """Every migration applied in order, on a database that has seen none of them.
+def test_migrations_compose_from_an_empty_database(throwaway_dsn: str) -> None:
+    """Every migration applied in order, on a database that has seen none.
 
     The session fixture migrates once and every later test inherits that, so
-    without this the second migration would only ever be exercised as an
-    upgrade. A fresh clone is the more common case.
+    without this the later migrations would only ever be exercised as upgrades.
+    A fresh clone is the more common case.
     """
 
-    from research_os.runtime.db import Database
-
-    with Database(pg_dsn) as db, db.autocommit() as conn:
-        conn.execute("drop database if exists research_os_migrate_probe")
-        conn.execute("create database research_os_migrate_probe")
-    probe_dsn = pg_dsn.replace("/research_os_test", "/research_os_migrate_probe")
-    try:
-        with Database(probe_dsn) as probe:
-            applied = migrate(probe)
-            assert applied == tuple(m.version for m in discover())
-            assert pending(probe) == ()
-            with probe.tx() as conn:
-                indexes = conn.execute(
-                    "select indexname from pg_indexes where tablename = 'artifact_links'"
-                ).fetchall()
-            assert any(
-                row["indexname"] == "artifact_links_identity_idx" for row in indexes
-            )
-    finally:
-        with Database(pg_dsn) as db, db.autocommit() as conn:
-            conn.execute("drop database if exists research_os_migrate_probe")
+    with Database(throwaway_dsn) as probe:
+        applied = migrate(probe)
+        assert applied == tuple(m.version for m in discover())
+        assert pending(probe) == ()
+        with probe.tx() as conn:
+            indexes = conn.execute(
+                "select indexname from pg_indexes where tablename = 'artifact_links'"
+            ).fetchall()
+        assert any(row["indexname"] == "artifact_links_identity_idx" for row in indexes)

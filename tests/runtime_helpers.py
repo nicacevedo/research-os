@@ -23,6 +23,8 @@ operation in PostgreSQL and truncating eleven small tables is not.
 from __future__ import annotations
 
 import os
+import re
+import secrets
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -142,3 +144,42 @@ def runtime_project(runtime_db: Database) -> str:
         project_id="demo-project", repo_path="/tmp/demo-project", title="Demo"
     )
     return "demo-project"
+
+
+@pytest.fixture
+def throwaway_dsn(pg_dsn: str) -> Iterator[str]:
+    """A fresh, empty database that is dropped afterwards.
+
+    For tests that change ``schema_migrations`` or run migrations from nothing.
+    The session database is shared and ``runtime_db`` truncates only the
+    runtime tables -- deliberately, because re-migrating per test would cost
+    seconds -- so a test that tampers with a *checksum* leaks into every later
+    test that calls ``migrate()``.
+
+    That is not hypothetical: it broke five CLI tests, and only after they were
+    run in a different order. In the default alphabetical order the CLI tests
+    happen to run before the schema tests, so the suite passed by luck.
+    """
+
+    name = f"research_os_probe_{secrets.token_hex(4)}"
+    with Database(pg_dsn) as admin, admin.autocommit() as conn:
+        conn.execute(f'create database "{name}"')
+    try:
+        yield _with_database(pg_dsn, name)
+    finally:
+        with Database(pg_dsn) as admin, admin.autocommit() as conn:
+            conn.execute(f'drop database if exists "{name}" with (force)')
+
+
+def _with_database(dsn: str, name: str) -> str:
+    """Point a DSN at a different database, whatever form it is in."""
+
+    if "dbname=" in dsn:
+        return re.sub(r"dbname=\S+", f"dbname={name}", dsn)
+    if "://" in dsn:
+        scheme, _, rest = dsn.partition("://")
+        authority, _, tail = rest.partition("/")
+        path, _, query = tail.partition("?")
+        del path
+        return f"{scheme}://{authority}/{name}" + (f"?{query}" if query else "")
+    return f"{dsn} dbname={name}"
