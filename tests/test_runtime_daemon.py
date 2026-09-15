@@ -672,3 +672,208 @@ def test_two_finished_events_for_one_run_open_one_successor(
         if r.parent_run_id == run.run_id
     ]
     assert len(successors) == 1
+
+
+def test_an_unchanged_frontier_stops_the_chain(plane: dict[str, Any]) -> None:
+    """The waste a real pilot demonstrated, now refused.
+
+    The first pilot against a real project ran seven chained cycles over an
+    identical frontier, each concluding START_NEXT_CYCLE, stopping only at the
+    configured ceiling -- fifteen model calls and 2.65 USD for one assessment's
+    worth of information.
+
+    The cause is structural: the runtime cannot write a capsule, so its own work
+    never changes the frontier its planning is derived from. Progress has to be
+    checked, not assumed.
+    """
+
+    from research_os.runtime.cycles import CycleResult, should_continue
+
+    store: RuntimeStore = plane["store"]
+    parent = store.create_run(project_id="alpha-project", objective="o")
+    store.set_frontier_digest(parent.run_id, "the-same-frontier")
+    child = store.create_run(
+        project_id="alpha-project",
+        objective="o",
+        parent_run_id=parent.run_id,
+        cycle_index=1,
+    )
+    store.set_frontier_digest(child.run_id, "the-same-frontier")
+
+    proceed, why = should_continue(
+        db=plane["db"],
+        config=plane["config"],
+        result=CycleResult(
+            run=store.require_run(child.run_id),
+            status=RunStatus.SUCCEEDED,
+            terminal_state=TerminalState.DONE_FOR_NOW,
+            pending_approval_id=None,
+            recommendation="START_NEXT_CYCLE",
+            notes=(),
+            state={},
+        ),
+    )
+    assert proceed is False
+    assert "unchanged from the previous cycle" in why
+    assert "needs a person" in why
+
+
+def test_a_changed_frontier_still_continues(plane: dict[str, Any]) -> None:
+    """Progress must not be mistaken for repetition either."""
+
+    from research_os.runtime.cycles import CycleResult, should_continue
+
+    store: RuntimeStore = plane["store"]
+    parent = store.create_run(project_id="alpha-project", objective="o")
+    store.set_frontier_digest(parent.run_id, "before")
+    child = store.create_run(
+        project_id="alpha-project",
+        objective="o",
+        parent_run_id=parent.run_id,
+        cycle_index=1,
+    )
+    store.set_frontier_digest(child.run_id, "after")
+    proceed, _why = should_continue(
+        db=plane["db"],
+        config=plane["config"],
+        result=CycleResult(
+            run=store.require_run(child.run_id),
+            status=RunStatus.SUCCEEDED,
+            terminal_state=TerminalState.DONE_FOR_NOW,
+            pending_approval_id=None,
+            recommendation="START_NEXT_CYCLE",
+            notes=(),
+            state={},
+        ),
+    )
+    assert proceed is True
+
+
+def test_work_that_ran_out_of_attempts_is_not_replaced_with_fresh_work(
+    plane: dict[str, Any],
+) -> None:
+    """The attempt cap was defeated by the thing meant to honour it.
+
+    ``_recover`` emitted WORKER_RECOVERED for every item it touched, including
+    the ones it had just marked FAILED -- and that event mapped to a *new*
+    work item with a *fresh* attempt budget. So an item that killed three
+    workers was marked FAILED and immediately replaced by one that would kill
+    three more, and the backlog for one run grew without bound. Found by an
+    independent review.
+    """
+
+    queue: WorkQueue = plane["queue"]
+    store: RuntimeStore = plane["store"]
+    run = store.create_run(project_id="alpha-project", objective="o")
+    work = queue.enqueue(
+        project_id="alpha-project",
+        kind=WorkKind.RUN_CYCLE,
+        run_id=run.run_id,
+        max_attempts=1,
+    ).item
+    queue.claim(owner="doomed", lease_seconds=60)
+    with plane["db"].tx() as conn:
+        conn.execute("update work_items set lease_expires_at = now() - interval '1s'")
+
+    report = plane["daemon"].tick()
+    assert report.leases_reclaimed == 1
+    assert report.work_enqueued == 0, "exhausted work was replaced with fresh work"
+    assert any("out of attempts" in note for note in report.notes)
+
+    assert queue.get(work.work_id).status is WorkStatus.FAILED  # type: ignore[union-attr]
+    kinds = [event.kind for event in store.list_events(run_id=run.run_id)]
+    assert "WORK_EXHAUSTED" in kinds
+    assert "WORKER_RECOVERED" not in kinds
+    # And no new item exists for the run.
+    assert len(queue.list_for_run(run.run_id)) == 1
+
+
+def test_a_recovered_item_does_not_become_a_second_concurrent_attempt(
+    plane: dict[str, Any],
+) -> None:
+    """The requeued item *is* the retry; a second one would run in parallel."""
+
+    queue: WorkQueue = plane["queue"]
+    store: RuntimeStore = plane["store"]
+    run = store.create_run(project_id="alpha-project", objective="o")
+    queue.enqueue(
+        project_id="alpha-project",
+        kind=WorkKind.RUN_CYCLE,
+        run_id=run.run_id,
+        max_attempts=4,
+    )
+    for _ in range(2):
+        queue.claim(owner="flaky", lease_seconds=60)
+        with plane["db"].tx() as conn:
+            conn.execute(
+                "update work_items set lease_expires_at = now() - interval '1s' "
+                "where status = 'LEASED'"
+            )
+        plane["daemon"].tick()
+    resume_items = [
+        item
+        for item in queue.list_for_run(run.run_id)
+        if item.kind == WorkKind.RESUME_CYCLE
+    ]
+    assert len(resume_items) <= 1, "two resume items for one run"
+
+
+def test_an_event_is_not_consumed_until_its_work_exists(plane: dict[str, Any]) -> None:
+    """Consuming first lost the work permanently on a crash in between.
+
+    Nothing re-emits these events: a run is requested once, a decision recorded
+    once, a job finished once. An independent review found the comment claiming
+    a "next producer" would cover it.
+    """
+
+    store: RuntimeStore = plane["store"]
+    run = store.create_run(project_id="alpha-project", objective="o")
+    store.record_event(
+        kind="RESEARCH_RUN_REQUESTED",
+        project_id="alpha-project",
+        run_id=run.run_id,
+        dedup_key=f"requested:{run.run_id}",
+    )
+    # Claiming leases; it does not consume.
+    leased = store.claim_events(owner="w", lease_seconds=120)
+    assert len(leased) == 1
+    assert leased[0].consumed_at is None
+    assert store.unconsumed_event_count() == 1
+
+    # A second claimer sees nothing while the lease holds.
+    assert store.claim_events(owner="other", lease_seconds=120) == ()
+
+    # And once the lease expires, the event is claimable again -- which is what
+    # makes a crash between claiming and enqueueing recoverable.
+    with plane["db"].tx() as conn:
+        conn.execute("update events set claimed_at = now() - interval '1 hour'")
+    again = store.claim_events(owner="w2", lease_seconds=120)
+    assert [event.event_id for event in again] == [leased[0].event_id]
+    assert store.consume_event(again[0].event_id) is True
+    assert store.consume_event(again[0].event_id) is False
+    assert store.unconsumed_event_count() == 0
+
+
+def test_a_decision_and_its_resuming_event_are_one_transaction(
+    plane: dict[str, Any],
+) -> None:
+    """Two transactions left an approved gate with no event, stalling forever."""
+
+    store: RuntimeStore = plane["store"]
+    run = store.create_run(project_id="alpha-project", objective="o")
+    approval, _ = store.request_approval(
+        run_id=run.run_id,
+        project_id="alpha-project",
+        kind="accept_claim",
+        question="q",
+        packet={},
+        interrupt_key="k",
+    )
+    store.record_decision(
+        approval.approval_id,
+        granted=True,
+        decision={"granted": True},
+        decided_by="tester@host",
+    )
+    kinds = [event.kind for event in store.list_events(run_id=run.run_id)]
+    assert "SCIENTIFIC_DECISION_RECORDED" in kinds

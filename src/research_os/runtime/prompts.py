@@ -372,12 +372,17 @@ EXPERIMENTALIST = PromptTemplate(
     independence=Independence.DIFFERENT_CONTEXT,
     instruction=(
         "Specify one experiment that would test the hypothesis below.\n"
+        "You may only choose one of the experiment commands the researcher has "
+        "declared for this project -- they are listed in the quoted block -- and "
+        "supply values for the parameters that command declares. You cannot "
+        "specify a command of your own; a command the researcher has not declared "
+        "is not something this system will run.\n"
         "The specification is preregistration: name the primary endpoint and its "
         "success and failure criteria BEFORE any result exists. Secondary endpoints "
         "are allowed and must be labelled secondary.\n"
         "Name the seeds, the dataset identity, and the resources required. If the "
-        "hypothesis cannot be tested with the data described, say that instead of "
-        "specifying something else."
+        "hypothesis cannot be tested with the declared commands, say so instead of "
+        "choosing one that does not test it."
     ),
     fields=("hypothesis", "data_description", "available_executors"),
     blocks=(("repository", REPOSITORY_FENCE),),
@@ -389,10 +394,9 @@ EXPERIMENTALIST = PromptTemplate(
             "primary_endpoint",
             "success_criteria",
             "failure_criteria",
-            "argv",
-            "resources",
+            "command",
+            "command_parameters",
             "seeds",
-            "outputs",
         ],
         "properties": {
             "testable": {"type": "boolean"},
@@ -401,10 +405,13 @@ EXPERIMENTALIST = PromptTemplate(
             "secondary_endpoints": {"type": "array", "items": {"type": "string"}},
             "success_criteria": {"type": "string"},
             "failure_criteria": {"type": "string"},
-            "argv": {"type": "array", "items": {"type": "string"}},
+            # The *name* of a command the researcher declared, and values for
+            # the parameters that command declares. Not an argv vector: a model
+            # cannot specify what this system runs.
+            "command": {"type": "string"},
+            "command_parameters": {"type": "object"},
             "resources": {"type": "object"},
             "seeds": {"type": "array", "items": {"type": "integer"}},
-            "outputs": {"type": "array", "items": {"type": "string"}},
             "dataset_identity": {"type": "string"},
         },
     },

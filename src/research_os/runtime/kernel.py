@@ -225,7 +225,14 @@ class ScientificKernelAdapter:
         """
 
         report = self.validate()
-        if report.project is None:
+        if report.project is None or not report.ok:
+            # A capsule with validation errors is a capsule whose cross-object
+            # invariants are not known to hold, and the acceptance rule is a
+            # cross-object rule. An independent review found that this checked
+            # only for a readable project identity, so prose could be drafted
+            # from a claim in a capsule that does not validate -- caught
+            # afterwards by `deterministic_check`, but only after the draft
+            # existed as an artifact.
             return ()
         by_id = {str(obj.id): obj for obj in report.objects}
         project_id = str(report.project.id)

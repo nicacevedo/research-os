@@ -61,10 +61,37 @@ from research_os.runtime.routing import RoutingError
 LOG = logging.getLogger("research_os.runtime.actions.experiments")
 
 
+def declared_commands(context: CycleContext, project_id: str) -> dict[str, Any]:
+    """The experiment commands the *researcher* declared for this project.
+
+    From ``experiments.yaml``, through the v1 experiment config. This is the
+    boundary that keeps the runtime from executing model-authored argv: the
+    experimentalist chooses *which declared command* to run and supplies values
+    for the parameters the researcher declared, and it cannot express anything
+    else.
+
+    The first version took ``argv`` straight from the model and ran it with
+    ``cwd`` set to the canonical checkout. An independent review pointed out
+    what that is. It was unreachable only because the executors were never
+    wired up, which is a wiring omission rather than a policy -- so the policy
+    is here now.
+    """
+
+    from research_os.experiment.config import load_config as load_experiment_config
+
+    try:
+        config = load_experiment_config()
+    except ResearchOSError as exc:
+        LOG.debug("no experiment configuration: %s", exc)
+        return {}
+    project = config.projects.get(project_id)
+    return dict(project.commands) if project is not None else {}
+
+
 def design_experiment(
     state: Mapping[str, Any], context: CycleContext, plan: Mapping[str, Any]
 ) -> ActionOutcome:
-    """Produce a preregistered specification. Runs nothing.
+    """Produce a preregistered specification over a declared command. Runs nothing.
 
     ``A0``: writing down what you intend to test changes nothing. Whether it is
     then *run* is a separate action with its own authority, which is what makes
@@ -83,6 +110,18 @@ def design_experiment(
             "no untested hypothesis to design for", data={"hypotheses": []}
         )
 
+    available = declared_commands(context, str(state["project_id"]))
+    if not available:
+        # Not a failure, and not something to work around. An experiment this
+        # runtime may run is one the researcher declared in `experiments.yaml`;
+        # with none declared there is nothing it is permitted to run, and saying
+        # so is the correct outcome.
+        return ActionOutcome.succeeded(
+            "no experiment commands are declared for this project, so there is "
+            "nothing the runtime may run. Declare one in experiments.yaml.",
+            data={"hypotheses": list(hypothesis_ids), "declared_commands": []},
+        )
+
     target = str(hypothesis_ids[0])
     try:
         obj = context.kernel.object(target)
@@ -92,7 +131,11 @@ def design_experiment(
             f"could not read {target}: {exc}", failure_class=FailureClass.CODE_EXCEPTION
         )
 
-    available = ", ".join(sorted(context.executors)) or "local"
+    catalogue = [
+        f"{name}: {spec.description or '(no description)'} "
+        f"[parameters: {', '.join(p.name for p in spec.parameters) or 'none'}]"
+        for name, spec in sorted(available.items())
+    ]
     prompt = EXPERIMENTALIST.render(
         fields={
             "hypothesis": f"{target}: {statement}",
@@ -100,9 +143,9 @@ def design_experiment(
                 plan.get("parameters", {}).get("data_description")
                 or "the project repository; no external dataset declared"
             ),
-            "available_executors": available,
+            "available_executors": ", ".join(sorted(context.executors)) or "local",
         },
-        blocks={"repository": [state["repo_path"]]},
+        blocks={"repository": [*catalogue, f"repository: {state['repo_path']}"]},
     )
     try:
         response = context.models.complete(
@@ -134,7 +177,7 @@ def design_experiment(
         # described" is better science than specifying something else and
         # calling it a test of the hypothesis.
         return ActionOutcome.succeeded(
-            f"{target} is not testable with the data described",
+            f"{target} is not testable with the declared commands",
             data={
                 "hypothesis": target,
                 "testable": False,
@@ -142,23 +185,47 @@ def design_experiment(
             },
         )
 
-    spec = _spec_from_design(design, state=state, name=f"{target.lower()}-test")
+    chosen = str(design.get("command") or "").strip()
+    if chosen not in available:
+        return ActionOutcome.failed(
+            f"{chosen!r} is not a command this project declares. Available: "
+            f"{', '.join(sorted(available))}",
+            failure_class=FailureClass.POLICY_REFUSED,
+        )
+
+    from research_os.experiment.spec import resolve_command
+
+    try:
+        resolved = resolve_command(
+            available[chosen], dict(design.get("command_parameters") or {})
+        )
+    except ResearchOSError as exc:
+        # The v1 resolver validates each value against the type the researcher
+        # declared and refuses a value for a parameter that was not declared.
+        return ActionOutcome.failed(
+            f"the experimentalist's parameters do not fit {chosen}: {exc}",
+            failure_class=FailureClass.POLICY_REFUSED,
+        )
+
+    spec = _spec_from_resolved(
+        resolved, design, state=state, name=f"{target.lower()}-test"
+    )
     digest = spec_digest(spec)
     record = {
         "hypothesis": target,
         "testable": True,
         "spec_digest": digest,
+        "command": chosen,
+        "command_parameters": dict(resolved.parameters),
         "primary_endpoint": design.get("primary_endpoint", ""),
         "secondary_endpoints": design.get("secondary_endpoints", []),
         "success_criteria": design.get("success_criteria", ""),
         "failure_criteria": design.get("failure_criteria", ""),
         "dataset_identity": design.get("dataset_identity", ""),
         # The frozen spec itself, in full, so the submitting step reconstructs
-        # exactly this and not its own reading of the model's design. The first
-        # version re-derived the spec at submission and named it differently --
-        # "hyp-0001" instead of "hyp-0001-test" -- so the digests disagreed and
-        # the preregistration guard rejected every legitimate experiment. Found
-        # by the test that submits a design it had just produced.
+        # exactly this and not its own reading of the model's design. An earlier
+        # version re-derived it at submission and named it differently, so the
+        # digests disagreed and the guard rejected every legitimate experiment.
         "spec": _spec_record(spec),
     }
     ref = context.artifacts.put_text(
@@ -168,9 +235,50 @@ def design_experiment(
         producer=f"{response.provider}:{EXPERIMENTALIST.identity}",
     )
     return ActionOutcome.succeeded(
-        f"preregistered a test of {target} ({digest[:12]})",
+        f"preregistered a test of {target} using the declared command {chosen} "
+        f"({digest[:12]})",
         data=record,
         artifacts=(ref,),
+    )
+
+
+def _spec_from_resolved(
+    resolved: Any,
+    design: Mapping[str, Any],
+    *,
+    state: Mapping[str, Any],
+    name: str,
+) -> ExecutionSpec:
+    """Build the frozen spec from a *resolved declared command*.
+
+    ``argv`` comes from the researcher's declaration with validated parameter
+    values substituted, never from the model. ``cwd`` is the run directory and
+    not the canonical checkout: an experiment reads the repository through
+    declared inputs, and running in the checkout meant any command could write
+    to it.
+
+    Seeds default to one fixed value rather than a random one: an experiment
+    whose seed is chosen at submission is an experiment nobody can rerun.
+    """
+
+    resources = {
+        str(key): str(value)
+        for key, value in dict(design.get("resources") or {}).items()
+    }
+    resources.pop("timeout_seconds", None)
+    seeds = tuple(int(seed) for seed in design.get("seeds") or (20260915,))
+    return ExecutionSpec(
+        name=name,
+        argv=tuple(str(token) for token in resolved.argv),
+        cwd=str(resolved.working_directory or state["repo_path"]),
+        environment={"kind": "uv", "project": str(state["repo_path"])},
+        resources=resources,
+        env={
+            f"RESEARCH_OS_SEED_{index}": str(seed) for index, seed in enumerate(seeds)
+        },
+        timeout_seconds=int(resolved.timeout_seconds),
+        outputs=tuple(str(item) for item in resolved.outputs),
+        seeds=seeds,
     )
 
 
@@ -211,34 +319,30 @@ def _spec_from_record(record: Mapping[str, Any]) -> ExecutionSpec:
     )
 
 
-def _spec_from_design(
-    design: Mapping[str, Any], *, state: Mapping[str, Any], name: str
-) -> ExecutionSpec:
-    """Turn a model's design into a frozen specification.
+def _preregistration_exists(context: CycleContext, digest: str) -> bool:
+    """Whether a preregistration artifact with this spec digest was stored.
 
-    Every field is taken from the design or defaulted deterministically. Seeds
-    default to one fixed value rather than a random one: an experiment whose seed
-    is chosen at submission is an experiment nobody can rerun.
+    The artifact is content-addressed, so its id is the hash of the
+    preregistration *record*, not of the spec. So the lookup reads every
+    ``role='preregistration'`` artifact and compares its ``spec_digest``. There
+    are a handful per project, and the alternative is trusting the caller about
+    when a criterion was fixed -- which is the whole thing the guard exists to
+    establish.
     """
 
-    resources = {
-        str(key): str(value)
-        for key, value in dict(design.get("resources") or {}).items()
-    }
-    seeds = tuple(int(seed) for seed in design.get("seeds") or (20260915,))
-    return ExecutionSpec(
-        name=name,
-        argv=tuple(str(token) for token in design.get("argv") or ("true",)),
-        cwd=str(state["repo_path"]),
-        environment={"kind": "uv", "project": str(state["repo_path"])},
-        resources=resources,
-        env={
-            f"RESEARCH_OS_SEED_{index}": str(seed) for index, seed in enumerate(seeds)
-        },
-        timeout_seconds=int(resources.pop("timeout_seconds", 3600) or 3600),
-        outputs=tuple(str(item) for item in design.get("outputs") or ()),
-        seeds=seeds,
-    )
+    with context.db.tx() as conn:
+        rows = conn.execute(
+            "select artifact_id from artifacts where role = 'preregistration' "
+            "order by created_at desc limit 200"
+        ).fetchall()
+    for row in rows:
+        try:
+            record = json.loads(context.artifacts.get_text(str(row["artifact_id"])))
+        except (ResearchOSError, ValueError, UnicodeDecodeError):
+            continue
+        if str(record.get("spec_digest") or "") == digest:
+            return True
+    return False
 
 
 def _submit(
@@ -283,7 +387,28 @@ def _submit(
         )
     digest = spec_digest(spec)
     declared = str(design.get("spec_digest") or "")
-    if declared and declared != digest:
+    if not declared:
+        # `if declared and declared != digest` let a design with no digest past
+        # the guard entirely, and the design comes from plan parameters under an
+        # unconstrained schema -- so the planner supplied both halves of the
+        # comparison and omitting one half skipped it. An independent review
+        # found this.
+        return ActionOutcome.failed(
+            "the design declares no spec_digest, so there is nothing to check it "
+            "against. Only design_experiment produces a runnable design.",
+            failure_class=FailureClass.POLICY_REFUSED,
+        )
+    if not _preregistration_exists(context, digest):
+        # And the digest must name a preregistration this runtime actually
+        # stored. Otherwise the check compares a self-consistent blob against
+        # itself, which establishes nothing about when the endpoint was fixed.
+        return ActionOutcome.failed(
+            f"no stored preregistration matches {digest[:12]}. The endpoint and "
+            f"its criteria must be recorded by design_experiment before the "
+            f"experiment runs, not supplied alongside it.",
+            failure_class=FailureClass.MISSING_SCIENTIFIC_AUTHORITY,
+        )
+    if declared != digest:
         # The thing about to run is not the thing that was preregistered.
         return ActionOutcome.failed(
             f"the specification changed after preregistration "

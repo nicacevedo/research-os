@@ -60,7 +60,8 @@ LOG = logging.getLogger("research_os.runtime.store")
 
 RUN_COLUMNS = (
     "run_id, project_id, objective, status, terminal_state, autonomy, parent_run_id, "
-    "cycle_index, thread_id, detail, created_at, started_at, finished_at, updated_at"
+    "cycle_index, thread_id, detail, frontier_digest, created_at, started_at, "
+    "finished_at, updated_at"
 )
 EVENT_COLUMNS = "event_id, project_id, run_id, work_id, kind, payload, dedup_key, created_at, consumed_at"
 APPROVAL_COLUMNS = (
@@ -73,8 +74,9 @@ JOB_COLUMNS = (
 )
 MODEL_CALL_COLUMNS = (
     "call_id, run_id, work_id, invocation_id, provider, model, role, criticality, "
-    "independence_group, prompt_version, input_digest, output_artifact_id, tokens_in, "
-    "tokens_out, cost_usd, latency_ms, status, error, created_at"
+    "independence_group, independence, independence_note, prompt_version, "
+    "input_digest, output_artifact_id, tokens_in, tokens_out, cost_usd, latency_ms, "
+    "status, error, created_at"
 )
 SCHEDULE_COLUMNS = (
     "schedule_id, project_id, kind, payload, interval_seconds, next_run_at, "
@@ -255,6 +257,20 @@ class RuntimeStore:
             )
         return ResearchRun.model_validate(row)
 
+    def set_frontier_digest(self, run_id: str, digest: str) -> None:
+        """Record what the frontier looked like when this cycle concluded.
+
+        So the *next* cycle's continuation decision can tell "we learned
+        something" from "we ran again".
+        """
+
+        with self._db.tx() as conn:
+            conn.execute(
+                "update research_runs set frontier_digest = %s, updated_at = now() "
+                "where run_id = %s",
+                (digest, run_id),
+            )
+
     def lineage_depth(self, run_id: str) -> int:
         """How many cycles this objective has already chained.
 
@@ -325,29 +341,61 @@ class RuntimeStore:
             raise RuntimeStateError(f"event with dedup key {dedup_key!r} vanished")
         return Event.model_validate(existing), False
 
-    def claim_events(self, *, limit: int = 50) -> tuple[Event, ...]:
-        """Take up to ``limit`` unconsumed events, marking them consumed.
+    def claim_events(
+        self, *, limit: int = 50, owner: str = "", lease_seconds: int = 120
+    ) -> tuple[Event, ...]:
+        """Lease up to ``limit`` unconsumed events. Does **not** consume them.
 
-        ``skip locked`` again: the daemon may run more than one ingest loop, and
-        an event must be turned into work by exactly one of them.
+        Consuming here and enqueueing the work in a second transaction lost the
+        work permanently on a crash in between -- and nothing re-emits these
+        events, so a run never started or a human's decision never resumed its
+        cycle. An independent review found the comment that claimed otherwise.
+
+        So this *leases*, exactly as the work queue does, and
+        :meth:`consume_event` is called once the work row exists. An expired
+        lease makes the event claimable again.
+
+        ``skip locked`` so several ingest loops can share the stream.
         """
 
         with self._db.tx() as conn:
             rows = conn.execute(
                 f"""
                 with due as (
-                    select event_id from events where consumed_at is null
+                    select event_id from events
+                    where consumed_at is null
+                      and (claimed_at is null
+                           or claimed_at < now() - make_interval(secs => %(lease)s))
                     order by created_at, event_id
                     for update skip locked
                     limit %(limit)s
                 )
-                update events e set consumed_at = now()
+                update events e
+                set claimed_at = now(), claimed_by = %(owner)s
                 from due d where e.event_id = d.event_id
                 returning {", ".join("e." + c.strip() for c in EVENT_COLUMNS.split(","))}
                 """,
-                {"limit": limit},
+                {"limit": limit, "owner": owner or None, "lease": float(lease_seconds)},
             ).fetchall()
         return tuple(Event.model_validate(row) for row in rows)
+
+    def consume_event(self, event_id: str) -> bool:
+        """Mark one leased event handled. Returns ``False`` if it already was."""
+
+        with self._db.tx() as conn:
+            row = conn.execute(
+                "update events set consumed_at = now() "
+                "where event_id = %s and consumed_at is null returning event_id",
+                (event_id,),
+            ).fetchone()
+        return row is not None
+
+    def unconsumed_event_count(self) -> int:
+        with self._db.tx() as conn:
+            row = conn.execute(
+                "select count(*) as n from events where consumed_at is null"
+            ).fetchone()
+        return int(row["n"]) if row else 0
 
     def list_events(
         self,
@@ -451,8 +499,17 @@ class RuntimeStore:
         granted: bool,
         decision: dict[str, Any],
         decided_by: str,
+        emit_event: bool = True,
     ) -> Approval:
-        """Store a human's answer. Refuses to overwrite one already given."""
+        """Store a human's answer, and the event that resumes its cycle, atomically.
+
+        One transaction, because two left a window an independent review found:
+        a crash or a Ctrl-C between recording the decision and emitting the
+        event left the approval decided and the run stalled in WAITING_HUMAN
+        forever -- and unrecoverable by the researcher, because
+        ``record_decision`` refuses an already-decided approval and nothing
+        reconciles a decided-but-unresumed one.
+        """
 
         status = ApprovalStatus.GRANTED if granted else ApprovalStatus.DECLINED
         with self._db.tx() as conn:
@@ -471,6 +528,29 @@ class RuntimeStore:
                     "decided_by": decided_by,
                 },
             ).fetchone()
+            if row is not None and emit_event:
+                conn.execute(
+                    """
+                    insert into events
+                        (event_id, project_id, run_id, kind, payload, dedup_key)
+                    values (%(event_id)s, %(project_id)s, %(run_id)s,
+                            'SCIENTIFIC_DECISION_RECORDED', %(payload)s, %(dedup_key)s)
+                    on conflict (dedup_key) do nothing
+                    """,
+                    {
+                        "event_id": new_event_id(),
+                        "project_id": row["project_id"],
+                        "run_id": row["run_id"],
+                        "payload": jsonb(
+                            {
+                                "approval_id": approval_id,
+                                "granted": granted,
+                                "kind": row["kind"],
+                            }
+                        ),
+                        "dedup_key": f"decided:{approval_id}",
+                    },
+                )
         if row is None:
             current = self.get_approval(approval_id)
             if current is None:
@@ -512,6 +592,8 @@ class RuntimeStore:
         model: str | None = None,
         criticality: str = "normal",
         independence_group: str | None = None,
+        independence: str | None = None,
+        independence_note: str | None = None,
         prompt_version: str | None = None,
         input_digest: str | None = None,
         output_artifact_id: str | None = None,
@@ -526,11 +608,12 @@ class RuntimeStore:
                 f"""
                 insert into model_calls
                     (call_id, run_id, work_id, invocation_id, provider, model, role,
-                     criticality, independence_group, prompt_version, input_digest,
-                     output_artifact_id, tokens_in, tokens_out, cost_usd, latency_ms,
-                     status, error)
+                     criticality, independence_group, independence, independence_note,
+                     prompt_version, input_digest, output_artifact_id, tokens_in,
+                     tokens_out, cost_usd, latency_ms, status, error)
                 values (%(call_id)s, %(run_id)s, %(work_id)s, %(invocation_id)s, %(provider)s,
                         %(model)s, %(role)s, %(criticality)s, %(independence_group)s,
+                        %(independence)s, %(independence_note)s,
                         %(prompt_version)s, %(input_digest)s, %(output_artifact_id)s,
                         %(tokens_in)s, %(tokens_out)s, %(cost_usd)s, %(latency_ms)s,
                         %(status)s, %(error)s)
@@ -546,6 +629,10 @@ class RuntimeStore:
                     "role": role,
                     "criticality": criticality,
                     "independence_group": independence_group,
+                    "independence": independence,
+                    "independence_note": independence_note[:2000]
+                    if independence_note
+                    else None,
                     "prompt_version": prompt_version,
                     "input_digest": input_digest,
                     "output_artifact_id": output_artifact_id,

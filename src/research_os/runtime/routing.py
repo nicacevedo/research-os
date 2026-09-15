@@ -451,6 +451,8 @@ class ModelRouter:
             status=status,
             criticality=str(request.criticality),
             independence_group=request.independence_group,
+            independence=str(routed.independence),
+            independence_note=routed.note,
             prompt_version=request.prompt_version,
             input_digest=prompt_ref.artifact_id,
             output_artifact_id=output_ref.artifact_id if output_ref else None,

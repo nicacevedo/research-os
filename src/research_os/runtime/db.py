@@ -107,6 +107,28 @@ def classify_db_error(exc: BaseException) -> RuntimeDatabaseError:
     return RuntimeDatabaseError(str(exc))
 
 
+def _reset_session(conn: Any) -> None:
+    """Return a connection to the pool with no session state of its own.
+
+    Only advisory locks matter here today, and they matter a lot: see the
+    ``reset`` comment in :meth:`Database._ensure_pool`.
+    """
+
+    try:
+        conn.execute("select pg_advisory_unlock_all()")
+        # The pool requires the connection back out of a transaction. A
+        # non-autocommit connection opens one on the first statement, so the
+        # reset has to close it -- without this, psycopg discards every
+        # connection it resets and the pool churns.
+        conn.commit()
+    except Exception as exc:  # noqa: BLE001 - a failed reset must not kill the pool
+        LOG.warning("could not reset a pooled connection: %s", exc)
+        try:
+            conn.rollback()
+        except Exception as rollback_exc:  # noqa: BLE001 - nothing more to try
+            LOG.warning("could not roll back a pooled connection: %s", rollback_exc)
+
+
 class Database:
     """A pooled PostgreSQL handle.
 
@@ -147,7 +169,21 @@ class Database:
                 max_size=self._max_size,
                 open=True,
                 timeout=30.0,
-                kwargs={"row_factory": dict_row, "autocommit": False},
+                # `lock_timeout` so an advisory lock taken with wait=True can
+                # never block a worker forever, and a statement timeout as a
+                # backstop against a pathological query holding a connection.
+                kwargs={
+                    "row_factory": dict_row,
+                    "autocommit": False,
+                    "options": "-c lock_timeout=30s -c idle_in_transaction_session_timeout=60s",
+                },
+                # psycopg's own reset only normalises transaction status; it does
+                # not clear *session* state, and a session-scoped
+                # `pg_advisory_lock` is session state. Without this, a lock whose
+                # unlock was skipped -- a signal between acquiring and entering
+                # the try block -- is held by a connection that returns to the
+                # pool and is never released until the process exits.
+                reset=_reset_session,
             )
             pool.wait(timeout=30.0)
         except Exception as exc:  # noqa: BLE001 - classified, then re-raised

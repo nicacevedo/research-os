@@ -219,3 +219,51 @@ def make_router(
         project_id=project_id,
         work_id=work_id,
     )
+
+
+def declare_experiment_command(
+    *,
+    project_id: str = "alpha-project",
+    name: str = "demo-test",
+    argv: tuple[str, ...] = ("true",),
+    outputs: tuple[str, ...] = (),
+) -> Path:
+    """Write an ``experiments.yaml`` declaring one experiment command.
+
+    The runtime will only run a command the *researcher* declared, so a test
+    that exercises the experiment path has to declare one -- which is the point
+    of the design rather than an inconvenience of the test.
+    """
+
+    import yaml
+
+    from research_os.paths import config_home
+
+    path = config_home() / "experiments.yaml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "schema_version": 1,
+                "projects": {
+                    project_id: {
+                        "default_executor": "local",
+                        "commands": {
+                            name: {
+                                "name": name,
+                                "description": "a declared demo command",
+                                "argv": list(argv),
+                                "parameters": [],
+                                "outputs": list(outputs),
+                                "timeout_seconds": 60,
+                                "executor": "local",
+                            }
+                        },
+                    }
+                },
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    return path

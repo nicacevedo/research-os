@@ -64,6 +64,15 @@ class IdempotencyError(ResearchOSError):
     """Raised when a side effect cannot be safely performed or reused."""
 
 
+class InvocationTakenOverError(IdempotencyError):
+    """Raised when a worker acts on an invocation it no longer owns.
+
+    Not a crash: the expected outcome of being slow enough to be abandoned. The
+    late worker's result is discarded, and because the action was idempotent
+    whoever took over either reused it or established the truth by reconciling.
+    """
+
+
 class UnreconciledInvocationError(IdempotencyError):
     """Raised when a previous attempt's outcome is unknown and cannot be checked.
 
@@ -202,22 +211,56 @@ class InvocationLedger:
             ).fetchone()
         return row is not None
 
-    def complete(self, invocation_id: str, *, result: dict[str, Any]) -> ToolInvocation:
+    def complete(
+        self, invocation_id: str, *, result: dict[str, Any], owner: str | None = None
+    ) -> ToolInvocation:
+        """Record that the side effect took hold.
+
+        Guarded on ownership when an owner is given, exactly as
+        :meth:`WorkQueue.succeed` is. Without the guard, a worker whose
+        invocation had been abandoned and taken over could return late and
+        overwrite the new owner's record -- and if it landed ``mark_failed``
+        last, the row would read FAILED for an action that had in fact
+        completed, which the retry path would then read as permission to do it
+        again.
+
+        ``owner=None`` is the *reconciliation* case and is deliberately
+        unguarded: a reconciler has looked at the world and established that the
+        action took hold, which is authoritative over any worker's opinion and
+        over any earlier status. Hence the status set includes ABANDONED and
+        FAILED -- the two states a reconciler exists to correct.
+        """
+
         with self._db.tx() as conn:
             row = conn.execute(
                 f"""
                 update tool_invocations
                 set status = 'COMPLETED', result = %(result)s, error = null, finished_at = now()
                 where invocation_id = %(invocation_id)s
+                  and status <> 'COMPLETED'
+                  and (%(owner)s::text is null or
+                       (status = 'IN_FLIGHT' and owner = %(owner)s))
                 returning {INVOCATION_COLUMNS}
                 """,
-                {"invocation_id": invocation_id, "result": jsonb(result)},
+                {
+                    "invocation_id": invocation_id,
+                    "result": jsonb(result),
+                    "owner": owner,
+                },
             ).fetchone()
         if row is None:
-            raise IdempotencyError(f"no such invocation: {invocation_id}")
+            current = self.get_by_id(invocation_id)
+            if current is None:
+                raise IdempotencyError(f"no such invocation: {invocation_id}")
+            raise InvocationTakenOverError(
+                f"invocation {invocation_id} is {current.status} and owned by "
+                f"{current.owner}; this worker's result is discarded"
+            )
         return ToolInvocation.model_validate(row)
 
-    def mark_failed(self, invocation_id: str, *, error: str) -> ToolInvocation:
+    def mark_failed(
+        self, invocation_id: str, *, error: str, owner: str | None = None
+    ) -> ToolInvocation:
         """Record that the action definitely did not happen.
 
         Distinct from abandoning. A failure recorded here means the side effect
@@ -232,13 +275,29 @@ class InvocationLedger:
                 update tool_invocations
                 set status = 'FAILED', error = %(error)s, finished_at = now()
                 where invocation_id = %(invocation_id)s
+                  and status = 'IN_FLIGHT'
+                  and (%(owner)s::text is null or owner = %(owner)s)
                 returning {INVOCATION_COLUMNS}
                 """,
-                {"invocation_id": invocation_id, "error": error[:4000]},
+                {"invocation_id": invocation_id, "error": error[:4000], "owner": owner},
             ).fetchone()
         if row is None:
-            raise IdempotencyError(f"no such invocation: {invocation_id}")
+            current = self.get_by_id(invocation_id)
+            if current is None:
+                raise IdempotencyError(f"no such invocation: {invocation_id}")
+            raise InvocationTakenOverError(
+                f"invocation {invocation_id} is {current.status} and owned by "
+                f"{current.owner}; this worker's failure is not recorded over it"
+            )
         return ToolInvocation.model_validate(row)
+
+    def get_by_id(self, invocation_id: str) -> ToolInvocation | None:
+        with self._db.tx() as conn:
+            row = conn.execute(
+                f"select {INVOCATION_COLUMNS} from tool_invocations where invocation_id = %s",
+                (invocation_id,),
+            ).fetchone()
+        return ToolInvocation.model_validate(row) if row else None
 
     def reopen(self, key: str) -> None:
         """Allow a definitively-failed action to be attempted again.
@@ -322,6 +381,24 @@ class InvocationLedger:
                 raise IdempotencyError(
                     f"{kind} previously failed ({invocation.error}) and is not retryable"
                 )
+            # FAILED means "the performer raised", which is *not* the same as
+            # "the effect did not happen". `perform` routinely raises after the
+            # external world has already changed -- an `sbatch` that succeeded
+            # and then a database blip while recording the job id. The first
+            # version deleted the row and re-performed, which submitted the same
+            # experiment to a cluster twice. So the reconciler gets the first
+            # word here too, exactly as it does for ABANDONED.
+            if reconcile is not None:
+                found = reconcile(invocation)
+                if found is not None:
+                    LOG.warning(
+                        "invocation %s (%s) recorded a failure but the action had "
+                        "taken hold; reusing it",
+                        invocation.invocation_id,
+                        kind,
+                    )
+                    recovered = self.complete(invocation.invocation_id, result=found)
+                    return Outcome(result=found, invocation=recovered, reused=True)
             self.reopen(key)
             invocation, claimed = self._claim(
                 key=key,

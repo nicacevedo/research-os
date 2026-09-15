@@ -174,6 +174,9 @@ class ResearchRun(_Record):
     cycle_index: int
     thread_id: str | None = None
     detail: str | None = None
+    #: A hash of the frontier as this cycle left it. Compared against the
+    #: parent's so a cycle that changed nothing does not open a successor.
+    frontier_digest: str | None = None
     created_at: datetime
     started_at: datetime | None = None
     finished_at: datetime | None = None
@@ -273,6 +276,12 @@ class ModelCall(_Record):
     latency_ms: int | None
     status: ModelCallStatus
     error: str | None
+    #: The separation actually achieved, and why. Persisted rather than left in
+    #: a log line and a prunable checkpoint: "independently reviewed" is the
+    #: claim the review apparatus rests on, and an unfalsifiable claim is worse
+    #: than an acknowledged absence.
+    independence: str | None = None
+    independence_note: str | None = None
     created_at: datetime
 
 

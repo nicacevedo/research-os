@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import socket
 import sys
 from pathlib import Path
 
@@ -95,10 +96,28 @@ def add_runtime_parser(subparsers: argparse._SubParsersAction) -> None:
     approve = actions.add_parser("approve", help="Authorise a pending decision.")
     approve.add_argument("approval_id", metavar="APPROVAL_ID")
     approve.add_argument("--note", default="", help="Why, for the record.")
+    approve.add_argument(
+        "--i-am-a-person",
+        dest="i_am_a_person",
+        action="store_true",
+        help=(
+            "Answer without an interactive terminal. Deliberate, recorded, and "
+            "not something an autonomous process should be passing."
+        ),
+    )
 
     decline = actions.add_parser("decline", help="Refuse a pending decision.")
     decline.add_argument("approval_id", metavar="APPROVAL_ID")
     decline.add_argument("--note", default="", help="Why, for the record.")
+    decline.add_argument(
+        "--i-am-a-person",
+        dest="i_am_a_person",
+        action="store_true",
+        help=(
+            "Answer without an interactive terminal. Deliberate, recorded, and "
+            "not something an autonomous process should be passing."
+        ),
+    )
 
     jobs = actions.add_parser("jobs", help="External (cluster) jobs.")
     jobs.add_argument("--run", dest="run_id", default=None)
@@ -346,26 +365,62 @@ def _approvals(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _is_interactive() -> bool:
+    """Whether a person is driving this invocation.
+
+    The same seam ``researchctl review`` uses, for the same reason and with the
+    same honest caveat: it is a usability and safety guard, not authentication.
+    It makes unattended approval inconvenient and obvious.
+    """
+
+    try:
+        return sys.stdin.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
+def _actor() -> str:
+    """Who is recording this decision, as accurately as this can be known.
+
+    An earlier version wrote the literal string ``"researcher"`` for every
+    decision. An independent review pointed out that this is a fabricated
+    attribution: the field is provenance for a scientific-authority decision,
+    and filling it with a guess makes the audit trail claim something it does
+    not know.
+    """
+
+    import getpass
+
+    try:
+        user = getpass.getuser()
+    except (OSError, KeyError):  # pragma: no cover - no passwd entry
+        user = "unknown"
+    return f"{user}@{socket.gethostname()}"
+
+
 def _decide(args: argparse.Namespace, *, granted: bool) -> int:
+    # The same boundary AGENTS.md draws around `researchctl review`. Answering a
+    # scientific-authority gate is a person's act; an autonomous process must
+    # not be able to clear its own gate by running the CLI.
+    if not _is_interactive() and not args.i_am_a_person:
+        raise ResearchOSError(
+            "Answering a scientific decision requires an interactive terminal. "
+            "This gate exists so that an autonomous process cannot authorise "
+            "its own work. If you are scripting a deliberate batch approval, "
+            "pass --i-am-a-person and your shell history will say you did."
+        )
     config = load_config()
     with _database(config) as db:
         store = RuntimeStore(db)
+        # `record_decision` writes the decision and the resuming event in one
+        # transaction. Emitting the event here, as an earlier version did, left
+        # a window in which a Ctrl-C stalled the run in WAITING_HUMAN with no
+        # way for the researcher to retry.
         approval = store.record_decision(
             args.approval_id,
             granted=granted,
             decision={"granted": granted, "note": args.note.strip()},
-            decided_by="researcher",
-        )
-        store.record_event(
-            kind="SCIENTIFIC_DECISION_RECORDED",
-            project_id=approval.project_id,
-            run_id=approval.run_id,
-            payload={
-                "approval_id": approval.approval_id,
-                "granted": granted,
-                "kind": approval.kind,
-            },
-            dedup_key=f"decided:{approval.approval_id}",
+            decided_by=_actor(),
         )
     verb = "authorised" if granted else "declined"
     print(

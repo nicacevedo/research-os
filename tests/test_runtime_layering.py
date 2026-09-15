@@ -224,3 +224,37 @@ def test_importing_the_cli_does_not_connect_to_anything() -> None:
         timeout=120,
     )
     assert completed.stdout.strip() == "False False", completed.stdout
+
+
+def test_the_runtime_fixtures_isolate_every_xdg_directory(
+    runtime_xdg: Path, tmp_path: Path
+) -> None:
+    """A guard on the test setup itself, not on the product.
+
+    Before it existed, the experiment tests wrote job directories into the
+    researcher's real data home and a chaos test came within one line of
+    deleting their literature database. ``isolate_xdg_env`` only unsets the
+    overrides, so an unredirected test silently falls back to the real
+    directories instead of failing -- which is the worst possible default for a
+    suite that deletes things.
+    """
+
+    from research_os.paths import cache_home, config_home, data_home, state_home
+    from research_os.runtime.config import artifacts_root, dev_db_root
+    from research_os.runtime.executors import runs_root
+    from research_os.runtime.notify import inbox_path
+
+    for path in (
+        config_home(),
+        data_home(),
+        cache_home(),
+        state_home(),
+        artifacts_root(),
+        dev_db_root(),
+        runs_root(),
+        inbox_path(),
+    ):
+        assert tmp_path in path.parents or path == tmp_path, (
+            f"{path} is outside the test's tmp_path; a test could write to or "
+            f"delete the researcher's real data"
+        )

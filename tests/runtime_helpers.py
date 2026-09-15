@@ -86,8 +86,43 @@ def pg_dsn(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
 
 
 @pytest.fixture
-def runtime_db(pg_dsn: str) -> Iterator[Database]:
-    """A migrated, empty database, and a handle to it."""
+def runtime_xdg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Redirect every Research OS directory into ``tmp_path``.
+
+    Autoused by :func:`runtime_db`, and not optional. The runtime reaches the
+    XDG homes in more places than is obvious -- the artifact store, experiment
+    run directories, the notification inbox, the literature index, the
+    disposable database's cluster -- and ``isolate_xdg_env`` only *unsets* the
+    overrides, which makes an unredirected test fall back to the researcher's
+    real directories rather than fail.
+
+    That is not hypothetical. Before this fixture existed, the experiment tests
+    wrote seven job directories into the real data home, and the derived-index
+    chaos test was one line away from deleting the researcher's actual
+    literature database -- it was stopped by an unrelated schema check, which is
+    not a safety mechanism.
+    """
+
+    root = tmp_path / "xdg"
+    mapping = {
+        "RESEARCH_OS_CONFIG_HOME": root / "config",
+        "RESEARCH_OS_DATA_HOME": root / "data",
+        "RESEARCH_OS_CACHE_HOME": root / "cache",
+        "RESEARCH_OS_STATE_HOME": root / "state",
+    }
+    for name, path in mapping.items():
+        path.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setenv(name, str(path))
+    return mapping["RESEARCH_OS_DATA_HOME"]
+
+
+@pytest.fixture
+def runtime_db(pg_dsn: str, runtime_xdg: Path) -> Iterator[Database]:
+    """A migrated, empty database, and a handle to it.
+
+    Depends on :func:`runtime_xdg` so that no test using it can touch the
+    researcher's real directories, whatever else it does.
+    """
 
     with Database(pg_dsn) as db:
         with db.tx() as conn:

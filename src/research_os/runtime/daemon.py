@@ -64,6 +64,7 @@ from research_os.runtime.models import (
     ExternalJobStatus,
     TerminalState,
     WorkItem,
+    WorkStatus,
 )
 from research_os.runtime.notify import FileNotifier
 from research_os.runtime.queue import LeaseLostError, WorkQueue
@@ -253,7 +254,36 @@ class Daemon:
         reclaimed = self._queue.reclaim_expired()
         report.leases_reclaimed = len(reclaimed)
         for item in reclaimed:
+            if item.status is WorkStatus.FAILED:
+                # Out of attempts. The event is recorded so the failure is
+                # visible, but it must not map to new work: an independent
+                # review found that it did, and that the new item arrived with a
+                # *fresh* attempt budget -- so an item that killed three workers
+                # was marked FAILED and immediately replaced by one that would
+                # kill three more. The queue's attempt cap was defeated by the
+                # thing that was supposed to honour it, and the backlog for one
+                # run grew without bound.
+                self._store.record_event(
+                    kind="WORK_EXHAUSTED",
+                    project_id=item.project_id,
+                    run_id=item.run_id,
+                    work_id=item.work_id,
+                    payload={
+                        "kind": item.kind,
+                        "attempts": item.attempts,
+                        "failure_class": item.failure_class,
+                    },
+                    dedup_key=f"exhausted:{item.work_id}",
+                )
+                report.notes.append(
+                    f"{item.work_id} ({item.kind}) is out of attempts after "
+                    f"{item.attempts} and will not be retried"
+                )
+                continue
             if item.run_id:
+                # Requeued, and the requeued item *is* the retry. The event
+                # exists so the recovery is visible; its work item is deduped
+                # per run so it cannot become a second concurrent attempt.
                 self._store.record_event(
                     kind="WORKER_RECOVERED",
                     project_id=item.project_id,
@@ -286,17 +316,34 @@ class Daemon:
         of the same event enqueues the same dedup key rather than a duplicate.
         """
 
-        events = self._store.claim_events(limit=50)
+        events = self._store.claim_events(
+            limit=50,
+            owner=self._owner,
+            lease_seconds=self._config.settings.lease_seconds,
+        )
         report.events_ingested = len(events)
         for event in events:
             kind = EVENT_WORK.get(event.kind)
             if kind is None:
+                # Informational. Consumed so it is not claimed again; it
+                # deliberately produces no work.
+                self._store.consume_event(event.event_id)
+                continue
+            if event.project_id is None:
+                report.notes.append(
+                    f"event {event.event_id} ({event.kind}) has no project and "
+                    f"cannot become work; left unconsumed for inspection"
+                )
                 continue
             if self._enqueue_for(event, kind):
                 report.work_enqueued += 1
+            # Consumed only now that the work row exists. A crash before this
+            # leaves the event claimable again once its lease expires, which is
+            # why `claim_events` leases rather than consumes.
+            self._store.consume_event(event.event_id)
 
     def _enqueue_for(self, event: Event, kind: str) -> bool:
-        if event.project_id is None:
+        if event.project_id is None:  # pragma: no cover - checked by the caller
             return False
         result = self._queue.enqueue(
             project_id=event.project_id,
@@ -323,7 +370,10 @@ class Daemon:
         even a future duplicate cannot fork the lineage.
         """
 
-        if kind == WorkKind.CONTINUE_OBJECTIVE and event.run_id:
+        if (
+            kind in {WorkKind.CONTINUE_OBJECTIVE, WorkKind.RESUME_CYCLE}
+            and event.run_id
+        ):
             return f"{kind}:{event.run_id}"
         return f"{kind}:{event.event_id}"
 
@@ -592,7 +642,14 @@ class Daemon:
         repo = self._repo_for(run.project_id)
         resume_value: Any = None
         if item.payload.get("event_kind") == "SCIENTIFIC_DECISION_RECORDED":
-            resume_value = {"granted": True, "source": "recorded decision"}
+            # A wake-up, carrying no verdict. `await_decision` reads the actual
+            # decision from the approvals table; passing `granted` here would be
+            # the control plane asserting an outcome it is not entitled to
+            # assert, and an earlier version did exactly that.
+            resume_value = {
+                "source": "recorded decision",
+                "approval_id": item.payload.get("approval_id"),
+            }
         result = resume_cycle(
             config=self._config,
             db=self._db,

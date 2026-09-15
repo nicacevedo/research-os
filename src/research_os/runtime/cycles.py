@@ -41,6 +41,7 @@ from research_os.runtime.idempotency import InvocationLedger
 from research_os.runtime.ids import thread_id_for
 from research_os.runtime.interfaces import ModelProvider
 from research_os.runtime.kernel import ScientificKernelAdapter
+from research_os.runtime.locks import research_run_lock
 from research_os.runtime.models import (
     Autonomy,
     BudgetScope,
@@ -346,7 +347,15 @@ def _execute(
         "notes": [],
     }
 
-    with checkpointer(config.require_dsn()) as saver:
+    # One worker in one thread. Two entering the same LangGraph thread
+    # duplicates model spend and writes concurrently to one checkpoint stream,
+    # and the run's status transition is not a guard -- RUNNING -> RUNNING
+    # succeeds. Refuses fast rather than queueing: the caller puts the work item
+    # back and picks up something else.
+    with (
+        research_run_lock(db, run.run_id),
+        checkpointer(config.require_dsn()) as saver,
+    ):
         app = build_cycle_graph().compile(checkpointer=saver)
 
         # What to hand LangGraph depends on the thread, not on the caller's
@@ -403,6 +412,9 @@ def _execute(
         )
 
     _settle_wall_clock(db, run)
+    digest = str(final.get("frontier_digest") or "")
+    if digest:
+        store.set_frontier_digest(run.run_id, digest)
 
     raw_terminal = str(final.get("terminal_state") or TerminalState.DONE_FOR_NOW)
     terminal = TerminalState(raw_terminal)
@@ -496,6 +508,28 @@ def should_continue(
     ceiling = config.settings.max_cycles_per_objective
     if depth + 1 >= ceiling:
         return False, f"{depth + 1} cycles reached the configured ceiling of {ceiling}"
+
+    # Did this cycle change anything? The first real pilot ran seven chained
+    # cycles over an identical frontier, each concluding START_NEXT_CYCLE,
+    # stopping only at the ceiling -- fifteen model calls for one assessment's
+    # worth of information.
+    #
+    # The cause is structural, not a planner mistake: the runtime cannot write a
+    # capsule, so it cannot retire a hypothesis, record an experiment, or move a
+    # claim. Its own work never changes the frontier that the frontier is
+    # derived from. So progress has to be *checked* rather than assumed, and
+    # when there is none the honest recommendation is to stop and say why.
+    digest = result.run.frontier_digest
+    if digest and result.run.parent_run_id:
+        parent = store.get_run(result.run.parent_run_id)
+        if parent is not None and parent.frontier_digest == digest:
+            return False, (
+                "the frontier is unchanged from the previous cycle. The runtime "
+                "cannot alter canonical scientific state, so repeating the cycle "
+                "would repeat its cost without adding information. What is "
+                "outstanding needs a person: see `researchctl runtime run "
+                f"{result.run.run_id}`."
+            )
 
     exhausted = BudgetLedger(db).exhausted_dimensions(
         run_id=result.run.run_id, project_id=result.run.project_id

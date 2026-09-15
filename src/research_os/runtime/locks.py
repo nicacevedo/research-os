@@ -56,6 +56,11 @@ class LockClass(IntEnum):
     REPOSITORY_MUTATION = 1
     PROJECT_CAPSULE = 2
     DERIVED_INDEX = 3
+    #: One cycle at a time per run. Two workers entering one LangGraph thread
+    #: duplicates model spend and writes concurrently to one checkpointed
+    #: thread; nothing else in the design prevented it, because the run's
+    #: status transition is not a guard (RUNNING -> RUNNING succeeds).
+    RESEARCH_RUN = 4
 
 
 class RepositoryBusyError(ResearchOSError):
@@ -79,14 +84,27 @@ def advisory_lock(
     *,
     lock_class: LockClass,
     subject: str,
-    wait: bool = True,
+    wait: bool = False,
 ) -> Iterator[None]:
     """Hold one advisory lock for the body of the block.
 
-    With ``wait=False`` a lock already held by someone else raises
-    :class:`RepositoryBusyError` immediately, which is what a worker wants: it
-    puts the work item back on the queue and picks up something else rather than
-    blocking a worker slot on a lock.
+    ``wait=False`` is the default, and it was not at first. Every caller took
+    the blocking form, which meant ``pg_advisory_lock`` with no
+    ``lock_timeout`` -- an unbounded wait. Because ``Daemon.tick`` runs work
+    inline on one thread, a single stuck holder stopped lease reclamation,
+    approval notification and job polling for that whole process, while the
+    blocked worker's own lease keeper kept its lease alive so nothing recovered
+    it either. Every ``RepositoryBusyError`` handler in the tree was
+    unreachable.
+
+    So the default refuses fast. A worker that cannot get the lock puts its work
+    item back and picks up something else, which is what a worker should do.
+    ``wait=True`` remains available for a caller that genuinely wants to queue,
+    and there is currently none.
+
+    Releasing is best-effort and cannot mask the body's exception: an unlock
+    that itself fails is logged, because raising from the ``finally`` would hide
+    whatever actually went wrong inside the block.
     """
 
     key = _key(lock_class, subject)
@@ -107,11 +125,22 @@ def advisory_lock(
         try:
             yield
         finally:
-            conn.execute("select pg_advisory_unlock(%s, %s)", (ADVISORY_NAMESPACE, key))
-            LOG.debug("released %s lock for %s", lock_class.name, subject)
+            try:
+                conn.execute(
+                    "select pg_advisory_unlock(%s, %s)", (ADVISORY_NAMESPACE, key)
+                )
+            except Exception as exc:  # noqa: BLE001 - must not mask the body's error
+                LOG.error(
+                    "could not release the %s lock for %s: %s",
+                    lock_class.name,
+                    subject,
+                    exc,
+                )
+            else:
+                LOG.debug("released %s lock for %s", lock_class.name, subject)
 
 
-def repository_lock(db: Database, repo_path: str, *, wait: bool = True):
+def repository_lock(db: Database, repo_path: str, *, wait: bool = False):
     """Serialise mutations of one canonical checkout."""
 
     return advisory_lock(
@@ -119,7 +148,7 @@ def repository_lock(db: Database, repo_path: str, *, wait: bool = True):
     )
 
 
-def capsule_lock(db: Database, project_id: str, *, wait: bool = True):
+def capsule_lock(db: Database, project_id: str, *, wait: bool = False):
     """Serialise writes to one project's capsule."""
 
     return advisory_lock(
@@ -127,11 +156,24 @@ def capsule_lock(db: Database, project_id: str, *, wait: bool = True):
     )
 
 
-def derived_index_lock(db: Database, name: str, *, wait: bool = True):
+def derived_index_lock(db: Database, name: str, *, wait: bool = False):
     """Serialise rebuilds of one derived, rebuildable index."""
 
     return advisory_lock(
         db, lock_class=LockClass.DERIVED_INDEX, subject=name, wait=wait
+    )
+
+
+def research_run_lock(db: Database, run_id: str, *, wait: bool = False):
+    """Serialise execution of one bounded cycle.
+
+    Two workers entering one LangGraph thread duplicates model spend and writes
+    concurrently to one checkpoint stream. Nothing else prevented it: the run's
+    status transition is not a guard, because RUNNING -> RUNNING succeeds.
+    """
+
+    return advisory_lock(
+        db, lock_class=LockClass.RESEARCH_RUN, subject=run_id, wait=wait
     )
 
 

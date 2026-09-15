@@ -44,6 +44,7 @@ a new thread with recorded lineage, bounded by
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from typing import Any
@@ -63,7 +64,7 @@ from research_os.runtime.idempotency import (
     idempotency_key,
 )
 from research_os.runtime.interfaces import ModelRequest
-from research_os.runtime.kernel import ScientificAuthorityError
+from research_os.runtime.kernel import Frontier, ScientificAuthorityError
 from research_os.runtime.models import TerminalState
 from research_os.runtime.policy import (
     ActionKind,
@@ -540,16 +541,33 @@ def await_decision(state: CycleState, runtime: Runtime[CycleContext]) -> dict[st
             "packet": state.get("decision_packet", {}),
         }
     )
+
+    # The resume payload is a *wake-up*, not a verdict. Whoever resumed the
+    # thread -- the control plane, the CLI, a test -- does not get to say what
+    # was decided; the approvals table does, because that is where a person's
+    # decision is recorded and the only place it can be audited from.
+    #
+    # The first version fell back to `granted=bool(answer)` when no approval row
+    # could be read, which made any truthy resume value an approval. Now the
+    # absence of a recorded decision is recorded as not granted, and
+    # `apply_decision` refuses on it.
     recorded = context.store.get_approval(approval_id) if approval_id else None
-    decision = (
-        dict(recorded.decision or {})
-        if recorded is not None and recorded.decision
-        else {"granted": bool(answer), "raw": str(answer)}
-    )
-    if recorded is not None:
-        decision["status"] = str(recorded.status)
-        decision["granted"] = str(recorded.status) in {"GRANTED", "APPLIED"}
-        decision["decided_by"] = recorded.decided_by
+    if recorded is None:
+        return {
+            "decision": {
+                "granted": False,
+                "status": "UNRECORDED",
+                "detail": (
+                    f"no recorded decision for {approval_id or '(no approval id)'}; "
+                    f"the runtime does not infer one from a resume payload"
+                ),
+                "resume_payload": str(answer),
+            }
+        }
+    decision = dict(recorded.decision or {})
+    decision["status"] = str(recorded.status)
+    decision["granted"] = str(recorded.status) in {"GRANTED", "APPLIED"}
+    decision["decided_by"] = recorded.decided_by
     return {"decision": decision}
 
 
@@ -571,11 +589,29 @@ def apply_decision(state: CycleState, runtime: Runtime[CycleContext]) -> dict[st
             "terminal_state": str(TerminalState.WAITING_FOR_SCIENTIFIC_DECISION),
             "notes": note(state, "no approval to apply"),
         }
+
+    # `mark_approval_applied` only succeeds for a row that has actually been
+    # decided, so a PENDING approval fails here -- which is the protection. But
+    # "already applied" and "never decided" are different facts and the first
+    # version reported both with the same sentence, which would mislead anyone
+    # auditing why a gated action did not happen.
+    current = context.store.get_approval(approval_id)
+    if current is None or str(current.status) == "PENDING":
+        return {
+            "terminal_state": str(TerminalState.WAITING_FOR_SCIENTIFIC_DECISION),
+            "notes": note(
+                state,
+                f"{approval_id} has no recorded decision; the cycle stays waiting "
+                f"rather than proceeding",
+            ),
+        }
     claimed = context.store.mark_approval_applied(approval_id)
     if not claimed:
         return {
             "decision_applied": True,
-            "notes": note(state, "decision was already applied; not applying it again"),
+            "notes": note(
+                state, f"{approval_id} was already applied; not applying it again"
+            ),
         }
     if not granted:
         return {
@@ -654,9 +690,11 @@ def conclude(state: CycleState, runtime: Runtime[CycleContext]) -> dict[str, Any
         }
 
     frontier = context.kernel.frontier()
+    digest = frontier_digest(frontier)
     check = state.get("check_result") or {}
     if not check.get("passed", True):
         return {
+            "frontier_digest": digest,
             "terminal_state": str(TerminalState.DONE_FOR_NOW),
             "next_recommendation": "START_NEXT_CYCLE",
             "notes": note(
@@ -665,11 +703,13 @@ def conclude(state: CycleState, runtime: Runtime[CycleContext]) -> dict[str, Any
         }
     if frontier.empty:
         return {
+            "frontier_digest": digest,
             "terminal_state": str(TerminalState.DONE_FOR_NOW),
             "next_recommendation": "DONE_FOR_NOW",
             "notes": note(state, "concluded: the frontier is empty"),
         }
     return {
+        "frontier_digest": digest,
         "terminal_state": str(TerminalState.DONE_FOR_NOW),
         "next_recommendation": "START_NEXT_CYCLE",
         "notes": note(state, "concluded: frontier still has work"),
@@ -677,6 +717,35 @@ def conclude(state: CycleState, runtime: Runtime[CycleContext]) -> dict[str, Any
 
 
 # -------------------------------------------------------------- assembly ----
+def frontier_digest(frontier: Frontier) -> str:
+    """A stable hash of what is outstanding.
+
+    Compared between a cycle and its parent so continuation can tell "we
+    learned something" from "we ran again". The first real pilot ran seven
+    chained cycles over an identical frontier before its ceiling stopped it --
+    fifteen model calls for one assessment's worth of information.
+
+    Derived from the *ids*, sorted, not from counts: two frontiers with the same
+    shape and different members are different frontiers.
+    """
+
+    payload = json.dumps(
+        {
+            "open_questions": sorted(frontier.open_questions),
+            "actionable_hypotheses": sorted(frontier.actionable_hypotheses),
+            "hypotheses_without_tests": sorted(frontier.hypotheses_without_tests),
+            "claims_awaiting_review": sorted(frontier.claims_awaiting_review),
+            "claims_with_stale_review": sorted(frontier.claims_with_stale_review),
+            "contested_claims": sorted(frontier.contested_claims),
+            "evidence_gaps": sorted(frontier.evidence_gaps),
+            "pending_experiments": sorted(frontier.pending_experiments),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def _after_validation(state: CycleState) -> str:
     """Route to the human gate, straight to the end, or on to the action."""
 

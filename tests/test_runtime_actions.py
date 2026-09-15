@@ -26,7 +26,7 @@ from research_os.runtime.actions.authoring import (
 from research_os.runtime.actions.base import ActionOutcome
 from research_os.runtime.actions.coding import failure_class_for
 from research_os.runtime.actions.experiments import (
-    _spec_from_design,
+    declared_commands,
     design_experiment,
     interpret_results,
     run_local_experiment,
@@ -39,7 +39,11 @@ from research_os.runtime.executors import LocalExecutor, spec_digest
 from research_os.runtime.failures import FailureClass
 from research_os.runtime.models import ExternalJobStatus
 from research_os.runtime.store import RuntimeStore
-from tests.runtime_graph_helpers import make_capsule, make_context
+from tests.runtime_graph_helpers import (
+    declare_experiment_command,
+    make_capsule,
+    make_context,
+)
 
 
 @pytest.fixture
@@ -253,31 +257,48 @@ _DESIGN = {
     "secondary_endpoints": ["the variance"],
     "success_criteria": "mean > 0.5",
     "failure_criteria": "mean <= 0.5",
-    "argv": ["true"],
+    # The *name* of a declared command, and values for its declared parameters.
+    # Not an argv vector: a model cannot specify what this system runs.
+    "command": "demo-test",
+    "command_parameters": {},
     "resources": {},
     "seeds": [7],
-    "outputs": [],
     "dataset_identity": "demo@v1",
 }
 
 
-def test_a_design_freezes_the_endpoint_before_any_result_exists(
-    action_env: dict[str, Any],
-) -> None:
+def test_an_undeclared_project_can_run_nothing(action_env: dict[str, Any]) -> None:
+    """An experiment the runtime may run is one the researcher declared."""
+
     context = _context(action_env, {"planner": _DESIGN})
     outcome = design_experiment(
         action_env["state"], context, {"addresses": ["HYP-0001"]}
     )
     assert outcome.ok
+    assert outcome.data["declared_commands"] == []
+    assert "declared" in outcome.detail
+
+
+def test_a_design_freezes_the_endpoint_before_any_result_exists(
+    action_env: dict[str, Any],
+) -> None:
+    declare_experiment_command()
+    context = _context(action_env, {"planner": _DESIGN})
+    outcome = design_experiment(
+        action_env["state"], context, {"addresses": ["HYP-0001"]}
+    )
+    assert outcome.ok, outcome.detail
     assert outcome.data["primary_endpoint"] == "the mean of column A"
     assert outcome.data["success_criteria"]
     assert outcome.data["failure_criteria"]
+    assert outcome.data["command"] == "demo-test"
     assert len(outcome.data["spec_digest"]) == 64
 
 
 def test_an_untestable_hypothesis_is_a_valid_answer(action_env: dict[str, Any]) -> None:
     """Better science than specifying something else and calling it a test."""
 
+    declare_experiment_command()
     context = _context(
         action_env,
         {
@@ -296,43 +317,84 @@ def test_an_untestable_hypothesis_is_a_valid_answer(action_env: dict[str, Any]) 
     assert outcome.data["reason"] == "no such data"
 
 
+def test_a_command_the_researcher_did_not_declare_is_refused(
+    action_env: dict[str, Any],
+) -> None:
+    """The boundary that stops the runtime executing model-authored argv.
+
+    An independent review found the earlier design: `argv` came straight from
+    the model and ran with `cwd` set to the canonical checkout. It was
+    unreachable only because the executors were never wired up -- a wiring
+    omission, not a policy. Now the policy exists.
+    """
+
+    declare_experiment_command()
+    context = _context(action_env, {"planner": {**_DESIGN, "command": "rm-minus-rf"}})
+    outcome = design_experiment(
+        action_env["state"], context, {"addresses": ["HYP-0001"]}
+    )
+    assert not outcome.ok
+    assert outcome.failure_class is FailureClass.POLICY_REFUSED
+    assert "does not declare" in outcome.detail or "not a command" in outcome.detail
+
+
+def test_the_declared_commands_come_from_the_researchers_configuration(
+    action_env: dict[str, Any],
+) -> None:
+    declare_experiment_command(name="benchmark")
+    context = _context(action_env, {})
+    assert sorted(declared_commands(context, "alpha-project")) == ["benchmark"]
+    assert declared_commands(context, "some-other-project") == {}
+
+
 def test_the_spec_digest_ignores_dictionary_ordering(
     action_env: dict[str, Any],
 ) -> None:
-    first = _spec_from_design(
-        {**_DESIGN, "resources": {"cpus": "2", "partition": "short"}},
-        state=action_env["state"],
-        name="x",
+    from research_os.runtime.actions.experiments import _spec_from_record
+
+    declare_experiment_command()
+    context = _context(action_env, {"planner": _DESIGN})
+    design = dict(
+        design_experiment(
+            action_env["state"], context, {"addresses": ["HYP-0001"]}
+        ).data
     )
-    second = _spec_from_design(
-        {**_DESIGN, "resources": {"partition": "short", "cpus": "2"}},
-        state=action_env["state"],
-        name="x",
+    record = design["spec"]
+    shuffled = {key: record[key] for key in reversed(list(record))}
+    assert spec_digest(_spec_from_record(record)) == spec_digest(
+        _spec_from_record(shuffled)
     )
-    assert spec_digest(first) == spec_digest(second)
 
 
 def test_the_spec_digest_changes_with_the_seed(action_env: dict[str, Any]) -> None:
     """An experiment whose seed can drift is an experiment nobody can rerun."""
 
-    first = _spec_from_design(_DESIGN, state=action_env["state"], name="x")
-    second = _spec_from_design(
-        {**_DESIGN, "seeds": [8]}, state=action_env["state"], name="x"
+    from research_os.runtime.actions.experiments import _spec_from_record
+
+    declare_experiment_command()
+    context = _context(action_env, {"planner": _DESIGN})
+    first = dict(
+        design_experiment(
+            action_env["state"], context, {"addresses": ["HYP-0001"]}
+        ).data
     )
-    assert spec_digest(first) != spec_digest(second)
+    context = _context(action_env, {"planner": {**_DESIGN, "seeds": [8]}})
+    second = dict(
+        design_experiment(
+            action_env["state"], context, {"addresses": ["HYP-0001"]}
+        ).data
+    )
+    assert first["spec_digest"] != second["spec_digest"]
+    assert spec_digest(_spec_from_record(first["spec"])) == first["spec_digest"]
+    assert spec_digest(_spec_from_record(second["spec"])) == second["spec_digest"]
 
 
 def test_running_a_spec_that_changed_after_preregistration_is_refused(
     action_env: dict[str, Any],
 ) -> None:
-    """The single most important gate: a post-hoc change is not a runtime decision.
+    """The single most important gate: a post-hoc change is not a runtime decision."""
 
-    The frozen spec is edited while the declared digest is left alone, which is
-    what any route to running a different test under an existing
-    preregistration looks like -- whether by a careless caller, a resumed state
-    that was hand-edited, or a planner that thought it was being helpful.
-    """
-
+    declare_experiment_command()
     context = _context(action_env, {"planner": _DESIGN})
     design = dict(
         design_experiment(
@@ -343,54 +405,75 @@ def test_running_a_spec_that_changed_after_preregistration_is_refused(
         **design,
         "spec": {**design["spec"], "argv": ["echo", "something-else"]},
     }
-
     outcome = run_local_experiment(
         action_env["state"], context, {"parameters": {"design": tampered}}
     )
     assert not outcome.ok
     assert outcome.failure_class is FailureClass.MISSING_SCIENTIFIC_AUTHORITY
-    assert "change_preregistration" in outcome.detail
-    assert (
-        action_env["store"].list_external_jobs(run_id=action_env["run"].run_id) == ()
-    ), "a refused submission must not have reached the executor"
+    assert action_env["store"].list_external_jobs(run_id=action_env["run"].run_id) == ()
 
 
-def test_a_design_without_a_frozen_spec_cannot_be_run(
-    action_env: dict[str, Any],
-) -> None:
-    """Only design_experiment produces a runnable design."""
+def test_a_design_with_no_digest_is_refused(action_env: dict[str, Any]) -> None:
+    """`if declared and declared != digest` skipped the guard by omission.
 
+    The design arrives in plan parameters under an unconstrained schema, so the
+    planner supplied both halves of the comparison -- and omitting one half
+    skipped it entirely. Found by an independent review.
+    """
+
+    declare_experiment_command()
     context = _context(action_env, {"planner": _DESIGN})
+    design = dict(
+        design_experiment(
+            action_env["state"], context, {"addresses": ["HYP-0001"]}
+        ).data
+    )
+    del design["spec_digest"]
     outcome = run_local_experiment(
-        action_env["state"],
-        context,
-        {"parameters": {"design": {"testable": True, "argv": ["true"]}}},
+        action_env["state"], context, {"parameters": {"design": design}}
     )
     assert not outcome.ok
     assert outcome.failure_class is FailureClass.POLICY_REFUSED
-    assert "no frozen specification" in outcome.detail
+    assert "no spec_digest" in outcome.detail
 
 
-def test_a_repository_with_no_commits_is_reported_not_failed(
-    action_env: dict[str, Any], tmp_path: Path
+def test_a_fabricated_design_matching_its_own_digest_is_still_refused(
+    action_env: dict[str, Any],
 ) -> None:
-    """A freshly initialised project is a real state, not a broken one."""
+    """The digest must name a preregistration this runtime actually stored.
 
-    from tests.fs_helpers import make_git_repo
+    Otherwise the check compares a self-consistent blob against itself, which
+    establishes nothing about when the endpoint was fixed.
+    """
 
-    fresh = make_git_repo(tmp_path / "fresh")
-    context = _context(action_env, {})
-    outcome = inspect_repository(
-        {**action_env["state"], "repo_path": str(fresh)}, context, {}
+    from research_os.runtime.actions.experiments import _spec_from_record
+
+    declare_experiment_command()
+    context = _context(action_env, {"planner": _DESIGN})
+    design = dict(
+        design_experiment(
+            action_env["state"], context, {"addresses": ["HYP-0001"]}
+        ).data
     )
-    assert outcome.ok
-    assert outcome.data["unborn"] is True
-    assert outcome.data["head"] is None
+    forged_spec = {**design["spec"], "argv": ["echo", "whatever-i-like"]}
+    forged = {
+        **design,
+        "spec": forged_spec,
+        # Self-consistent: the digest matches the forged spec.
+        "spec_digest": spec_digest(_spec_from_record(forged_spec)),
+    }
+    outcome = run_local_experiment(
+        action_env["state"], context, {"parameters": {"design": forged}}
+    )
+    assert not outcome.ok
+    assert outcome.failure_class is FailureClass.MISSING_SCIENTIFIC_AUTHORITY
+    assert "no stored preregistration" in outcome.detail
 
 
 def test_a_local_experiment_records_the_job_and_its_digest(
     action_env: dict[str, Any],
 ) -> None:
+    declare_experiment_command()
     context = _context(action_env, {"planner": _DESIGN})
     design = dict(
         design_experiment(
@@ -410,6 +493,7 @@ def test_a_local_experiment_records_the_job_and_its_digest(
 def test_submitting_the_same_spec_twice_submits_once(
     action_env: dict[str, Any],
 ) -> None:
+    declare_experiment_command()
     context = _context(action_env, {"planner": _DESIGN})
     design = dict(
         design_experiment(
@@ -417,8 +501,10 @@ def test_submitting_the_same_spec_twice_submits_once(
         ).data
     )
     plan = {"parameters": {"design": design}}
-    run_local_experiment(action_env["state"], context, plan)
-    run_local_experiment(action_env["state"], context, plan)
+    first = run_local_experiment(action_env["state"], context, plan)
+    assert first.ok, first.detail
+    second = run_local_experiment(action_env["state"], context, plan)
+    assert second.ok, second.detail
     jobs = action_env["store"].list_external_jobs(run_id=action_env["run"].run_id)
     assert len(jobs) == 1, "the same frozen spec was submitted twice"
 

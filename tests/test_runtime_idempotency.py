@@ -232,3 +232,99 @@ def test_a_failure_marked_unretryable_stays_refused(ledger: InvocationLedger) ->
         ledger.run(
             key=key, kind="demo", perform=lambda: {"x": 1}, retry_on_failure=False
         )
+
+
+def test_a_failure_recorded_after_the_effect_landed_does_not_repeat_it(
+    ledger: InvocationLedger,
+) -> None:
+    """The defect an independent review found, and the most dangerous one here.
+
+    ``perform`` routinely raises *after* the external world has changed: an
+    ``sbatch`` that succeeded and then a database blip while recording the job
+    id. The first version treated any exception as "the effect did not happen",
+    deleted the ledger row, and re-performed -- submitting the same experiment
+    to a cluster twice. The reconciler now gets the first word on a FAILED row
+    just as it does on an ABANDONED one.
+    """
+
+    effects: list[str] = []
+    key = idempotency_key("slurm.submit", "WORK-1", "spec-abc")
+
+    def perform_then_fail() -> dict[str, object]:
+        effects.append("submitted")
+        raise RuntimeError("the database went away after sbatch returned")
+
+    def reconcile(_invocation: object) -> dict[str, object] | None:
+        return {"job": "4711", "recovered": True} if effects else None
+
+    with pytest.raises(RuntimeError, match="after sbatch"):
+        ledger.run(
+            key=key, kind="slurm.submit", perform=perform_then_fail, reconcile=reconcile
+        )
+    assert ledger.get(key).status is InvocationStatus.FAILED  # type: ignore[union-attr]
+
+    performed_again: list[str] = []
+
+    def perform_again() -> dict[str, object]:
+        performed_again.append("submitted")
+        effects.append("submitted")
+        return {"job": "duplicate"}
+
+    outcome = ledger.run(
+        key=key, kind="slurm.submit", perform=perform_again, reconcile=reconcile
+    )
+    assert outcome.reused is True
+    assert outcome.result == {"job": "4711", "recovered": True}
+    assert performed_again == [], "the action was performed a second time"
+    assert effects == ["submitted"]
+    assert ledger.get(key).status is InvocationStatus.COMPLETED  # type: ignore[union-attr]
+
+
+def test_a_genuine_pre_effect_failure_still_retries(ledger: InvocationLedger) -> None:
+    """The reconciler saying "it did not happen" must not block the retry."""
+
+    attempts: list[int] = []
+    key = idempotency_key("demo", "pre-effect")
+
+    def flaky() -> dict[str, object]:
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise RuntimeError("refused before doing anything")
+        return {"ok": True}
+
+    with pytest.raises(RuntimeError):
+        ledger.run(key=key, kind="demo", perform=flaky, reconcile=lambda _i: None)
+    outcome = ledger.run(key=key, kind="demo", perform=flaky, reconcile=lambda _i: None)
+    assert outcome.reused is False
+    assert outcome.result == {"ok": True}
+    assert len(attempts) == 2
+
+
+def test_a_taken_over_invocation_refuses_the_late_workers_result(
+    ledger: InvocationLedger,
+) -> None:
+    """A slow worker must not overwrite the record of whoever took over.
+
+    Without the ownership guard, a late ``mark_failed`` would record FAILED for
+    an action that had completed -- and the next retry would read that as
+    permission to perform it again.
+    """
+
+    from research_os.runtime.idempotency import InvocationTakenOverError
+
+    key = idempotency_key("demo", "contended")
+    first, _claimed = ledger._claim(
+        key=key, kind="demo", request={}, run_id=None, work_id=None, owner="slow"
+    )
+    ledger.abandon_stale(older_than_seconds=0)
+    assert ledger._retake(first.invocation_id, owner="took-over")
+    ledger.complete(first.invocation_id, result={"by": "took-over"}, owner="took-over")
+
+    with pytest.raises(InvocationTakenOverError, match="discarded"):
+        ledger.complete(first.invocation_id, result={"by": "slow"}, owner="slow")
+    with pytest.raises(InvocationTakenOverError, match="not recorded over it"):
+        ledger.mark_failed(
+            first.invocation_id, error="slow worker failed", owner="slow"
+        )
+
+    assert ledger.get(key).result == {"by": "took-over"}  # type: ignore[union-attr]
