@@ -77,12 +77,41 @@ def _default_roles() -> dict[str, RoleSetting]:
     provider family the review is at least a different model reading a frozen
     diff rather than the implementer marking its own work. That is still not an
     independent review, and the run reports it as degraded.
+
+    **The planner is the strongest model, and that is a measured decision.** It
+    shipped as ``sonnet`` and was changed on evidence, not on principle. Thirty
+    real planner calls over five archived fixtures -- a capsule project, a
+    capsule-less assessment, a 5,402-file repository, a ``src``-layout code
+    workflow and a full experiment-and-write pipeline -- were judged by the
+    production validators, twice each, under three policies:
+
+    ==============================  =====  =====  ==========  ==========
+    policy                          calls  valid  first-pass  degenerate
+    ==============================  =====  =====  ==========  ==========
+    ``sonnet`` + one re-ask            16   7/10        4/10           3
+    ``opus`` + one re-ask              10    9/9         8/9           0
+    ``sonnet``, then ``opus`` on a
+    deterministic failure              16   8/10        4/10           3
+    ==============================  =====  =====  ==========  ==========
+
+    Every structured-output exhaustion and every placeholder plan in that
+    benchmark came from the smaller model; the stronger one produced neither,
+    needed the fewest calls, cost the least *per accepted plan*, and was the
+    only policy with no systematic failure on a project mode. Escalating after a
+    failure recovered two of the three losses and still spent sixteen calls, so
+    it buys routing code and a wasted attempt for less reliability than simply
+    asking the stronger model first. ``docs/V1_BUILD_RECORD.md`` §32 records the
+    protocol, the fixtures and every call.
+
+    This is a default, not a requirement. ``planner:`` in ``automation.yaml``
+    still wins, and a run whose planner model is unavailable fails with the
+    provider's own error rather than quietly answering from another model.
     """
 
     return {
         "planner": RoleSetting(
             provider="claude",
-            model="sonnet",
+            model="opus",
             effort="high",
             read_only=True,
             access=Access.CONTEXT_ONLY,

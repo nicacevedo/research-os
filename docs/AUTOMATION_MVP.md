@@ -158,7 +158,7 @@ optional; anything absent uses the shipped default.
 ```yaml
 planner:
   provider: claude
-  model: sonnet
+  model: opus
   effort: high
   read_only: true
 analyst:
@@ -187,6 +187,15 @@ budget:
   max_work_orders: 4
 allowed_check_programs: [uv, pytest, ruff]
 ```
+
+The planner defaults to the strongest model because planning is the one call
+whose output is a schema-constrained instruction to run commands. A benchmark of
+thirty real planner calls over five archived fixtures, judged by the production
+validators, is recorded in `docs/V1_BUILD_RECORD.md` §32: the smaller model
+produced every structured-output exhaustion and every placeholder plan in it,
+and the stronger one needed fewer calls to reach more accepted plans. Set
+`planner.model` here to override it; a model this machine cannot reach fails the
+run with the provider's own error rather than answering from a different one.
 
 ### Review independence
 
