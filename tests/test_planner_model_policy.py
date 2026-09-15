@@ -13,6 +13,12 @@ invariants pinned here are the default itself, the researcher's authority to
 override it, honesty about which model actually answered, and -- the safety
 property -- that no rejection of any kind escalates the planner. There is no
 fallback in this release, and these tests are what would notice one appearing.
+
+Scope, stated because an independent review found the earlier docstring
+overbroad: the bounded two-attempt re-ask lives in
+``ResearchController._planned`` and is what the escalation tests below drive.
+The *automation* controller's planner is single-attempt and raises on failure,
+so it has no re-ask to escalate and nothing here tests one.
 """
 
 from __future__ import annotations
@@ -176,6 +182,79 @@ def test_the_requested_model_is_recorded_when_the_provider_confirms_it(
     assert result.resolved_model == "claude-opus-5"
 
 
+def test_a_reply_billed_only_to_the_auxiliary_model_is_not_recorded_as_the_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One of the two shapes an independent review supplied.
+
+    The usage report names only the auxiliary model, so the requested one did
+    not run. Echoing ``opus`` back here would attribute a plan to a model that
+    never made it, and a default naming one specific model is exactly the
+    configuration where that happens quietly.
+    """
+
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        _Recorder(
+            _envelope(modelUsage={"claude-haiku-4-5-20251001": {"outputTokens": 3}})
+        ),
+    )
+    result = ClaudeCodeProvider().invoke(_planner_request("opus"))
+
+    assert result.resolved_model == "claude-haiku-4-5-20251001"
+    assert result.resolved_model != "opus"
+
+
+def test_a_reply_billed_to_two_other_models_is_not_recorded_as_the_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The second shape: two substantive models, neither the one asked for.
+
+    There is no single right answer to record, so the record names every model
+    the provider did, which reads oddly on purpose. What it must never do is
+    pick the one model that is known not to have run.
+    """
+
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        _Recorder(
+            _envelope(
+                modelUsage={
+                    "claude-sonnet-5": {"outputTokens": 5},
+                    "claude-sonnet-4-5-20250929": {"outputTokens": 2},
+                }
+            )
+        ),
+    )
+    result = ClaudeCodeProvider().invoke(_planner_request("opus"))
+
+    assert result.resolved_model == "claude-sonnet-4-5-20250929+claude-sonnet-5"
+    assert result.resolved_model != "opus"
+
+
+def test_a_provider_that_reported_no_usage_at_all_keeps_the_requested_alias(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Silence is the one case that may fall back to the alias.
+
+    Nothing was reported, so nothing is known, and the alias is the only thing
+    the record can honestly carry. The boundary matters: an *empty* usage object
+    is silence too, and must not be read as "some unnamed model answered".
+    """
+
+    monkeypatch.setattr(subprocess, "run", _Recorder(_envelope()))
+    assert (
+        ClaudeCodeProvider().invoke(_planner_request("opus")).resolved_model == "opus"
+    )
+
+    monkeypatch.setattr(subprocess, "run", _Recorder(_envelope(modelUsage={})))
+    assert (
+        ClaudeCodeProvider().invoke(_planner_request("opus")).resolved_model == "opus"
+    )
+
+
 def test_the_planner_model_reaches_the_provider_command_line(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -194,21 +273,6 @@ def test_the_planner_model_reaches_the_provider_command_line(
 
 
 # -- what a failed plan must not buy ------------------------------------------
-
-
-@pytest.fixture
-def research_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    root = tmp_path / "xdg"
-    mapping = {
-        "RESEARCH_OS_CONFIG_HOME": root / "config",
-        "RESEARCH_OS_DATA_HOME": root / "data",
-        "RESEARCH_OS_CACHE_HOME": root / "cache",
-        "RESEARCH_OS_STATE_HOME": root / "state",
-    }
-    for name, path in mapping.items():
-        path.mkdir(parents=True)
-        monkeypatch.setenv(name, str(path))
-    return mapping["RESEARCH_OS_STATE_HOME"]
 
 
 def _planner_only(responses: list[ScriptedResponse]) -> FakeProvider:
@@ -236,8 +300,20 @@ def _planner_models(provider: FakeProvider) -> list[str | None]:
     return [item.model for item in provider.requests_for(Role.PLANNER)]
 
 
+def _abandoned_run(state_home: Path) -> dict[str, Any]:
+    """Read the one run record left behind when planning raised.
+
+    A planning failure has no run to return, so the only way to assert what it
+    spent and what state it ended in is the file it wrote.
+    """
+
+    records = sorted((state_home / "research").glob("*/run.json"))
+    assert len(records) == 1, f"expected exactly one run record, found {records}"
+    return json.loads(records[0].read_text(encoding="utf-8"))
+
+
 def test_a_plan_accepted_first_time_spends_one_call_at_the_configured_model(
-    research_home: Path, tmp_path: Path
+    automation_home: Path, tmp_path: Path
 ) -> None:
     provider = _planner_only([ScriptedResponse(structured=plan_payload())])
     _, run = _plan(tmp_path, provider)
@@ -247,7 +323,7 @@ def test_a_plan_accepted_first_time_spends_one_call_at_the_configured_model(
 
 
 def test_a_provider_failure_is_re_asked_of_the_very_same_model(
-    research_home: Path, tmp_path: Path
+    automation_home: Path, tmp_path: Path
 ) -> None:
     """The failure class an escalating router would most want to react to.
 
@@ -275,7 +351,7 @@ def test_a_provider_failure_is_re_asked_of_the_very_same_model(
 
 
 def test_a_refused_scientific_checkpoint_does_not_escalate_the_planner(
-    research_home: Path, tmp_path: Path
+    automation_home: Path, tmp_path: Path
 ) -> None:
     """The case the benchmark hit most often, and the one that must never route.
 
@@ -307,7 +383,7 @@ def test_a_refused_scientific_checkpoint_does_not_escalate_the_planner(
 
 
 def test_a_budget_refusal_does_not_escalate_the_planner(
-    research_home: Path, tmp_path: Path
+    automation_home: Path, tmp_path: Path
 ) -> None:
     """A plan too big for its budget is a plan, not a provider failure."""
 
@@ -331,7 +407,7 @@ def test_a_budget_refusal_does_not_escalate_the_planner(
 
 
 def test_a_degenerate_plan_does_not_escalate_the_planner(
-    research_home: Path, tmp_path: Path
+    automation_home: Path, tmp_path: Path
 ) -> None:
     """The other failure an escalating router would have reacted to.
 
@@ -358,9 +434,16 @@ def test_a_degenerate_plan_does_not_escalate_the_planner(
 
 
 def test_the_planner_is_bounded_at_two_attempts_and_both_are_charged(
-    research_home: Path, tmp_path: Path
+    automation_home: Path, tmp_path: Path
 ) -> None:
-    """Two attempts however they are spent, and no third at any model."""
+    """Two attempts however they are spent, and no third at any model.
+
+    The charge has to be read off disk rather than off a returned run, because
+    the second refusal raises and there is no run to return. An earlier version
+    of this test asserted only the two requests, which left "both are charged"
+    as a claim in the name and nothing in the body: deleting the charge call
+    entirely would have kept it green. Found by an independent review.
+    """
 
     degenerate = ScriptedResponse(
         structured=plan_payload(summary="test", tasks=[task(title="test", goal="test")])
@@ -372,16 +455,23 @@ def test_the_planner_is_bounded_at_two_attempts_and_both_are_charged(
         _plan(tmp_path, provider)
 
     assert _planner_models(provider) == ["fake-planner", "fake-planner"]
+    assert _abandoned_run(automation_home)["model_calls_used"] == 2
 
 
-def test_an_unreachable_planner_model_fails_the_run_and_says_so(
-    research_home: Path, tmp_path: Path
+def test_a_provider_that_refuses_the_model_twice_ends_the_run_in_its_own_words(
+    automation_home: Path, tmp_path: Path
 ) -> None:
-    """A default naming a model this machine cannot reach must fail loudly.
+    """What the controller can actually guarantee about an unreachable model.
 
-    Not silently answered by whatever is available: the provider's own words
-    reach the researcher, and the run ends rather than producing a plan nobody
-    can attribute.
+    Deliberately named for what it tests. Whether the installed CLI refuses an
+    unreachable alias or quietly answers from another model is the CLI's
+    behaviour and not this repository's to assert; a fake scripted to return an
+    error proves nothing about it. What *is* enforceable here is the half that
+    belongs to the controller: a provider error is not swallowed, is not
+    retried more than the one bounded time, reaches the researcher verbatim,
+    and leaves no plan behind. The other half -- that a substituted model
+    cannot hide in the ledger -- is
+    ``test_the_run_records_the_model_that_answered_not_the_one_requested``.
     """
 
     unavailable = ScriptedResponse(
@@ -392,29 +482,62 @@ def test_an_unreachable_planner_model_fails_the_run_and_says_so(
         _plan(tmp_path, provider)
 
     assert _planner_models(provider) == ["fake-planner", "fake-planner"]
+    abandoned = _abandoned_run(automation_home)
+    assert abandoned["state"] == "FAILED"
+    assert abandoned["tasks"] == []
 
 
-def test_every_planner_attempt_is_ledgered_with_its_own_provider_and_model(
-    research_home: Path, tmp_path: Path
+class _ResolvingProvider(FakeProvider):
+    """A fake whose reported model differs from the one it was asked for.
+
+    ``FakeProvider`` answers with ``resolved_model=request.model``, which makes
+    requested and resolved indistinguishable -- so a ledger assertion written
+    against it passes whether the controller records the resolution or echoes
+    the alias. An independent review pointed out that this made the ledger test
+    vacuous. This double reports a concrete id no caller asked for, so the two
+    can be told apart.
+    """
+
+    resolved: str = "claude-fake-9"
+
+    def invoke(self, request: Any) -> Any:
+        import dataclasses
+
+        return dataclasses.replace(
+            super().invoke(request), resolved_model=self.resolved
+        )
+
+
+def test_every_planner_attempt_is_ledgered_with_the_model_that_answered_it(
+    automation_home: Path, tmp_path: Path
 ) -> None:
-    """Two attempts, two invocation records, each naming what answered it."""
+    """Two attempts, two records, each naming what answered rather than what was asked.
 
-    provider = _planner_only(
-        [
-            ScriptedResponse(
-                structured=None,
-                exit_code=1,
-                error="error_max_structured_output_retries",
-            ),
-            ScriptedResponse(structured=plan_payload()),
-        ]
+    The distinguishing assertion is ``!= "fake-planner"``: the configured role
+    model must not be what lands in the record when the provider reported
+    something else.
+    """
+
+    provider = _ResolvingProvider(
+        responses={
+            str(Role.PLANNER): [
+                ScriptedResponse(
+                    structured=None,
+                    exit_code=1,
+                    error="error_max_structured_output_retries",
+                ),
+                ScriptedResponse(structured=plan_payload()),
+            ]
+        }
     )
     store, _ = _plan(tmp_path, provider)
 
+    assert _planner_models(provider) == ["fake-planner", "fake-planner"]
     records = sorted((store.path("invocations")).glob("*.json"))
     assert len(records) == 2
     for path in records:
         payload = json.loads(path.read_text(encoding="utf-8"))
         assert payload["role"] == "planner"
         assert payload["provider"] == "fake"
-        assert payload["model"] == "fake-planner"
+        assert payload["model"] == "claude-fake-9"
+        assert payload["model"] != "fake-planner"

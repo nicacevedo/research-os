@@ -85,14 +85,22 @@ def _default_roles() -> dict[str, RoleSetting]:
     workflow and a full experiment-and-write pipeline -- were judged by the
     production validators, twice each, under three policies:
 
-    ==============================  =====  =====  ==========  ==========
-    policy                          calls  valid  first-pass  degenerate
-    ==============================  =====  =====  ==========  ==========
-    ``sonnet`` + one re-ask            16   7/10        4/10           3
-    ``opus`` + one re-ask              10    9/9         8/9           0
+    ==============================  =====  =====  =====  ==========  ==========
+    policy                          cells  calls  valid  first-pass  degenerate
+    ==============================  =====  =====  =====  ==========  ==========
+    ``sonnet`` + one re-ask            10     16   7/10        4/10           3
+    ``opus`` + one re-ask               9     10    9/9         8/9           0
     ``sonnet``, then ``opus`` on a
-    deterministic failure              16   8/10        4/10           3
-    ==============================  =====  =====  ==========  ==========
+    deterministic failure              10     16   8/10        4/10           3
+    ==============================  =====  =====  =====  ==========  ==========
+
+    Two things about that table, because it does not add up on its own. The
+    calls column sums to 42, not 30, because the first two policies make the
+    *same* first call -- same model, same prompt, same schema -- so it was drawn
+    once and scored for both. And the ``opus`` row has nine cells, not ten: the
+    thirty-call cap was reached before its last repetition, so one cell was
+    never measured. Had that cell failed, the row would read 9/10, still ahead
+    of both alternatives on every criterion that decided this.
 
     Every structured-output exhaustion and every placeholder plan in that
     benchmark came from the smaller model; the stronger one produced neither,
@@ -103,9 +111,15 @@ def _default_roles() -> dict[str, RoleSetting]:
     asking the stronger model first. ``docs/V1_BUILD_RECORD.md`` §32 records the
     protocol, the fixtures and every call.
 
-    This is a default, not a requirement. ``planner:`` in ``automation.yaml``
-    still wins, and a run whose planner model is unavailable fails with the
-    provider's own error rather than quietly answering from another model.
+    This is a default, not a requirement: ``planner:`` in ``automation.yaml``
+    replaces it, and the run records the model that actually answered rather
+    than the alias that was asked for, so a substitution cannot hide in the
+    ledger. One qualification an independent review was right to insist on --
+    if the *provider* a role names is not installed, ``resolve_roles`` re-homes
+    that role onto an available one and drops the model with it, because an
+    alias is provider-specific. A researcher who configures a planner model on
+    a provider this machine does not have gets the substitution recorded in
+    ``ResolvedRoles.substitutions``, not their chosen model.
     """
 
     return {

@@ -1467,3 +1467,497 @@ Full suite 2,581 passing, `ruff check`, `ruff format --check` and
 projects — the `src`-layout check-profile pilot and the capsule-less cuPDLP.jl
 assessment — both `READY_FOR_HUMAN`, no new controller defect, and every pilot
 project's tree and index digest still identical to before the campaign began.
+
+## 32. The planner reliability gate, and the one value it moved
+
+### The discrepancy
+
+v1.1 shipped with `planner.model: sonnet` and every pilot that *succeeded* from
+B onwards had `opus` configured by hand. §30 recorded that as a residual risk in
+the honest but unusable form: "roughly half its attempts." Roughly half of an
+unrecorded denominator, gathered while the code under it was changing, is an
+anecdote. A released default has to rest on something better, so the question
+was measured before the candidate was frozen.
+
+### Protocol
+
+Five fixtures, one per category the campaign had exercised, each taken from a
+specific archived run of the v1.1 validation campaign. Nothing was hand-written:
+for each fixture the prompt and **every validator input** — `ProjectProfile`,
+provenance mode, budgets, checkpoint policy, available check profiles, declared
+experiment commands and their required parameters, and the capsule counts the
+checkpoint eligibility rule reads — were re-derived by calling the same
+functions `ResearchController.start` calls, and the result was digest-compared
+against the prompt the real run actually sent.
+
+| fixture | category | source run | chars | prompt sha256 |
+| --- | --- | --- | --- | --- |
+| `F1-ccao-capsule` | capsule-aware CCAO scientific project | `RR-20260914T154755Z-7cfc4cb0` | 77,499 | `3189110d3ce4401b…` |
+| `F2-cupdlp-capsuleless` | capsule-less cuPDLP repository assessment | `RR-20260915T003602Z-30656094` | 11,934 | `8f7cf55b67e0f783…` |
+| `F3-large-assessment` | large repository assessment (5,402 files) | `RR-20260914T190927Z-234b0a63` | 31,398 | `968406f609d8432b…` |
+| `F4-srclayout-code` | `src`-layout implementation workflow | `RR-20260914T201232Z-6a71d9b9` | 9,406 | `57948dcdd94b6d98…` |
+| `F5-experiment-write` | synthetic capsule project, experiment + write | `RR-20260915T004424Z-1df69b1d` | 13,530 | `d9b1d96bc788f131…` |
+
+The reconstructions differed from the archived text in two ways and no others: a
+context `generated_at` timestamp, and — for F1 and F3 — prompt wording that
+later v1.1 repair commits had changed. Benchmarking the shipped prompt is the
+point, so the reconstruction is what was sent, and it is never the easier text:
+F1 and F3 gained the sentence telling the planner that an omitted experiment
+parameter is refused. F5's declared experiment command lives in the pilot's own
+config home and was restored from it; without that the fixture would silently
+have lost the declared-experiment half of its category, which is exactly the
+kind of quiet simplification the protocol forbids.
+
+Thirty real calls through `ClaudeCodeProvider`, the installed CLI at 2.1.272,
+`--json-schema PLAN_SCHEMA`, `--no-session-persistence`, no tools, no write
+permission anywhere, cwd outside every project. Model identifiers were verified
+against the CLI rather than assumed: the alias `sonnet` resolves to
+**`claude-sonnet-5`** and `opus` to **`claude-opus-5`**, both installed and
+authenticated.
+
+A response counts as valid only if the *production* controller would accept it.
+The judge imports and runs, in order, `parse_research_plan`,
+`assert_plan_says_something`, `validate_research_plan`, `to_tasks`,
+`ResearchController._assert_budget_could_finish`, and the `ResearchRun`
+forward-only-graph validator. Nothing was re-implemented and no success
+criterion was invented after seeing a result. Before a single call was spent the
+judge was checked against archived evidence: all five real accepted pilot plans
+pass it, a placeholder plan and `error_max_structured_output_retries` classify
+as deterministic failures, and a discretionary checkpoint under
+`scientific_only` classifies as a *correct refusal* — so no correct refusal can
+ever be scored as a reliability failure or trigger an escalation.
+
+Three policies. **A** is the shipped default plus the controller's existing one
+bounded re-ask at the same model. **B** is the same controller policy with
+`opus`. **C** is the default once, then `opus` — and only after a provider
+structured-output failure or a production degenerate-plan rejection; after any
+other refusal C re-asks at the same model, because escalating past a budget,
+command-policy or scientific-checkpoint refusal is not a reliability measure.
+
+A and C make the same first call — same model, same frozen prompt, same schema,
+same adapter. It is one random draw, so it was drawn once and scored for both;
+likewise C's second attempt where C does not escalate *is* A's second attempt.
+That keeps the comparison paired and the call count honest. The cap was 30 and
+the run stopped on reaching it, which cost one cell: policy B's second
+repetition of F5 was never measured, and the table says so.
+
+### Results
+
+| policy | cells | real calls | final valid | first-pass valid | structured-output failures | degenerate plans | final failures | median latency | cost / accepted plan |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| A `sonnet` + one re-ask | 10 | 16 | **7/10** | 4/10 | 3 | 3 | 3 | 60 s | $0.34 |
+| B `opus` + one re-ask | 9 | 10 | **9/9** | 8/9 | **0** | **0** | **0** | 61 s | **$0.32** |
+| C `sonnet` → `opus` bounded | 10 | 16 | **8/10** | 4/10 | 3 | 3 | 2 | 63 s | $0.34 |
+
+Per cell, with `S` = `claude-sonnet-5` and `O` = `claude-opus-5`:
+
+| fixture | rep | A | B | C |
+| --- | --- | --- | --- | --- |
+| `F1-ccao-capsule` | 1 | S:ok | O:ok | S:ok |
+| `F1-ccao-capsule` | 2 | S:ok | O:ok | S:ok |
+| `F2-cupdlp-capsuleless` | 1 | S:ok | O:ok | S:ok |
+| `F2-cupdlp-capsuleless` | 2 | S:struct-out → S:ok | O:ok | S:struct-out → O:ok |
+| `F3-large-assessment` | 1 | S:struct-out → S:**checkpoint** | O:ok | S:struct-out → O:ok |
+| `F3-large-assessment` | 2 | S:degenerate → S:ok | O:ok | S:degenerate → O:ok |
+| `F4-srclayout-code` | 1 | S:ok | O:ok | S:ok |
+| `F4-srclayout-code` | 2 | S:degenerate → S:ok | O:ok | S:degenerate → O:ok |
+| `F5-experiment-write` | 1 | S:checkpoint → S:**struct-out** | O:checkpoint → O:ok | S:checkpoint → S:**struct-out** |
+| `F5-experiment-write` | 2 | S:checkpoint → S:**degenerate** | *not measured (cap)* | S:checkpoint → S:**degenerate** |
+
+Three things in that table decided the release.
+
+**Every structured-output exhaustion and every placeholder plan came from the
+smaller model.** Six failures of those two kinds, six from `claude-sonnet-5`,
+zero from `claude-opus-5`. The degenerate plans were literally the shape §4 and
+§25 describe: `{"summary": "test"}` and a task titled `"test"`, arriving after a
+rich prompt the model had every fact it needed to answer. The guard caught all
+three, which is the guard working and not the planner working.
+
+**The stronger model needed fewer calls, not more.** Sixteen against ten,
+because the smaller model's failures are paid for twice — once in the wasted
+attempt and once in the re-ask. It was also cheaper *per accepted plan* and no
+slower: 61 s against 60 s median, and 47,818 output tokens against 102,514,
+since a structured-output retry loop bills for every attempt it abandons.
+
+**Only the stronger model had no systematic failure on a project mode.** Both
+`sonnet` policies lost `F5-experiment-write` in both repetitions — the mode with
+an experiment and a write task, which is the most authority a plan can ask for.
+That is criterion 3 of the selection rule, and it is the one that is not about
+averages.
+
+The `checkpoint` refusals are worth naming precisely, because they are *not* a
+planner reliability failure and were deliberately not scored as one. In three
+cells the planner labelled a checkpoint `claim_acceptance` or `human_review` in
+a project holding no Claim, and `eligibility_failure` refused it — the
+scientific-authority corroboration added in this release, doing exactly its job
+on live output from both models. `claude-opus-5` recovered from it on the one
+bounded correction; `claude-sonnet-5` did not, in either repetition, failing
+instead into a structured-output exhaustion and a placeholder plan.
+
+### The decision, by the stated rule
+
+Reliability first: B (9/9) > C (8/10) > A (7/10). First-pass: B (8/9) > A = C
+(4/10). No systematic mode failure: B only. Total calls: B (10) < A = C (16).
+B wins the first four criteria outright and loses only the last one,
+"lower-capability-model usage" — which is ranked last precisely so that it
+cannot outvote the four above it.
+
+The missing cell does not change this. Had B also failed `F5` rep 2, B would be
+9/10, still strictly ahead of C's 8/10 and A's 7/10 and still on the fewest
+calls. The decision is robust to the one thing the cap prevented measuring.
+
+Bounded escalation is therefore *not* implemented. It recovered two of A's three
+losses and still spent sixteen calls, so against B it buys routing code, a
+wasted attempt and a re-ask latency in exchange for less reliability than simply
+asking the stronger model first. §8's own instruction — prefer the simplest
+policy among those of equivalent reliability — points the same way when the
+simplest policy is also the most reliable one. No router, no trigger table, no
+new failure semantics.
+
+### What changed
+
+One value, in the one place that is authoritative:
+
+```
+src/research_os/automation/config.py  _default_roles()["planner"].model
+    "sonnet" -> "opus"
+```
+
+`docs/AUTOMATION_MVP.md` now shows the shipped default and says why. Nothing
+else in production changed: no new field, no routing, no change to
+`PLAN_SCHEMA`, to the placeholder guard, to `_planned`'s two-attempt bound, or
+to how a call is charged. The planner role is read by four workers — the
+research planner, the automation planner, the assessment worker and the proposal
+worker — and all four now default to the stronger model, which is the same
+argument applied to the same kind of output.
+
+Two properties preserved on purpose. `planner:` in `automation.yaml` still wins
+outright, and a planner model this machine cannot reach fails the run with the
+provider's own error rather than being answered by whatever else is installed —
+`_resolved_model` records the model that *answered*, not the alias requested, so
+a substitution cannot hide in the ledger.
+
+### The tests, and what they are really for
+
+`tests/test_planner_model_policy.py`, sixteen tests. Three pin the default and
+that changing it did not widen the planner's authority — still read-only, still
+`CONTEXT_ONLY`, still no tools. Two pin the researcher's override. Three pin
+honesty about which model answered. Eight pin the thing that matters most: **no
+rejection of any kind escalates the planner.** The two failure classes an
+escalating router would have reacted to are tested by name, and so is the one
+the benchmark hit most often — a checkpoint refused by the scientific-authority
+guard, where reaching for a stronger model because a scientific boundary was
+inconvenient is the move this system must never make.
+
+Five mutations, all caught:
+
+| mutation | caught by |
+| --- | --- |
+| M-R1 escalate to `opus` after a rejected plan | 4 tests |
+| M-R2 escalate to `opus` after a provider failure | 3 tests |
+| M-R3 allow a third planner attempt | 2 tests |
+| M-R4 revert the default to `sonnet` | 3 tests |
+| M-R5 echo the requested alias into the ledger | 1 test |
+
+M-R1 and M-R2 are the interesting pair: they are the two halves of the policy
+that was *considered and rejected*, so the suite would notice it arriving by
+accident as readily as it would notice it arriving on purpose.
+
+### Revalidation under the actual default
+
+Both pilots below were started with **no `automation.yaml` at all** —
+`load_config(None)` returns `source: None`, `explicit_roles: frozenset()` — so
+the planner they used is the shipped default and nothing else. No CLI flag
+overrides a role model, and none was available to use.
+
+**Pilot 1 — capsule-aware, `RR-20260915T052122Z-fc9cf373`.** The registered CCAO
+project, `--max-write-tasks 0 --max-experiments 0 --checkpoint-policy
+scientific-only`, goal: assess the current Gate E.4 sensitivity evidence and
+produce the single highest-value grounded next research action without changing
+the prespecified threshold, verdict, files or scientific state.
+
+`READY_FOR_HUMAN`, **6 of 12 model calls**. The planner was `claude-opus-5` and
+its only event is `plan_accepted`: no `plan_retry_started`, no
+`plan_correction_started`, accepted on the first attempt. Three tasks —
+literature, analysis, proposal — all `done`. Zero checkpoints of any kind, so no
+discretionary stop and no hard one either. `write_tasks_used` 0,
+`experiments_used` 0. The proposal spent its one bounded grounding correction
+(`INV-0002` refused, `INV-0003` accepted) and produced ten items grounded on
+twenty capsule identifiers including `CLAIM-0001` and `REV-0001` plus literature
+DOIs; the proposal's own assessment ran on `claude-sonnet-5` and the delegated
+analysis worker on `claude-sonnet-5`, both unchanged by this release. The
+actionable result names the one asymmetry in the gate — the curvature-ratio arm
+passing with a minimum margin of 4.255 against `R_accept_min` 1.20 while the
+penalty-contribution arm fails in exactly one cell of forty-five, fold 1 at
+rho=100, M = 0.011803871804554139 against `M_accept_max` 0.01 — and asks for a
+read-only enumeration of the acceptance cells before anything else.
+
+**Pilot 2 — capsule-less, `RR-20260915T054626Z-88ff0ab7`.** cuPDLP.jl at
+`05ee41f4`, same three constraints, goal: assess the repository and produce one
+grounded highest-value next technical or research action without modifying the
+repository.
+
+`READY_FOR_HUMAN`, **5 of 12 model calls**. Planner `claude-opus-5`, again
+`plan_accepted` on the first attempt with no retry and no correction. Four tasks
+— literature, two analyses, proposal — all `done`. `capsule_present: False`,
+`project_id: None`, and the proposal dispatched to the assessment worker:
+`mode: repository_assessment`, a `TechnicalAssessment` with twelve observations
+grounded on **fourteen repository files at `05ee41f4`** and twenty literature
+DOIs, and `capsule_ids: []` — the fail-closed emptiness holding, with no
+scientific identifier invented or required. It spent its one bounded grounding
+correction (`INV-0001` refused, `INV-0002` accepted). Its `open_question`
+carries `blocked_by_evidence: true`, which §14 of this session's brief names as
+an acceptable grounded outcome: the recommended action is to build the
+measurement floor — record the exact invocation surface, capture three exit
+statuses verbatim, then add a load test and one end-to-end solve with an
+asserted termination status.
+
+**Neither project was touched.** `HEAD`, the `HEAD^{tree}` object, `git status
+--porcelain`, the full `git ls-files -s` index digest and — for CCAO — the
+digest over all twenty-four `.research/` files were captured before each run and
+recompared after. Byte-identical in every field, and the CCAO project was also
+recompared mid-run while the proposal worker was live.
+
+| | Pilot 1 (capsule) | Pilot 2 (capsule-less) |
+| --- | --- | --- |
+| planner model | `claude-opus-5` | `claude-opus-5` |
+| planner attempts | 1 (accepted first pass) | 1 (accepted first pass) |
+| model calls | 6 / 12 | 5 / 12 |
+| final state | `READY_FOR_HUMAN` | `READY_FOR_HUMAN` |
+| checkpoints | none | none |
+| mode | `scientific_project` | `repository_assessment` |
+| grounding | 20 capsule ids + literature | 14 repository files + 20 DOIs, `capsule_ids: []` |
+| write tasks / experiments | 0 / 0 | 0 / 0 |
+| project mutation | none | none |
+
+No pilot was rerun. Neither needed the one rerun the acceptance gate allows.
+
+### Large-context observation, measured not acted on
+
+Re-measured on the same repository this release's Pilot C used:
+
+| | value |
+| --- | --- |
+| tracked files (`git ls-files`) | 5,402 |
+| citable paths enumerated in the assessment prompt | 1,200 (cut at `MAX_CITABLE_FILES`, and the prompt says it was cut) |
+| paths the repository context carries into the planner prompt | 200 |
+| largest archived assessment prompt | **113,648 characters** |
+| planner prompt for the same repository | 31,398 characters |
+| provider/model outcome on the large prompt | `claude-opus-5`, succeeded, valid grounded assessment |
+
+§30 recorded 101,704 characters for this repository; 113,648 is the largest
+archived prompt for it and supersedes that figure as the measurement of record.
+Nothing was implemented in response: no context compression, no embeddings, no
+lexical ranking, no hierarchical selection. This stays a post-release
+operational metric, and only repeated real-use evidence should move it.
+
+### Validation results, final candidate
+
+Figures below are the final ones, after the delta-review repairs described two
+subsections down; the planner-default commit on its own was 2,602.
+
+| gate | result |
+| --- | --- |
+| `uv run pytest -q` | **2,605 passed** (2,586 at the previous candidate; +19 new, none removed, disabled or skipped) |
+| `uv run ruff check .` | clean |
+| `uv run ruff format --check .` | clean (199 files) |
+| `git diff --check` | clean |
+| R0 scientific integrity | 490 passed |
+| security regressions | 580 passed |
+| prompt/data boundaries | 191 passed |
+| command policy | 52 passed |
+| ProjectProfile | 34 passed |
+| TechnicalAssessment | 45 passed |
+| validation profiles | 36 passed |
+| checkpoint policy | 33 passed |
+| literature pacing | 47 passed |
+| model-call budgets | 166 passed |
+| planner parsing / degenerate guards | 160 passed |
+| provider routing + planner model policy | 72 passed |
+
+One correction to the record while we are here: §29's table says 2,552 for the
+previous candidate and the external packet's own test table says 2,586. The
+collected count at `2fa935ca` is **2,586**, so 2,552 was stale. §29 is left as
+written — it is the history — and this is the number to trust.
+
+A note on how the suite must be run, because it cost time to rediscover. Several
+tests execute a bare `pytest -q` inside a real worktree, and `pytest` is only on
+`PATH` under `uv run`. Invoking `.venv/bin/python -m pytest` produces 89
+spurious failures at *any* commit, including an unmodified `2fa935ca`. `uv run
+pytest -q` is the gate.
+
+### Residual risks after the final candidate
+
+- **No licence.** Unchanged, and still a human decision. Nothing is granted
+  until it is made.
+- **The planner default is now the most expensive model.** That is the measured
+  trade and it is cheaper per accepted plan, not more expensive, but a
+  researcher on a tight budget should know the lever is `planner:` in
+  `automation.yaml` and that the benchmark says what they give up by pulling it:
+  roughly three accepted plans in ten, concentrated on the modes that write.
+- **The planner readily mislabels a checkpoint's kind.** In three of thirty
+  benchmark calls — from *both* models — a checkpoint in a project with no Claim
+  was labelled `claim_acceptance` or `human_review`. The eligibility rule
+  refuses every one, which is the guard working; but it means a run's one
+  bounded correction is sometimes spent on this rather than on a real planning
+  error, and the smaller model did not recover from it in either repetition.
+- **One benchmark cell was never measured.** Policy B's second repetition of the
+  experiment-and-write fixture was cut by the 30-call cap. The decision is
+  robust to it either way, and it is recorded rather than quietly dropped.
+- **The benchmark is an operational release decision, not a statistical claim.**
+  Ten cells per policy on one machine, one provider family, one day. It is
+  enough to choose a default and not enough to characterise a model.
+- **A possible credential in an external research repository.** A prior
+  real-repository assessment flagged
+  `analysis/berry_cmf_validation/logs/box_cookies.txt` in
+  `soft-vertical-equity-constrained-mass-appraissal` as potentially holding
+  session or token material. It was **not opened, read, copied, hashed, parsed
+  or committed** by this session, and nothing about it is in this repository.
+  A human must resolve it before that external repository is used again. It is
+  not a Research OS defect and it caused no change here.
+- **Review independence is still degraded.** Only `claude` is installed, so
+  every run reports `DEGRADED_SAME_PROVIDER_FAMILY`, and so does this session's
+  own delta review of the planner commit. That is the gap the external
+  cross-family review exists to close.
+- **Everything §30 lists that this session did not touch** still stands: the
+  narrow proposal-layer correction trigger, the all-filler false positive,
+  worktree isolation not being an OS sandbox.
+- **10.8 GB of finished-run worktrees are still held** (measured at 11 G over 61
+  worktrees), deliberately. `researchctl storage --reclaim` was **not** run, so
+  the external reviewer can inspect the pilot evidence.
+
+### The delta review of the planner commit, and the four things it found
+
+One read-only review of `2fa935ca..b34e69a` — the planner-default commit and
+nothing else — fresh context, strongest local model, no write authority, an
+explicit ban on running the test suite, and an explicit ban on proposing
+architecture. Five questions: routing authority, fallback triggers, budget
+accounting, role model overrides, failure semantics. Plus one instruction that
+earned its place: *assess the added tests adversarially and name any that would
+still pass if the property in its name were broken.*
+
+**Four of the five questions came back clean, with the reasoning shown.**
+`_default_roles` is the single source and every consumer reads the resolved dict
+rather than a literal (`research/controller.py:324`,
+`automation/controller.py:512`, `assessment/controller.py:214`,
+`proposal/controller.py:251`); the only other `RoleSetting(` naming a model is
+coder-only. `setting` is bound once at `research/controller.py:324` and never
+rebound inside `for correction in (False, True)`, so no path exists where the
+second attempt uses a different model. `_invoke` asserts remaining budget, calls
+once, charges once, and returns the updated run that both post-attempt guards
+then read. And nothing anywhere keys off the *value* of the planner model:
+`_assess_independence` reads only `coder` and `reviewer`, so the planner default
+now equalling the coder default changes no behaviour.
+
+**One concrete defect, in the fifth.** `ClaudeCodeProvider._resolved_model` could
+record the requested alias when a different model answered, in two shapes:
+
+- the provider bills the reply only to the auxiliary model, so the non-haiku
+  filter empties the candidate list, `len(candidates) == 1` is false, and the
+  function returns `"opus"`;
+- the provider bills two substantive models, neither of them the one asked for,
+  so `len(candidates) == 2` and the function again returns `"opus"`.
+
+Both reproduced exactly as described. The consequence is a run record
+attributing a plan to a model that never made it — pre-existing code, but this
+release is what made it load-bearing, because a default naming one specific
+model is the configuration where that goes wrong quietly.
+
+The fix inverts which case falls back. Silence is now the *only* thing that
+yields the alias: if `modelUsage` is absent or empty nothing was reported and
+the alias is all the record can honestly carry, and otherwise the answer comes
+from what was reported — the matching id where there is one, the single
+substantive id where there is one, and otherwise every id the provider named,
+joined with `+`. That last form reads oddly in a report precisely because
+something odd happened, and it is checkable against the archived envelope beside
+it. Nothing parses this field; it is display-only in `automation/report.py` and
+`diagnostics.py`.
+
+**Three of the sixteen tests were vacuous, and the review was right about all
+three.** This is the useful part of the finding ledger, because each one is a
+test that would have passed over a broken implementation:
+
+> **"both are charged" was never asserted.** The bounded-attempts test checked
+> only that two requests were made; because the second refusal raises, no run is
+> returned and nothing read `model_calls_used`. Deleting
+> `run = self._charge(store, run, 1)` outright kept it green. It now reads the
+> charge off the run record the failed run left on disk.
+>
+> **The unreachable-model test did not test unreachability.** Its planner model
+> was `"fake-planner"` and the string `"model 'opus' is not available"` was
+> test-supplied decoration. Whether the installed CLI refuses an unreachable
+> alias is the CLI's behaviour and not this repository's to assert, so the test
+> was renamed for what it actually constrains — a provider error is not
+> swallowed, is bounded at one re-ask, reaches the caller verbatim, and leaves a
+> `FAILED` run with no tasks — and the honesty half was moved to where it can be
+> proved.
+>
+> **The ledger test could not tell requested from resolved.** `FakeProvider`
+> sets `resolved_model=request.model`, so `assert payload["model"] ==
+> "fake-planner"` passed under the mutation `model=setting.model` — one of the
+> five the commit message claimed to have killed. A provider double that reports
+> a concrete id nobody asked for now distinguishes them, and the assertion is
+> `!= "fake-planner"`.
+
+**Two overstated claims in prose this session wrote**, both narrowed. The
+docstring said `planner:` in `automation.yaml` "still wins" without
+qualification; `resolve_roles` re-homes a role whose *provider* is missing and
+drops the model with it, which is defensible — an alias is provider-specific —
+but is not the configured model being honoured, so both the docstring and
+`docs/AUTOMATION_MVP.md` now say so. And both claimed a run "fails with the
+provider's own error rather than quietly answering from another model", which is
+a claim about the installed CLI that nothing here enforces; the docs now
+separate the half Research OS guarantees from the half it cannot.
+
+**One arithmetic complaint, upheld.** The docstring table said "thirty real
+planner calls" beside a calls column summing to 42, and set a `9/9` row against
+two `/10` rows with no note. Both are explained above — A and C share their
+first draw, and the cap left one B cell unmeasured — and the docstring now
+explains them where it makes the claim, since a reader of `config.py` should not
+have to find §32 to reconcile the table in front of them.
+
+### Repairs, and the gates after them
+
+| finding | severity | disposition |
+| --- | --- | --- |
+| `_resolved_model` echoes the alias when only the auxiliary model answered | MINOR | fixed, 3 regressions, 2 mutations |
+| `_resolved_model` echoes the alias when two other models answered | MINOR | same fix |
+| "both are charged" unasserted | MINOR | test now reads the charge off the abandoned run record |
+| unreachable-model test tests something else | MINOR | renamed and re-scoped to what is enforceable |
+| ledger test cannot distinguish requested from resolved | MINOR | provider double reporting a different id |
+| docstring table does not reconcile | MINOR | shared-draw and missing-cell notes added |
+| `automation.yaml` override claim unqualified | INFORMATIONAL | narrowed in docstring and docs |
+| unreachable-model claim not enforceable here | INFORMATIONAL | split into the half that is |
+| provider substitution drops a configured model | INFORMATIONAL | documented; behaviour unchanged, pre-existing and defensible |
+| automation planner has no re-ask to escalate | INFORMATIONAL | test docstring scoped |
+| fixture and helper duplication | INFORMATIONAL | `research_home` dropped for conftest's `automation_home` |
+
+Four more mutations against the repairs, all caught:
+
+| mutation | caught by |
+| --- | --- |
+| M-R6 delete the planner's `_charge` call | 5 tests (0 before the repair) |
+| M-R7 ledger the configured role model instead of what answered | 1 test (0 before the repair) |
+| M-R8 revert `_resolved_model` to echoing the alias | 2 tests |
+| M-R9 read an empty `modelUsage` as an unnamed model | 1 test |
+
+M-R6 and M-R7 are the two the review predicted would survive, and they did: both
+were green against the original sixteen tests and both fail now.
+
+Gates after the repairs: **`uv run pytest -q` 2,605 passed** (2,586 at the
+previous candidate; +19, none removed, disabled or skipped), `ruff check`,
+`ruff format --check` and `git diff --check` clean, and every targeted suite
+re-run — R0 490, security 580, prompt/data 191, command policy 52,
+ProjectProfile 34, TechnicalAssessment 45, validation profiles 36, checkpoint
+policy 33, literature pacing 47, model-call budgets 166, planner guards 160,
+provider routing and planner policy 72.
+
+The review was not repeated. Its findings were a provider-honesty defect and a
+set of tests that did not test what they said, both repaired and both
+mutation-proved; nothing it found touched planner routing, budget accounting or
+the release decision, and running a third same-family pass would substitute for
+the cross-family review rather than prepare it.
+
+**Independence: `DEGRADED_SAME_PROVIDER_FAMILY`.** Same family, different model,
+frozen diff. It found a real defect and three vacuous tests, and it is still not
+an independent review.

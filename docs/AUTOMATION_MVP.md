@@ -193,9 +193,22 @@ whose output is a schema-constrained instruction to run commands. A benchmark of
 thirty real planner calls over five archived fixtures, judged by the production
 validators, is recorded in `docs/V1_BUILD_RECORD.md` §32: the smaller model
 produced every structured-output exhaustion and every placeholder plan in it,
-and the stronger one needed fewer calls to reach more accepted plans. Set
-`planner.model` here to override it; a model this machine cannot reach fails the
-run with the provider's own error rather than answering from a different one.
+and the stronger one needed fewer calls to reach more accepted plans.
+
+Set `planner.model` here to override that. Two things to know about how far an
+override reaches:
+
+- Whether an unreachable model name is refused or silently answered by another
+  model is the installed CLI's behaviour, not something Research OS can force.
+  What the run guarantees is its own half: a provider error is reported
+  verbatim and the run fails rather than proceeding, and the invocation record
+  names the model the provider said actually answered — not the alias that was
+  requested — so a substitution is visible afterwards even when it was silent
+  at the time.
+- Naming a `provider` this machine does not have re-homes the role onto an
+  available provider and **drops the model with it**, since an alias is
+  provider-specific. That substitution is recorded, and `researchctl auto
+  providers` prints it, but the configured model is not honoured.
 
 ### Review independence
 

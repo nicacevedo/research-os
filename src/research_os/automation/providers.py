@@ -335,10 +335,27 @@ class ClaudeCodeProvider:
         resolved to. Recording the resolution is the difference between a run
         report that says which model reviewed the diff and one that repeats the
         alias back.
+
+        The one rule that matters: **when the provider said which models ran,
+        this never answers with the alias.** Echoing ``opus`` back over a report
+        that names only some other model is not a missing detail, it is a run
+        record attributing a plan to a model that did not make it -- and a
+        default naming one specific model is exactly the configuration where
+        that goes wrong quietly. Found by an independent review of the planner
+        default, which supplied both shapes: a reply billed only to the
+        auxiliary model, and a reply billed to two substantive models neither of
+        which was the one asked for.
+
+        So silence is the only thing that falls back to the alias. If usage was
+        reported at all, the answer comes from it: the matching id where there
+        is one, the single substantive id where there is one, and otherwise
+        every id the provider named, joined -- which reads oddly in a report
+        precisely because something odd happened, and is checkable against the
+        archived envelope beside it.
         """
 
         usage = payload.get("modelUsage")
-        if not isinstance(usage, dict):
+        if not isinstance(usage, dict) or not usage:
             return requested
         if requested:
             for key in sorted(usage):
@@ -347,9 +364,10 @@ class ClaudeCodeProvider:
         candidates = [
             key for key in sorted(usage) if not key.startswith("claude-haiku")
         ]
-        if len(candidates) == 1:
-            return candidates[0]
-        return requested
+        reported = candidates or sorted(usage)
+        if len(reported) == 1:
+            return reported[0]
+        return "+".join(reported)
 
     def _auth_status(self, path: str) -> str:
         """Report whether the CLI is signed in, without revealing credentials."""

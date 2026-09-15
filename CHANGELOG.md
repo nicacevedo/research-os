@@ -93,11 +93,53 @@ pushed.
 - The budget entry gate stated a requirement that is false for a capsule-less
   proposal task; a symbol could not be written `solve()`.
 
+### Changed
+
+- **The shipped default planner model is now `opus`, was `sonnet`.** Decided by
+  measurement, not principle: thirty real planner calls over five archived
+  fixtures from this release's own validation campaign, each rebuilt through the
+  production prompt builder with the project's real profile, budgets, checkpoint
+  policy, validation profiles and declared experiments, and every answer judged
+  by the production validators. `sonnet` plus the existing one re-ask reached
+  seven valid plans in ten and needed sixteen calls; `opus` reached nine in nine
+  and needed ten. Every structured-output exhaustion and every placeholder plan
+  in the benchmark came from the smaller model. `docs/V1_BUILD_RECORD.md` §32
+  records the protocol and every call.
+
+  A bounded `sonnet` → `opus` escalation was benchmarked as a third policy and
+  **deliberately not implemented**: it recovered two of the three losses, still
+  spent sixteen calls, and would have added routing code for less reliability
+  than asking the stronger model first. There is no planner fallback in this
+  release, and `tests/test_planner_model_policy.py` exists partly to notice one
+  appearing.
+
+  `planner:` in `automation.yaml` overrides this. Naming a *provider* this
+  machine does not have still re-homes the role and drops the model with it,
+  which is unchanged and documented.
+
+### Fixed after the planner delta review
+
+- `ClaudeCodeProvider._resolved_model` could record the requested model alias
+  when a different model answered — when the provider billed the reply only to
+  the auxiliary model, or to two substantive models neither of which was the one
+  asked for. Both shapes made a run record attribute a plan to a model that
+  never made it. Silence is now the only case that falls back to the alias: if
+  usage was reported at all, the record names what was reported. Pre-existing,
+  and made load-bearing by the planner default naming one specific model.
+- Three of the sixteen new planner tests did not constrain the property in their
+  name: "both attempts are charged" asserted only the two requests, the
+  unreachable-model test exercised no unreachability, and the ledger test could
+  not distinguish the requested model from the resolved one because the test
+  double reports them identically. All three now fail under the mutations they
+  were written to catch.
+
 ### Unchanged
 
 R0 kernel semantics, scientific object schemas, digests, stale-review detection,
 Claim acceptance, worktree isolation, argv-based execution with no shell, the
 prompt/data boundary, and the one-repair bound everywhere it already applied.
+Also unchanged by the planner default: `PLAN_SCHEMA`, the degenerate-plan guard,
+the planner's two-attempt bound, and how a model call is charged.
 
 ## [1.0.0] — 2026-09-13
 
