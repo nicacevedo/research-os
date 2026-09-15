@@ -2,6 +2,82 @@
 
 All notable changes to Research OS. Dates are release dates.
 
+## [Unreleased] — R5 autonomous runtime
+
+On `r5/autonomous-runtime`. The scientific kernel is unchanged; this is the
+durable operational layer around it. `docs/RUNTIME.md` is the specification and
+`docs/R5_BUILD_RECORD.md` the build record.
+
+### Added
+
+- **An operational database, and the boundary that keeps it operational.**
+  PostgreSQL holds runs, work items, events, approvals, invocations, model-call
+  provenance, external jobs, artifact references, budgets, schedules and
+  provider health. It holds no science. `research_os.runtime.kernel` is the only
+  module that reads a capsule and has no method that writes one;
+  `tests/test_runtime_authority.py` asserts that by parsing the package.
+- **A durable work queue.** `for update skip locked`, renewable leases with
+  server-computed deadlines, and reclamation when a holder stops reporting.
+  Claiming charges the attempt, so work that kills its worker runs out of
+  attempts rather than out of workers.
+- **An idempotency ledger.** Every externally visible side effect is claimed
+  durably before it happens, keyed by the action's stable identity. A retry
+  reuses a completed one; an outcome nothing can establish is refused rather
+  than guessed at.
+- **Bounded resumable cycles.** One LangGraph thread per cycle, persistent
+  PostgreSQL checkpoints, `durability="sync"`, and checkpoint retention that is
+  implemented rather than aspirational. A human gate is three nodes — prepare,
+  interrupt, apply — because a side effect before `interrupt()` is replayed when
+  the interrupt is answered. That was measured, not read.
+- **`researchd`**, a control-plane daemon whose loop is one testable function.
+  It ingests events, claims due work, renews and reclaims leases, polls external
+  jobs, enforces budgets, tracks provider health and surfaces approvals. It
+  calls no model.
+- **Provider routing with honest independence.** A graph node asks for a
+  capability and a criticality, never a vendor. Critical work is never silently
+  downgraded. Independence is *reported*, so a review that had to run on the
+  producer's own family is recorded as degraded rather than claimed as
+  independent.
+- **`researchctl runtime`** — status, runs, run, approvals, approve, decline,
+  jobs, costs, events, cancel, doctor, migrate, daemon, dev-db — each with a
+  deterministic `--json` counterpart.
+- **A disposable local PostgreSQL** (`runtime dev-db`) for a machine with no
+  system service, no container runtime and no root.
+- **`deploy/researchd.service`**, a systemd *user* unit, shipped and never
+  installed.
+- **`pilots/run_pilot.sh`**, one command against a real project, which hashes
+  the project before and after and fails if it moved.
+
+### Changed
+
+- `ARCHITECTURE.md` §12: PostgreSQL, LangGraph and a background service left the
+  postponed list, each with the requirement that forced it recorded in §12a.
+  `DESIGN_INVARIANTS.md` gains a change-control record; no invariant changed.
+- Three new fences in `automation/promptdata.FENCES` for frontier state,
+  hypothesis proposals and experiment results.
+
+### Fixed
+
+Two adversarial reviews and a real pilot found these; `docs/RUNTIME.md` §16
+records them in full, including one reported finding that was wrong and one
+suggested fix that was wrong.
+
+- The attempt cap was defeated by the recovery code meant to honour it.
+- The invocation ledger's `FAILED` path deleted its row without consulting the
+  reconciler — but `perform` routinely raises *after* the effect lands, so this
+  submitted the same experiment twice.
+- Events were consumed and enqueued in separate transactions, and nothing
+  re-emits them, so a crash between lost a run permanently.
+- Nothing serialised two workers entering one LangGraph thread.
+- Every lock was taken with an unbounded wait, so one stuck holder froze the
+  control plane and every contention handler was unreachable.
+- The preregistration guard was skipped by omitting the digest, and the
+  experimentalist authored its own `argv`. It now selects a command the
+  *researcher* declared.
+- `runtime approve` had no interactive guard and recorded a fabricated actor.
+- Continuation assumed progress. A real pilot chained seven cycles over an
+  identical frontier; it now hashes the frontier and stops.
+
 ## [1.0.0] — 2026-09-13
 
 First stable operational release. The architecture of `research-os-v1` plus the

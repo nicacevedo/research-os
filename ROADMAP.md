@@ -75,11 +75,25 @@ Not started.
 
 ## R5 — Autonomous OS
 
-Watchers, MCP, cross-project exploration, optional UI and containers.
-Not started.
+The durable autonomous runtime: an operational database, a work queue with
+leases, an idempotency ledger, a content-addressed artifact store, bounded
+resumable reasoning cycles, a control-plane daemon, and the capability handlers
+that let a cycle actually do research. In progress; `docs/RUNTIME.md` is its
+live specification and `docs/R5_BUILD_RECORD.md` records what was built and
+what remains.
+
+What R5 deliberately did **not** acquire is epistemic authority. All eight
+actions that require human scientific authority turn out to be actions the
+person performs; the runtime prepares the decision and hands over the command.
+
+Still not started, and not part of R5: MCP, a UI, containers.
 
 ## Postponed until a later release proves them necessary
 
-Docker, Podman, Apptainer, PostgreSQL, vector databases, MCP, LangGraph,
-PaperQA, local LLMs, Ollama, web UI, systemd services, Slurm, HPC abstraction,
-automatic merge, automatic scientific acceptance.
+Docker, Podman, Apptainer, vector databases, MCP, PaperQA, local LLMs, Ollama,
+web UI, automatic merge, automatic scientific acceptance.
+
+PostgreSQL, LangGraph and a background service left this list in R5; Slurm and
+HPC abstraction left it in v1. `ARCHITECTURE.md` §12 and §12a record what forced
+each, because "we needed orchestration" is not a reason and would have
+justified any of them.
