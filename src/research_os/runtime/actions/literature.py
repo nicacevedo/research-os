@@ -384,3 +384,59 @@ def rebuild_literature_index(
     return ActionOutcome.succeeded(
         f"literature index rebuilt ({rebuilt} rows)", data={"rows": rebuilt}
     )
+
+
+def reconcile_fetched_literature(
+    state: Mapping[str, Any], context: CycleContext, plan: Mapping[str, Any]
+) -> dict[str, Any] | None:
+    """Did a previous attempt already acquire full text for these works?
+
+    The registry's docstring said "the store's own file records are what a
+    reconciler consults", and for a while the registered reconciler was
+    ``lambda ...: None`` -- the exact stub the same docstring calls a lie. An
+    independent review pointed out that since this is the only non-replay-safe
+    action, the entire reconciler apparatus was satisfied by that stub.
+
+    So it consults them. The literature store records every file it acquired, by
+    work key and content hash, which is a lookup rather than a guess.
+    """
+
+    keys = [
+        str(item)
+        for item in plan.get("parameters", {}).get("work_keys", ())
+        if str(item)
+    ]
+    if not keys:
+        previous = dict(state.get("action_result", {}).get("data") or {})
+        keys = [
+            str(item.get("key"))
+            for item in previous.get("ranked", ())
+            if item.get("key")
+        ]
+    if not keys:
+        return None
+
+    service = _service(context)
+    recovered: list[dict[str, Any]] = []
+    for key in keys:
+        try:
+            files = service.store.files(key)
+        except ResearchOSError as exc:
+            LOG.warning("could not read file records for %s: %s", key, exc)
+            return None
+        if files:
+            recovered.append(
+                {
+                    "key": key,
+                    "acquired": True,
+                    "path": files[0].stored_path,
+                    "sha256": files[0].file_sha256,
+                }
+            )
+    if not recovered:
+        return None
+    return {
+        "fetched": recovered,
+        "acquired": len(recovered),
+        "reconciled": True,
+    }

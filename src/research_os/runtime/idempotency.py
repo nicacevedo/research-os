@@ -419,6 +419,13 @@ class InvocationLedger:
                 work_id=work_id,
                 owner=who,
             )
+            if invocation.status is InvocationStatus.COMPLETED:
+                # A racing worker deleted, reinserted, performed and completed
+                # the row inside that window. Falling through would perform the
+                # effect a second time.
+                return Outcome(
+                    result=invocation.result or {}, invocation=invocation, reused=True
+                )
 
         if invocation.status is InvocationStatus.ABANDONED:
             if reconcile is None:
@@ -456,11 +463,19 @@ class InvocationLedger:
         try:
             result = perform()
         except Exception as exc:
+            # `owner=who`, so the ownership guard is exercised rather than
+            # short-circuited. Without it a slow worker whose invocation had been
+            # abandoned and retaken could land `mark_failed` on the new owner's
+            # live IN_FLIGHT row, and a third worker entering in that window
+            # would read FAILED, find nothing to reconcile yet, reopen, and
+            # perform the effect a second time.
             self.mark_failed(
-                invocation.invocation_id, error=f"{type(exc).__name__}: {exc}"
+                invocation.invocation_id,
+                error=f"{type(exc).__name__}: {exc}",
+                owner=who,
             )
             raise
-        completed = self.complete(invocation.invocation_id, result=result)
+        completed = self.complete(invocation.invocation_id, result=result, owner=who)
         return Outcome(result=result, invocation=completed, reused=False)
 
     def list_for_run(

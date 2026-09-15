@@ -58,6 +58,7 @@ from research_os.runtime.actions.literature import (
     fetch_literature,
     parse_literature,
     rebuild_literature_index,
+    reconcile_fetched_literature,
     search_literature,
 )
 from research_os.runtime.actions.review import assess_frontier_ranked, review_science
@@ -117,7 +118,7 @@ ACTION_HANDLERS: dict[ActionKind, RegisteredAction] = {
     ActionKind.FETCH_LITERATURE: RegisteredAction(
         fetch_literature,
         replay_safe=False,
-        reconcile=lambda state, context, plan: None,
+        reconcile=reconcile_fetched_literature,
     ),
     ActionKind.PARSE_LITERATURE: RegisteredAction(parse_literature, replay_safe=True),
     # --- co-exploration and review ---------------------------------------

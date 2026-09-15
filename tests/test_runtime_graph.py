@@ -355,6 +355,38 @@ def test_an_a2_action_stops_at_a_gate_with_a_prepared_packet(
     assert all("consequence" in option for option in packet["alternatives"])
 
 
+def test_an_a2_action_is_never_performed_by_the_runtime_at_all(
+    graph_env: dict[str, Any], tmp_path: Path
+) -> None:
+    """Not merely "not before the gate". Not after it either.
+
+    All eight scientific-authority actions are ones the person performs, so
+    there is no state of the world in which the runtime executes one. The child
+    process registers a handler for it anyway, and the handler must never run.
+    """
+
+    effects = tmp_path / "effects.log"
+    effects.touch()
+    first = _run_child(
+        graph_env, "start", effects=effects, action=str(ActionKind.ACCEPT_CLAIM)
+    )
+    store = RuntimeStore(graph_env["db"])
+    store.record_decision(
+        first["pending_approval_id"],
+        granted=True,
+        decision={"granted": True},
+        decided_by="researcher@host",
+    )
+    _run_child(
+        graph_env,
+        "answer",
+        effects=effects,
+        run_id=first["run_id"],
+        action=str(ActionKind.ACCEPT_CLAIM),
+    )
+    assert effects.read_text() == ""
+
+
 def test_an_a2_action_is_not_performed_before_the_gate(
     graph_env: dict[str, Any], tmp_path: Path
 ) -> None:
@@ -401,7 +433,18 @@ def test_answering_the_gate_resumes_in_a_fresh_process_and_acts_once(
         action=str(ActionKind.ACCEPT_CLAIM),
     )
     assert second["status"] == "SUCCEEDED"
-    assert effects.read_text().splitlines() == ["action"]
+
+    # The decision was recorded and the action was NOT performed -- even though
+    # the child process deliberately registered a handler for it. `accept_claim`
+    # is human-executed: approval unlocks a recorded decision and the command to
+    # run, never an execution. An earlier version reached the handler lookup
+    # instead and would have run whatever was registered.
+    assert effects.read_text() == "", (
+        "a human-executed action ran inside the runtime after approval"
+    )
+    assert any("You perform it" in note for note in second["notes"])
+    assert any("researchctl review" in note for note in second["notes"])
+
     applied = store.get_approval(approval_id)
     assert applied is not None
     assert applied.status is ApprovalStatus.GRANTED

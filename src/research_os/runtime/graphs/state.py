@@ -68,6 +68,13 @@ class CycleState(TypedDict, total=False):
     # --- termination -------------------------------------------------------
     terminal_state: str
     next_recommendation: str
+    #: A hash of the frontier as this cycle left it, so the continuation
+    #: decision can tell progress from repetition. Declared here and not only
+    #: returned by `conclude`: a `StateGraph` over a TypedDict keeps only the
+    #: channels the schema declares, so an undeclared key is silently dropped
+    #: -- which is how this arrived at the database as NULL while the node that
+    #: computed it looked correct.
+    frontier_digest: str
 
     # --- accumulating record ----------------------------------------------
     #: Artifact references produced by this cycle, as plain dicts so the

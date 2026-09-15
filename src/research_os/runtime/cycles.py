@@ -136,16 +136,42 @@ def build_context(
 
 
 def apply_default_budgets(
-    ledger: BudgetLedger, *, config: RuntimeConfig, run_id: str
+    ledger: BudgetLedger,
+    *,
+    config: RuntimeConfig,
+    run_id: str,
+    project_id: str | None = None,
 ) -> None:
-    """Give a new cycle its own budget from the configured defaults.
+    """Give a new cycle its own budget, and its project a standing ceiling.
 
-    Per run, not per project, and never widened afterwards: a cycle that is
-    already going has the budget it started with, so editing the configuration
-    cannot retroactively authorise more spending on work in flight.
+    The per-run budget is never widened afterwards: a cycle that is already
+    going has the budget it started with, so editing the configuration cannot
+    retroactively authorise more spending on work in flight.
+
+    The per-*project* cost ceiling exists because the run budget alone does not
+    bound an objective. ``should_continue`` deliberately ignores run scope when
+    deciding to continue -- the successor gets a fresh run budget -- so without
+    this, one objective's exposure was ``max_cycles_per_objective`` times the
+    per-run cost, which at the defaults is 300 USD with nothing warning. An
+    independent review pointed that out. It is set only if absent, so a
+    researcher who has chosen their own ceiling keeps it.
     """
 
     defaults = config.budget
+    if project_id is not None:
+        existing = ledger.get(
+            scope=BudgetScope.PROJECT,
+            scope_id=project_id,
+            dimension=Dimension.MODEL_COST_USD,
+        )
+        if existing is None:
+            ledger.set_limit(
+                scope=BudgetScope.PROJECT,
+                scope_id=project_id,
+                dimension=Dimension.MODEL_COST_USD,
+                limit_value=defaults.max_model_cost_usd
+                * config.settings.max_cycles_per_objective,
+            )
     for dimension, limit in (
         (Dimension.MODEL_CALLS, defaults.max_model_calls),
         (Dimension.MODEL_COST_USD, defaults.max_model_cost_usd),
@@ -190,7 +216,9 @@ def open_cycle(
         parent_run_id=parent_run_id,
         cycle_index=cycle_index,
     )
-    apply_default_budgets(BudgetLedger(db), config=config, run_id=run.run_id)
+    apply_default_budgets(
+        BudgetLedger(db), config=config, run_id=run.run_id, project_id=project_id
+    )
     store.record_event(
         kind="RESEARCH_RUN_REQUESTED",
         project_id=project_id,
@@ -387,6 +415,12 @@ def _execute(
     pending = [item for item in (snapshot.interrupts or ())]
     notes = tuple(final.get("notes", []))
 
+    # Charged before the gate branch, not after it. An earlier version settled
+    # only on the non-pending path, so a cycle that stopped for a human
+    # decision charged nothing for the time it spent getting there -- and a run
+    # that gated and resumed repeatedly never accrued wall clock at all.
+    _settle_wall_clock(db, run, entered_at=entered_at)
+
     if pending:
         approval_id = ""
         value = pending[0].value
@@ -415,7 +449,6 @@ def _execute(
             state=final,
         )
 
-    _settle_wall_clock(db, run, entered_at=entered_at)
     digest = str(final.get("frontier_digest") or "")
     if digest:
         store.set_frontier_digest(run.run_id, digest)

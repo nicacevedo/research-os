@@ -652,6 +652,42 @@ def apply_decision(state: CycleState, runtime: Runtime[CycleContext]) -> dict[st
 
     plan = state.get("plan") or {}
     action = ActionKind(str(plan["action"]))
+    policy = policy_for(action)
+
+    if policy.human_executes:
+        # Approval unlocks a recorded decision and the exact command to run,
+        # never an execution. Every A2 action in this build is one the person
+        # performs, so this is the *only* reachable path for a granted gate --
+        # and an earlier version reached the handler lookup instead and told the
+        # researcher their approved action "has no handler in this build",
+        # which is both wrong and unhelpful. The `human_executes` branch had
+        # been written into the decision *packet* by mistake rather than here.
+        subject = (
+            ", ".join(str(item) for item in plan.get("addresses", ())) or "the subject"
+        )
+        follow_up = policy.follow_up.replace("{subject}", subject)
+        context.store.record_event(
+            kind="SCIENTIFIC_DECISION_RECORDED",
+            project_id=state["project_id"],
+            run_id=state["run_id"],
+            payload={
+                "action": str(action),
+                "approval_id": approval_id,
+                "decided_by": decision.get("decided_by"),
+                "follow_up": follow_up,
+            },
+            dedup_key=f"decision-applied:{approval_id}",
+        )
+        return {
+            "decision_applied": True,
+            "follow_up": follow_up,
+            "terminal_state": str(TerminalState.DONE_FOR_NOW),
+            "notes": note(
+                state,
+                f"{action} was authorised and recorded. You perform it: {follow_up}",
+            ),
+        }
+
     registered = ACTION_HANDLERS.get(action)
     if registered is None:
         return {

@@ -294,8 +294,19 @@ class ModelRouter:
         seen = {
             families.get(str(row["provider"]), str(row["provider"])) for row in rows
         }
+        # Merged into the stored set, not returned beside it. The first version
+        # returned `{} | seen` -- a fresh set -- and marked the group loaded,
+        # so every later lookup took the hot path and found an *empty* set with
+        # the database-derived families gone. The consequence was the worst kind:
+        # a reviewer routed to the producer's own family and recorded as
+        # `DIFFERENT_FAMILY` with a note naming a provider that had in fact
+        # already answered. False independence provenance, which is the one
+        # thing this accounting exists to prevent. An independent review found
+        # it and reproduced it.
+        merged = self._used_families.setdefault(group, set())
+        merged |= seen
         self._loaded_groups.add(group)
-        return self._used_families.setdefault(group, set()) | seen
+        return merged
 
     # --------------------------------------------------------------- calling --
     def complete(self, request: ModelRequest) -> ModelResponse:

@@ -878,3 +878,161 @@ def test_a_decision_and_its_resuming_event_are_one_transaction(
     )
     kinds = [event.kind for event in store.list_events(run_id=run.run_id)]
     assert "SCIENTIFIC_DECISION_RECORDED" in kinds
+
+
+def test_an_answered_gate_is_never_silently_dropped(plane: dict[str, Any]) -> None:
+    """The worst failure this system had, and the narrowest.
+
+    `RESUME_CYCLE` was briefly deduped per run, so once a recovery had claimed
+    `resume_cycle:{run_id}` a researcher's answered gate produced
+    SCIENTIFIC_DECISION_RECORDED, got `created=False`, and queued nothing --
+    leaving the run in WAITING_HUMAN forever with a GRANTED approval and no
+    operator verb to rescue it. Found by an independent review.
+    """
+
+    store: RuntimeStore = plane["store"]
+    run = store.create_run(project_id="alpha-project", objective="o")
+
+    # A recovery event and a decision event, in that order, for one run.
+    store.record_event(
+        kind="WORKER_RECOVERED",
+        project_id="alpha-project",
+        run_id=run.run_id,
+        payload={"kind": WorkKind.RUN_CYCLE},
+        dedup_key=f"recovered:{run.run_id}:1",
+    )
+    store.record_event(
+        kind="EXTERNAL_JOB_FINISHED",
+        project_id="alpha-project",
+        run_id=run.run_id,
+        payload={"job_id": "XJOB-x"},
+        dedup_key="job-finished:XJOB-x",
+    )
+    store.record_event(
+        kind="SCIENTIFIC_DECISION_RECORDED",
+        project_id="alpha-project",
+        run_id=run.run_id,
+        payload={"approval_id": "APRV-x"},
+        dedup_key="decided:APRV-x",
+    )
+    report = plane["daemon"].tick()
+    assert report.events_ingested == 3
+
+    kinds = [item.kind for item in plane["queue"].list_for_run(run.run_id)]
+    # The recovery produces nothing -- the reclaimed item is its own retry --
+    # and the two real events each produce their own work.
+    assert kinds.count(WorkKind.RESUME_CYCLE) == 2, kinds
+    payloads = [
+        item.payload.get("event_kind")
+        for item in plane["queue"].list_for_run(run.run_id)
+    ]
+    assert "SCIENTIFIC_DECISION_RECORDED" in payloads, (
+        "the researcher's decision produced no work"
+    )
+
+
+def test_a_recovery_event_produces_no_work(plane: dict[str, Any]) -> None:
+    """The reclaimed item is the retry; a second item was pure duplication."""
+
+    from research_os.runtime.daemon import EVENT_WORK
+
+    assert "WORKER_RECOVERED" not in EVENT_WORK
+
+    store: RuntimeStore = plane["store"]
+    run = store.create_run(project_id="alpha-project", objective="o")
+    store.record_event(
+        kind="WORKER_RECOVERED",
+        project_id="alpha-project",
+        run_id=run.run_id,
+        dedup_key="recovered:x:1",
+    )
+    report = plane["daemon"].tick()
+    assert report.events_ingested == 1
+    assert report.work_enqueued == 0
+    assert plane["queue"].list_for_run(run.run_id) == ()
+
+
+def test_a_project_less_event_does_not_stall_ingestion(plane: dict[str, Any]) -> None:
+    """It used to be re-claimed every lease period, forever, at the head of the
+    batch -- so fifty of them would starve every real event, silently."""
+
+    store: RuntimeStore = plane["store"]
+    # A project-less schedule is enough to produce one.
+    store.create_schedule(kind="RESEARCH_RUN_REQUESTED", interval_seconds=3600)
+    fired = plane["daemon"].tick()
+    assert fired.schedules_fired == 1
+
+    ingested = plane["daemon"].tick()
+    assert ingested.events_ingested >= 1
+    assert any("cannot become work" in note for note in ingested.notes)
+    kinds = [event.kind for event in store.list_events()]
+    assert "EVENT_UNROUTABLE" in kinds
+
+    # And it is gone from the claimable set, so a later real event is seen.
+    store.record_event(
+        kind="RESEARCH_RUN_REQUESTED",
+        project_id="alpha-project",
+        run_id=store.create_run(project_id="alpha-project", objective="o").run_id,
+        dedup_key="requested:real",
+    )
+    after = plane["daemon"].tick()
+    assert after.work_enqueued == 1
+
+
+def test_maintenance_prunes_checkpoints_without_being_asked(
+    plane: dict[str, Any],
+) -> None:
+    """`prune_checkpoints` had a handler, a setting and a docstring, and nothing
+    ever created the work. The checkpoint tables were append-only forever."""
+
+    from research_os.runtime.cycles import resume_cycle
+
+    store: RuntimeStore = plane["store"]
+    run = store.create_run(project_id="alpha-project", objective="o")
+    resume_cycle(
+        config=plane["config"],
+        db=plane["db"],
+        run_id=run.run_id,
+        repo_path=plane["repo"],
+        models=plane["router"],
+    )
+    thread = store.require_run(run.run_id).thread_id
+    assert thread
+    with plane["db"].tx() as conn:
+        present = conn.execute(
+            "select count(*) as n from checkpoints where thread_id = %s", (thread,)
+        ).fetchone()
+    assert present["n"] > 0
+
+    with plane["db"].tx() as conn:
+        conn.execute(
+            "update research_runs set finished_at = now() - interval '90 days' "
+            "where run_id = %s",
+            (run.run_id,),
+        )
+    # A fresh daemon, so the maintenance stamp is unset and the pass runs it.
+    fresh = Daemon(
+        config=plane["config"],
+        db=plane["db"],
+        repo_for=lambda _p: plane["repo"],
+        models=lambda _r, _p, _w: plane["router"],
+        notifier=plane["notifier"],
+        clock=FrozenClock(),
+        owner="maintenance-worker",
+    )
+    report = fresh.tick()
+    assert report.checkpoints_pruned == 1
+    with plane["db"].tx() as conn:
+        after = conn.execute(
+            "select count(*) as n from checkpoints where thread_id = %s", (thread,)
+        ).fetchone()
+    assert after["n"] == 0
+
+
+def test_maintenance_does_not_run_on_every_pass(plane: dict[str, Any]) -> None:
+    """One indexed query an hour, not one per tick."""
+
+    daemon: Daemon = plane["daemon"]
+    daemon.tick()
+    second = daemon.tick()
+    assert second.checkpoints_pruned == 0

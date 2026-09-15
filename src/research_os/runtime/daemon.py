@@ -37,6 +37,7 @@ import signal
 import sys
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from types import FrameType
 from typing import Any
@@ -72,6 +73,10 @@ from research_os.runtime.store import RuntimeStore
 
 LOG = logging.getLogger("researchd")
 
+#: How often maintenance runs. An hour: pruning a day-old checkpoint a few
+#: minutes late costs nothing, and the query is cheap but not free.
+_MAINTENANCE_INTERVAL = 3600.0
+
 
 # --------------------------------------------------------------- work kinds --
 class WorkKind:
@@ -98,8 +103,19 @@ EVENT_WORK: dict[str, str] = {
     "SCIENTIFIC_DECISION_RECORDED": WorkKind.RESUME_CYCLE,
     "EXTERNAL_JOB_FINISHED": WorkKind.RESUME_CYCLE,
     "RESEARCH_CYCLE_FINISHED": WorkKind.CONTINUE_OBJECTIVE,
-    "WORKER_RECOVERED": WorkKind.RESUME_CYCLE,
 }
+
+#: Deliberately absent above: ``WORKER_RECOVERED``.
+#:
+#: A reclaimed work item *is* its own retry -- ``reclaim_expired`` puts it back
+#: on the queue -- so mapping the recovery event to a second item only ever
+#: duplicated it, and because the two had different kinds they had different
+#: dedup keys, so the duplication was not even caught.
+#:
+#: The per-run key introduced to bound that duplication then collided with the
+#: real resume events, which is the failure recorded in ``_dedup_key``. Removing
+#: the mapping fixes both: there is nothing to bound, and the key can go back to
+#: being per event.
 
 
 @dataclass
@@ -178,6 +194,7 @@ class Daemon:
         "_config",
         "_db",
         "_ledger",
+        "_maintenance_stamp",
         "_models",
         "_notifier",
         "_owner",
@@ -210,6 +227,7 @@ class Daemon:
         self._clock = clock or SystemClock()
         self._owner = owner or worker_identity()
         self._stopping = False
+        self._maintenance_stamp: datetime | None = None
 
     @property
     def owner(self) -> str:
@@ -235,9 +253,47 @@ class Daemon:
         self._ingest_events(report)
         self._fire_schedules(report)
         self._poll_external_jobs(report)
+        self._maintain(report)
         self._surface_approvals(report)
         self._claim_and_run(report)
         return report
+
+    # --------------------------------------------------------- maintenance --
+    def _maintain(self, report: TickReport) -> None:
+        """Prune the checkpoints of cycles that finished long ago.
+
+        Called from ``tick`` rather than waiting for something to enqueue the
+        work, because nothing did. ``prune_checkpoints`` had a handler, a
+        ``checkpoint_retention_days`` setting, and a module docstring insisting
+        retention was "implemented rather than aspirational" -- and no code path
+        that ever created the work item. The checkpoint tables were append-only
+        for the life of a deployment, and ``TickReport.checkpoints_pruned`` was
+        permanently zero. An independent review found it.
+
+        Paced by an in-process timestamp rather than a schedule row, so it works
+        on a fresh database with no seeding. A prune that runs a few minutes
+        late costs nothing.
+        """
+
+        now = self._clock.now()
+        if (
+            self._maintenance_stamp is not None
+            and (now - self._maintenance_stamp).total_seconds() < _MAINTENANCE_INTERVAL
+        ):
+            return
+        self._maintenance_stamp = now
+        try:
+            pruned = checkpoints.prune(
+                self._db,
+                self._config.require_dsn(),
+                retention_days=self._config.settings.checkpoint_retention_days,
+            )
+        except ResearchOSError as exc:
+            report.notes.append(f"checkpoint prune failed: {exc}")
+            return
+        report.checkpoints_pruned = len(pruned)
+        if pruned:
+            LOG.info("pruned checkpoints for %d finished cycle(s)", len(pruned))
 
     # ------------------------------------------------------------ recovery --
     def _recover(self, report: TickReport) -> None:
@@ -330,13 +386,33 @@ class Daemon:
                 self._store.consume_event(event.event_id)
                 continue
             if event.project_id is None:
+                # Consumed, not left. "Left for inspection" meant its lease
+                # expired and it was re-claimed every lease period forever --
+                # and because `claim_events` orders oldest first with a limit,
+                # fifty such events would starve every real one. A total
+                # control-plane stall, with no error. A project-less schedule is
+                # enough to produce one.
+                self._store.record_event(
+                    kind="EVENT_UNROUTABLE",
+                    payload={"event_id": event.event_id, "event_kind": event.kind},
+                    dedup_key=f"unroutable:{event.event_id}",
+                )
+                self._store.consume_event(event.event_id)
                 report.notes.append(
-                    f"event {event.event_id} ({event.kind}) has no project and "
-                    f"cannot become work; left unconsumed for inspection"
+                    f"event {event.event_id} ({event.kind}) has no project, so it "
+                    f"cannot become work; recorded EVENT_UNROUTABLE and consumed"
                 )
                 continue
             if self._enqueue_for(event, kind):
                 report.work_enqueued += 1
+            else:
+                # The dedup key was already taken. Recorded rather than passed
+                # over silently: this is exactly how a dropped decision looked
+                # from the outside -- no work, no note, no log.
+                report.notes.append(
+                    f"event {event.event_id} ({event.kind}) matched an existing "
+                    f"{kind} work item and queued nothing"
+                )
             # Consumed only now that the work row exists. A crash before this
             # leaves the event claimable again once its lease expires, which is
             # why `claim_events` leases rather than consumes.
@@ -363,17 +439,24 @@ class Daemon:
     def _dedup_key(event: Event, kind: str) -> str:
         """The key that decides whether this is new work.
 
-        Per *event* for most kinds, because two distinct events legitimately
-        mean two pieces of work. Per *run* for continuation, because a run may
-        have at most one successor however many events claim it finished -- and
-        it turned out two did. Defence in depth behind the single-event fix:
-        even a future duplicate cannot fork the lineage.
+        Per *event* for everything but continuation, because two distinct
+        events legitimately mean two pieces of work.
+
+        ``RESUME_CYCLE`` was briefly per *run*, to bound a duplication that is
+        now removed at its source, and that was the worst bug this system had:
+        once the key was taken, a researcher's answered gate produced
+        ``SCIENTIFIC_DECISION_RECORDED``, got ``created=False``, and queued
+        nothing -- so the run waited forever with a GRANTED approval and no
+        operator verb to rescue it. Concurrency is the run lock's job, not the
+        dedup key's.
+
+        ``CONTINUE_OBJECTIVE`` stays per run, because there the invariant really
+        is "at most one successor".
         """
 
-        if (
-            kind in {WorkKind.CONTINUE_OBJECTIVE, WorkKind.RESUME_CYCLE}
-            and event.run_id
-        ):
+        if kind == WorkKind.CONTINUE_OBJECTIVE and event.run_id:
+            # Per run: a run may have at most one successor, however many events
+            # claim it finished -- and two once did.
             return f"{kind}:{event.run_id}"
         return f"{kind}:{event.event_id}"
 
@@ -405,7 +488,10 @@ class Daemon:
         failure: the job keeps its status and is polled again.
         """
 
-        active = self._store.active_external_jobs(limit=50)
+        active = self._store.active_external_jobs(
+            limit=50,
+            poll_interval_seconds=self._config.settings.external_poll_seconds,
+        )
         if not active:
             return
         from research_os.runtime.executors import poll_job

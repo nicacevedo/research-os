@@ -234,6 +234,12 @@ def design_experiment(
         role="preregistration",
         producer=f"{response.provider}:{EXPERIMENTALIST.identity}",
     )
+    # Linked here rather than relying on the graph node to do it. The
+    # preregistration check looks the artifact up *through* its run link, so a
+    # handler that leaves the linking to its caller is a handler whose guard
+    # depends on who called it -- which is exactly the kind of thing that works
+    # in the pipeline and fails everywhere else.
+    context.artifacts.link(ref, role="preregistration", run_id=state["run_id"])
     return ActionOutcome.succeeded(
         f"preregistered a test of {target} using the declared command {chosen} "
         f"({digest[:12]})",
@@ -252,10 +258,21 @@ def _spec_from_resolved(
     """Build the frozen spec from a *resolved declared command*.
 
     ``argv`` comes from the researcher's declaration with validated parameter
-    values substituted, never from the model. ``cwd`` is the run directory and
-    not the canonical checkout: an experiment reads the repository through
-    declared inputs, and running in the checkout meant any command could write
-    to it.
+    values substituted, never from the model.
+
+    ``cwd`` is the declared ``working_directory`` if the researcher set one, and
+    otherwise the project checkout. An earlier version of this docstring claimed
+    it was the run directory; it never was, and it cannot be -- ``cwd`` is part
+    of the spec digest, and a run directory is named for the job, so the digest
+    would change on every submission and the preregistration check would reject
+    every experiment. An independent review caught the claim.
+
+    Running in the checkout is where an experiment's code and data are, so it is
+    the right default and not a lapse. What it means is that a declared command
+    *can* write to the repository, with model-supplied parameter values in its
+    argv. That is the same exposure the coding path has, and it gets the same
+    treatment: :func:`_submit` fingerprints the canonical capsule and every Git
+    ref before and after and refuses on drift. Detection, not prevention.
 
     Seeds default to one fixed value rather than a random one: an experiment
     whose seed is chosen at submission is an experiment nobody can rerun.
@@ -319,26 +336,47 @@ def _spec_from_record(record: Mapping[str, Any]) -> ExecutionSpec:
     )
 
 
-def _preregistration_exists(context: CycleContext, digest: str) -> bool:
+def _preregistration_exists(
+    context: CycleContext, digest: str, *, project_id: str
+) -> bool:
     """Whether a preregistration artifact with this spec digest was stored.
 
     The artifact is content-addressed, so its id is the hash of the
-    preregistration *record*, not of the spec. So the lookup reads every
-    ``role='preregistration'`` artifact and compares its ``spec_digest``. There
-    are a handful per project, and the alternative is trusting the caller about
-    when a criterion was fixed -- which is the whole thing the guard exists to
-    establish.
+    preregistration *record*, not of the spec. So the lookup reads this
+    *project's* ``role='preregistration'`` artifacts and compares each
+    ``spec_digest``. Scoped to the project and bounded at 500: an earlier
+    version scanned globally with a limit of 200, which fails closed -- a
+    busy machine would silently refuse a legitimate submission.
+
+    The alternative to any of this is trusting the caller about when a criterion
+    was fixed, which is the whole thing the guard exists to establish.
     """
 
     with context.db.tx() as conn:
         rows = conn.execute(
-            "select artifact_id from artifacts where role = 'preregistration' "
-            "order by created_at desc limit 200"
+            """
+            select distinct a.artifact_id, a.created_at
+            from artifacts a
+            join artifact_links l on l.artifact_id = a.artifact_id
+            join research_runs r on r.run_id = l.run_id
+            where a.role = 'preregistration' and r.project_id = %s
+            order by a.created_at desc
+            limit 500
+            """,
+            (project_id,),
         ).fetchall()
     for row in rows:
         try:
             record = json.loads(context.artifacts.get_text(str(row["artifact_id"])))
-        except (ResearchOSError, ValueError, UnicodeDecodeError):
+        except (ResearchOSError, ValueError, UnicodeDecodeError) as exc:
+            # Logged rather than swallowed: an unreadable preregistration would
+            # otherwise look identical to "no preregistration matches", which is
+            # a refusal the researcher would have no way to explain.
+            LOG.warning(
+                "could not read preregistration artifact %s: %s",
+                row["artifact_id"],
+                exc,
+            )
             continue
         if str(record.get("spec_digest") or "") == digest:
             return True
@@ -398,7 +436,9 @@ def _submit(
             "against. Only design_experiment produces a runnable design.",
             failure_class=FailureClass.POLICY_REFUSED,
         )
-    if not _preregistration_exists(context, digest):
+    if not _preregistration_exists(
+        context, digest, project_id=str(state["project_id"])
+    ):
         # And the digest must name a preregistration this runtime actually
         # stored. Otherwise the check compares a self-consistent blob against
         # itself, which establishes nothing about when the endpoint was fixed.
@@ -465,6 +505,19 @@ def _submit(
         }
 
     def perform() -> dict[str, Any]:
+        # The same guard the coding path has, for the same reason: a declared
+        # command runs in the project checkout with model-supplied parameter
+        # values in its argv, and nothing here can stop it writing there. An
+        # independent review pointed out that this path had no detector at all,
+        # in the module whose whole purpose is that the preregistered thing is
+        # what ran.
+        from research_os.runtime.actions.coding import (
+            _describe_drift,
+            canonical_fingerprint,
+        )
+
+        repo = Path(str(state["repo_path"]))
+        before = canonical_fingerprint(repo)
         run_dir = prepare_run_dir(spec, job_id=job_id)
         # The row first, in SUBMITTING, so a crash in the window between this and
         # the executor returning leaves something to reconcile rather than a job
@@ -492,6 +545,22 @@ def _submit(
             exit_code=handle.exit_code,
             detail=handle.detail,
         )
+
+        after = canonical_fingerprint(repo)
+        if after != before:
+            drift = _describe_drift(before, after)
+            LOG.error("experiment %s changed the canonical checkout: %s", job_id, drift)
+            return {
+                "ok": False,
+                "detail": (
+                    f"the experiment changed the canonical checkout, which it must "
+                    f"never do: {drift}. The declared command wrote outside its "
+                    f"outputs. The job record and its run directory are left for "
+                    f"inspection."
+                ),
+                "data": {"job_id": job_id, "canonical_drift": drift},
+                "_escaped": True,
+            }
         return {
             "ok": True,
             "detail": handle.detail or "submitted",
@@ -531,6 +600,14 @@ def _submit(
 
     context.budgets.settle_all(grants)
     data = dict(outcome.result.get("data") or {})
+    if outcome.result.get("_escaped"):
+        # A policy refusal, not an executor failure: it must not be retried,
+        # because retrying would run the same escaping command again.
+        return ActionOutcome.failed(
+            str(outcome.result.get("detail") or "the experiment escaped its scope"),
+            failure_class=FailureClass.POLICY_REFUSED,
+            data=data,
+        )
     artifacts = _collect_outputs(context, spec, data)
     return ActionOutcome.succeeded(
         str(outcome.result.get("detail") or "submitted"),

@@ -498,3 +498,123 @@ def test_every_runtime_model_call_is_read_only_and_tool_less(
             f"{request.role} got {request.access}"
         )
         assert request.tools == (), f"{request.role} was handed tools: {request.tools}"
+
+
+def test_independence_accounting_survives_a_router_rebuild(
+    runtime_db: Database, tmp_path: Path, run_id: str, runtime_project: str
+) -> None:
+    """The bug that produced false independence provenance.
+
+    A router is built per work item, so a cycle that crashes and resumes gets a
+    new one. The DB-derived families were read once and then discarded, so a
+    rebuilt router routed the reviewer to the producer's own family and recorded
+    it as DIFFERENT_FAMILY with a note naming a provider that had in fact
+    already answered. Found and reproduced by an independent review.
+    """
+
+    families = {"one": "family-one", "two": "family-two", "three": "family-three"}
+    adapters = {name: _provider(name, family) for name, family in families.items()}
+    profiles = tuple(
+        ProviderProfile(name=name, family=family, tier=3)
+        for name, family in families.items()
+    )
+    group = "explore:RRUN-x:0"
+
+    def build() -> ModelRouter:
+        return _router(
+            runtime_db,
+            tmp_path,
+            run_id=run_id,
+            project_id=runtime_project,
+            adapters=adapters,
+            profiles=profiles,
+        )
+
+    first = build().complete(
+        _request(
+            role=ModelRole.SEEDED_EXPLORER,
+            capability=Capability.SYNTHESIS,
+            independence=Independence.DIFFERENT_FAMILY,
+            independence_group=group,
+        )
+    )
+
+    # A fresh router, as a resumed cycle gets, then two calls in the group.
+    rebuilt = build()
+    second = rebuilt.complete(
+        _request(
+            role=ModelRole.BLIND_EXPLORER,
+            capability=Capability.SYNTHESIS,
+            independence=Independence.DIFFERENT_FAMILY,
+            independence_group=group,
+        )
+    )
+    third = rebuilt.complete(
+        _request(
+            role=ModelRole.SKEPTIC,
+            capability=Capability.CRITIQUE,
+            criticality=Criticality.CRITICAL,
+            independence=Independence.DIFFERENT_FAMILY,
+            independence_group=group,
+        )
+    )
+    answered = {first.provider, second.provider, third.provider}
+    assert len(answered) == 3, (
+        f"a rebuilt router reused a family that had already answered: {answered}"
+    )
+    for response in (second, third):
+        if response.independence is Independence.DIFFERENT_FAMILY:
+            assert response.provider not in {first.provider}, (
+                "claimed a different family while using the producer's provider"
+            )
+
+
+def test_a_rebuilt_router_reports_degradation_rather_than_fresh_context(
+    runtime_db: Database, tmp_path: Path, run_id: str, runtime_project: str
+) -> None:
+    """With one family, a resumed reviewer must still say so.
+
+    Before the fix it read `already={}` and returned "first call in group; no
+    producer to differ from yet" -- suppressing a degradation that had already
+    happened.
+    """
+
+    adapters = {"only": _provider("only", "one-family")}
+    profiles = (ProviderProfile(name="only", family="one-family", tier=3),)
+    group = "explore:RRUN-y:0"
+
+    def build() -> ModelRouter:
+        return _router(
+            runtime_db,
+            tmp_path,
+            run_id=run_id,
+            project_id=runtime_project,
+            adapters=adapters,
+            profiles=profiles,
+        )
+
+    build().complete(
+        _request(
+            role=ModelRole.SEEDED_EXPLORER,
+            capability=Capability.SYNTHESIS,
+            independence=Independence.DIFFERENT_FAMILY,
+            independence_group=group,
+        )
+    )
+    resumed = build().complete(
+        _request(
+            role=ModelRole.SKEPTIC,
+            capability=Capability.CRITIQUE,
+            criticality=Criticality.CRITICAL,
+            independence=Independence.DIFFERENT_FAMILY,
+            independence_group=group,
+        )
+    )
+    assert resumed.independence_note.startswith("DEGRADED")
+    assert "not independent review" in resumed.independence_note
+    call = next(
+        c
+        for c in RuntimeStore(runtime_db).list_model_calls(run_id=run_id)
+        if c.role == str(ModelRole.SKEPTIC)
+    )
+    assert call.independence_note and call.independence_note.startswith("DEGRADED")

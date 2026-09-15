@@ -197,6 +197,38 @@ uv run pytest -q tests/test_runtime_*.py
 Set `RESEARCH_OS_SKIP_PG_TESTS=1` to skip them; they skip themselves with a
 reason if `pgserver` is not installed.
 
+## 8a. Budgets, and what each dimension actually enforces
+
+Not all five behave the same way, and the difference matters when reading a
+report.
+
+| dimension | enforcement |
+|---|---|
+| `model_calls` | reserved before the call, settled after. A call cannot happen without capacity |
+| `model_cost_usd` | reserved at the profile's estimate, settled at the provider's reported cost |
+| `external_jobs` | reserved before submission |
+| `work_items` | reserved before a local experiment |
+| `wall_clock_seconds` | **charged after the fact**, per cycle entry |
+
+Wall clock is the exception and it is worth being explicit. Nothing interrupts a
+running graph on elapsed time; a cycle's duration is bounded by the per-call and
+per-experiment timeouts, and the budget records what it used so the *next*
+continuation decision can see it. That is weaker than the v1 research layer,
+which checks elapsed time before every invocation, and the difference is
+deliberate: interrupting a graph mid-node would leave exactly the
+half-completed-effect state the invocation ledger exists to avoid.
+
+It is charged per *entry*, not from the run's start, and it is charged when a
+cycle stops at a human gate as well as when it finishes — both of which were
+bugs an independent review found.
+
+Two scopes are created by default: a per-run budget from `runtime.yaml`, and a
+per-*project* cost ceiling of `max_model_cost_usd x max_cycles_per_objective`.
+The project ceiling exists because `should_continue` ignores run scope when
+deciding to continue — the successor gets a fresh run budget — so without it one
+objective's exposure was the per-run cost times the cycle ceiling, with nothing
+warning.
+
 ## 9. researchd, the control plane
 
 One local process, one loop, deterministic work. `deploy/researchd.service` is a
