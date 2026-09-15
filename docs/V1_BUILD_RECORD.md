@@ -1334,3 +1334,136 @@ migration carry `''` and are correctly never served as a cache hit.
 - **10.8 GB of finished-run worktrees are held** after today's pilots.
   `researchctl storage --reclaim` releases them; they were left in place so the
   external reviewer can inspect the pilot evidence.
+
+## 31. The independent delta review, and the twelve things it found
+
+One read-only review of `v1.0.0..2da74e1`, fresh context, strongest local model,
+no write authority and an explicit ban on running the test suite — the same
+scoping that made the v1.0.0 review usable after its first attempt spent its
+budget on pytest. Verdict: **PASS WITH BOUNDED REPAIR**, twelve findings. Three
+graded DEFECT, seven MINOR, two INFORMATIONAL. All twelve were repaired.
+
+Independence: **`DEGRADED_SAME_PROVIDER_FAMILY`**. Only one model family is
+installed on this machine. That is the gap the external review exists to close
+and it is the reason this candidate is not being merged.
+
+### The three defects, which are one defect
+
+Every one of them was the controller claiming to know something it did not.
+
+**The capsule test accepted a directory on disk.** `capsule_present` was
+`".research/project.yaml" in tracked or (root / ".research").is_dir()` — two
+substrates, one of them the working tree, inside a module whose stated premise
+is that a file somebody left lying around cannot change what kind of project
+this is. A crashed `init-project`, a hand-made directory or a symlink flipped
+it. And it never asked whether the capsule could be *read*, while
+`build_science_context` decides the same fact by asking exactly that. When they
+disagreed, one prompt carried both *"This project holds a Research Capsule, so
+scientific objects exist and may be cited by their identifiers"* and *"no
+Research Capsule at .research, so this project holds no scientific state"* —
+under a heading saying these are facts and not to contradict them. The worker's
+only available citations were then invented ones: the capsule-less failure this
+release exists to close, reached from the other side. The researcher could not
+override it either, because the config key is per project id and a project whose
+capsule will not parse has no id to key on.
+
+**`cross_project_promotion` was a free pass.** Every other hard kind is
+corroborated against something the controller reads. This one was refused only
+when there was no capsule at all — so any checkpoint in any capsule project
+could be relabelled `cross_project_promotion`, and an unattended run would stop
+to ask "shall I continue?" with the ledger recording it as hard. That is the
+single failure `scientific_only` exists to prevent, surviving inside the feature
+built to prevent it. `costly_authorization` had the weaker version: one
+experiment task anywhere made the label eligible for every checkpoint in the
+plan, including ones placed after the experiment had already run, and including
+runs that were never authorised to spend anything.
+
+**Check discovery offered `uv run pytest` to projects that declare no pytest.**
+A `tests/` directory was enough. Because a profile then exists, the plan is
+*forced* to name the check and forbidden from writing its own — so the command
+cannot spawn, the bounded repair burns on an environment error, and the run
+fails closed having verified nothing. The v1.0.0 trap, reintroduced through the
+profile instead of through the planner, with the profile printing
+`pytest_available: no` beside it.
+
+### The nine smaller ones
+
+A cache-served retrieval wrote no `SearchRecord`, three lines under a docstring
+promising every path records one. `network_calls` counted a refused reservation
+and a real 429 the same way, so it answered the quota question wrongly in
+exactly the case it was asked. The long-`Retry-After` early return fires for
+five statuses and read the header for one. A successful search erased a recorded
+quota reset while the stale count beside it survived. The pacer leaked raw
+`sqlite3.Error`, which is not in `WORKER_ERRORS` and would leave a research task
+`RUNNING` rather than `FAILED`; and a failed `COMMIT` left the transaction open
+under a restored isolation level, so the next write would silently join it. A
+truncated tracked-file list was reported as a deterministic *absence*.
+`MINIMUM_CALLS[PROPOSAL]` stated a requirement that is false for the dispatch it
+refuses. A symbol could not be written `solve()`.
+
+And the placeholder guard, which this release had **over-corrected**. Dropping
+the "at least one token must be a placeholder" half also refused "Query the
+data", "Results summary" and "First results" — ordinary titles — costing a
+re-ask on a plan that was fine and then a failed run on the second identical
+phrasing. The requirement is restored. It still catches every degenerate field
+any live pilot produced, because every one of them contained "test", and the
+length rule still catches the class no word list can.
+
+### One suggestion not taken
+
+A nesting guard on the pacing transaction was written, broke a test that
+legitimately left an uncommitted write on the shared connection, and was
+removed. The review had already verified `_immediate()` is never nested, so it
+was speculative hardening rather than a repair of anything found.
+
+### What the review could not break
+
+Recorded because it is the more useful half, and because it is what the external
+reviewer should try to break next. No model-originated value reaches
+`ProjectProfile`, a `CheckProfile` argv, or a checkpoint's eligibility decision
+— the reviewer traced every input and found `git ls-files`, `tomllib`, and a
+config file outside every worktree. A `CLAIM-0001` cannot be got through a
+capsule-less assessment: `capsule_ids` is hard-coded empty and
+`_reject_unsupplied` compares against it. A `FileRef` cannot escape the
+repository: field-level rules reject absolute, traversing and backslash paths,
+and the survivor must then be an exact member of `git ls-files`. `PlannedCommand`
+declaring `required` means `extra="forbid"` would *not* have caught a model
+setting it — the explicit `parse_plan` guard is the only thing that does, and
+`parse_plan` is the only construction site fed a model payload. `_reach_checkpoint`
+does not consult the policy at all, so no branch can drop a hard checkpoint. The
+replan bound is `for correction in (False, True)`: structurally two iterations.
+The migration is correct against a real v1 database and `cache_key != ''` means
+a pre-migration row can never be mistaken for a cache entry. And there is no
+path that spends a model call without charging it — the reviewer enumerated
+every raise site either side of the first `_invoke`.
+
+### Mutation proofs for the repairs
+
+Nine more mutations, one per repair. Eight detected on the first attempt; **one
+was not**, and it is the same lesson as `M5a`:
+
+| # | mutation | detected by |
+| --- | --- | --- |
+| M11 | `capsule_present` accepts an on-disk `.research/` again | 3 tests |
+| M12 | `capsule_present` stops asking whether the capsule parses | 2 tests |
+| M13 | `cross_project_promotion` needs only a capsule again | 2 tests |
+| M14 | a `tests/` directory alone justifies `uv run pytest` again | **initially MISSED** |
+| M15 | a cache hit is not archived | 1 test |
+| M16 | a 5xx `Retry-After` is not persisted | 1 test |
+| M17 | `quota_reset_at` is clearable again | 1 test |
+| M18 | `network_calls` filters on status again | 1 test |
+| M19 | the failed `COMMIT` leaves the transaction open | 1 test |
+
+M14 was missed because every fixture in the check-profile tests declared pytest,
+so no test distinguished "declared" from "has a tests directory". Two now do,
+one of them an invariant asserting that a discovered profile never contradicts
+the capability printed beside it — which is the property that was actually
+violated, rather than the instance.
+
+### After the repairs
+
+Full suite 2,581 passing, `ruff check`, `ruff format --check` and
+`git diff --check` clean. Two further consecutive workflows against real
+projects — the `src`-layout check-profile pilot and the capsule-less cuPDLP.jl
+assessment — both `READY_FOR_HUMAN`, no new controller defect, and every pilot
+project's tree and index digest still identical to before the campaign began.
