@@ -352,3 +352,281 @@ name had misled a reader. Every available provider is assumed tier 3. That is
 now stated in the class docstring, in `docs/RUNTIME.md` §11, and by
 `runtime doctor` on every run — rather than fixed by building a benchmark, which
 the brief was explicit should wait for a measured routing failure.
+
+## 6. The closed-loop CCAO pilot
+
+`pilots/run_closed_loop.sh`, against the real `ccao-covariance-regressivity`
+capsule. What it adds to `pilots/run_pilot.sh` is the human scientific gate, and
+because a promotion writes a capsule file it works on a **copy** of the capsule
+inside the pilot sandbox: the researcher's repository is read once, hashed
+before and after, and never written.
+
+### The one thing in it that is not the real act
+
+Phase 2 writes a capsule object through the capsule layout, exactly as
+`researchctl propose promote` does, and does **not** invoke that command.
+`AGENTS.md` forbids an automated agent from invoking it or answering its
+confirmation prompt, and the command requires an interactive terminal for that
+reason. So the promotion is a *stand-in for the human act*, labelled as one
+everywhere it appears.
+
+That is honest about what is being demonstrated. The promotion path is v1 code
+with its own tests; what had never been shown is that the runtime *notices* a
+promotion nobody told it about and continues on its own. Phase 3 is the claim
+and phase 2 is its premise.
+
+### What the first run produced, and the two defects it found
+
+Real provider, real capsule, four model calls, 0.364 USD.
+
+Ten of eleven checks passed on the first run. The two that mattered are worth
+recording in full, because both are the kind of thing only a real run finds.
+
+**The planner chose to propose, for the right reason.** Unprompted by anything
+except the frontier and a finding count, `claude-opus-5` returned:
+
+> One finding is available and no permitted action would tell this runtime
+> anything new about the project. The frontier's only live items are the
+> contested CLAIM-0001 and the open Q-0001, and both require canonical
+> scientific writes (adjudication, retirement, promotion) that this runtime
+> cannot perform — so re-reading the repository or the literature would return
+> the same frontier at nonzero cost. [...] The remaining productive move is to
+> convert the existing finding into a grounded, noncanonical capsule-change
+> proposal [...] and place it in front of a human who can actually decide.
+
+That is the reasoning `PLANNER@2` was rewritten to make available, arrived at on
+a real capsule. The proposal cited `FIND-...65821c72`, quoted it, recorded a
+scientific basis, and the stand-in promotion wrote `Q-0002` as `question/open`
+— draft strength, which is the only strength promotion produces.
+
+**Defect 1: the continuation refused at the exact moment the wait had ended.**
+`CAPSULE_CHANGED` fired, `frontier_changed: True`, the advance work item ran —
+and no successor cycle opened.
+
+The cause is worth stating because it is a *semantic* error rather than a
+mechanical one. `should_continue`'s progress check compared the parked cycle's
+frontier digest with its **parent's**. For the ordinary continuation that is
+right: a cycle that has just concluded is its own "now". For an advance it is
+wrong — it asks "did that old cycle learn anything", and the answer is no,
+which is precisely why it stopped and waited. The two digests were identical
+(`43866175b23b` for both cycles), as they are for *every* real successor,
+because the runtime cannot move the frontier its own planning is derived from.
+
+`should_continue` now takes `observed_frontier`, the frontier as measured by
+the caller, and the comparison becomes "has the frontier moved since this cycle
+recorded one" — which is the question both callers actually mean. An *empty*
+measurement is explicitly not a change: it means the capsule could not be read,
+and treating unknown as changed opens a cycle over a frontier nobody measured.
+`tests/test_runtime_capsule_watch.py` reproduces the pilot's exact shape.
+
+**Defect 2: a failed assessor lost a good proposal — or rescued it by accident.**
+The assessor exhausted its structured-output retries
+(`error_max_structured_output_retries`) *after* the proposal had been stored,
+because `ProposalController` stores and then assesses. The work item was
+recorded FAILED. The proposal survived only because the idempotency ledger
+consults the reconciler on its FAILED path:
+
+```text
+WARNING invocation IVK-...  (cycle.propose_capsule_change) recorded a failure
+        but the action had taken hold; reusing it
+```
+
+It worked, and it worked by accident of a mechanism built for a different
+purpose. A `ProviderInvocationError` now looks for the reserved proposal before
+failing: if it is there, the action *succeeds*, `assessed=False` is stated in
+the data and in the detail, and the run is not reported as failed for producing
+exactly what it was asked for. A proposal that reached a person without the
+independent assessment is a weaker thing than one that passed, and nothing said
+so where a reader would look.
+
+## 7. The scientific-authority audit, stated as things a reader can check
+
+Not a promise. Each row names the file to read or the test to run.
+
+| claim | how to check it |
+|---|---|
+| the runtime cannot promote a proposal | `tests/test_runtime_authority.py::test_no_runtime_module_promotes_a_proposal` parses every file under `research_os/runtime` for an import of `research_os.proposal.promote` or a call to `write_promotion`/`prepare_promotion` |
+| the proposal action writes no file itself | `test_the_proposal_action_writes_no_capsule_file` parses `actions/proposals.py` for a builtin `open` or a `write_text`/`write_bytes`/`mkdir`/`unlink`/`rmtree` attribute call |
+| the runtime cannot author a human Review | `test_no_runtime_module_writes_a_human_review`; `research_os.review`'s writers are unreachable from the package |
+| the runtime cannot accept a Claim | `test_no_runtime_module_reimplements_the_acceptance_rule`; the runtime may *call* `validate.claim_approval` and may not define anything shaped like it |
+| only one module reaches a capsule | `test_only_the_kernel_adapter_reaches_the_capsule`; `runtime/kernel.py` is the sole importer of `research_os.capsule`/`validate`/`review` |
+| that module has no write method | `test_the_kernel_adapter_exposes_no_write_method` inspects `ScientificKernelAdapter`'s public surface |
+| no `A2` action has a handler | `tests/test_runtime_registry.py` |
+| a nomination cannot become knowledge | `tests/test_runtime_nominations.py::test_a_nomination_is_written_with_the_transfer_judgement_left_blank` and `test_nothing_is_promoted_and_no_insight_exists_afterwards` |
+| PostgreSQL holds no science | `sql/0001_runtime.sql`'s header states it and the schema contains no scientific object; deleting the database loses the queue, the leases, the spend and the checkpoints, and loses no science |
+| human promotion stays explicit | `proposal/commands.py::_promote` and `insights/commands.py::_promote` both refuse a non-interactive terminal, and `AGENTS.md` binds agents regardless of what the terminal permits |
+
+Two things this release *added* to the boundary rather than merely preserving:
+
+**A proposal is refused if its scientific basis moved.** Promotion is the only
+door, and before this it would open onto a capsule that had changed since the
+reasoning was written. `research_os/proposal/basis.py`.
+
+**A nomination cannot express the judgement that a finding transfers.** The
+runtime leaves `scope`, `assumptions` and `applicability` empty, and a
+`PromotedInsight` requires all three non-empty. The gap is not a field a future
+convenience can fill; it is two types in two stores.
+
+## 8. Operational autonomy: what is still manual, and which of it is intentional
+
+The distinction the whole release rests on. These are different lists and
+conflating them is how "the system needs babysitting" and "the system asks me
+about science" get confused.
+
+### Intentional human scientific decisions — these are the design
+
+```text
+researchctl review <CLAIM-ID>          accept a Claim; needs a TTY
+researchctl propose promote <PROP> --item <PR-00N>
+                                       make a proposed item a DRAFT object
+researchctl insight promote <NOM>      make a nomination cross-project knowledge
+edit a manifest + record a Decision    change a primary endpoint
+create a new Experiment                change a preregistration materially
+merge a candidate branch yourself      integrate to a canonical branch
+submit or release it yourself          publish
+delete it yourself, in a Git commit    delete scientific state
+```
+
+All eight `A2` actions are human-*executed*, which is a property rather than a
+policy: each means writing canonical scientific state, merging to a canonical
+branch, or publishing, and the runtime has no method for any of those.
+
+### Remaining manual *operational* actions
+
+Honest and short.
+
+| action | why it is still manual |
+|---|---|
+| `researchctl runtime start <project> --objective ...` | starting an objective is the launch. Nothing should invent one |
+| starting `researchd`, or installing `deploy/researchd.service` | enabling a persistent service on someone's machine is theirs to decide; `AGENTS.md` rule 13 |
+| `researchctl runtime migrate` on upgrade | idempotent and called at every startup, so in practice automatic; listed because a DSN pointing at a database the operator has not migrated is a real state |
+| `researchctl runtime dev-db start` | only on a machine with no PostgreSQL |
+| `researchctl storage --reclaim` | 12 GB of finished worktrees on this machine. Reclaiming is destructive and bounded, so it asks |
+| answering a surfaced approval with `runtime approve` / `decline` | this *is* the scientific gate. Operational only in the sense that the verb is a CLI command |
+
+**What is no longer manual, and was before this release:** continuing an
+objective after a scientific change. That was a typed command, and it is now
+`_observe_capsules` plus `_work_advance_objective`.
+
+## 8a. The three independent adversarial audits
+
+Three audits ran against the branch after the first closed-loop pilot, one per
+area, each told to try to break a specific claim rather than to review the diff.
+All three findings tables are in `docs/RUNTIME.md` §16. What is worth recording
+here is the *shape* of what they found, because it was not what the mission
+brief anticipated.
+
+**Not one of them found a missing feature.** Every finding was a place where
+this code, or a docstring in it, or this document, asserted a property the
+implementation did not have. Seven of the twenty-one were assertions that had
+been true when written and had stopped being true; the rest had never been true.
+
+Four are worth naming as classes, because each one recurs:
+
+**A lock held for less time than the thing it protects.** `lock_run` took
+`pg_advisory_xact_lock` inside its own `with self._db.tx()`, which commits
+before the function returns. The docstring described the race precisely and the
+implementation released the lock before the caller's next statement. The same
+shape nearly went into `claim_next_interpretation` — the first draft of the fix
+for the interpretation race was `for update skip locked` on the eligibility
+query, in its own transaction, which would have been exactly as useless. The
+lesson is mechanical: a transaction-scoped lock is only a lock for callers
+inside that transaction, so either the whole check-then-act moves into the
+transaction, or the invariant moves into the schema. Both were used here — the
+first for the interpretation claim, the second (a partial unique index) for run
+succession, because the protected region there is a multi-minute LangGraph
+cycle and no database transaction should be open across one.
+
+**A guard proven in one direction.** `test_each_status_constraint_matches_its_
+python_enum` is parametrized over `ENUM_CONSTRAINTS`, so it proves that every
+constraint *named in the dictionary* matches its enum, and says nothing about a
+constraint in the schema that nobody added to the dictionary. Two had escaped.
+The same asymmetry produced the grounding check that verified quoted ⊆ citable
+and not the reverse. A test whose domain is a hand-maintained list is a test
+whose coverage is a hand-maintained list.
+
+**Containment that breaks the thing it contains.** The sandbox's PATH is four
+system directories and its binds are a fixed allowlist. `uv` — the first token
+of every acceptance command in this repository — is in neither, so a contained
+check exits 127 and is recorded as an acceptance failure of the code the worker
+had just written. This is worse than no containment, because it is containment
+that reports a false scientific-adjacent result. Turning containment on had
+never been tried end to end on this host, which is exactly why: it cannot be.
+
+**A threat model borrowed from the wrong reader.** `terminal_safe` escapes
+control characters because a *terminal* interprets them. A researcher reading a
+proposal is not a terminal. `\u202e` is not a control character, is handled
+perfectly correctly by every terminal, and reverses the displayed order of the
+sentence a person is about to make a scientific decision from. The fix is
+narrow on purpose — bidi, zero-width, separators, tag characters — because
+escaping the whole of Unicode category Cf would make a reviewer's Hebrew title
+unreadable in order to prevent an attack the narrow set already prevents.
+
+**What the audits did not find, and it matters:** no authority escape. No path
+by which the runtime records a Review, a promotion, an acceptance or a Decision;
+no way for a prompt to reach a capsule writer; no action that moves a proposal
+to promoted. The structural tests that assert this were tightened
+(`record_promotion` added to the forbidden import set) and not weakened.
+
+## 9. External blockers, with the evidence
+
+Three. None is a defect and none was worked around.
+
+**No Slurm.** `sbatch`, `squeue`, `sacct`, `scancel`, `srun`, `sinfo` are all
+absent; `/etc/slurm*` does not exist; `slurmd` and `munge` are inactive. The
+submission path has never met a scheduler. `tests/test_experiment_slurm_live.py`
+is the harness, behind `-m slurm_live`; its bodies are written and have never
+been executed.
+
+**No OS containment.** `kernel.apparmor_restrict_unprivileged_userns = 1` and
+`/usr/bin/bwrap` is not setuid, so every bubblewrap variant fails at the uid map
+or at loopback setup; `unshare -U` succeeds and writing `/proc/self/uid_map` is
+denied; `systemd-run --user`'s sandboxing directives start the unit and do not
+bind; `podman`, `docker` and `apptainer` are absent. Lifting it needs root,
+which `AGENTS.md` rule 8 forbids without explicit authorisation. Consequence:
+high-autonomy execution of model-written code is **refused** on this host.
+
+**One provider family.** `claude` is authenticated; `codex` and `gemini` are
+not installed. So `review_independence: require` would refuse every critical
+scientific review here, and `prefer` — the default — records
+`DEGRADED_SAME_PROVIDER_FAMILY` instead. A same-family reviewer is not
+relabelled as cross-provider independence.
+
+**One real research programme.** `ccao-covariance-regressivity` is the only
+capsule on this machine that is somebody's actual research. The second pilot
+therefore runs against `pilots/fixtures/streamstats-variance`, and what that is
+needs stating precisely.
+
+Its *capsule* -- one open question about whether a one-pass variance estimator
+survives a large additive offset, and one draft hypothesis addressing it -- was
+authored in an earlier session and had been living in that session's scratchpad
+under `/tmp`, registered from there. That is not durable and it is not
+reproducible from this repository, so both the capsule objects and a rewritten,
+extended version of the code are vendored here: three estimators rather than
+two, a test suite whose accuracy cases fail if the shifted estimator is
+"simplified" back into the naive one, and `scripts/bench_variance.py`, a
+parameterised experiment that measures accuracy *and* per-element cost against
+`statistics.variance` over the same values. `experiments.yaml.example` is the
+declaration the researcher copies to `~/.config/research-os/experiments.yaml`;
+it is not read from the repository, because an experiment's argv is the
+researcher's to declare.
+
+Its frontier is the reason it is here: one actionable, untested hypothesis and
+one open question, where CCAO has one contested claim and one open question.
+`critique_hypothesis` and `design_experiment` are reachable on this frontier and
+not on that one, which is what "structurally different" means for the
+engineering.
+
+**What it is not:** a second research programme, or evidence that the loop
+produces good science on a capsule it did not anticipate. The hypothesis was
+written to be testable by a command that exists, by the same hand that wrote the
+runtime. The CCAO run is the one with a real scientific frontier behind it, and
+the two runs are reported separately for that reason.
+
+One note on this document's own accuracy. An earlier revision said the fixture
+was "authored as a pilot fixture in an earlier session", which was true; a later
+revision of *this section* asserted the path was empty and the claim false,
+which was wrong -- `find /home/nicacevedo -maxdepth 6 -type d -name .research`
+does not reach `/tmp`, and the registry did. Both statements are left recorded
+rather than replaced, because a build record that edits away its own mistakes is
+not a record of anything.

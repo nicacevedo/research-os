@@ -131,8 +131,10 @@ class ProposalStore:
         read.
 
         A directory that exists but holds no valid proposal is a half-written
-        one, and :meth:`create` still refuses it -- silently completing it would
-        mean guessing which of two attempts' content belongs there.
+        one, and it is moved aside rather than completed: completing it would
+        mean guessing which of two attempts' content belongs there, and
+        refusing it wedged the cycle permanently, because a reserved id cannot
+        be regenerated.
         """
 
         directory = proposals_root() / proposal.proposal_id
@@ -140,6 +142,33 @@ class ProposalStore:
             store = cls(directory)
             store.load()
             return store, False
+        if directory.exists():
+            # A directory with no valid proposal in it: a crash inside
+            # `create`, between the `mkdir` and the `save`. Moved aside rather
+            # than completed or refused.
+            #
+            # Refusing was the previous behaviour and it was a permanent wedge,
+            # which an adversarial review executed: `create` raises "proposal
+            # directory already exists", and because a reserved id is a pure
+            # function of the reservation key, *no* retry can ever get a
+            # different one. That cycle could never produce its proposal again.
+            #
+            # Completing it would mean guessing which of two attempts' content
+            # belongs there. Moving it aside is safe because it is runtime
+            # state that nobody has read -- it has no `proposal.json`, so
+            # nothing could have rendered it.
+            aside = directory.with_name(f"{directory.name}.partial")
+            index = 1
+            while aside.exists():
+                aside = directory.with_name(f"{directory.name}.partial-{index}")
+                index += 1
+            try:
+                directory.rename(aside)
+            except OSError as exc:
+                raise ProposalStoreError(
+                    f"{directory} holds no valid proposal and could not be "
+                    f"moved aside: {exc}"
+                ) from exc
         return cls.create(proposal), True
 
     @classmethod
@@ -177,20 +206,54 @@ class ProposalStore:
     def list_proposal_ids(cls) -> tuple[str, ...]:
         """Return every proposal id on disk, newest last.
 
-        Proposal ids begin with a UTC timestamp, so lexical order is
-        chronological.
+        Ordered by each proposal's own ``created_at``, not by its id. The id
+        used to be the order -- it begins with a UTC timestamp, so lexical order
+        was chronological -- and that stopped being true the moment the runtime
+        started reserving identities. A reserved id's timestamp is derived from
+        the reservation key so that a retry recomputes it, which means it cannot
+        also be the attempt's clock; :func:`reserved_proposal_id` stamps
+        ``19700101T000000Z`` rather than a plausible-looking lie. An adversarial
+        review pointed out the consequence: every runtime proposal sorted to the
+        front of the researcher's decision queue, before every proposal they
+        made themselves, in digest order among themselves.
+
+        So the order comes from the document. ``created_at`` is a real timestamp
+        on every proposal, reserved or not. A file that cannot be read or has no
+        usable timestamp falls back to its id, which keeps the listing total and
+        keeps an unreadable proposal visible rather than dropping it.
         """
 
         root = proposals_root()
         if not root.is_dir():
             return ()
+        entries = [
+            entry for entry in root.iterdir() if (entry / PROPOSAL_FILENAME).is_file()
+        ]
         return tuple(
-            sorted(
-                entry.name
-                for entry in root.iterdir()
-                if (entry / PROPOSAL_FILENAME).is_file()
-            )
+            entry.name
+            for entry in sorted(entries, key=lambda item: cls._order_key(item))
         )
+
+    @staticmethod
+    def _order_key(directory: Path) -> tuple[str, str]:
+        """``(created_at, id)`` for one proposal directory, cheaply.
+
+        The id is the tiebreak, so two proposals created in the same second have
+        a stable order. Any failure to read the timestamp yields the empty
+        string, which sorts such a proposal first -- visible, and in front of
+        the queue rather than silently absent from it.
+        """
+
+        created = ""
+        try:
+            document = json.loads(
+                (directory / PROPOSAL_FILENAME).read_text(encoding="utf-8")
+            )
+            if isinstance(document, dict):
+                created = str(document.get("created_at") or "")
+        except (OSError, ValueError):
+            created = ""
+        return (created, directory.name)
 
     def load(self) -> ResearchProposal:
         raw = self._read(self.proposal_file)

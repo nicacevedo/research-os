@@ -75,3 +75,50 @@ def test_the_package_declares_a_license_or_this_test_says_so() -> None:
             f"pyproject declares license {declared!r} but no LICENSE file is in "
             "the tree, so nothing states the terms it refers to"
         )
+
+
+def test_every_migration_ships_in_the_package() -> None:
+    """A migration that is not packaged is a database an installed copy cannot build.
+
+    The runtime's schema is numbered SQL files discovered from
+    ``research_os/runtime/sql/`` at runtime, and they are *data* rather than
+    modules. A build backend that shipped only ``.py`` files would produce a
+    wheel that imports fine, starts fine, and fails at ``runtime migrate`` on
+    somebody else's machine with "no migration files found" — which is the kind
+    of defect that cannot happen when you run from source and always happens on
+    first install.
+
+    Asserted against the declared package data rather than by building a wheel:
+    a build takes seconds and this needs to run in every suite. The build itself
+    was verified once by hand, and the property that keeps it true is that the
+    backend includes non-Python files under the package root.
+    """
+
+    from research_os.runtime.migrations import discover, sql_dir
+
+    found = discover()
+    assert found, "no migrations discovered; the path in `sql_dir` is wrong"
+    on_disk = sorted(path.name for path in sql_dir().glob("*.sql"))
+    assert [migration.path.name for migration in found] == on_disk
+
+    # The package directory is inside the importable package, which is what
+    # makes it shippable at all. A migration directory beside `src/` would be
+    # discovered in a source checkout and absent from every install.
+    import research_os
+
+    package_root = Path(research_os.__file__).resolve().parent
+    assert package_root in sql_dir().resolve().parents
+
+
+def test_the_declared_schema_version_is_the_highest_shipped_migration() -> None:
+    """Duplicated in `test_runtime_schema.py`, and deliberately also here.
+
+    That copy needs a database and skips without one. This one does not, so a
+    packaging change that dropped a migration file fails a test that always
+    runs.
+    """
+
+    from research_os.runtime import RUNTIME_SCHEMA_VERSION
+    from research_os.runtime.migrations import discover
+
+    assert RUNTIME_SCHEMA_VERSION == max(m.version for m in discover())

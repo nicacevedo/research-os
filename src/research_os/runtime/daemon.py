@@ -75,7 +75,7 @@ from research_os.runtime.models import (
 )
 from research_os.runtime.notify import FileNotifier
 from research_os.runtime.queue import LeaseLostError, WorkQueue
-from research_os.runtime.store import RuntimeStore
+from research_os.runtime.store import RuntimeStore, SuccessorExistsError
 
 LOG = logging.getLogger("researchd")
 
@@ -473,12 +473,15 @@ class Daemon:
             )
             if not changed:
                 continue
-            report.capsule_changes += 1
-            # Exactly one event per (project, new digest). The dedup key is the
-            # mechanism; recording the previous digest in the payload is what
-            # makes "what changed" answerable afterwards from the event log
-            # alone.
-            self._store.record_event(
+            # Exactly one event per *transition*, not per destination digest.
+            #
+            # The key was `capsule-changed:{project}:{capsule}`, and event
+            # dedup is global and permanent -- so promote, revert, re-promote
+            # produced two events for three real changes and the third was
+            # discarded in silence. An adversarial review executed it. Keying
+            # on the pair means a state the project has been in before is still
+            # a change when it is arrived at again.
+            _event, created = self._store.record_event(
                 kind="CAPSULE_CHANGED",
                 project_id=project.project_id,
                 payload={
@@ -488,14 +491,30 @@ class Daemon:
                     "previous_frontier_digest": previous_frontier,
                     "frontier_changed": frontier != (previous_frontier or ""),
                 },
-                dedup_key=f"capsule-changed:{project.project_id}:{capsule}",
+                dedup_key=(
+                    f"capsule-changed:{project.project_id}:"
+                    f"{(previous_capsule or 'none')[:16]}->{capsule[:16]}"
+                ),
             )
-            LOG.info(
-                "%s: canonical scientific state changed (%s -> %s)",
-                project.project_id,
-                (previous_capsule or "none")[:12],
-                capsule[:12],
-            )
+            if created:
+                report.capsule_changes += 1
+                LOG.info(
+                    "%s: canonical scientific state changed (%s -> %s)",
+                    project.project_id,
+                    (previous_capsule or "none")[:12],
+                    capsule[:12],
+                )
+            else:
+                # Counted only when it became an event. The counter is what a
+                # person reads to answer "has this been noticing anything", and
+                # one that counts observations no work came from answers wrongly
+                # in the direction of reassurance -- which is the mistake
+                # `observe_capsule`'s own docstring argues against.
+                report.notes.append(
+                    f"{project.project_id}: the capsule changed to a state it "
+                    f"has been in before ({capsule[:12]}), which an earlier "
+                    f"event already claimed; no new work was queued"
+                )
 
     # -------------------------------------------------------------- events --
     def _ingest_events(self, report: TickReport) -> None:
@@ -600,8 +619,11 @@ class Daemon:
             # ingest. Keyed on the digest rather than the project so that a
             # *second*, later change is a second advance rather than being
             # swallowed by the first one's key.
+            # Per project and *transition*, matching the event's own key, so a
+            # state the project has been in before still becomes work.
+            previous = str(event.payload.get("previous_capsule_digest") or "none")
             digest = str(event.payload.get("capsule_digest") or event.event_id)
-            return f"{kind}:{event.project_id}:{digest}"
+            return f"{kind}:{event.project_id}:{previous[:16]}->{digest[:16]}"
         return f"{kind}:{event.event_id}"
 
     def _fire_schedules(self, report: TickReport) -> None:
@@ -993,12 +1015,16 @@ class Daemon:
         2. it has **no successor already**. Two observations of one change
            cannot produce two cycles; the work item's dedup key makes that
            unlikely and this makes it impossible.
-        3. the **frontier actually moved**. A capsule change that leaves the
-           unresolved work identical -- a charter rewrite, a sharpened
-           statement -- is recorded as an event and does not open a cycle,
-           because a successor over an identical frontier is the seven-cycle
-           pilot in ``docs/RUNTIME.md`` §16 all over again.
-        4. ``should_continue``'s own bounds permit it: lineage depth against
+        3. the **frontier actually moved**, and moved *since this cycle recorded
+           one*. Checked by `should_continue` against the frontier this pass
+           measured, which is passed in explicitly -- see the comment at the
+           call. A capsule change that leaves the unresolved work identical (a
+           charter rewrite, a sharpened statement) is recorded as an event and
+           opens no cycle, because a successor over an identical frontier is
+           the seven-cycle pilot in ``docs/RUNTIME.md`` §16 again. A frontier
+           that could not be *computed* is also not a change: unknown is not
+           changed.
+        4. ``should_continue``'s other bounds permit it: lineage depth against
            ``max_cycles_per_objective``, and the project budget.
 
         A refusal returns why. "Nothing happened and the log says nothing" is
@@ -1024,18 +1050,6 @@ class Daemon:
         advanced: list[dict[str, Any]] = []
         skipped: list[dict[str, str]] = []
         for run in parked:
-            if frontier and run.frontier_digest and frontier == run.frontier_digest:
-                skipped.append(
-                    {
-                        "run_id": run.run_id,
-                        "reason": (
-                            "the canonical science changed but the unresolved "
-                            "frontier did not, so a successor cycle would "
-                            "recompute the same work and add no information"
-                        ),
-                    }
-                )
-                continue
             previous = CycleResult(
                 run=run,
                 status=run.status,
@@ -1052,25 +1066,58 @@ class Daemon:
                 notes=(),
                 state={},
             )
+            # The measured frontier, passed explicitly. Without it
+            # `should_continue` compares this parked cycle's digest against its
+            # *parent's* -- which asks "did that old cycle learn anything", and
+            # the answer is no, which is why it stopped and waited. It therefore
+            # refused the successor at the exact moment the wait had ended. The
+            # first closed-loop pilot against the real CCAO capsule caught it:
+            # CAPSULE_CHANGED fired, the advance ran, and no cycle opened.
+            # A cheap pre-check, not the guard. Two concurrent advances can
+            # both read False here; `research_runs_one_successor_idx` is what
+            # makes only one of them succeed, and the loser raises
+            # `SuccessorExistsError` at the insert below. This used to call
+            # `lock_run` first, which took an advisory lock and released it
+            # before returning -- see `sql/0014_one_successor_per_run.sql`.
+            if self._store.has_successor(run.run_id):
+                skipped.append(
+                    {
+                        "run_id": run.run_id,
+                        "reason": (
+                            "another pass opened this objective's successor "
+                            "while this one was deciding"
+                        ),
+                    }
+                )
+                continue
             proceed, why = should_continue(
-                db=self._db, config=self._config, result=previous
+                db=self._db,
+                config=self._config,
+                result=previous,
+                observed_frontier=frontier,
             )
             if not proceed:
                 skipped.append({"run_id": run.run_id, "reason": why})
                 continue
-            successor = start_cycle(
-                config=self._config,
-                db=self._db,
-                project_id=project_id,
-                repo_path=self._repo_for(project_id),
-                objective=run.objective,
-                models=lambda successor_id: self._models(
-                    successor_id, project_id, item.work_id
-                ),
-                autonomy=Autonomy(str(run.autonomy)),
-                parent_run_id=run.run_id,
-                cycle_index=run.cycle_index + 1,
-            )
+            try:
+                successor = start_cycle(
+                    config=self._config,
+                    db=self._db,
+                    project_id=project_id,
+                    repo_path=self._repo_for(project_id),
+                    objective=run.objective,
+                    models=lambda successor_id: self._models(
+                        successor_id, project_id, item.work_id
+                    ),
+                    autonomy=Autonomy(str(run.autonomy)),
+                    parent_run_id=run.run_id,
+                    cycle_index=run.cycle_index + 1,
+                )
+            except SuccessorExistsError as exc:
+                # The race the pre-check above cannot close, closed here by the
+                # database. A lost race is not a failure of this work item.
+                skipped.append({"run_id": run.run_id, "reason": str(exc)})
+                continue
             advanced.append(
                 {
                     "parent_run_id": run.run_id,

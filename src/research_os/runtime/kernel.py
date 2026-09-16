@@ -245,10 +245,18 @@ class ScientificKernelAdapter:
         return tuple(quotable)
 
     # -------------------------------------------------------------- frontier --
-    def frontier(self) -> Frontier:
-        """Derive the unresolved frontier from the files, deterministically."""
+    def frontier(self, report: ProjectValidationReport | None = None) -> Frontier:
+        """Derive the unresolved frontier from the files, deterministically.
 
-        report = self.validate()
+        ``report`` lets a caller that has already validated pass its own reading
+        in, so two derived values describe one moment instead of two. The
+        capsule watcher needs that: it computes a capsule digest and a frontier
+        digest together, and a human commit landing between two independent
+        validations would pair a digest from before it with a frontier from
+        after. See :func:`research_os.runtime.capsulewatch.observed_digests`.
+        """
+
+        report = self.validate() if report is None else report
         if report.project is None:
             raise CapsuleError(f"{self._repo}: no valid project identity")
         project_id = str(report.project.id)
@@ -323,11 +331,29 @@ class ScientificKernelAdapter:
 
     # ------------------------------------------------------------- authority --
     def refuse_scientific_authority(self, action: str) -> None:
-        """Refuse, loudly, an action only a human may take.
+        """The message a refusal of human scientific authority carries.
 
-        Exists so that the refusal is one call with one message rather than a
-        scattering of ad-hoc raises, and so that the list of refused actions is
-        greppable.
+        **Not the gate.** An adversarial review went looking for the callers
+        this method's previous docstring implied -- "the list of refused actions
+        is greppable" -- and found none, because there is nothing in the runtime
+        for it to refuse. The enforcement is structural and lives in three
+        places, none of which is a call to this method:
+
+        * this adapter has no method that writes a Review, a promotion or an
+          acceptance, and ``tests/test_runtime_authority.py`` fails if one is
+          added or if this module so much as imports ``write_review``,
+          ``write_promotion``, ``prepare_promotion`` or ``record_promotion``;
+        * the eight ``A2`` actions are ``human_executes`` in
+          :mod:`research_os.runtime.policy`, so the graph's own dispatch has no
+          handler to reach;
+        * the scientific kernel is file-backed and append-only through the
+          capsule writers, which the runtime does not hold.
+
+        What this *is* for: a caller that finds itself one step from recording a
+        human decision raises this rather than inventing its own sentence, so
+        the researcher gets the same instruction -- run the command yourself --
+        wherever the boundary is met. Keeping it costs one method; removing it
+        would mean the next such caller writes its own wording.
         """
 
         raise ScientificAuthorityError(

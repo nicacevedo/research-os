@@ -43,7 +43,12 @@ from research_os.runtime.models import RunStatus, TerminalState
 from research_os.runtime.notify import CollectingNotifier
 from research_os.runtime.policy import ActionKind
 from research_os.runtime.store import RuntimeStore
-from tests.fs_helpers import hypothesis_data, write_yaml
+from tests.fs_helpers import (
+    hypothesis_data,
+    make_git_repo,
+    write_minimal_capsule,
+    write_yaml,
+)
 from tests.runtime_graph_helpers import (
     ScriptedRouter,
     make_capsule,
@@ -652,3 +657,371 @@ def test_the_closed_loop_from_finding_to_successor_cycle(
     # And the project's science is the person's: the runtime wrote one file
     # under `.research/`, and it was the person's promotion fixture.
     assert (plane["repo"] / ".research" / "hypotheses" / "HYP-0002.yaml").is_file()
+
+
+# ------------------------------------------- the link that opened the loop ---
+def test_an_action_that_observes_something_records_a_citable_finding(
+    plane: dict[str, Any],
+) -> None:
+    """The link that was missing, and that kept the loop open.
+
+    Every handler already returned a one-sentence ``detail`` and structured
+    ``data``; nothing turned either into something with an identifier. So
+    ``propose_capsule_change`` had an empty grounding allowlist, and the field
+    the v1 validator has always checked stayed unused -- the loop was closed in
+    code and open in practice.
+    """
+
+    from research_os.runtime.cycles import open_cycle
+    from research_os.runtime.policy import ActionKind
+
+    daemon: Daemon = plane["daemon"]
+    store: RuntimeStore = plane["store"]
+    plane["router"].answers["planner"] = plan_answer(str(ActionKind.INSPECT_REPOSITORY))
+    run = open_cycle(
+        config=daemon._config,
+        db=plane["db"],
+        project_id="alpha-project",
+        repo_path=plane["repo"],
+        objective="what does this repository contain",
+    )
+    for _ in range(4):
+        daemon.tick()
+
+    findings = store.list_findings(project_id="alpha-project")
+    assert findings, "an inspection produced no finding, so nothing can cite it"
+    finding = store.get_finding(findings[0].finding_id)
+    assert finding is not None
+    assert finding.source_run_id == run.run_id
+    assert finding.source_action == str(ActionKind.INSPECT_REPOSITORY)
+    assert finding.summary, "the finding carries no statement"
+    # The handler's own words, not a paraphrase: a summariser between the
+    # observation and the citation is one more place for a claim to drift from
+    # its evidence.
+    assert finding.summary == findings[0].summary
+
+    # And it names what it rests on. Which edges exist depends on the action --
+    # a repository inspection cites the capsule objects the plan addressed, a
+    # frontier assessment cites its own artifact, a literature search cites
+    # work keys -- so what is asserted is that *some* provenance edge exists,
+    # not a particular one. A finding with none would be a citable identifier
+    # for nothing.
+    assert finding.artifact_ids or finding.capsule_refs or finding.literature_keys, (
+        "the finding names nothing it rests on"
+    )
+
+
+def test_a_frontier_assessment_names_the_artifact_it_produced(
+    plane: dict[str, Any],
+) -> None:
+    """The edge a person follows from a proposal to bytes by content hash."""
+
+    from research_os.runtime.cycles import open_cycle
+    from research_os.runtime.policy import ActionKind
+
+    daemon: Daemon = plane["daemon"]
+    store: RuntimeStore = plane["store"]
+    plane["router"].answers["planner"] = plan_answer(str(ActionKind.ASSESS_FRONTIER))
+    open_cycle(
+        config=daemon._config,
+        db=plane["db"],
+        project_id="alpha-project",
+        repo_path=plane["repo"],
+        objective="what is outstanding",
+    )
+    for _ in range(4):
+        daemon.tick()
+
+    findings = [
+        store.get_finding(item.finding_id)
+        for item in store.list_findings(project_id="alpha-project")
+    ]
+    assessed = [
+        item
+        for item in findings
+        if item is not None and item.source_action == str(ActionKind.ASSESS_FRONTIER)
+    ]
+    assert assessed, "the frontier assessment produced no finding"
+    assert assessed[0].artifact_ids, "it names no artifact"
+    # And the artifact is really there, by its content address.
+    from research_os.runtime.artifacts import FilesystemArtifactStore
+
+    artifacts = FilesystemArtifactStore(daemon._config.artifacts_root, store=store)
+    assert artifacts.exists(assessed[0].artifact_ids[0])
+
+
+def test_an_action_whose_output_is_an_ask_records_no_finding(
+    plane: dict[str, Any],
+) -> None:
+    """A finding about having asked would be a citable observation with nothing
+    behind it."""
+
+    from research_os.runtime.graphs.cycle import FINDING_FOR_ACTION
+    from research_os.runtime.policy import ActionKind
+
+    for action in (
+        ActionKind.PROPOSE_CAPSULE_CHANGE,
+        ActionKind.NOMINATE_INSIGHT,
+        ActionKind.DRAFT_MANUSCRIPT,
+        ActionKind.RUN_LOCAL_EXPERIMENT,
+        ActionKind.SUBMIT_CLUSTER_EXPERIMENT,
+        ActionKind.DESIGN_EXPERIMENT,
+    ):
+        assert action not in FINDING_FOR_ACTION, (
+            f"{action} produces an ask or a plan, not an observation"
+        )
+
+
+def test_the_planner_is_told_how_many_findings_exist(
+    plane: dict[str, Any],
+) -> None:
+    """Because `propose_capsule_change` is the only action that can move the
+    frontier, and it has nothing to propose from without them.
+
+    A count rather than the findings themselves: the planner is choosing an
+    action, and handing it the text would invite it to plan from a finding's
+    content rather than from the project's state.
+    """
+
+    from research_os.runtime.cycles import open_cycle
+    from research_os.runtime.policy import ActionKind
+
+    daemon: Daemon = plane["daemon"]
+    plane["router"].answers["planner"] = plan_answer(str(ActionKind.ASSESS_FRONTIER))
+    open_cycle(
+        config=daemon._config,
+        db=plane["db"],
+        project_id="alpha-project",
+        repo_path=plane["repo"],
+        objective="o",
+    )
+    for _ in range(4):
+        daemon.tick()
+
+    planner_prompts = [
+        request.prompt for request in plane["router"].requests_for("planner")
+    ]
+    assert planner_prompts, "the planner was never asked"
+    assert "FINDINGS AVAILABLE:" in planner_prompts[0].upper()
+    assert "propose_capsule_change" in planner_prompts[0]
+
+
+# ------------------------------------- what the first real pilot caught ------
+def test_a_parked_cycle_with_an_identical_parent_still_advances(
+    plane: dict[str, Any],
+) -> None:
+    """The defect the first closed-loop CCAO pilot found, as a test.
+
+    The shape is the ordinary one and that is why it mattered: cycle 0 runs,
+    cycle 1 is its successor, cycle 1 records the *same* frontier as cycle 0
+    (correctly -- the runtime cannot change canonical science, so its own work
+    never moves the frontier), cycle 1 produces a proposal and parks.
+
+    A person then promotes it. `CAPSULE_CHANGED` fires, the advance runs, and
+    `should_continue` compared cycle 1's digest against **cycle 0's**, found
+    them equal, and refused -- at the exact moment the wait had ended. The
+    comparison asked "did that old cycle learn anything", and the answer was no,
+    which is precisely why it had stopped.
+
+    The question it must ask is "has the frontier moved *since* cycle 1
+    recorded one", so the measured frontier is passed in.
+    """
+
+    daemon: Daemon = plane["daemon"]
+    clock: FrozenClock = plane["clock"]
+    store: RuntimeStore = plane["store"]
+    daemon.tick()
+
+    _capsule, before = observed_digests(plane["repo"])
+    first = store.create_run(
+        project_id="alpha-project", objective="whether the widget deforms"
+    )
+    store.set_frontier_digest(first.run_id, before)
+    store.set_run_status(first.run_id, RunStatus.RUNNING)
+    store.set_run_status(
+        first.run_id, RunStatus.SUCCEEDED, terminal_state=TerminalState.DONE_FOR_NOW
+    )
+    second = store.create_run(
+        project_id="alpha-project",
+        objective="whether the widget deforms",
+        parent_run_id=first.run_id,
+        cycle_index=1,
+    )
+    # The same digest as its parent. Not a mistake -- the runtime's own work
+    # cannot move the frontier, so this is what every real successor records.
+    store.set_frontier_digest(second.run_id, before)
+    store.set_run_status(second.run_id, RunStatus.RUNNING)
+    store.set_run_status(
+        second.run_id,
+        RunStatus.SUCCEEDED,
+        terminal_state=TerminalState.WAITING_FOR_SCIENTIFIC_DECISION,
+    )
+
+    _promote_a_hypothesis(plane["repo"])
+    clock.advance(60)
+    daemon.tick()
+    daemon.tick()
+
+    successors = [
+        run
+        for run in store.list_runs(project_id="alpha-project")
+        if run.parent_run_id == second.run_id
+    ]
+    assert len(successors) == 1, (
+        "the promotion did not continue the objective; `should_continue` "
+        "compared the parked cycle with its parent instead of with now"
+    )
+    assert successors[0].cycle_index == second.cycle_index + 1
+
+
+def test_an_uncomputable_frontier_is_not_treated_as_a_change(
+    plane: dict[str, Any],
+) -> None:
+    """Unknown is not changed.
+
+    `observed_digests` returns an empty frontier when the capsule cannot be
+    read -- mid-edit, a checkout in progress. An earlier version of the
+    eligibility check was `if frontier and ... == ...`, so an empty string fell
+    through to "changed" and opened a successor cycle over a frontier nobody
+    had measured.
+    """
+
+    from research_os.runtime.cycles import should_continue
+
+    store: RuntimeStore = plane["store"]
+    run = store.create_run(project_id="alpha-project", objective="o")
+    store.set_frontier_digest(run.run_id, "a" * 64)
+    store.set_run_status(run.run_id, RunStatus.RUNNING)
+    store.set_run_status(
+        run.run_id, RunStatus.SUCCEEDED, terminal_state=TerminalState.DONE_FOR_NOW
+    )
+    parked = store.require_run(run.run_id)
+
+    from research_os.runtime.cycles import CycleResult
+
+    result = CycleResult(
+        run=parked,
+        status=parked.status,
+        terminal_state=parked.terminal_state,
+        pending_approval_id=None,
+        recommendation="START_NEXT_CYCLE",
+        notes=(),
+        state={},
+    )
+    proceed, why = should_continue(
+        db=plane["db"],
+        config=plane["daemon"]._config,
+        result=result,
+        observed_frontier="",
+    )
+    assert proceed is False
+    assert "could not be computed" in why
+    assert "Unknown is not changed" in why
+
+    # And a measured, different frontier does proceed.
+    proceed, why = should_continue(
+        db=plane["db"],
+        config=plane["daemon"]._config,
+        result=result,
+        observed_frontier="b" * 64,
+    )
+    assert proceed is True, why
+
+
+def test_status_shows_a_parked_objective_and_the_observation_count(
+    plane: dict[str, Any],
+) -> None:
+    """The state a researcher most needs to see and the one hardest to notice.
+
+    A parked run is ``SUCCEEDED``, so it appears nowhere under RUNNING, WAITING
+    FOR YOU or FAILED. Its terminal state is the only thing saying a person is
+    the next step, and before this it was visible only by reading
+    ``runtime runs``.
+
+    The observation count answers the other question a stuck researcher asks:
+    is the watcher watching? Zero changes on a project whose science has moved
+    is the symptom of a daemon that is not running, and it looks identical to a
+    project nobody has touched.
+    """
+
+    from research_os.runtime.report import collect_status, render_status
+
+    daemon: Daemon = plane["daemon"]
+    daemon.tick()
+    parked = _park_a_run(plane)
+
+    # Before any promotion: the parked run is the one shown, and the project
+    # has been observed without anything having changed.
+    report = collect_status(plane["db"])
+    assert [run.run_id for _project, run in report.parked] == [parked.run_id]
+    assert [project for project, _digest, _seen in report.observations] == [
+        "alpha-project"
+    ]
+    assert report.observations[0][2] == 0, "a first observation is not a change"
+
+    rendered = render_status(report)
+    assert "WAITING FOR A SCIENTIFIC DECISION" in rendered
+    assert parked.run_id in rendered
+    assert "CAPSULE OBSERVATION" in rendered
+    payload = report.payload()
+    assert payload["parked"][0]["run_id"] == parked.run_id
+    assert payload["observations"][0]["changes_seen"] == 0
+
+    # After the promotion the count moves, and the parked row becomes the
+    # successor -- which is the loop working, not a reporting bug: the original
+    # run now has a child, so it is no longer the tip of its lineage.
+    _promote_a_hypothesis(plane["repo"])
+    plane["clock"].advance(60)
+    daemon.tick()
+    daemon.tick()
+
+    after = collect_status(plane["db"])
+    assert after.observations[0][2] == 1, "the change was not counted"
+    parked_ids = {run.run_id for _project, run in after.parked}
+    assert parked.run_id not in parked_ids, (
+        "a run that has a successor is no longer waiting for anyone"
+    )
+
+
+# -- one validation, not two ------------------------------------------------
+def test_both_digests_come_from_one_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pair has to describe one moment, and it did not.
+
+    `capsule_digest(kernel)` called `kernel.validate()` and `kernel.frontier()`
+    called it again, so the two digests came from two independent reads of the
+    working tree. What lands in between is a researcher's `git commit` of a
+    promotion -- the exact event this function exists to notice -- and the
+    resulting row paired a capsule digest from before it with a frontier from
+    after.
+    """
+
+    repo = make_git_repo(tmp_path / "counted")
+    write_minimal_capsule(repo, project_id="counted-project")
+
+    from research_os.runtime import kernel as kernel_module
+
+    calls: list[str] = []
+    original = kernel_module.validate_project
+
+    def counting(path: object) -> object:
+        calls.append(str(path))
+        return original(path)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(kernel_module, "validate_project", counting)
+
+    capsule, frontier = observed_digests(repo)
+
+    assert capsule and frontier
+    assert len(calls) == 1, f"the capsule was validated {len(calls)} times"
+
+
+def test_an_unreadable_capsule_is_reported_once(tmp_path: Path) -> None:
+    """And the early return does not lose the reason."""
+
+    empty = make_git_repo(tmp_path / "hollow")
+    capsule, frontier = observed_digests(empty)
+
+    assert capsule.startswith(UNREADABLE_PREFIX)
+    assert frontier == ""

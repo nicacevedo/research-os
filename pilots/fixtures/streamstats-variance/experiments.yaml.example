@@ -1,0 +1,44 @@
+# The declaration this project needs in ~/.config/research-os/experiments.yaml.
+#
+# Copied there rather than read from here, deliberately: the file lives outside
+# every automation worktree so that a worker confined to one cannot add a
+# command or widen an existing one. What an experiment may run is the
+# researcher's declaration, not a model's.
+
+schema_version: 1
+
+projects:
+  streamstats-variance:
+    default_executor: local
+    commands:
+      bench-variance:
+        name: bench-variance
+        description: >-
+          Measure the accuracy and the per-element cost of all three
+          estimators against statistics.variance over the same values.
+        argv:
+          - "python3"
+          - "scripts/bench_variance.py"
+          - "--n"
+          - "{n}"
+          - "--offset"
+          - "{offset}"
+          - "--seed"
+          - "{seed}"
+        parameters:
+          - name: n
+            type: integer
+            required: true
+            minimum: 1000
+            maximum: 2000000
+          - name: offset
+            type: number
+            required: true
+            minimum: 0
+            maximum: 1000000000000
+          - name: seed
+            type: integer
+            required: true
+            minimum: 0
+            maximum: 65535
+        timeout_seconds: 600

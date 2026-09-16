@@ -247,3 +247,67 @@ def test_the_prompt_boundary_is_untouched_by_the_display_boundary() -> None:
 
     assert promptdata.CONTROL_CHARS is CONTROL_CHARS
     assert promptdata.prompt_safe(f"a{CLEAR_SCREEN}b") == "a [2Jb"
+
+
+# -- characters that are not control characters and are not text ------------
+#
+# Written as `chr(...)` throughout. A test about invisible characters that
+# embeds them as literals is a test whose own source cannot be reviewed -- and
+# ruff refuses the file, for the same reason.
+RLO = chr(0x202E)  # RIGHT-TO-LEFT OVERRIDE
+ZWSP = chr(0x200B)  # ZERO WIDTH SPACE
+TAG_A = chr(0xE0041)  # TAG LATIN CAPITAL LETTER A
+
+
+def test_a_bidi_override_is_made_visible() -> None:
+    """A finding that reads one way and archives another.
+
+    U+202E contains no control character, so ``CONTROL_CHARS`` let it through.
+    It reverses the display order of everything after it, which means the
+    sentence a researcher reads in a run report is not the sentence stored --
+    at the exact boundary the authority model is protecting.
+    """
+
+    rendered = terminal_safe(f"the effect is {RLO}real")
+
+    assert RLO not in rendered
+    assert rendered == "the effect is \\u202ereal"
+
+
+def test_zero_width_characters_cannot_hide_inside_an_identifier() -> None:
+    """Two ids that render identically are two ids a reader cannot tell apart."""
+
+    assert terminal_safe(f"EXP-0001{ZWSP} vs EXP-0001") == (
+        "EXP-0001\\u200b vs EXP-0001"
+    )
+
+
+def test_a_tag_character_is_escaped_as_its_own_code_point() -> None:
+    """Above the BMP, so the escape has to widen rather than truncate."""
+
+    assert terminal_safe(f"hi{TAG_A}") == "hi\\U000e0041"
+
+
+def test_legitimate_text_is_untouched() -> None:
+    """The set is deliberately narrow. Accented and non-Latin text is text."""
+
+    for text in (
+        "caf\u00e9",
+        "\u03a9\u03bc\u03ad\u03b3\u03b1",
+        "\u05e2\u05d1\u05e8\u05d9\u05ea",
+        "a\tb\nc",
+    ):
+        assert terminal_safe(text) == text
+
+
+def test_the_prompt_boundary_replaces_them_with_spaces() -> None:
+    """A visible escape is four characters of noise inside a prompt.
+
+    The prompt boundary neutralises rather than displays, which is what the
+    rest of ``_scrub_control`` does to every control character.
+    """
+
+    from research_os.automation.promptdata import prompt_safe
+
+    assert RLO not in prompt_safe(f"the effect is {RLO}real")
+    assert ZWSP not in prompt_safe(f"EXP{ZWSP}-0001")

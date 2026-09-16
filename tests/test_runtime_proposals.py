@@ -732,3 +732,76 @@ def _capsule_fingerprint(repo: Path) -> dict[str, str]:
                 path.read_bytes()
             ).hexdigest()
     return found
+
+
+# ------------------------------------- what the first real pilot caught ------
+def test_an_assessor_failure_keeps_the_proposal_and_says_it_is_unassessed(
+    env: dict[str, Any],
+) -> None:
+    """The second defect the first closed-loop CCAO pilot found.
+
+    `ProposalController` stores the proposal and *then* runs the independent
+    assessment, so an assessor failure raises after the valuable artifact
+    exists. In the pilot the assessor exhausted its structured-output retries;
+    the work item was recorded FAILED, and the proposal survived only because
+    the idempotency ledger consults the reconciler on its FAILED path. It
+    worked, and it worked by accident of a mechanism built for a different
+    purpose.
+
+    Now it is intended: the proposal is returned, the run is not reported as
+    failed for producing exactly what it was asked for, and `assessed=False`
+    says plainly that nobody independent looked at it.
+    """
+
+    finding = _finding(env)
+    from tests.fake_providers import FakeProvider, ScriptedResponse
+
+    provider = FakeProvider(
+        name="claude",
+        family="anthropic",
+        responses={
+            "planner": [
+                ScriptedResponse(
+                    structured=proposal_payload(
+                        items=[item(grounded_in_findings=[finding.finding_id])]
+                    )
+                )
+            ],
+            # What the pilot's provider actually did.
+            "reviewer": [ScriptedResponse(error="error_max_structured_output_retries")],
+        },
+    )
+    controller = make_controller({"claude": provider})
+    env["monkeypatch"].setattr(proposal_action, "_controller", lambda _ctx: controller)
+
+    outcome = propose_capsule_change(env["state"], _context(env), {})
+    assert outcome.ok, outcome.detail
+    assert outcome.data["assessed"] is False
+    assert "NO independent assessment" in outcome.detail
+    assert outcome.data["assessment_error"]
+
+    from research_os.proposal.store import ProposalStore
+
+    created = ProposalStore.list_proposal_ids()
+    assert len(created) == 1, "the proposal was lost with the assessment"
+    assert outcome.data["proposal_id"] == created[0]
+    assert ProposalStore.open(created[0]).load_assessment() is None
+
+
+def test_a_successful_proposal_reports_that_it_was_assessed(
+    env: dict[str, Any],
+) -> None:
+    """The distinction only means something if the other side is asserted too."""
+
+    finding = _finding(env)
+    _install_controller(
+        env,
+        proposal=proposal_payload(
+            items=[item(grounded_in_findings=[finding.finding_id])]
+        ),
+    )
+    outcome = propose_capsule_change(env["state"], _context(env), {})
+    assert outcome.ok, outcome.detail
+    assert outcome.data["assessed"] is True
+    assert outcome.data["assessment"]["verdict"]
+    assert "NO independent assessment" not in outcome.detail

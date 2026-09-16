@@ -50,20 +50,98 @@ def _charter_digest(root: Path) -> str | None:
         return None
 
 
-def referenced_object_ids(proposal: ResearchProposal) -> tuple[str, ...]:
-    """The capsule objects this proposal's items actually cite, sorted.
+def _object_digest(obj: object, project_id: str) -> str:
+    """One cited object's semantic digest, or a marker if it has none.
 
-    The *cited* set, not the offered one. ``grounding.capsule_ids`` is
+    Guarded, because `Reviewable` is every scientific object *except* ``Review``
+    and a proposal can legitimately cite a Review: ``build_science_context``
+    includes reviews in the citable set, so a worker that wrote
+    ``addresses: ["REV-0001"]`` produced a *valid* proposal whose basis snapshot
+    then raised an uncaught ``TypeError`` — through `ProposalController._parse`,
+    past every handler in `propose_capsule_change`, leaving the reservation
+    `RESERVED` and the action dead on exactly the projects where a human has
+    recorded a Review. Found by an adversarial review.
+
+    `research_os.runtime.capsulewatch` guards the same call for the same reason.
+    """
+
+    from research_os.models import Review
+
+    if isinstance(obj, Review):
+        # A Review has no subject digest of its own; what identifies it for
+        # staleness is the verdict and what it was a verdict *about*.
+        return (
+            f"review|{obj.reviewer_kind}|{obj.verdict}|{obj.subject}|"
+            f"{obj.subject_digest}"
+        )
+    try:
+        return subject_digest(obj, project_id=project_id)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return "not-reviewable"
+
+
+def referenced_object_ids(
+    proposal: ResearchProposal, *, root: Path | None = None
+) -> tuple[str, ...]:
+    """What this proposal rests on: the objects it cites, and what *they* rest on.
+
+    The *cited* set rather than the offered one. ``grounding.capsule_ids`` is
     everything the worker was shown -- usually every object in the project --
     and snapshotting that would make any change anywhere in the capsule
     invalidate every waiting proposal, which is the over-broad check this whole
     mechanism exists to replace.
+
+    **Plus one hop, which an adversarial review showed is not optional.** A
+    proposal citing ``HYP-0001`` rests on the Evidence that hypothesis rests on
+    and on any Review that has judged it, and neither is in ``addresses``.
+    Executed: retracting the cited hypothesis's supporting Evidence -- status to
+    ``withdrawn``, statement replaced with "RETRACTED: the load cell was
+    miscalibrated" -- and adding a human Review with ``verdict: reject`` left
+    the basis reporting ``fresh``, and the promotion proceeded. Neither change
+    touches the cited object's own semantic digest: ``semantic_projection`` puts
+    only evidence *ids* in a Hypothesis's projection, and a Review is a separate
+    object the subject does not point at.
+
+    So one hop: each cited object's ``supporting_evidence``,
+    ``contrary_evidence``, ``assumptions`` and ``hypotheses``, plus every Review
+    whose ``subject`` is a cited object. One hop and not transitive closure,
+    because the closure of a mature capsule is the capsule, and that is the
+    over-broad check again.
+
+    ``root`` is the project to read the graph from. Without it only the directly
+    cited ids are returned, which is what a caller that has no project to read
+    can honestly say.
     """
 
     cited: set[str] = set()
     for item in proposal.items:
         cited.update(item.addresses)
-    return tuple(sorted(cited))
+    if root is None or not cited:
+        return tuple(sorted(cited))
+
+    report = validate_project(root)
+    by_id = {str(obj.id): obj for obj in report.objects}
+    neighbours: set[str] = set()
+    for object_id in cited:
+        obj = by_id.get(object_id)
+        if obj is None:
+            continue
+        for attribute in (
+            "supporting_evidence",
+            "contrary_evidence",
+            "assumptions",
+            "hypotheses",
+        ):
+            for value in getattr(obj, attribute, None) or ():
+                neighbours.add(str(value))
+    for obj in report.objects:
+        subject = getattr(obj, "subject", None)
+        if subject is not None and str(subject) in cited:
+            # A Review of a cited object. Adding one, removing one, or changing
+            # its verdict is the most consequential change that can happen to
+            # what a proposal rests on.
+            neighbours.add(str(obj.id))
+    return tuple(sorted(cited | (neighbours & set(by_id))))
 
 
 def scientific_basis(
@@ -113,9 +191,7 @@ def scientific_basis(
             statuses[object_id] = "<missing>"
             continue
         status = str(getattr(obj, "status", ""))
-        pairs.append(
-            (object_id, f"{status}|{subject_digest(obj, project_id=resolved_project)}")
-        )
+        pairs.append((object_id, f"{status}|{_object_digest(obj, resolved_project)}"))
         statuses[object_id] = status
         versions[object_id] = int(getattr(obj, "schema_version", 1))
     return ScientificBasisSnapshot(
@@ -143,6 +219,17 @@ class BasisStatus:
     fresh: bool
     reason: str = ""
     changed_objects: tuple[str, ...] = ()
+    unchecked: tuple[str, ...] = ()
+    """Parts of the basis this caller could not verify. Reported, never blocking.
+
+    A fourth answer, and it has to be distinct from the other three. "The
+    objects are unchanged and the runtime findings were not re-checked" is not
+    staleness -- blocking on it would refuse every runtime proposal forever,
+    because recomputing a finding digest needs the operational database and the
+    scientific layers deliberately do not depend on it. Nor is it freshness
+    with nothing to say. So it is freshness *with a caveat*, and the caveat is
+    printed where a person will read it before deciding.
+    """
 
     @property
     def stale(self) -> bool:
@@ -181,6 +268,24 @@ def basis_status(
                 "science it rested on has changed cannot be established. It was "
                 "made before basis snapshots existed; regenerate it if the "
                 "project has moved on since."
+            ),
+        )
+    if not snapshot.referenced_object_ids and snapshot.charter_digest is None:
+        # Nothing was cited, so nothing's change could be detected, so `fresh`
+        # would be asserting a check that did not happen. Reachable and not
+        # hypothetical: `addresses` is optional for a question, a hypothesis and
+        # an experiment, so a whole proposal can legitimately cite nothing --
+        # and an adversarial review executed it, answering a Question, retiring
+        # a Hypothesis and withdrawing an Evidence while the basis reported
+        # `fresh` and the promotion proceeded. The only surviving check was the
+        # project id.
+        return BasisStatus(
+            checkable=False,
+            fresh=False,
+            reason=(
+                "this proposal cites no scientific object and was not grounded "
+                "in the charter, so there is nothing whose change could be "
+                "detected. Read it against the project's current state yourself."
             ),
         )
 
@@ -242,20 +347,35 @@ def basis_status(
                 "and the proposal was grounded in it"
             ),
         )
-    if (
-        finding_packet_digest is not None
-        and snapshot.finding_packet_digest is not None
-        and finding_packet_digest != snapshot.finding_packet_digest
-    ):
-        return BasisStatus(
-            checkable=True,
-            fresh=False,
-            reason=(
-                "the runtime findings this proposal was grounded in have been "
-                "superseded, so what it cites no longer says what it said"
-            ),
-        )
-    return BasisStatus(checkable=True, fresh=True, reason="the basis is unchanged")
+    unchecked: tuple[str, ...] = ()
+    if snapshot.finding_packet_digest is not None:
+        if finding_packet_digest is None:
+            # The one part of a *runtime* proposal's basis that a human
+            # promotion never checks, and it used to report "the basis is
+            # unchanged" anyway. An adversarial review found that.
+            #
+            # Reported rather than blocking. `_promote` cannot recompute the
+            # digest -- that needs the operational database, which the
+            # scientific layers deliberately do not depend on -- so refusing on
+            # it would refuse every runtime proposal forever. Saying so is the
+            # honest answer; saying nothing was the defect.
+            unchecked = ("the runtime findings it cites were not re-checked",)
+        elif finding_packet_digest != snapshot.finding_packet_digest:
+            return BasisStatus(
+                checkable=True,
+                fresh=False,
+                reason=(
+                    "the runtime findings this proposal was grounded in have "
+                    "been superseded, so what it cites no longer says what it "
+                    "said"
+                ),
+            )
+    return BasisStatus(
+        checkable=True,
+        fresh=True,
+        reason="the basis is unchanged",
+        unchecked=unchecked,
+    )
 
 
 def _changed_objects(snapshot: ScientificBasisSnapshot, root: Path) -> tuple[str, ...]:

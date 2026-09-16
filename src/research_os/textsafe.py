@@ -23,6 +23,12 @@ characters ``\\x1b`` -- so nothing is hidden from the reader and nothing is
 interpreted by the terminal. Rewriting the characters rather than parsing escape
 *sequences* means there is no sequence grammar to get wrong: a terminal cannot
 act on an ESC it never receives, whatever follows it.
+
+The same treatment is applied to :data:`DECEPTIVE_CHARS`, which are not control
+characters and which a terminal handles perfectly correctly -- that is the
+problem. They change what the reader sees while leaving the bytes intact, and
+the reader is the person the authority boundary is protecting. See that
+constant for what is in the set and, more importantly, what is not.
 """
 
 from __future__ import annotations
@@ -36,8 +42,66 @@ CONTROL_CHARS: frozenset[str] = frozenset(
     chr(code) for code in (*range(0x20), 0x7F, *range(0x80, 0xA0))
 )
 
+#: Characters that are not control characters but are not text either.
+#:
+#: An adversarial review of the display boundary made the point that
+#: :data:`CONTROL_CHARS` is the *terminal's* threat model, not the reader's. A
+#: finding containing ``\u202e`` contains no control character at all; it
+#: reverses the display order of everything after it, so the sentence a
+#: researcher reads in the report is not the sentence the archive stores. The
+#: same review showed a zero-width joiner splitting an experiment id so that two
+#: different ids rendered identically.
+#:
+#: Four groups, and each one changes what a human sees without changing the
+#: bytes:
+#:
+#: * bidirectional overrides and isolates -- ``\u061c``, ``\u200e``,
+#:   ``\u200f``, ``\u202a``-``\u202e``, ``\u2066``-``\u2069``;
+#: * zero-width and invisible characters -- ``\u00ad`` (soft hyphen),
+#:   ``\u200b``-``\u200d``, ``\u2060``, ``\ufeff``;
+#: * the Unicode line and paragraph separators ``\u2028`` and ``\u2029``,
+#:   which some terminals and every text widget treat as line breaks although
+#:   ``str.splitlines`` is the only thing in Python that agrees;
+#: * interlinear annotation ``\ufff9``-``\ufffb`` and the deprecated tag
+#:   characters ``\U000e0000``-``\U000e007f``, both of which carry text that
+#:   renders as nothing.
+#:
+#: Deliberately *not* included: combining marks, emoji modifiers, and the
+#: general category Cf beyond the list above. Those appear in legitimate text --
+#: a reviewer quoting a Hebrew title, a finding naming a file with an accent --
+#: and escaping them would make honest content unreadable to force an attack
+#: that the four groups above already cover.
+DECEPTIVE_CHARS: frozenset[str] = frozenset(
+    (
+        "\u061c",
+        "\u200e",
+        "\u200f",
+        "\u00ad",
+        "\u2060",
+        "\ufeff",
+        "\u2028",
+        "\u2029",
+        *(chr(code) for code in range(0x202A, 0x202F)),
+        *(chr(code) for code in range(0x2066, 0x206A)),
+        *(chr(code) for code in range(0x200B, 0x200E)),
+        *(chr(code) for code in range(0xFFF9, 0xFFFC)),
+        *(chr(code) for code in range(0xE0000, 0xE0080)),
+    )
+)
+
 #: The control characters a rendered report keeps, because they are its layout.
 DISPLAY_KEPT: frozenset[str] = frozenset({"\n", "\t"})
+
+
+def _escape(character: str) -> str:
+    """One unsafe character as the visible text of its own code point."""
+
+    code = ord(character)
+    if code <= 0xFF:
+        return f"\\x{code:02x}"
+    if code <= 0xFFFF:
+        return f"\\u{code:04x}"
+    return f"\\U{code:08x}"
 
 
 def terminal_safe(text: str, *, keep: frozenset[str] = DISPLAY_KEPT) -> str:
@@ -50,10 +114,9 @@ def terminal_safe(text: str, *, keep: frozenset[str] = DISPLAY_KEPT) -> str:
     that cleared their screen would not be.
     """
 
-    unsafe = CONTROL_CHARS - keep
+    unsafe = (CONTROL_CHARS | DECEPTIVE_CHARS) - keep
     if not any(character in unsafe for character in text):
         return text
     return "".join(
-        f"\\x{ord(character):02x}" if character in unsafe else character
-        for character in text
+        _escape(character) if character in unsafe else character for character in text
     )

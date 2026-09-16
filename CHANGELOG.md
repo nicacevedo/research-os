@@ -122,6 +122,97 @@ either line exercised the combination.
   once in a test's hand-written list, so adding a kind made an unrelated test
   fail. It is one module constant now.
 
+#### What the first closed-loop pilot changed
+
+Run against the real CCAO capsule with a real provider. Ten of eleven asserted
+properties passed first time; the two defects it found are the kind only a real
+run produces.
+
+- **The continuation refused at the exact moment the wait had ended.**
+  `should_continue`'s progress check compared the parked cycle's frontier digest
+  with its *parent's*. For an ordinary continuation that is right. For an
+  advance it asks "did that old cycle learn anything" — and the answer is no,
+  which is precisely why it stopped and waited. The two digests are identical
+  for *every* real successor, because the runtime cannot move the frontier its
+  own planning is derived from. `CAPSULE_CHANGED` fired, `frontier_changed:
+  True`, the advance ran, and no cycle opened. `should_continue` now takes the
+  frontier as *measured by the caller*, and an unmeasurable frontier is
+  explicitly not a change.
+- **A failed assessor lost a good proposal, or rescued it by accident.** The
+  assessor exhausted its structured-output retries after the proposal had been
+  stored, because the controller stores and then assesses. The work item was
+  recorded FAILED and the proposal survived only because the idempotency ledger
+  consults the reconciler on its FAILED path — a mechanism built for something
+  else. It is intended now, and `assessed=False` is stated in the result and in
+  the detail.
+- Two hardenings found while fixing those: a run that requires containment on a
+  host without it is refused **at preflight**, before a worktree exists (a
+  `SandboxError` raised from inside a check is not an `AutomationError`, so it
+  escaped the handler that fails a run cleanly and left it EXECUTING forever);
+  and `parked_objectives` selects one run per objective by a *total* order,
+  because two runs can share `created_at` to the microsecond and both would
+  otherwise be advanced.
+- `runtime status` now shows parked objectives and the capsule-observation
+  count. A parked run is `SUCCEEDED`, so it appeared nowhere under RUNNING,
+  WAITING FOR YOU or FAILED — the state a researcher most needs to see was the
+  one hardest to notice. The observation count answers the other question a
+  stuck researcher asks: is the watcher watching?
+
+#### What three independent adversarial audits changed
+
+Three audits ran against this branch — authority, containment, concurrency —
+after the first closed-loop pilot. Every finding they raised was about a claim
+the code or its documentation made and did not support, not about a missing
+feature. `docs/RUNTIME.md` §16 has the full table; the substantive repairs:
+
+- **The citable finding ids now live outside every data fence** in the prompt
+  that writes a proposal, not only in the one that corrects it. The list of ids
+  a worker may cite must not be reachable from inside a block of text a model
+  wrote, which is the whole reason `render_supplied_findings` renders the ids
+  twice.
+- **The stored `SuppliedFinding.statement` is the string the worker read.** The
+  prompt clipped at 1500 characters and the record kept 4000, so a conclusion
+  past the cut appeared in `propose show` and never reached the worker.
+- **Grounding is checked in both directions.** A citable finding whose text the
+  proposal does not carry is refused, not just a quoted finding outside the
+  allowlist. The justification for the one-directional form described a caller
+  that does not exist.
+- **`runtime_proposal_links` distinguishes offered from cited** (schema 0011).
+  The table claimed to record what a proposal rested on and recorded the whole
+  packet it was shown.
+- **Proposals are listed by `created_at`, not by id.** A reserved id's timestamp
+  is a deliberate placeholder so a retry can recompute it, which sorted every
+  runtime proposal ahead of everything the researcher wrote.
+- **Choosing the Slurm executor is no longer a route around `required`
+  containment.** Nothing in this process can contain a process on a compute
+  node, so at `required` the Slurm executor refuses as
+  `WAITING_FOR_EXTERNAL_DEPENDENCY` rather than running uncontained. Batch
+  scripts also carry `#SBATCH --export=NONE`: sbatch's default copied the
+  daemon's environment, including provider keys, into every job.
+- **Containment no longer makes the acceptance command vanish.** `uv` lives
+  outside the sandbox's read-only OS paths and its cache lives under a home the
+  sandbox replaces with a tmpfs, so a contained check exited 127 and the failure
+  looked like the project's.
+- **Bidi, zero-width, separator and tag characters are escaped at the display
+  boundary.** They are not control characters, so they reached a researcher's
+  terminal intact and could make a finding read differently from what is
+  archived.
+- **Selecting and claiming an experiment to interpret is one transaction**
+  (`for update of j skip locked`). Two workers each performed the whole reading
+  and the unique constraint discarded the loser's.
+- **One successor per run is a partial unique index** (schema 0014). The
+  advisory lock that was supposed to serialise it was taken and released inside
+  its own transaction, so it serialised nothing.
+- **The preregistration lookup is an indexed equality match** (schema 0012). It
+  scanned the newest 500 and reported "no preregistration found" — falsely —
+  for everything past the horizon.
+- **Deleting a run no longer deletes the interpretations of its experiments**
+  (schema 0013). `external_jobs.run_id` was the only external-effect relation in
+  the schema that cascaded.
+- **Every value-list check constraint in the database must mirror a Python
+  enum**, tested in both directions. Two constraints had escaped the
+  forward-only proof.
+
 #### Known divergence, reported rather than closed
 
 v1.1 moved validation-check resolution into the controller: `researchctl

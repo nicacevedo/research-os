@@ -1,0 +1,12 @@
+id: HYP-0001
+type: hypothesis
+schema_version: 1
+status: draft
+title: The one-pass estimator's error grows with the offset, not with the spread
+statement: >-
+  The absolute error of the one-pass estimator against the two-pass reference is
+  a function of the offset applied to the data, not of the variance being
+  estimated. Holding the spread fixed and increasing the offset should increase
+  the error monotonically until the estimate is entirely noise.
+addresses:
+  - Q-0001

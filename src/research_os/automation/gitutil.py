@@ -7,12 +7,54 @@ for any of them would replace a certainty with a guess.
 
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
 from research_os.errors import GitError
 
 GIT_TIMEOUT_SECONDS = 120
+
+
+#: Configuration a repository must not be able to set for a command we run.
+#:
+#: Git is a code-execution primitive in a directory somebody else can write.
+#: ``core.fsmonitor``, ``diff.external``, ``core.pager`` and a hooks path are
+#: programs git will run, and every one of them can be set by a `.git/config`
+#: inside a worktree a write-enabled worker has been given.
+#:
+#: An adversarial review executed the whole chain: a contained acceptance
+#: command rewrote `<worktree>/.git` -- which is a *file* holding
+#: ``gitdir: ...``, inside the bind the sandbox correctly makes writable -- to
+#: point at a gitdir it built itself, whose config set ``core.fsmonitor``. The
+#: controller then ran ``git add --intent-to-add`` and ``git diff HEAD`` in that
+#: worktree, on the host, with no containment, and git executed the program.
+#: Output: "HOST CODE EXECUTION as <user>, keys visible: 2".
+#:
+#: The redirect is invisible to the scope check, because ``git diff --name-only``
+#: cannot report a change inside `.git`, and invisible to the symlink check,
+#: because a gitdir pointer is not a symlink.
+#:
+#: So every git command this module runs is run with these emptied. `-c` beats
+#: the repository's own config, and the two `GIT_CONFIG_*` variables remove the
+#: user's and the system's.
+_NEUTRALISED_CONFIG: tuple[str, ...] = (
+    "core.fsmonitor=",
+    "core.hooksPath=/dev/null",
+    "core.pager=cat",
+    "core.sshCommand=",
+    "protocol.ext.allow=never",
+    "uploadpack.packObjectsHook=",
+)
+
+#: Subcommands that take ``--no-ext-diff``, and get it.
+#:
+#: ``diff.external`` is the one hostile setting ``-c`` cannot neutralise:
+#: ``-c diff.external=`` makes git try to *run* the empty string
+#: (``error: cannot run : No such file or directory``) rather than disabling the
+#: feature. Measured, not assumed. The subcommand flag is the correct
+#: incantation and was verified to defeat a repository-set ``diff.external``.
+_NO_EXTERNAL_DIFF: frozenset[str] = frozenset({"diff", "log", "show"})
 
 
 def git(
@@ -22,17 +64,46 @@ def git(
     check: bool = True,
     timeout: int = GIT_TIMEOUT_SECONDS,
 ) -> subprocess.CompletedProcess[str]:
-    """Run one Git command with no shell and no inherited standard input."""
+    """Run one Git command with no shell, no inherited stdin, and no hooks.
 
+    "No hooks" is doing real work and is not a tidiness measure: several of the
+    settings a repository can put in its own config name programs git will then
+    execute, and this module runs git inside worktrees that a write-enabled
+    worker has just been editing. See :data:`_NEUTRALISED_CONFIG`.
+    """
+
+    environment = {
+        **os.environ,
+        # The user's and the system's config, removed. A worker cannot write
+        # either, but a command run with them is a command whose behaviour
+        # depends on the researcher's machine rather than on the repository.
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_SYSTEM": os.devnull,
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_ASKPASS": "",
+        # `git` runs the ssh binary for a remote operation. Nothing here does
+        # one, and an empty command fails loudly rather than reaching the
+        # researcher's agent.
+        "GIT_SSH_COMMAND": "",
+    }
+    neutralised: list[str] = []
+    for setting in _NEUTRALISED_CONFIG:
+        neutralised.extend(["-c", setting])
+    invocation = list(args)
+    if invocation and invocation[0] in _NO_EXTERNAL_DIFF:
+        invocation.insert(1, "--no-ext-diff")
     try:
         completed = subprocess.run(
-            ["git", *args],
+            ["git", *neutralised, *invocation],
             cwd=str(cwd),
             check=False,
             capture_output=True,
             text=True,
+            errors="replace",
             stdin=subprocess.DEVNULL,
             timeout=timeout,
+            env=environment,
+            start_new_session=True,
         )
     except FileNotFoundError as exc:
         raise GitError("git is not available on PATH") from exc

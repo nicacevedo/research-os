@@ -687,3 +687,106 @@ def test_the_correction_prompt_distinguishes_the_three_reference_fields() -> Non
     assert "addresses_items" in prompt
     assert "A capsule id is not a proposed item id." in prompt
     assert "then renumber the remaining items" in prompt
+
+
+# -- the citable catalogue lives outside every fence ------------------------
+def _empty_context() -> Any:
+    """A minimal science context, so these tests are about the prompt only."""
+
+    from research_os.proposal.context import ScienceContext
+
+    return ScienceContext(project_path="/tmp/widget-study", project_id="widget-study")
+
+
+def test_the_findings_catalogue_is_outside_the_fenced_block() -> None:
+    """The ids the worker may cite must not be influenceable by what it reads.
+
+    `render_supplied_findings` says the duplication is the point: the fenced
+    block is what the worker reads and the plain list is what it may cite. Only
+    the *correction* prompt carried a list. The prompt that actually writes the
+    proposal said "the finding ids in the evidence blocks below", so the ids
+    existed in exactly one place -- inside the fence, next to text a model
+    wrote.
+    """
+
+    from research_os.automation.promptdata import FENCES
+    from research_os.proposal.models import SuppliedFinding
+    from research_os.proposal.planner import (
+        build_proposal_prompt,
+        render_supplied_findings,
+    )
+
+    findings = (
+        SuppliedFinding(
+            finding_id="F-001",
+            kind="experiment",
+            statement="the residuals grow with load",
+        ),
+        SuppliedFinding(
+            finding_id="F-002",
+            kind="review",
+            statement="the reviewer asked for a second load cell",
+        ),
+    )
+    prompt = build_proposal_prompt(
+        goal="settle it",
+        context=_empty_context(),
+        findings_data=render_supplied_findings(findings),
+        grounding_finding_ids=("F-001", "F-002"),
+    )
+
+    catalogue = prompt.index('Analyst finding ids, for the "grounded_in_findings"')
+    assert "- F-001" in prompt[catalogue:]
+    assert "- F-002" in prompt[catalogue:]
+    # And the catalogue is not inside any data block.
+    for fence in FENCES:
+        begin = prompt.find(fence.begin)
+        end = prompt.find(fence.end)
+        if begin == -1 or end == -1:
+            continue
+        assert not begin < catalogue < end, (
+            f"the citable-id catalogue is inside the {fence.begin} block"
+        )
+
+
+def test_a_prompt_with_no_findings_offers_no_catalogue() -> None:
+    """Nothing supplied, nothing citable, and no section inviting a citation."""
+
+    from research_os.proposal.planner import build_proposal_prompt
+
+    prompt = build_proposal_prompt(goal="settle it", context=_empty_context())
+    assert 'Analyst finding ids, for the "grounded_in_findings"' not in prompt
+
+
+def test_the_stored_statement_is_what_the_worker_actually_read() -> None:
+    """Two limits, and the record showed the longer one.
+
+    The prompt clipped a finding at `MAX_FINDING_CHARS`; the stored
+    `SuppliedFinding` kept everything up to the runtime's own, larger limit. So
+    `propose show` displayed a conclusion sitting past the prompt's cut, which
+    the worker never saw, and a reader would attribute the proposal's reasoning
+    to it.
+    """
+
+    from research_os.proposal.planner import MAX_FINDING_CHARS, clipped_statement
+
+    long = "x" * (MAX_FINDING_CHARS + 500) + "AND THEREFORE IT IS AN ARTEFACT"
+    clipped = clipped_statement(long)
+
+    # The conclusion the worker never saw is not in the stored statement.
+    assert "ARTEFACT" not in clipped
+    # And the clip is announced rather than silent, so a reader of the record
+    # knows there was more.
+    assert clipped != long
+    assert "truncated" in clipped or clipped.endswith("...")
+
+    # The prompt renders the stored statement unchanged from here on, which is
+    # the property that makes the two agree.
+    from research_os.proposal.models import SuppliedFinding
+    from research_os.proposal.planner import render_supplied_findings
+
+    rendered = render_supplied_findings(
+        (SuppliedFinding(finding_id="F-001", kind="analysis", statement=clipped),)
+    )
+    assert clipped_statement(clipped) == clipped
+    assert "ARTEFACT" not in rendered

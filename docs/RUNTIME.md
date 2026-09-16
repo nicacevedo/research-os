@@ -487,6 +487,26 @@ proposed scientific change
   -> bytes, by content hash
 ```
 
+**Where findings come from.** `graphs/cycle.FINDING_FOR_ACTION` maps the
+actions whose outcome is an *observation* to a finding kind, and
+`perform_action` records one from the handler's own `detail` and `data` after a
+successful action. The handler's own sentence, not a paraphrase: a summariser
+between the observation and the citation would be one more place for a claim to
+drift from its evidence.
+
+Deliberately not every action. A submission is not an observation, so
+`run_local_experiment` and `submit_cluster_experiment` are absent and
+`interpret_results` is the one that reads what came back. `propose_capsule_
+change` and `nominate_insight` are absent because their output is an *ask*, and
+a finding about having asked would be a citable observation with nothing behind
+it. `draft_manuscript` is absent for the same reason, and `design_experiment`
+because a specification is a plan whose preregistration artifact is already
+durable and already looked up by digest.
+
+The planner is told the finding *count*, not the findings. It is choosing an
+action, and handing it the text would invite it to plan from a finding's
+content rather than from the project's state.
+
 Findings are **immutable and deduplicated by content**. The digest excludes the
 run and the cycle deliberately: the runtime recomputes an unchanged frontier on
 every cycle, and a cycle index in the digest would mint seven citable
@@ -515,6 +535,17 @@ What the runtime adds is what the v1 layer cannot know about:
 | grounding in runtime findings | the allowlist had the field and nothing supplied it |
 | a reserved proposal identity | `make_proposal_id` is deterministic in project, goal and *second*, and a retry does not reproduce the second |
 | immutable links to the findings | so the chain above is traversable from the database rather than from prose |
+| surviving a failed assessor | the controller stores the proposal and *then* assesses, so an assessor failure raises after the valuable artifact exists |
+
+That last one is also from the first pilot. The assessor exhausted its
+structured-output retries after the proposal had been stored; the work item was
+recorded FAILED, and the proposal survived only because the idempotency ledger
+consults the reconciler on its FAILED path. It worked, by accident of a
+mechanism built for something else. A `ProviderInvocationError` now looks for
+the reserved proposal before failing: if it is there the action *succeeds*, and
+`assessed=False` is stated in the data and in the detail. A proposal that
+reached a person without the independent assessment is a weaker thing than one
+that passed, and nothing said so where a reader would look.
 
 The handler writes no capsule file, does not import
 `research_os.proposal.promote`, authors no Review, accepts no Claim, and changes
@@ -621,15 +652,47 @@ parked thread. Eligibility requires all of:
 1. the objective's latest cycle has **finished**. One still holding a live
    interrupt is waiting for a different answer and is woken by
    `SCIENTIFIC_DECISION_RECORDED`;
-2. it has **no successor already**;
-3. the **frontier actually moved**;
-4. `should_continue`'s own bounds permit it -- lineage depth against
+2. it has **no successor already**, and it is the newest run of its objective
+   — chosen by a *total* order, because two runs can share `created_at` to the
+   microsecond and both would otherwise be advanced;
+3. the **frontier moved since that cycle recorded one**;
+4. `should_continue`'s other bounds permit it -- lineage depth against
    `max_cycles_per_objective`, and the project budget. `BUDGET_EXHAUSTED` is
    deliberately not eligible: the science moving does not create budget.
 
 A refusal records why. "Nothing happened and the log says nothing" is how the
 missing continuation looked from the outside, and reproducing that with a
 different cause would not be an improvement.
+
+### Which two frontier digests get compared, and why the first pilot got it wrong
+
+Point 3 above says "since *that cycle* recorded one", and the wording is the
+whole of a defect the first closed-loop pilot found.
+
+`should_continue` owns the progress check, and it had exactly one form of it:
+compare the run's digest with its **parent's**. For the ordinary continuation
+that is right — a cycle that has just concluded is its own "now", and this is
+the seven-cycle stop in §16.
+
+For an *advance* it is wrong. The parked cycle and its parent recorded the same
+digest, as every real successor does: the runtime cannot write a capsule, so
+its own work never moves the frontier its planning is derived from. Comparing
+the two asks "did that old cycle learn anything", and the answer is no — which
+is precisely why it stopped and waited. So the continuation refused at the
+exact moment the wait had ended. `CAPSULE_CHANGED` fired, `frontier_changed:
+True`, the advance ran, and no cycle opened.
+
+`should_continue` now takes `observed_frontier`, the frontier as measured by
+the caller, and the comparison becomes "has the frontier moved since this cycle
+recorded one" — which is the question both callers actually mean. The
+continuation path passes nothing and is unchanged; the advance passes what it
+measured.
+
+An **empty** measurement is explicitly not a change. `observed_digests` returns
+an empty frontier when the capsule could not be read — mid-edit, a checkout in
+progress — and an earlier version's `if frontier and ... == ...` let that fall
+through to "changed", opening a successor over a frontier nobody had measured.
+Unknown is not changed.
 
 ## 14b. Which experiment an interpretation is of
 
@@ -852,6 +915,47 @@ repository.
 | worker identity was not unique | host and pid, and it *is* the queue's only ownership guard. Pid reuse would have let a stale worker renew a lease it did not hold. Now includes a per-instance token. |
 | the wall clock double-charged | charged from `started_at`, which never advances, so each resume billed the whole run again; the `least()` clamp then hid the overrun. |
 | unreachable interpretation | `interpret_results` had no `ActionKind`, and the citation audit looked for its input in graph state, which does not cross a cycle boundary. Artifacts are linked to their run now, and both find their input in the durable record. |
+
+### The third review: what the loop-closure work itself got wrong
+
+Three independent adversarial audits ran against the integration branch, one per
+area. Their findings are below, and none of them was about the feature set --
+every one was about a claim this documentation or a docstring made that the code
+did not support.
+
+**Authority.**
+
+| finding | what it was |
+|---|---|
+| the citable ids lived inside the fence | `render_supplied_findings` says the duplication *is* the mechanism: the fenced block is what the worker reads, the plain list is what it may cite, and the second must not be influenceable by the first. Only the *correction* prompt carried a list. The prompt that writes the proposal said "the finding ids in the evidence blocks below" — the ids existed in exactly one place, next to text a model wrote. |
+| the record showed text the worker never read | the prompt clipped a finding at `MAX_FINDING_CHARS` (1500); the stored `SuppliedFinding` kept up to `MAX_SUMMARY_CHARS` (4000). A conclusion placed past the prompt's cut appeared in `propose show` and never reached the worker. `clipped_statement` makes the two one string. |
+| grounding was checked in one direction | justified by a caller supplying ids whose text travels in a separate `analysis_data` block. There is no such caller, and nothing passes `analysis_data` to `build_proposal_prompt` at all. Both directions now: citable implies quoted, quoted implies citable. |
+| the links over-claimed | `runtime_proposal_links` said "the findings this proposal actually cited"; the writer inserted the whole packet. Eight offered, two cited, six rows asserting a dependence that did not exist. `cited` separates them — `0011`. |
+| every runtime proposal sorted as 1970 | a reserved id's timestamp is derived from the reservation key so a retry can recompute it, so it is a deliberate placeholder. Listing by id put every runtime proposal ahead of everything the researcher proposed. The listing reads `created_at` now. |
+| a refusal with no callers | `refuse_scientific_authority` advertised "the list of refused actions is greppable". There is no list; the enforcement is the absence of write methods, the `human_executes` policy, and a structural test. The docstring says that now. |
+| no cross-cycle dedup | two cycles grounded in the same findings produced two proposals saying the same thing. An equivalent *pending* proposal now short-circuits; a promoted or declined one does not, because re-offering either is arguing with a decision. |
+
+**Containment.**
+
+| finding | what it was |
+|---|---|
+| `executor: slurm` was a one-word bypass | `build_executors` raises the local executor to `required` at high autonomy and passed the mode only to the local one. The Slurm path never reached `contain()`, and nothing in this process can contain a process on a compute node. It now *refuses* at `required`, as `WAITING_FOR_EXTERNAL_DEPENDENCY`. |
+| the batch job inherited the daemon's environment | sbatch defaults to `--export=ALL`, so the runtime's provider keys and DSN were copied into every job. `--export=NONE` plus the frozen spec's own exports. |
+| containment made the command vanish | `uv` installs to `~/.local/bin`, which is in neither the read-only OS binds nor the sandbox PATH, and uv's cache is under a home the sandbox replaces with a tmpfs. A contained acceptance run exited 127, recorded as a failure of the code the worker had just written. The program is bound at its own path and uv's cache and interpreter directories are made writable. |
+| invisible characters survived the display boundary | `terminal_safe` escapes control characters, which is the *terminal's* threat model. `\u202e` contains none and reverses everything after it, so a finding read one way and archived another — at the boundary the authority model exists to protect. `DECEPTIVE_CHARS` covers bidi, zero-width, separator and tag characters, deliberately and narrowly. |
+| `--share-net` promised a middle setting | there is none. Bubblewrap has no packet filter and this build adds none; `network=True` is the host's network namespace, including 127.0.0.1. |
+
+**Concurrency.**
+
+| finding | what it was |
+|---|---|
+| two workers, one experiment, one identity | `eligible_job_for_interpretation` then `claim_interpretation` is a check-then-act. Both workers did the whole reading and the unique constraint discarded the loser's. `claim_next_interpretation` does both in one transaction with `for update of j skip locked`. |
+| `lock_run` serialised nothing | it took a transaction-scoped advisory lock inside its own `tx()`, which committed before the function returned. The lock was released before `has_successor` ran and long gone before `start_cycle` inserted. Replaced by a partial unique index — `0014` — so the loser fails at the insert whenever it arrives. |
+| the preregistration horizon | the guard scanned this project's newest 500 preregistrations and compared each `spec_digest` in Python. Past 500 the older ones fall out of the window, and the older ones are exactly the experiments still waiting to be interpreted; the refusal was permanent and said "no preregistration found", which was false. The digest is in the artifact role now, so the lookup is an indexed equality match — `0012`. |
+| two reads, one claimed moment | `observed_digests` said both digests came from one read of the capsule and called `validate()` twice. A researcher's commit landing between them paired a capsule digest from before it with a frontier from after. |
+| pruning a run erased interpretations | `external_jobs.run_id` cascaded, alone among the schema's external-effect relations, and `experiment_interpretations.job_id` cascades from it. Deleting one old run destroyed the record that its experiments had been interpreted, while the project and the artifacts survived — `0013`. |
+| two constraints the proof did not cover | `test_each_status_constraint_matches_its_python_enum` is parametrized over `ENUM_CONSTRAINTS`, so a constraint absent from the dictionary was never checked. `runtime_finding_refs_kind_ck` and `runtime_proposal_reservations_status_ck` had no enum. The reverse test now asks the database what value lists it has. |
+| the reconciler recomputed the id | correct only for as long as two functions agreed. It reads the reservation row and derives only when there is none. |
 
 ### A suggestion that was wrong, and why
 

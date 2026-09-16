@@ -92,6 +92,22 @@ class FindingKind(StrEnum):
     OTHER = "other"
 
 
+class FindingRefKind(StrEnum):
+    """What one provenance edge of a finding points at.
+
+    Mirrored by ``runtime_finding_refs_kind_ck``. It was three string literals
+    in the SQL and three more in :meth:`RuntimeFinding.refs`, with nothing
+    holding them together -- an adversarial review noted that
+    ``tests/test_runtime_schema.py`` proves every *other* value list in the
+    schema matches a Python enum, so this one and the proposal reservation
+    statuses were the two the proof did not cover.
+    """
+
+    ARTIFACT = "artifact"
+    CAPSULE_OBJECT = "capsule_object"
+    LITERATURE_KEY = "literature_key"
+
+
 class RuntimeFinding(BaseModel):
     """One thing the runtime observed, with enough provenance to audit it.
 
@@ -194,9 +210,15 @@ class RuntimeFinding(BaseModel):
         """Every edge, as ``(kind, ref)`` pairs, for the refs table."""
 
         return (
-            *(("artifact", value) for value in self.artifact_ids),
-            *(("capsule_object", value) for value in self.capsule_refs),
-            *(("literature_key", value) for value in self.literature_keys),
+            *((FindingRefKind.ARTIFACT.value, value) for value in self.artifact_ids),
+            *(
+                (FindingRefKind.CAPSULE_OBJECT.value, value)
+                for value in self.capsule_refs
+            ),
+            *(
+                (FindingRefKind.LITERATURE_KEY.value, value)
+                for value in self.literature_keys
+            ),
         )
 
 
@@ -243,8 +265,16 @@ class FindingPacket(BaseModel):
         return tuple(item.finding_id for item in self.findings)
 
     @property
-    def digest(self) -> str:
-        """A stable hash of the packet, for the proposal's basis snapshot.
+    def digest(self) -> str | None:
+        """A stable hash of the packet, or ``None`` when nothing was supplied.
+
+        ``None`` for an empty packet, matching
+        :func:`research_os.proposal.planner.supplied_findings_digest` and for
+        the reason that function gives: a real-looking 64-hex digest of the
+        empty set is indistinguishable from "we forgot to record it". An
+        adversarial review found a recovered proposal reporting exactly that --
+        ``grounded_in_findings: []`` beside a confident digest -- for a proposal
+        whose stored allowlist named two findings.
 
         What it pins is "this proposal was grounded in exactly these findings,
         each saying exactly this". Recomputed before a human promotion, so a
@@ -252,6 +282,8 @@ class FindingPacket(BaseModel):
         being promoted on a basis that no longer holds.
         """
 
+        if not self.findings:
+            return None
         material = json.dumps(
             {
                 "v": 1,

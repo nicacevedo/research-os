@@ -442,21 +442,45 @@ class ResearchProposal(BaseModel):
         literature = set(self.grounding.literature_keys)
         findings = set(self.grounding.finding_ids)
 
-        # A quoted finding must be one the allowlist permits. One direction
-        # only, deliberately: a caller may also ground a proposal through
-        # ``analysis_data``, where the finding *text* travels in its own fenced
-        # block and only the ids reach ``grounding.finding_ids``. So "cited but
-        # not quoted here" is a legitimate shape, and "quoted but not allowed"
-        # is not -- the second means the prompt showed a worker more than the
-        # validator would accept, which is how an unsupplied citation gets
-        # written in the first place.
+        # The allowlist and the quoted text must name the same findings, in
+        # both directions.
+        #
+        # This was one direction for a while, and the comment justifying that
+        # described a caller supplying finding ids whose text travelled in a
+        # separate `analysis_data` block. An adversarial review checked and
+        # there is no such caller: `ProposalController` builds
+        # `grounding.finding_ids` and the rendered findings block from the same
+        # tuple, and `build_proposal_prompt` is never passed `analysis_data` by
+        # anything. The justification was for a shape the code cannot produce.
+        #
+        # Both directions are worth having and they fail for different reasons.
+        # "Quoted but not allowed" means the prompt showed a worker more than
+        # the validator would accept, which is how an unsupported citation gets
+        # written. "Allowed but not quoted" means the proposal permits a
+        # citation to an id whose statement it does not carry -- so a person
+        # reading it cannot see what they are being asked to rely on, and the
+        # operational database that holds the text is rebuildable state. The
+        # proposal is the durable artifact; if the id is citable, the sentence
+        # travels with it.
         quoted = {item.finding_id for item in self.supplied_findings}
         if len(quoted) != len(self.supplied_findings):
             raise ValueError("a proposal quotes the same supplied finding twice")
-        if quoted - findings:
+        if quoted != findings:
+            missing = sorted(findings - quoted)
+            extra = sorted(quoted - findings)
+            detail = "; ".join(
+                part
+                for part in (
+                    ("citable but not quoted: " + ", ".join(missing))
+                    if missing
+                    else "",
+                    ("quoted but not citable: " + ", ".join(extra)) if extra else "",
+                )
+                if part
+            )
             raise ValueError(
-                "a proposal quotes finding(s) that are not in its grounding "
-                "allowlist: " + ", ".join(sorted(quoted - findings))
+                f"a proposal's finding allowlist and its quoted findings must "
+                f"name the same findings ({detail})"
             )
         for item in self.items:
             _reject_unsupplied(item.item_id, "capsule object", item.addresses, capsule)

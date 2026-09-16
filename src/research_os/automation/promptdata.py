@@ -40,7 +40,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 from research_os.errors import PromptDataError
-from research_os.textsafe import CONTROL_CHARS
+from research_os.textsafe import CONTROL_CHARS, DECEPTIVE_CHARS
 
 #: The default cap on one rendered field.
 DEFAULT_FIELD_CHARS = 2_000
@@ -370,10 +370,20 @@ def _scrub_control(value: str, *, keep: frozenset[str]) -> str:
     A space rather than nothing, so removing a newline separates the words it
     separated instead of running them together. What a downstream worker reads
     should be the analyst's sentence, not a new word the sanitizer invented.
+
+    :data:`~research_os.textsafe.DECEPTIVE_CHARS` goes the same way. Rendered
+    prompt data is read twice -- once by the next worker and once by the person
+    reading ``propose show`` or a run report, which quotes the *same* rendered
+    field -- and a zero-width character inside a quoted id, or a bidi override
+    inside a quoted statement, makes those two readings differ. Here they become
+    spaces rather than visible escapes, because this output goes into a prompt
+    and ``\\u202e`` in a prompt is four characters of noise; the display
+    boundary escapes them instead, so a reader sees what was there.
     """
 
+    unsafe = CONTROL_CHARS | DECEPTIVE_CHARS
     return "".join(
-        character if character not in CONTROL_CHARS or character in keep else " "
+        character if character not in unsafe or character in keep else " "
         for character in value
     )
 

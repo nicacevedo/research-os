@@ -33,6 +33,7 @@ from research_os.proposal.models import (
     ProposalKind,
     ProposedItem,
     ResearchProposal,
+    SuppliedFinding,
 )
 from research_os.proposal.planner import parse_proposal, validate_proposal
 from tests.proposal_helpers import item, proposal_payload
@@ -43,8 +44,26 @@ GROUNDING = ProposalGrounding(
     finding_ids=["F-001"],
 )
 
+#: The text behind every id in ``GROUNDING.finding_ids``.
+#:
+#: The allowlist and the quoted findings have to name the same set -- see
+#: ``ResearchProposal._everything_cited_was_supplied`` -- so a fixture that
+#: allows ``F-001`` has to carry ``F-001``'s statement too. That is what a real
+#: proposal looks like: ``ProposalController`` builds both from one tuple.
+SUPPLIED = (
+    SuppliedFinding(
+        finding_id="F-001",
+        kind="analysis",
+        statement="The residuals grow with load, not with time.",
+    ),
+)
 
-def parse(payload: dict, grounding: ProposalGrounding = GROUNDING) -> ResearchProposal:
+
+def parse(
+    payload: dict,
+    grounding: ProposalGrounding = GROUNDING,
+    supplied: tuple[SuppliedFinding, ...] = SUPPLIED,
+) -> ResearchProposal:
     return parse_proposal(
         structured=payload,
         text=None,
@@ -54,6 +73,7 @@ def parse(payload: dict, grounding: ProposalGrounding = GROUNDING) -> ResearchPr
         base_commit="a" * 40,
         goal="Settle whether deformation is linear",
         grounding=grounding,
+        supplied_findings=supplied,
         provider="fake",
         model="fake-planner",
         invocation_id="INV-0001",
@@ -307,3 +327,47 @@ def test_a_human_decision_must_say_it_needs_a_human() -> None:
             rationale="it is a scientific judgement",
             requires_human=False,
         )
+
+
+# -- the allowlist and the quoted text name the same findings ----------------
+def test_a_citable_finding_whose_text_is_absent_is_refused() -> None:
+    """One direction of this was missing, justified by a caller that never was.
+
+    The comment said a caller might supply ids whose text travels in a separate
+    `analysis_data` block. `ProposalController` builds both from one tuple and
+    nothing passes `analysis_data` to `build_proposal_prompt` at all. A
+    proposal that permits a citation to an id whose statement it does not carry
+    is one a person cannot audit: the statement lives in the operational
+    database, which is rebuildable, and the proposal is the durable artifact.
+    """
+
+    with pytest.raises(ProposalValidationError, match="citable but not quoted"):
+        parse(proposal_payload(), supplied=())
+
+
+def test_quoting_a_finding_that_is_not_citable_is_refused() -> None:
+    """The other direction: the prompt showed more than the validator accepts."""
+
+    extra = SuppliedFinding(
+        finding_id="F-999",
+        kind="analysis",
+        statement="something the allowlist never permitted",
+    )
+    with pytest.raises(ProposalValidationError, match="quoted but not citable"):
+        parse(proposal_payload(), supplied=(*SUPPLIED, extra))
+
+
+def test_a_proposal_with_no_findings_needs_none_quoted() -> None:
+    """Most proposals ground in the capsule alone, and that stays legal."""
+
+    grounding = ProposalGrounding(
+        capsule_ids=["Q-0001", "HYP-0001"],
+        literature_keys=["doi:10.1000/widget"],
+        finding_ids=[],
+    )
+    proposal = parse(
+        proposal_payload(items=[item(grounded_in_findings=[])]),
+        grounding=grounding,
+        supplied=(),
+    )
+    assert proposal.supplied_findings == []

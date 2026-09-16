@@ -548,6 +548,7 @@ def should_continue(
     db: Database,
     config: RuntimeConfig,
     result: CycleResult,
+    observed_frontier: str | None = None,
 ) -> tuple[bool, str]:
     """Decide whether to open a successor cycle. Returns ``(continue?, why)``.
 
@@ -557,6 +558,24 @@ def should_continue(
     2. the lineage depth against ``max_cycles_per_objective``, measured in SQL
        so a corrupted parent chain cannot become an infinite loop;
     3. the budget, so a chain cannot continue into a cycle that cannot finish.
+
+    ``observed_frontier`` is the frontier **as of now**, supplied by a caller
+    that has just measured it. It changes only which two digests the
+    progress check compares, and getting that wrong is what a real pilot
+    caught:
+
+    - a cycle that has *just concluded* is its own "now", so the comparison is
+      its digest against its parent's. That is the default, and it is the
+      seven-cycle stop from ``docs/RUNTIME.md`` §16.
+    - a cycle that concluded some time ago and is being advanced *because a
+      person changed the science* is not its own "now". Comparing its digest
+      against its parent's asks "did that old cycle learn anything", and the
+      answer was no -- which is exactly why it stopped and waited. It refused
+      the successor at the precise moment the wait had ended.
+
+    So the caller that measured the current frontier passes it, and the
+    comparison becomes "has the frontier moved since this cycle recorded one",
+    which is the question both callers actually mean.
     """
 
     if result.recommendation != "START_NEXT_CYCLE":
@@ -578,17 +597,39 @@ def should_continue(
     # claim. Its own work never changes the frontier that the frontier is
     # derived from. So progress has to be *checked* rather than assumed, and
     # when there is none the honest recommendation is to stop and say why.
-    digest = result.run.frontier_digest
-    if digest and result.run.parent_run_id:
-        parent = store.get_run(result.run.parent_run_id)
-        if parent is not None and parent.frontier_digest == digest:
+    if observed_frontier is not None:
+        # A caller that has measured the frontier now. Compare against what
+        # this cycle recorded, which is the only comparison that answers "has
+        # anything changed since".
+        #
+        # An *empty* measurement is not a change. It means the capsule could
+        # not be read -- mid-edit, a checkout in progress -- and treating
+        # unknown as changed opened a successor cycle over an unchanged
+        # frontier, which the first closed-loop pilot did.
+        if not observed_frontier:
             return False, (
-                "the frontier is unchanged from the previous cycle. The runtime "
-                "cannot alter canonical scientific state, so repeating the cycle "
-                "would repeat its cost without adding information. What is "
-                "outstanding needs a person: see `researchctl runtime run "
-                f"{result.run.run_id}`."
+                "the current frontier could not be computed, so whether "
+                "anything changed is unknown. Unknown is not changed: no "
+                "successor is opened, and the next observation will decide."
             )
+        if observed_frontier == result.run.frontier_digest:
+            return False, (
+                "the canonical science changed but the unresolved frontier did "
+                "not, so a successor cycle would recompute the same work and "
+                "add no information."
+            )
+    else:
+        digest = result.run.frontier_digest
+        if digest and result.run.parent_run_id:
+            parent = store.get_run(result.run.parent_run_id)
+            if parent is not None and parent.frontier_digest == digest:
+                return False, (
+                    "the frontier is unchanged from the previous cycle. The "
+                    "runtime cannot alter canonical scientific state, so "
+                    "repeating the cycle would repeat its cost without adding "
+                    "information. What is outstanding needs a person: see "
+                    f"`researchctl runtime run {result.run.run_id}`."
+                )
 
     exhausted = BudgetLedger(db).exhausted_dimensions(
         run_id=result.run.run_id, project_id=result.run.project_id

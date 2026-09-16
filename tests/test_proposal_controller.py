@@ -15,6 +15,7 @@ said is archived.
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -488,3 +489,55 @@ def test_the_literature_report_is_archived_with_the_proposal(
 
     store = ProposalStore.open(outcome.proposal.proposal_id)
     assert store.path("literature", "report.json").is_file()
+
+
+# -- the decision queue is in the order the proposals were made -------------
+def test_proposals_are_listed_by_when_they_were_made(research_home: Path) -> None:
+    """A reserved id's timestamp is derived, not observed, so it cannot sort.
+
+    `reserved_proposal_id` derives the whole id from the reservation key so a
+    retry recomputes it, which means the timestamp in the id is a placeholder --
+    `19700101T000000Z`, deliberately implausible rather than a plausible lie.
+    Listing by id therefore put every runtime proposal at the front of the
+    researcher's queue, before everything they proposed themselves, in digest
+    order among themselves.
+    """
+
+    from research_os.proposal.store import proposals_root
+
+    root = proposals_root()
+    root.mkdir(parents=True, exist_ok=True)
+    made = {
+        "PROP-19700101T000000Z-aaaaaaaa": "2026-09-14T12:00:00Z",
+        "PROP-20260910T090000Z-bbbbbbbb": "2026-09-10T09:00:00Z",
+        "PROP-19700101T000000Z-cccccccc": "2026-09-12T18:30:00Z",
+    }
+    for proposal_id, created_at in made.items():
+        directory = root / proposal_id
+        directory.mkdir()
+        (directory / "proposal.json").write_text(
+            json.dumps({"proposal_id": proposal_id, "created_at": created_at}),
+            encoding="utf-8",
+        )
+
+    assert ProposalStore.list_proposal_ids() == (
+        "PROP-20260910T090000Z-bbbbbbbb",
+        "PROP-19700101T000000Z-cccccccc",
+        "PROP-19700101T000000Z-aaaaaaaa",
+    )
+
+
+def test_a_proposal_that_cannot_be_read_stays_in_the_listing(
+    research_home: Path,
+) -> None:
+    """Dropping it would hide a proposal a person may be waiting on."""
+
+    from research_os.proposal.store import proposals_root
+
+    root = proposals_root()
+    root.mkdir(parents=True, exist_ok=True)
+    broken = root / "PROP-20260910T090000Z-dddddddd"
+    broken.mkdir()
+    (broken / "proposal.json").write_text("{ not json", encoding="utf-8")
+
+    assert broken.name in ProposalStore.list_proposal_ids()

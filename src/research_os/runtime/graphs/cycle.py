@@ -47,13 +47,20 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from collections.abc import Mapping
 from typing import Any
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.runtime import Runtime
 from langgraph.types import interrupt
 
+from research_os.errors import ResearchOSError
 from research_os.runtime.budgets import BudgetExhaustedError
+from research_os.runtime.findings import (
+    MAX_REFS_PER_KIND,
+    FindingKind,
+    RuntimeFinding,
+)
 from research_os.runtime.graphs.state import (
     CycleContext,
     CycleState,
@@ -160,10 +167,18 @@ def plan_one_action(
             "notes": note(state, "frontier empty; planning an assessment only"),
         }
 
+    # How many findings this project already has. The planner needs it because
+    # `propose_capsule_change` is the only action that can change the frontier
+    # -- by asking a person to -- and it has nothing to propose from without
+    # them. Told as a count rather than as the findings themselves: the planner
+    # is choosing an action, not reasoning about evidence, and handing it the
+    # text would invite it to plan from a finding's content.
+    findings = context.store.list_findings(project_id=state["project_id"], limit=50)
     prompt = PLANNER.render(
         fields={
             "objective": state["objective"],
             "permitted_actions": ", ".join(context.permitted_actions),
+            "findings_available": str(len(findings)),
         },
         blocks={
             "frontier": [json.dumps(frontier, indent=2, sort_keys=True)],
@@ -358,15 +373,129 @@ def perform_action(state: CycleState, runtime: Runtime[CycleContext]) -> dict[st
             role=str(ref.get("role") or "output"),
             run_id=state["run_id"],
         )
+    finding_id = _record_finding(
+        state, context, action=action, plan=plan, result=result
+    )
     return {
         "action_result": result,
         "action_reused": outcome.reused,
         "artifacts": artifacts,
+        "finding_id": finding_id,
         "notes": note(
             state,
-            f"{action}: {'reused earlier result' if outcome.reused else result.get('detail', 'done')}",
+            f"{action}: {'reused earlier result' if outcome.reused else result.get('detail', 'done')}"
+            + (f" (finding {finding_id})" if finding_id else ""),
         ),
     }
+
+
+#: Which actions produce an *observation*, and what kind it is.
+#:
+#: The link between "an action ran" and "a proposal can cite what it found",
+#: and the reason the loop was open without it. Every handler already returns a
+#: one-sentence ``detail`` and structured ``data``; nothing turned either into
+#: something with an identifier, so ``propose_capsule_change`` had an empty
+#: allowlist and the grounding field the v1 validator has always checked stayed
+#: unused.
+#:
+#: Deliberately *not* every action. An action is listed here when its outcome is
+#: a claim about the world:
+#:
+#: - `run_local_experiment` and `submit_cluster_experiment` are absent: a
+#:   submission is not an observation, and `interpret_results` is the action
+#:   that reads what came back;
+#: - `propose_capsule_change` and `nominate_insight` are absent: their output is
+#:   an *ask*, and a finding about having asked would be a citable observation
+#:   with nothing behind it;
+#: - `draft_manuscript` is absent for the same reason -- prose about findings is
+#:   not a finding;
+#: - `design_experiment` is absent: a specification is a plan, and its
+#:   preregistration artifact is already durable and already looked up by digest.
+FINDING_FOR_ACTION: dict[ActionKind, FindingKind] = {
+    ActionKind.INSPECT_REPOSITORY: FindingKind.INSPECTION,
+    ActionKind.VALIDATE_CAPSULE: FindingKind.INSPECTION,
+    ActionKind.ASSESS_FRONTIER: FindingKind.FRONTIER,
+    ActionKind.SEARCH_LITERATURE: FindingKind.LITERATURE,
+    ActionKind.FETCH_LITERATURE: FindingKind.LITERATURE,
+    ActionKind.PARSE_LITERATURE: FindingKind.LITERATURE,
+    ActionKind.PROPOSE_HYPOTHESES: FindingKind.OTHER,
+    ActionKind.CRITIQUE_HYPOTHESES: FindingKind.REVIEW,
+    ActionKind.REVIEW_SCIENCE: FindingKind.REVIEW,
+    ActionKind.REFEREE_MANUSCRIPT: FindingKind.REVIEW,
+    ActionKind.AUDIT_CITATIONS: FindingKind.REVIEW,
+    ActionKind.INTERPRET_RESULTS: FindingKind.INTERPRETATION,
+    ActionKind.EDIT_IN_WORKTREE: FindingKind.CODE,
+}
+
+
+def _record_finding(
+    state: CycleState,
+    context: CycleContext,
+    *,
+    action: ActionKind,
+    plan: Mapping[str, Any],
+    result: Mapping[str, Any],
+) -> str | None:
+    """Turn one action's outcome into something a proposal can cite.
+
+    Deterministic, and it uses the *handler's own words*. ``detail`` is the
+    sentence the handler wrote about what it found, so nothing here paraphrases
+    a result -- a summariser between the observation and the citation would be
+    one more place for a claim to drift from its evidence.
+
+    The references come from three places that are all already established:
+    the artifacts the action produced, the capsule objects the *plan* addressed,
+    and the identifiers in the outcome's own structured data. Nothing is
+    inferred.
+
+    Returns the finding id, or ``None`` when this action does not produce an
+    observation. Failure to record is logged and never raised: a finding is
+    provenance, and losing one must not fail an action that otherwise worked.
+    """
+
+    kind = FINDING_FOR_ACTION.get(action)
+    if kind is None or not result.get("ok"):
+        return None
+    summary = str(result.get("detail") or "").strip()
+    if not summary:
+        return None
+
+    data = dict(result.get("data") or {})
+    artifacts = tuple(
+        str(ref["artifact_id"]) for ref in result.get("artifacts", ()) if ref
+    )
+    capsule_refs = tuple(str(item) for item in plan.get("addresses", ()) if item)
+    literature = tuple(
+        str(entry.get("key"))
+        for entry in data.get("ranked", ())
+        if isinstance(entry, dict) and entry.get("key")
+    )
+    try:
+        finding, created = context.store.record_finding(
+            RuntimeFinding(
+                project_id=str(state["project_id"]),
+                kind=kind,
+                summary=summary,
+                source_run_id=str(state["run_id"]),
+                source_cycle=int(state["cycle_index"]),
+                source_action=str(action),
+                artifact_ids=artifacts[:MAX_REFS_PER_KIND],
+                capsule_refs=capsule_refs[:MAX_REFS_PER_KIND],
+                literature_keys=literature[:MAX_REFS_PER_KIND],
+                experiment_job_id=str(data.get("job_id") or "") or None,
+                spec_digest=str(data.get("spec_digest") or "") or None,
+            )
+        )
+    except (ResearchOSError, ValueError) as exc:
+        LOG.warning("could not record a finding for %s: %s", action, exc)
+        return None
+    LOG.info(
+        "%s %s from %s",
+        "recorded finding" if created else "reused finding",
+        finding.finding_id,
+        action,
+    )
+    return finding.finding_id
 
 
 def deterministic_check(
@@ -778,26 +907,56 @@ def conclude(state: CycleState, runtime: Runtime[CycleContext]) -> dict[str, Any
     check = state.get("check_result") or {}
 
     if data.get("requires_human_promotion"):
-        # This cycle produced a proposal. The honest terminal state is not
-        # DONE_FOR_NOW: the runtime has done everything it is allowed to do and
-        # what remains is a person's scientific decision about what it wrote.
+        # This cycle produced something a person must decide about. The honest
+        # terminal state is not DONE_FOR_NOW: the runtime has done everything it
+        # is allowed to do and what remains is a scientific decision.
         #
         # It matters operationally as well as descriptively. `DONE_FOR_NOW`
         # would put this run among the ones a capsule change may advance --
         # which is correct -- but it would say "finished" to a researcher
         # reading `runtime status`, when the accurate word is "waiting for you".
         # The recommendation is WAIT_HUMAN, so `should_continue` opens no
-        # successor: the frontier cannot have changed, because a proposal is not
-        # canonical science. What moves this objective forward is the person
-        # promoting it, and `_observe_capsules` noticing that they did.
+        # successor: the frontier cannot have changed, because neither a
+        # proposal nor a nomination is canonical science. What moves this
+        # objective forward is the person acting, and `_observe_capsules`
+        # noticing that they did.
+        #
+        # The *noun* matters and was wrong. `nominate_insight` also sets
+        # `requires_human_promotion`, and this branch called its nomination "a
+        # proposal" -- collapsing in prose the one distinction the insight
+        # design keeps structural: an `InsightNomination` and a
+        # `ResearchProposal` are different types in different stores, and the
+        # gap between them cannot be closed by a field. An adversarial review
+        # found the message doing it anyway.
+        planned = str((state.get("plan") or {}).get("action", ""))
+        waiting_for = (
+            "a nomination"
+            if planned == str(ActionKind.NOMINATE_INSIGHT)
+            else "a proposal"
+        )
+        # And a failed deterministic check is not hidden by the existence of
+        # one. The same failure without a proposal concluded "checks failed; a
+        # repair cycle is warranted"; with one, it said nothing at all -- so a
+        # proposal produced against a capsule that does not validate reached a
+        # researcher with no mention that the capsule was broken, and
+        # `prepare_promotion` then blamed the promotion for a fault it did not
+        # cause.
+        caveat = ""
+        if not check.get("passed", True):
+            errors = ", ".join(check.get("capsule_errors", ())[:4]) or "see the run"
+            caveat = (
+                f" WARNING: this cycle's deterministic checks did not pass "
+                f"({errors}), so read it against the project's actual state."
+            )
         return {
             "frontier_digest": digest,
             "terminal_state": str(TerminalState.WAITING_FOR_SCIENTIFIC_DECISION),
             "next_recommendation": "WAIT_HUMAN",
             "notes": note(
                 state,
-                "concluded: a proposal is waiting for your decision -- "
-                + str(data.get("follow_up") or "see `researchctl propose list`"),
+                f"concluded: {waiting_for} is waiting for your decision -- "
+                + str(data.get("follow_up") or "see `researchctl propose list`")
+                + caveat,
             ),
         }
 

@@ -116,6 +116,22 @@ class StatusReport:
     budgets: tuple[BudgetRecord, ...]
     checkpoint_bytes: dict[str, int]
     notifications: tuple[dict[str, Any], ...]
+    parked: tuple[tuple[str, ResearchRun], ...] = ()
+    """Objectives that finished waiting for a scientific decision, by project.
+
+    The state a researcher most needs to see and the one hardest to notice: the
+    run is ``SUCCEEDED``, so it appears nowhere under RUNNING, WAITING FOR YOU
+    or FAILED, and its terminal state is the only thing that says a person is
+    the next step. Before this it was visible only by reading `runtime runs`.
+    """
+
+    observations: tuple[tuple[str, str, int], ...] = ()
+    """Per project: ``(project_id, capsule digest, changes seen)``.
+
+    So "is the watcher actually watching" is answerable. A count of zero on a
+    project whose science has moved is the symptom of a daemon that is not
+    running, which otherwise looks identical to a project nobody has touched.
+    """
 
     def payload(self) -> dict[str, Any]:
         return {
@@ -125,6 +141,21 @@ class StatusReport:
             "work_counts": {
                 str(status): count for status, count in self.work_counts.items()
             },
+            "parked": [
+                {
+                    "project_id": project,
+                    "run_id": run.run_id,
+                    "terminal_state": str(run.terminal_state)
+                    if run.terminal_state
+                    else None,
+                    "objective": _safe(run.objective, limit=200),
+                }
+                for project, run in self.parked
+            ],
+            "observations": [
+                {"project_id": project, "capsule_digest": digest, "changes_seen": seen}
+                for project, digest, seen in self.observations
+            ],
             "failed_work": [
                 {
                     "work_id": item.work_id,
@@ -209,6 +240,19 @@ def collect_status(db: Database, *, project_id: str | None = None) -> StatusRepo
         budgets=tuple(BudgetRecord.model_validate(row) for row in system_budgets),
         checkpoint_bytes=checkpoint_sizes(db),
         notifications=read_inbox(limit=5),
+        parked=tuple(
+            (project.project_id, run)
+            for project in store.list_projects()
+            if project_id is None or project.project_id == project_id
+            for run in store.parked_objectives(project_id=project.project_id, limit=5)
+        ),
+        observations=tuple(
+            (project.project_id, observed[0], observed[2])
+            for project in store.list_projects()
+            if project_id is None or project.project_id == project_id
+            for observed in (store.observed_capsule(project.project_id),)
+            if observed is not None
+        ),
     )
 
 
@@ -230,6 +274,40 @@ def render_status(report: StatusReport) -> str:
             ],
         )
     )
+
+    if report.parked:
+        parts.append("\nWAITING FOR A SCIENTIFIC DECISION (finished; you are next)\n")
+        parts.append(
+            _table(
+                ("run", "project", "concluded", "objective"),
+                [
+                    (
+                        run.run_id,
+                        _safe(project, limit=24),
+                        str(run.terminal_state or "-"),
+                        _safe(run.objective, limit=44),
+                    )
+                    for project, run in report.parked
+                ],
+            )
+        )
+        parts.append(
+            "  These finished cleanly. `researchctl propose list` shows what is "
+            "waiting;\n  promoting something is what lets the runtime continue "
+            "on its own.\n"
+        )
+
+    if report.observations:
+        parts.append("\nCAPSULE OBSERVATION\n")
+        parts.append(
+            _table(
+                ("project", "digest", "changes seen"),
+                [
+                    (_safe(project, limit=28), digest[:12], str(seen))
+                    for project, digest, seen in report.observations
+                ],
+            )
+        )
 
     if report.waiting_human:
         parts.append("\nWAITING FOR YOU\n")

@@ -7,6 +7,15 @@ the state without this conversation.
 Follows the convention of `docs/V1_BUILD_RECORD.md`: a record of a point in
 time, not a specification. `docs/RUNTIME.md` is the live specification.
 
+**Superseded in part, and deliberately not rewritten.** The R5 integration
+(`docs/INTEGRATION_BUILD_RECORD.md`) closed four of the six items in §8 below —
+the two missing handlers, the absent sandbox, the interpretation's
+most-recently-finished-job selection, and the tier documentation — and left
+Slurm and the single provider family as genuine external blockers. §8 still
+says what was true when R5 was built, because a build record that is edited to
+match later decisions stops being evidence of anything. Read it as history and
+`docs/RUNTIME.md` as the specification.
+
 ## 1. Starting point, verified
 
 ```text

@@ -33,7 +33,12 @@ from pathlib import Path
 
 from research_os.automation.models import AcceptanceCommand, CommandResult, utc_now
 from research_os.automation.uvlock import UV_FROZEN
-from research_os.sandbox import SandboxMode, SandboxSpec, contain
+from research_os.sandbox import (
+    SandboxMode,
+    SandboxSpec,
+    contain,
+    process_limit_preexec,
+)
 
 MAX_CAPTURE_CHARS = 200_000
 
@@ -106,6 +111,48 @@ def check_overrides(
     if uv_frozen:
         overrides[UV_FROZEN] = "1"
     return overrides
+
+
+def uv_support_paths(argv: Sequence[str]) -> tuple[Path, ...]:
+    """The directories ``uv`` needs to write, for a contained ``uv`` command.
+
+    ``uv run`` does not only read a project environment. It reads and writes its
+    package cache, and on a project whose ``.python-version`` names an
+    interpreter it manages, it reads that interpreter out of its own data
+    directory. Both live under the researcher's home, which the sandbox replaces
+    with an empty tmpfs -- so a contained ``uv run --frozen pytest`` with a
+    complete project environment still failed, because the first thing uv does
+    is open its cache.
+
+    The honest reading of what this grants: uv's cache and managed-interpreter
+    directories become writable inside the sandbox. They are already writable by
+    this user outside it, and nothing secret lives there. What the sandbox is
+    keeping out of reach is the researcher's environment, their credentials,
+    their ``.git`` and ``.research``, and the network; a package cache is not on
+    that list, and pretending otherwise would mean containment that cannot run
+    the checks it exists to contain.
+
+    Only for ``uv``. Every other program gets nothing, because every other
+    program's needs are the caller's to declare.
+    """
+
+    if not argv or argv[0] != UV_PROGRAM:
+        return ()
+    located = shutil.which(UV_PROGRAM)
+    if located is None:
+        return ()
+    # uv's own documented locations, resolved the way uv resolves them: the
+    # explicit variable first, then the XDG directory, then the default.
+    explicit = os.environ.get("UV_CACHE_DIR")
+    if explicit:
+        cache_dir = Path(explicit)
+    else:
+        xdg_cache = os.environ.get("XDG_CACHE_HOME")
+        base = Path(xdg_cache) if xdg_cache else Path.home() / ".cache"
+        cache_dir = base / "uv"
+    xdg_data = os.environ.get("XDG_DATA_HOME")
+    data_dir = (Path(xdg_data) if xdg_data else Path.home() / ".local" / "share") / "uv"
+    return tuple(path for path in (cache_dir, data_dir) if path.exists())
 
 
 def run_acceptance_command(
@@ -183,6 +230,7 @@ def run_acceptance_command(
         # every `uv run` check would fail for a reason that has nothing to do
         # with the project.
         writable.append(uv_project_environment)
+    writable.extend(uv_support_paths(argv))
     spec = SandboxSpec(
         workdir=cwd,
         writable=tuple(writable),
@@ -210,9 +258,28 @@ def run_acceptance_command(
             check=False,
             capture_output=True,
             text=True,
+            # Replace rather than raise. One byte of invalid UTF-8 from a check
+            # -- `printf '\377\376'` -- used to raise `UnicodeDecodeError` out
+            # of this function. That is a `ValueError`, caught by neither the
+            # controller's `except (AutomationError, SandboxError)` nor the
+            # runtime action's handlers, so the run was never marked terminal
+            # and the worktree, the branch and the in-flight run were left
+            # behind. Found by an adversarial review, which executed it.
+            errors="replace",
             stdin=subprocess.DEVNULL,
             timeout=timeout_seconds,
             env=prepared.environment if prepared.contained else inner_environment,
+            # A session of its own, so the command has no controlling terminal.
+            # The contained path gets this from `--new-session`; the uncontained
+            # path -- the live one wherever containment is unavailable -- had
+            # nothing, and an adversarial review opened `/dev/tty` from an
+            # acceptance command and repainted the researcher's terminal while
+            # stdout captured something innocuous. `terminal_safe` never sees
+            # those bytes, because they never pass through this process.
+            start_new_session=True,
+            # Only when contained; `RLIMIT_NPROC` is uid-scoped, so applying it
+            # to an uncontained child caps the researcher's whole session.
+            preexec_fn=process_limit_preexec(spec, contained=prepared.contained),
         )
         exit_code = completed.returncode
         stdout = completed.stdout or ""

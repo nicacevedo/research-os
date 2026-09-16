@@ -57,6 +57,7 @@ from research_os.runtime.context import CycleContext
 from research_os.runtime.executors import (
     LOCAL,
     SLURM,
+    ContainmentUnavailableError,
     ExecutorError,
     prepare_run_dir,
     spec_digest,
@@ -257,7 +258,11 @@ def design_experiment(
     ref = context.artifacts.put_text(
         json.dumps(record, indent=2, sort_keys=True),
         media_type="application/json",
-        role="preregistration",
+        # The digest is in the role so the guard can find this record by
+        # equality instead of scanning a window of the project's
+        # preregistrations and reading each one. See
+        # `sql/0012_preregistration_lookup.sql` and `_preregistration_rows`.
+        role=preregistration_role(digest),
         producer=f"{response.provider}:{EXPERIMENTALIST.identity}",
     )
     # Linked here rather than relying on the graph node to do it. The
@@ -265,7 +270,9 @@ def design_experiment(
     # handler that leaves the linking to its caller is a handler whose guard
     # depends on who called it -- which is exactly the kind of thing that works
     # in the pipeline and fails everywhere else.
-    context.artifacts.link(ref, role="preregistration", run_id=state["run_id"])
+    context.artifacts.link(
+        ref, role=preregistration_role(digest), run_id=state["run_id"]
+    )
     return ActionOutcome.succeeded(
         f"preregistered a test of {target} using the declared command {chosen} "
         f"({digest[:12]})",
@@ -362,46 +369,94 @@ def _spec_from_record(record: Mapping[str, Any]) -> ExecutionSpec:
     )
 
 
-def _preregistration_exists(
-    context: CycleContext, digest: str, *, project_id: str
-) -> bool:
-    """Whether a preregistration artifact with this spec digest was stored.
+#: How many legacy, un-digested preregistrations one lookup will read.
+#:
+#: Only rows written before ``sql/0012_preregistration_lookup.sql``, which do
+#: not carry the digest in their role and can therefore only be found by
+#: reading them. It is a horizon and it is documented as one: see that
+#: migration for why the digested path has no window at all.
+LEGACY_PREREGISTRATION_WINDOW = 500
 
-    The artifact is content-addressed, so its id is the hash of the
-    preregistration *record*, not of the spec. So the lookup reads this
-    *project's* ``role='preregistration'`` artifacts and compares each
-    ``spec_digest``. Scoped to the project and bounded at 500: an earlier
-    version scanned globally with a limit of 200, which fails closed -- a
-    busy machine would silently refuse a legitimate submission.
 
-    The alternative to any of this is trusting the caller about when a criterion
-    was fixed, which is the whole thing the guard exists to establish.
+def preregistration_role(digest: str) -> str:
+    """The artifact role a preregistration of this spec is stored under."""
+
+    return f"preregistration:{digest}"
+
+
+def _preregistration_rows(
+    context: CycleContext, *, digest: str, project_id: str
+) -> tuple[str, ...]:
+    """Artifact ids that may be a preregistration of this spec, newest first.
+
+    Two questions, because there are two generations of row. Records written
+    from ``0012`` on carry ``preregistration:<spec digest>`` as their role, so
+    the first question is an indexed equality match with no window: every such
+    record is found, however many the project has. Records written before that
+    carry the bare ``preregistration`` role with the digest only inside the
+    document, so the second question is the old bounded scan, and the caller
+    still has to read each one to know what it froze.
+
+    Both are scoped to the project through the run link. A preregistration from
+    another project is not this project's commitment, and the earliest version
+    of this lookup did not say so.
     """
 
     with context.db.tx() as conn:
-        rows = conn.execute(
+        exact = conn.execute(
             """
             select distinct a.artifact_id, a.created_at
             from artifacts a
             join artifact_links l on l.artifact_id = a.artifact_id
             join research_runs r on r.run_id = l.run_id
-            where a.role = 'preregistration' and r.project_id = %s
+            where a.role = %(role)s and r.project_id = %(project_id)s
             order by a.created_at desc
-            limit 500
             """,
-            (project_id,),
+            {"role": preregistration_role(digest), "project_id": project_id},
         ).fetchall()
-    for row in rows:
+        legacy = conn.execute(
+            """
+            select distinct a.artifact_id, a.created_at
+            from artifacts a
+            join artifact_links l on l.artifact_id = a.artifact_id
+            join research_runs r on r.run_id = l.run_id
+            where a.role = 'preregistration' and r.project_id = %(project_id)s
+            order by a.created_at desc
+            limit %(window)s
+            """,
+            {"project_id": project_id, "window": LEGACY_PREREGISTRATION_WINDOW},
+        ).fetchall()
+    seen: dict[str, None] = {}
+    for row in (*exact, *legacy):
+        seen.setdefault(str(row["artifact_id"]), None)
+    return tuple(seen)
+
+
+def _preregistration_exists(
+    context: CycleContext, digest: str, *, project_id: str
+) -> bool:
+    """Whether a preregistration artifact with this spec digest was stored.
+
+    Every candidate is still *read* and its ``spec_digest`` compared, including
+    the ones the role already names. The role is an index, not evidence: it is
+    written by the same code path that writes the document, and a guard that
+    trusted it would be trusting a label instead of the record it labels.
+
+    The alternative to any of this is trusting the caller about when a criterion
+    was fixed, which is the whole thing the guard exists to establish.
+    """
+
+    for artifact_id in _preregistration_rows(
+        context, digest=digest, project_id=project_id
+    ):
         try:
-            record = json.loads(context.artifacts.get_text(str(row["artifact_id"])))
+            record = json.loads(context.artifacts.get_text(artifact_id))
         except (ResearchOSError, ValueError, UnicodeDecodeError) as exc:
             # Logged rather than swallowed: an unreadable preregistration would
             # otherwise look identical to "no preregistration matches", which is
             # a refusal the researcher would have no way to explain.
             LOG.warning(
-                "could not read preregistration artifact %s: %s",
-                row["artifact_id"],
-                exc,
+                "could not read preregistration artifact %s: %s", artifact_id, exc
             )
             continue
         if str(record.get("spec_digest") or "") == digest:
@@ -613,6 +668,12 @@ def _submit(
             perform=perform,
             reconcile=reconcile,
         )
+    except ContainmentUnavailableError as exc:
+        # Terminal, not repairable. No repair makes a kernel offer user
+        # namespaces, and `EXECUTOR_FAILED` is `REPAIR`.
+        return ActionOutcome.failed(
+            str(exc), failure_class=FailureClass.CAPABILITY_DENIED
+        )
     except ExecutorError as exc:
         context.budgets.release_all(grants)
         return ActionOutcome.failed(
@@ -680,50 +741,128 @@ def submit_cluster_experiment(
     return _submit(state, context, plan, executor_name=SLURM)
 
 
-def _preregistered_criteria(
+def _preregistrations_for(
     context: CycleContext, *, digest: str, project_id: str
-) -> dict[str, Any] | None:
-    """The criteria recorded before this spec ran, or ``None`` if there are none.
+) -> tuple[tuple[str, dict[str, Any]], ...]:
+    """Every stored preregistration of this project whose spec digest matches.
 
-    Looked up by spec digest through the same stored preregistrations the
-    submission guard consults, so "these were the criteria" is a claim about a
-    stored artifact rather than about whatever happens to be in memory.
+    Plural, deliberately. ``spec_digest`` covers the *execution* -- argv, cwd,
+    environment, seeds -- and says nothing about the criteria, which live beside
+    it in the record. So two design passes over one declared command can store
+    two preregistrations with the same digest and different primary endpoints,
+    and a function that returned "the" preregistration would have to choose.
+
+    It used to choose the newest, and an adversarial review executed what that
+    permits: read an experiment, crash before recording it, design again with a
+    different endpoint, and the retry compares the same result against the new
+    criteria while reporting ``criteria_were_fixed_before_results: true``. A
+    post-hoc primary-endpoint change with no recorded Decision.
+
+    Scoped to the project, and found by the digested role rather than by
+    scanning a window of everything the project ever preregistered. See
+    :func:`_preregistration_rows`.
     """
 
-    with context.db.tx() as conn:
-        rows = conn.execute(
-            """
-            select distinct a.artifact_id, a.created_at
-            from artifacts a
-            join artifact_links l on l.artifact_id = a.artifact_id
-            join research_runs r on r.run_id = l.run_id
-            where a.role = 'preregistration' and r.project_id = %s
-            order by a.created_at desc
-            limit 500
-            """,
-            (project_id,),
-        ).fetchall()
-    for row in rows:
+    found: list[tuple[str, dict[str, Any]]] = []
+    for artifact_id in _preregistration_rows(
+        context, digest=digest, project_id=project_id
+    ):
         try:
-            record = json.loads(context.artifacts.get_text(str(row["artifact_id"])))
+            record = json.loads(context.artifacts.get_text(artifact_id))
         except (ResearchOSError, ValueError, UnicodeDecodeError) as exc:
+            # Logged rather than swallowed: an unreadable preregistration would
+            # otherwise look identical to "no preregistration matches", which is
+            # a refusal the researcher would have no way to explain.
             LOG.warning(
-                "could not read preregistration artifact %s: %s",
-                row["artifact_id"],
-                exc,
+                "could not read preregistration artifact %s: %s", artifact_id, exc
             )
             continue
         if str(record.get("spec_digest") or "") != digest:
             continue
-        return {
-            "primary_endpoint": str(record.get("primary_endpoint", "")),
-            "secondary_endpoints": list(record.get("secondary_endpoints", ())),
-            "success_criteria": str(record.get("success_criteria", "")),
-            "failure_criteria": str(record.get("failure_criteria", "")),
-            "dataset_identity": str(record.get("dataset_identity", "")),
-            "preregistration_artifact": str(row["artifact_id"]),
-        }
-    return None
+        found.append((artifact_id, record))
+    return tuple(found)
+
+
+def _criteria_from(artifact_id: str, record: Mapping[str, Any]) -> dict[str, Any]:
+    """The prespecified criteria, as this record stated them."""
+
+    return {
+        "primary_endpoint": str(record.get("primary_endpoint", "")),
+        "secondary_endpoints": list(record.get("secondary_endpoints", ())),
+        "success_criteria": str(record.get("success_criteria", "")),
+        "failure_criteria": str(record.get("failure_criteria", "")),
+        "dataset_identity": str(record.get("dataset_identity", "")),
+        "preregistration_artifact": artifact_id,
+    }
+
+
+def _comparable(criteria: Mapping[str, Any]) -> str:
+    """The criteria, canonically, for deciding whether two agree."""
+
+    return json.dumps(
+        {
+            key: value
+            for key, value in criteria.items()
+            if key != "preregistration_artifact"
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _preregistered_criteria(
+    context: CycleContext,
+    *,
+    digest: str,
+    project_id: str,
+    artifact_id: str | None = None,
+) -> dict[str, Any] | None:
+    """The criteria recorded before this spec ran, or ``None`` if there are none.
+
+    ``artifact_id`` names the preregistration this interpretation was bound to
+    when it was claimed. Given one, that artifact's criteria are the answer and
+    nothing designed since can change them -- which is the whole point of
+    storing it on the row.
+
+    Without one (a first reading), the criteria are looked up by spec digest.
+    If two preregistrations share the digest and **disagree** about the
+    criteria, this returns ``None`` rather than choosing: "which of these two
+    did we commit to" is not a question a runtime may answer by picking, and
+    the honest outcome is to refuse and let a person say.
+    """
+
+    if artifact_id:
+        try:
+            record = json.loads(context.artifacts.get_text(artifact_id))
+        except (ResearchOSError, ValueError, UnicodeDecodeError) as exc:
+            LOG.warning(
+                "the preregistration this interpretation was bound to (%s) is "
+                "unreadable: %s",
+                artifact_id,
+                exc,
+            )
+            return None
+        return _criteria_from(artifact_id, record)
+
+    found = _preregistrations_for(context, digest=digest, project_id=project_id)
+    if not found:
+        return None
+    candidates = [_criteria_from(item, record) for item, record in found]
+    distinct = {_comparable(item) for item in candidates}
+    if len(distinct) > 1:
+        LOG.error(
+            "%s has %d preregistrations sharing spec digest %s with different "
+            "criteria (%s); refusing to choose between them",
+            project_id,
+            len(candidates),
+            digest[:12],
+            ", ".join(item["preregistration_artifact"][:12] for item in candidates),
+        )
+        return None
+    # Identical criteria, so the oldest is the commitment and the rest are
+    # re-statements of it. Oldest, not newest: the earliest record is the one
+    # that was made before the result existed.
+    return candidates[-1]
 
 
 def _eligible_job(context: CycleContext, *, project_id: str) -> Any | None:
@@ -747,6 +886,24 @@ def _eligible_job(context: CycleContext, *, project_id: str) -> Any | None:
         project_id=project_id, interpreter_version=INTERPRETER_VERSION
     )
     return job
+
+
+def _bound_preregistration(
+    context: CycleContext, *, job: Any, project_id: str
+) -> str | None:
+    """The one preregistration the claim may name, or nothing.
+
+    ``None`` when the spec digest resolves to zero preregistrations or to more
+    than one. Naming an arbitrary member of an ambiguous set would be worse
+    than naming none: `_preregistered_criteria` refuses an ambiguous set that
+    disagrees, and it can only do that if the claim has not already picked a
+    winner.
+    """
+
+    offered = _preregistrations_for(
+        context, digest=job.spec_digest, project_id=project_id
+    )
+    return offered[-1][0] if len(offered) == 1 else None
 
 
 def _interpretation_record(
@@ -824,6 +981,8 @@ def interpret_results(
         plan.get("parameters", {}).get("job_id") or previous.get("job_id") or ""
     )
 
+    claim = None
+    created = False
     if requested:
         # An explicitly named job takes precedence over any selection, and a
         # name that does not resolve is an error rather than an invitation to
@@ -844,12 +1003,23 @@ def interpret_results(
                 failure_class=FailureClass.POLICY_REFUSED,
             )
     else:
-        job = _eligible_job(context, project_id=project_id)
-        if job is None:
+        # Select and claim in one transaction. Two workers advancing the same
+        # project used to select the same oldest-eligible job and each do the
+        # whole reading; see `RuntimeStore.claim_next_interpretation`.
+        taken = context.store.claim_next_interpretation(
+            project_id=project_id,
+            interpreter_version=INTERPRETER_VERSION,
+            run_id=str(state["run_id"]),
+            preregistration_for=lambda found: _bound_preregistration(
+                context, job=found, project_id=project_id
+            ),
+        )
+        if taken is None:
             return ActionOutcome.succeeded(
                 "no finished experiment is waiting to be interpreted",
                 data={"interpreted": False},
             )
+        job, claim, created = taken
 
     if job.status not in {
         ExternalJobStatus.COMPLETED,
@@ -862,13 +1032,21 @@ def interpret_results(
             failure_class=FailureClass.SCHEDULER_UNAVAILABLE,
         )
 
-    claim, created = context.store.claim_interpretation(
-        job_id=job.job_id,
-        project_id=project_id,
-        spec_digest=job.spec_digest,
-        interpreter_version=INTERPRETER_VERSION,
-        run_id=str(state["run_id"]),
-    )
+    if claim is None:
+        # Resolved *before* the claim, so the claim can name it and a replay
+        # can never be handed a different set of criteria. See
+        # `_preregistered_criteria` and
+        # `sql/0010_interpretation_preregistration.sql`.
+        claim, created = context.store.claim_interpretation(
+            job_id=job.job_id,
+            project_id=project_id,
+            spec_digest=job.spec_digest,
+            interpreter_version=INTERPRETER_VERSION,
+            run_id=str(state["run_id"]),
+            preregistration_artifact_id=_bound_preregistration(
+                context, job=job, project_id=project_id
+            ),
+        )
     if not created and claim.status is InterpretationStatus.COMPLETED:
         # Already read, by this reader version. Return what was concluded
         # rather than concluding it again: a second reading of one experiment
@@ -899,7 +1077,10 @@ def interpret_results(
     # `criteria_were_fixed_before_results: True` while reporting none of them,
     # which is the one claim in this handler that must never be made loosely.
     criteria = _preregistered_criteria(
-        context, digest=job.spec_digest, project_id=project_id
+        context,
+        digest=job.spec_digest,
+        project_id=project_id,
+        artifact_id=claim.preregistration_artifact_id,
     )
     if criteria is None and previous.get("success_criteria"):
         criteria = {

@@ -24,12 +24,13 @@ is always a resumed worker acting on stale state.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from decimal import Decimal
 from typing import Any
 
 from research_os.errors import ResearchOSError
-from research_os.runtime.db import Database, jsonb
-from research_os.runtime.findings import FindingKind, RuntimeFinding
+from research_os.runtime.db import Database, RuntimeDatabaseError, jsonb
+from research_os.runtime.findings import FindingKind, FindingRefKind, RuntimeFinding
 from research_os.runtime.ids import (
     new_approval_id,
     new_event_id,
@@ -50,9 +51,11 @@ from research_os.runtime.models import (
     ExperimentInterpretation,
     ExternalJob,
     ExternalJobStatus,
+    InterpretationStatus,
     ModelCall,
     ModelCallStatus,
     Project,
+    ProposalReservationStatus,
     ProviderHealth,
     ResearchRun,
     RunStatus,
@@ -88,7 +91,8 @@ FINDING_COLUMNS = (
 )
 INTERPRETATION_COLUMNS = (
     "interpretation_id, job_id, project_id, run_id, work_id, spec_digest, "
-    "interpreter_version, artifact_id, status, detail, created_at, completed_at"
+    "interpreter_version, artifact_id, preregistration_artifact_id, status, "
+    "detail, created_at, completed_at"
 )
 SCHEDULE_COLUMNS = (
     "schedule_id, project_id, kind, payload, interval_seconds, next_run_at, "
@@ -98,6 +102,45 @@ SCHEDULE_COLUMNS = (
 
 class RuntimeStateError(ResearchOSError):
     """Raised when an operational record is missing or a transition is refused."""
+
+
+#: The partial unique index that makes "one successor per run" a fact.
+SUCCESSOR_INDEX = "research_runs_one_successor_idx"
+
+
+class SuccessorExistsError(RuntimeStateError):
+    """Raised when a parent run already has the successor a caller is opening.
+
+    A lost race, not a defect. The caller's response is to skip this objective
+    and report that another pass advanced it, which is the truth.
+    """
+
+
+_ELIGIBLE_JOB_SQL = """
+select {columns} from external_jobs j
+where j.project_id = %(project_id)s
+  and j.status in ('COMPLETED','FAILED','TIMED_OUT','CANCELLED')
+  and not exists (
+      select 1 from experiment_interpretations i
+      where i.job_id = j.job_id
+        and i.interpreter_version = %(version)s
+        and i.status = 'COMPLETED'
+  )
+order by j.finished_at nulls last, j.job_id
+limit 1
+{lock}
+"""
+"""The eligibility query, in one place so the locked and unlocked readers
+cannot drift apart.
+
+Two callers format it: :meth:`RuntimeStore.eligible_job_for_interpretation`
+with no lock, for reporting and for callers that only want to know whether
+anything is waiting, and :meth:`RuntimeStore.claim_next_interpretation` with
+``for update of j skip locked``, which is the one that then claims what it
+found. Having written the predicate twice is how the ordering and the
+``not exists`` clause would end up differing between "what the doctor says is
+waiting" and "what a worker actually takes".
+"""
 
 
 class RuntimeStore:
@@ -163,9 +206,44 @@ class RuntimeStore:
         The LangGraph thread id is derived from the run id and stored, so the
         mapping between "a cycle" and "a checkpointed thread" is one to one and
         recorded, which is what makes checkpoint retention possible later.
+
+        Raises :class:`SuccessorExistsError` when ``parent_run_id`` already has
+        a successor. One parent, at most one successor, enforced by
+        ``research_runs_one_successor_idx`` rather than by a lock the caller
+        holds -- see ``sql/0014_one_successor_per_run.sql``.
         """
 
         run_id = new_run_id()
+        try:
+            return self._insert_run(
+                run_id=run_id,
+                project_id=project_id,
+                objective=objective,
+                autonomy=autonomy,
+                parent_run_id=parent_run_id,
+                cycle_index=cycle_index,
+            )
+        except RuntimeDatabaseError as exc:
+            # `research_runs_one_successor_idx`, not any unique violation: a
+            # collision on the run id itself is a different fact and must not
+            # be reported as "somebody else advanced this objective".
+            if parent_run_id and SUCCESSOR_INDEX in str(exc):
+                raise SuccessorExistsError(
+                    f"{parent_run_id} already has a successor; another pass "
+                    f"advanced this objective"
+                ) from exc
+            raise
+
+    def _insert_run(
+        self,
+        *,
+        run_id: str,
+        project_id: str,
+        objective: str,
+        autonomy: Autonomy,
+        parent_run_id: str | None,
+        cycle_index: int,
+    ) -> ResearchRun:
         with self._db.tx() as conn:
             row = conn.execute(
                 f"""
@@ -873,22 +951,70 @@ class RuntimeStore:
 
         with self._db.tx() as conn:
             row = conn.execute(
-                f"""
-                select {JOB_COLUMNS} from external_jobs j
-                where j.project_id = %(project_id)s
-                  and j.status in ('COMPLETED','FAILED','TIMED_OUT','CANCELLED')
-                  and not exists (
-                      select 1 from experiment_interpretations i
-                      where i.job_id = j.job_id
-                        and i.interpreter_version = %(version)s
-                        and i.status = 'COMPLETED'
-                  )
-                order by j.finished_at nulls last, j.job_id
-                limit 1
-                """,
+                _ELIGIBLE_JOB_SQL.format(columns=JOB_COLUMNS, lock=""),
                 {"project_id": project_id, "version": interpreter_version},
             ).fetchone()
         return ExternalJob.model_validate(row) if row else None
+
+    def claim_next_interpretation(
+        self,
+        *,
+        project_id: str,
+        interpreter_version: str,
+        run_id: str | None = None,
+        work_id: str | None = None,
+        preregistration_for: Callable[[ExternalJob], str | None] | None = None,
+    ) -> tuple[ExternalJob, ExperimentInterpretation, bool] | None:
+        """Select the next job to interpret *and* claim it, in one transaction.
+
+        :meth:`eligible_job_for_interpretation` and :meth:`claim_interpretation`
+        are each correct and were called one after the other, which left the
+        window between them open: two workers advancing the same project at the
+        same time both selected the oldest eligible job, both did the whole
+        reading, and the second one's work was discarded at the end because the
+        unique constraint had already given the identity to the first. Nothing
+        incorrect was recorded -- the reading is deterministic and
+        :meth:`complete_interpretation` yields to whoever finished first -- but
+        the duplicated work is real, and "two workers, one of them wasted" is
+        not a property to leave in a scheduler that is allowed to run two
+        workers.
+
+        ``for update of j skip locked`` closes it. The second worker does not
+        block on the locked job row and does not take it; it takes the *next*
+        eligible one, or gets ``None``. The lock lives only as long as the
+        transaction, which is exactly as long as it needs to: once the claim is
+        committed, a later worker re-selecting the same job finds the existing
+        row and gets ``created=False``, which is the crash-recovery path and
+        must keep working.
+
+        ``preregistration_for`` runs inside the transaction, between the lock
+        and the insert, so the claim can name the preregistration it was
+        resolved against. It reads the artifact store, not the database, so it
+        does not nest a transaction. It is called at most once.
+        """
+
+        with self._db.tx() as conn:
+            row = conn.execute(
+                _ELIGIBLE_JOB_SQL.format(
+                    columns=JOB_COLUMNS, lock="for update of j skip locked"
+                ),
+                {"project_id": project_id, "version": interpreter_version},
+            ).fetchone()
+            if row is None:
+                return None
+            job = ExternalJob.model_validate(row)
+            prereg = preregistration_for(job) if preregistration_for else None
+            record, created = self._claim_interpretation(
+                conn,
+                job_id=job.job_id,
+                project_id=project_id,
+                spec_digest=job.spec_digest,
+                interpreter_version=interpreter_version,
+                run_id=run_id,
+                work_id=work_id,
+                preregistration_artifact_id=prereg,
+            )
+        return job, record, created
 
     def claim_interpretation(
         self,
@@ -899,6 +1025,7 @@ class RuntimeStore:
         interpreter_version: str,
         run_id: str | None = None,
         work_id: str | None = None,
+        preregistration_artifact_id: str | None = None,
     ) -> tuple[ExperimentInterpretation, bool]:
         """Claim the right to interpret one experiment. Returns ``(row, created)``.
 
@@ -916,35 +1043,66 @@ class RuntimeStore:
         """
 
         with self._db.tx() as conn:
-            inserted = conn.execute(
-                f"""
-                insert into experiment_interpretations
-                    (interpretation_id, job_id, project_id, run_id, work_id,
-                     spec_digest, interpreter_version)
-                values (%(interpretation_id)s, %(job_id)s, %(project_id)s, %(run_id)s,
-                        %(work_id)s, %(spec_digest)s, %(version)s)
-                on conflict (job_id, interpreter_version) do nothing
-                returning {INTERPRETATION_COLUMNS}
-                """,
-                {
-                    "interpretation_id": new_interpretation_id(),
-                    "job_id": job_id,
-                    "project_id": project_id,
-                    "run_id": run_id,
-                    "work_id": work_id,
-                    "spec_digest": spec_digest,
-                    "version": interpreter_version,
-                },
-            ).fetchone()
-            if inserted is not None:
-                return ExperimentInterpretation.model_validate(inserted), True
-            row = conn.execute(
-                f"""
-                select {INTERPRETATION_COLUMNS} from experiment_interpretations
-                where job_id = %(job_id)s and interpreter_version = %(version)s
-                """,
-                {"job_id": job_id, "version": interpreter_version},
-            ).fetchone()
+            return self._claim_interpretation(
+                conn,
+                job_id=job_id,
+                project_id=project_id,
+                spec_digest=spec_digest,
+                interpreter_version=interpreter_version,
+                run_id=run_id,
+                work_id=work_id,
+                preregistration_artifact_id=preregistration_artifact_id,
+            )
+
+    def _claim_interpretation(
+        self,
+        conn: Any,
+        *,
+        job_id: str,
+        project_id: str,
+        spec_digest: str,
+        interpreter_version: str,
+        run_id: str | None,
+        work_id: str | None,
+        preregistration_artifact_id: str | None,
+    ) -> tuple[ExperimentInterpretation, bool]:
+        """The claim itself, on a caller-supplied connection.
+
+        Separate from :meth:`claim_interpretation` only so
+        :meth:`claim_next_interpretation` can put the select and the insert in
+        one transaction. The semantics are identical.
+        """
+
+        inserted = conn.execute(
+            f"""
+            insert into experiment_interpretations
+                (interpretation_id, job_id, project_id, run_id, work_id,
+                 spec_digest, interpreter_version, preregistration_artifact_id)
+            values (%(interpretation_id)s, %(job_id)s, %(project_id)s, %(run_id)s,
+                    %(work_id)s, %(spec_digest)s, %(version)s, %(prereg)s)
+            on conflict (job_id, interpreter_version) do nothing
+            returning {INTERPRETATION_COLUMNS}
+            """,
+            {
+                "interpretation_id": new_interpretation_id(),
+                "job_id": job_id,
+                "project_id": project_id,
+                "run_id": run_id,
+                "work_id": work_id,
+                "spec_digest": spec_digest,
+                "version": interpreter_version,
+                "prereg": preregistration_artifact_id,
+            },
+        ).fetchone()
+        if inserted is not None:
+            return ExperimentInterpretation.model_validate(inserted), True
+        row = conn.execute(
+            f"""
+            select {INTERPRETATION_COLUMNS} from experiment_interpretations
+            where job_id = %(job_id)s and interpreter_version = %(version)s
+            """,
+            {"job_id": job_id, "version": interpreter_version},
+        ).fetchone()
         if row is None:  # pragma: no cover - the conflict implies a row exists
             raise RuntimeStateError(
                 f"could not claim an interpretation of {job_id} at "
@@ -961,10 +1119,27 @@ class RuntimeStore:
     ) -> ExperimentInterpretation:
         """Record that the reading finished, once.
 
-        Guarded on ``status = 'IN_PROGRESS'`` so a replayed worker cannot
-        overwrite the artifact of a completed interpretation with its own. A
-        second caller gets the existing completed row back, which is what the
-        recovery path needs: the same artifact, not a new one.
+        Claimable from ``IN_PROGRESS`` **or** ``ABANDONED``, and that second one
+        is the fix for a real loss an adversarial review executed.
+        ``ABANDONED`` means "a reading was begun and its outcome is unknown" --
+        which is precisely the state a worker completing its own reading is
+        resolving. Guarding on ``IN_PROGRESS`` alone meant that a worker whose
+        claim had been reaped for age while it was still working (the recovery
+        pass has no way to tell a slow worker from a dead one) found its update
+        matching nothing, and the artifact it had just written was attached to
+        nothing. The job then stayed eligible, so every later cycle re-read the
+        same experiment, re-wrote the same artifact, reported success, and never
+        advanced.
+
+        A ``COMPLETED`` row stays immutable: a replayed worker cannot overwrite
+        the artifact of a finished interpretation with its own.
+
+        And it no longer returns a row it did not complete. The previous version
+        fell back to a bare re-read, so a caller was handed an ``ABANDONED`` row
+        with ``artifact_id`` null and reported ``interpreted: True``. A
+        ``COMPLETED`` row comes back as the recovery path needs; anything else
+        raises, because "I could not record this reading" is a fact the caller
+        has to handle rather than a value to interpret.
         """
 
         with self._db.tx() as conn:
@@ -976,7 +1151,7 @@ class RuntimeStore:
                     detail = coalesce(%(detail)s, detail),
                     completed_at = now()
                 where interpretation_id = %(interpretation_id)s
-                  and status = 'IN_PROGRESS'
+                  and status in ('IN_PROGRESS', 'ABANDONED')
                 returning {INTERPRETATION_COLUMNS}
                 """,
                 {
@@ -985,15 +1160,22 @@ class RuntimeStore:
                     "detail": detail,
                 },
             ).fetchone()
-            if row is None:
-                row = conn.execute(
-                    f"select {INTERPRETATION_COLUMNS} from experiment_interpretations "
-                    f"where interpretation_id = %s",
-                    (interpretation_id,),
-                ).fetchone()
-        if row is None:
+            if row is not None:
+                return ExperimentInterpretation.model_validate(row)
+            existing = conn.execute(
+                f"select {INTERPRETATION_COLUMNS} from experiment_interpretations "
+                f"where interpretation_id = %s",
+                (interpretation_id,),
+            ).fetchone()
+        if existing is None:
             raise RuntimeStateError(f"no such interpretation: {interpretation_id}")
-        return ExperimentInterpretation.model_validate(row)
+        record = ExperimentInterpretation.model_validate(existing)
+        if record.status is InterpretationStatus.COMPLETED:
+            # Somebody else finished it. Theirs is the interpretation.
+            return record
+        raise RuntimeStateError(  # pragma: no cover - the statuses are exhaustive
+            f"{interpretation_id} is {record.status} and could not be completed"
+        )
 
     def get_interpretation(
         self, *, job_id: str, interpreter_version: str
@@ -1190,23 +1372,45 @@ class RuntimeStore:
         *,
         proposal_id: str,
         finding_ids: tuple[str, ...],
+        cited_ids: tuple[str, ...] = (),
         run_id: str | None = None,
         work_id: str | None = None,
     ) -> int:
-        """Record, immutably, which findings one proposal was grounded in."""
+        """Record which findings one proposal was offered, and which it cited.
 
+        ``finding_ids`` is everything the worker was shown; ``cited_ids`` is the
+        subset its items are actually grounded in. Both are recorded, on one row
+        per finding, because they answer different questions -- see
+        ``sql/0011_proposal_link_citation.sql``. Passing no ``cited_ids`` records
+        the whole packet as offered and nothing as cited, which is the accurate
+        statement for a caller that does not know what was cited.
+
+        An id in ``cited_ids`` that is not in ``finding_ids`` is a programming
+        error, not a row to write: the proposal validator already refuses a
+        citation outside the allowlist, so reaching here means the two were
+        computed from different sets.
+        """
+
+        stray = set(cited_ids) - set(finding_ids)
+        if stray:
+            raise RuntimeStateError(
+                f"{proposal_id} cites finding(s) it was not offered: "
+                + ", ".join(sorted(stray))
+            )
         if not finding_ids:
             return 0
+        cited = set(cited_ids)
         with self._db.tx() as conn:
             for finding_id in finding_ids:
                 conn.execute(
                     """
                     insert into runtime_proposal_links
-                        (proposal_id, finding_id, run_id, work_id)
-                    values (%s, %s, %s, %s)
-                    on conflict (proposal_id, finding_id) do nothing
+                        (proposal_id, finding_id, run_id, work_id, cited)
+                    values (%s, %s, %s, %s, %s)
+                    on conflict (proposal_id, finding_id) do update
+                        set cited = runtime_proposal_links.cited or excluded.cited
                     """,
-                    (proposal_id, finding_id, run_id, work_id),
+                    (proposal_id, finding_id, run_id, work_id, finding_id in cited),
                 )
         return len(finding_ids)
 
@@ -1252,12 +1456,24 @@ class RuntimeStore:
         resolved = [self.get_finding(str(row["finding_id"])) for row in rows]
         return tuple(item for item in resolved if item is not None)
 
-    def proposal_findings(self, proposal_id: str) -> tuple[RuntimeFinding, ...]:
+    def proposal_findings(
+        self, proposal_id: str, *, cited_only: bool = False
+    ) -> tuple[RuntimeFinding, ...]:
+        """The findings linked to one proposal.
+
+        Everything it was offered by default, because the reconciler that reads
+        this needs the packet it built the proposal from. ``cited_only`` narrows
+        it to the citation edges, which is what a reader asking "what does this
+        proposal rest on" wants.
+        """
+
         with self._db.tx() as conn:
             rows = conn.execute(
                 "select finding_id from runtime_proposal_links "
-                "where proposal_id = %s order by finding_id",
-                (proposal_id,),
+                "where proposal_id = %(proposal_id)s "
+                "  and (not %(cited_only)s or cited) "
+                "order by finding_id",
+                {"proposal_id": proposal_id, "cited_only": cited_only},
             ).fetchall()
         resolved = [self.get_finding(str(row["finding_id"])) for row in rows]
         return tuple(item for item in resolved if item is not None)
@@ -1310,17 +1526,53 @@ class RuntimeStore:
             )
         return str(row["proposal_id"]), str(row["status"]), False
 
+    def reserved_proposal(self, reservation_key: str) -> tuple[str, str] | None:
+        """``(proposal_id, status)`` for one reservation key, or ``None``.
+
+        So a reconciler can *read* the reserved id instead of recomputing it.
+        The two are the same today, and that is the problem: they are the same
+        because two functions agree, and if they ever stop agreeing -- a bump in
+        ``reserved_proposal_id``'s derivation, a change in what
+        ``reservation_key_for`` includes -- the reconciler starts looking for a
+        directory that was never created, finds nothing, and lets the action
+        create a second proposal for the same cycle. The row is the record of
+        what was actually reserved; the derivation is how it was chosen.
+        """
+
+        with self._db.tx() as conn:
+            row = conn.execute(
+                "select proposal_id, status from runtime_proposal_reservations "
+                "where reservation_key = %s",
+                (reservation_key,),
+            ).fetchone()
+        if row is None:
+            return None
+        return str(row["proposal_id"]), str(row["status"])
+
     def settle_proposal_reservation(
         self, reservation_key: str, *, status: str, detail: str | None = None
     ) -> None:
-        """Mark a reservation ``CREATED`` or ``FAILED``, once.
+        """Mark a reservation ``CREATED`` or ``FAILED``.
 
-        Guarded on ``RESERVED`` so a slow worker cannot reopen a settled
-        reservation, and so a ``FAILED`` record of a proposal that did reach the
-        store cannot overwrite the ``CREATED`` one.
+        Only ``CREATED`` is absorbing, and that asymmetry is the point.
+        ``CREATED`` is a statement about the *directory*, which is monotone --
+        once a proposal exists it exists -- so nothing may overwrite it.
+        ``FAILED`` is a statement about one attempt, and a later attempt that
+        finds the proposal must be able to correct it.
+
+        Guarding both on ``RESERVED`` was the defect an adversarial review
+        executed: the v1 controller stores the proposal and *then* assesses, so
+        an assessor failure settles ``FAILED`` while the directory exists. The
+        retry then recovered the proposal, told the researcher to read it, and
+        its ``settle(..., "CREATED")`` was a silent no-op -- leaving a proposal
+        a person is being asked to decide about whose reservation row says the
+        attempt failed.
         """
 
-        if status not in {"CREATED", "FAILED"}:
+        if status not in {
+            ProposalReservationStatus.CREATED.value,
+            ProposalReservationStatus.FAILED.value,
+        }:
             raise RuntimeStateError(f"not a settlement status: {status!r}")
         with self._db.tx() as conn:
             conn.execute(
@@ -1329,10 +1581,32 @@ class RuntimeStore:
                 set status = %(status)s,
                     detail = coalesce(%(detail)s, detail),
                     settled_at = now()
-                where reservation_key = %(key)s and status = 'RESERVED'
+                where reservation_key = %(key)s
+                  and status <> 'CREATED'
+                  and (status = 'RESERVED' or %(status)s = 'CREATED')
                 """,
                 {"key": reservation_key, "status": status, "detail": detail},
             )
+
+    def has_successor(self, run_id: str) -> bool:
+        """Whether any run names this one as its parent.
+
+        A cheap pre-check that saves the work, not the thing that makes the
+        outcome correct. Two passes can both read ``False`` here; the one that
+        loses fails at the insert with :class:`SuccessorExistsError`, because
+        ``research_runs_one_successor_idx`` allows one row per parent. This used
+        to be preceded by ``lock_run``, an advisory lock taken and released
+        inside its own transaction, which serialised nothing -- see
+        ``sql/0014_one_successor_per_run.sql``.
+        """
+
+        with self._db.tx() as conn:
+            row = conn.execute(
+                "select 1 as present from research_runs where parent_run_id = %s "
+                "limit 1",
+                (run_id,),
+            ).fetchone()
+        return row is not None
 
     def parked_objectives(
         self, *, project_id: str, limit: int = 20
@@ -1354,14 +1628,27 @@ class RuntimeStore:
           moving does not create budget, and opening a cycle that cannot finish
           would turn one exhausted objective into a stream of them.
 
-        Grouped by objective rather than by run, because two runs of the same
-        objective are one objective, and the successor belongs to the newest.
+        One row per objective, and by a *total* order. Two runs of one objective
+        can share ``created_at`` to the microsecond -- a retry, a scripted
+        double start -- and the max-timestamp filter alone would then return
+        both, each eligible, each getting its own successor. ``distinct on
+        (objective)`` with ``run_id`` as the tiebreak makes "the successor
+        belongs to the newest" single-valued.
+
+        The max-timestamp filter stays, and it is doing something the
+        ``distinct on`` cannot: excluding an objective whose newest run is
+        *not* eligible. A cycle still RUNNING is not a child of the parked one,
+        so the lineage check would not see it -- but advancing an objective
+        while a cycle of it is in flight is exactly the two-threads-per-
+        objective state the whole design avoids.
         """
 
         with self._db.tx() as conn:
             rows = conn.execute(
-                f"""
-                select {RUN_COLUMNS} from research_runs r
+                rf"""
+                select distinct on (regexp_replace(btrim(r.objective), '\s+', ' ', 'g'))
+                       {RUN_COLUMNS}
+                from research_runs r
                 where r.project_id = %(project_id)s
                   and r.status in ('SUCCEEDED','FAILED')
                   and r.terminal_state in (
@@ -1373,9 +1660,18 @@ class RuntimeStore:
                   and r.created_at = (
                       select max(peer.created_at) from research_runs peer
                       where peer.project_id = r.project_id
-                        and peer.objective = r.objective
+                        -- Compared with whitespace collapsed. Exact text
+                        -- equality made "whether the widget deforms" and
+                        -- "whether  the widget deforms" two objectives, so one
+                        -- capsule change opened a full cycle for each -- and
+                        -- the cost of one observation became unbounded in the
+                        -- number of near-duplicate objective strings. An
+                        -- adversarial review executed three.
+                        and regexp_replace(btrim(peer.objective), '\s+', ' ', 'g')
+                            = regexp_replace(btrim(r.objective), '\s+', ' ', 'g')
                   )
-                order by r.created_at desc
+                order by regexp_replace(btrim(r.objective), '\s+', ' ', 'g'),
+                         r.run_id desc
                 limit %(limit)s
                 """,
                 {"project_id": project_id, "limit": limit},
@@ -1433,8 +1729,21 @@ class RuntimeStore:
 
             previous_capsule = str(existing["capsule_digest"])
             previous_frontier = str(existing["frontier_digest"])
-            changed = previous_capsule != capsule_digest
-            if changed or previous_frontier != frontier_digest:
+            # Either digest moving is a change. Not just the capsule one, and
+            # that was a real blind spot: the two digests answer different
+            # questions and neither is a superset of the other. An adversarial
+            # review executed the case -- a Review's verdict changing moved the
+            # frontier and left the capsule digest identical, so the highest-
+            # authority human act in the system was invisible. The capsule
+            # digest now covers a Review's fields as well, and this is the
+            # belt: whatever else either digest fails to see, a frontier that
+            # has moved means there is different work to do, which is the only
+            # thing the advance needs to know.
+            changed = (
+                previous_capsule != capsule_digest
+                or previous_frontier != frontier_digest
+            )
+            if changed:
                 conn.execute(
                     """
                     update capsule_observations
@@ -1448,7 +1757,7 @@ class RuntimeStore:
                         "project_id": project_id,
                         "capsule": capsule_digest,
                         "frontier": frontier_digest,
-                        "increment": 1 if changed else 0,
+                        "increment": 1,
                     },
                 )
         return changed, previous_capsule, previous_frontier
@@ -1627,9 +1936,9 @@ def _finding_from(row: Any, refs: Any = ()) -> RuntimeFinding:
     """
 
     by_kind: dict[str, list[str]] = {
-        "artifact": [],
-        "capsule_object": [],
-        "literature_key": [],
+        FindingRefKind.ARTIFACT.value: [],
+        FindingRefKind.CAPSULE_OBJECT.value: [],
+        FindingRefKind.LITERATURE_KEY.value: [],
     }
     for ref in refs or ():
         by_kind.setdefault(str(ref["kind"]), []).append(str(ref["ref"]))
@@ -1642,9 +1951,9 @@ def _finding_from(row: Any, refs: Any = ()) -> RuntimeFinding:
         source_cycle=row["source_cycle"],
         source_work_id=row["source_work_id"],
         source_action=row["source_action"],
-        artifact_ids=tuple(by_kind["artifact"]),
-        capsule_refs=tuple(by_kind["capsule_object"]),
-        literature_keys=tuple(by_kind["literature_key"]),
+        artifact_ids=tuple(by_kind[FindingRefKind.ARTIFACT.value]),
+        capsule_refs=tuple(by_kind[FindingRefKind.CAPSULE_OBJECT.value]),
+        literature_keys=tuple(by_kind[FindingRefKind.LITERATURE_KEY.value]),
         experiment_job_id=row["experiment_job_id"],
         spec_digest=row["spec_digest"],
         created_at=str(row["created_at"]),

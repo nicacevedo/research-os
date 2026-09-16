@@ -58,12 +58,28 @@ from research_os.runtime.failures import FailureClass
 from research_os.runtime.interfaces import ExecutionHandle, ExecutionSpec
 from research_os.runtime.models import ExternalJob, ExternalJobStatus
 from research_os.runtime.store import RuntimeStore
-from research_os.sandbox import SandboxError, SandboxMode, SandboxSpec, contain
+from research_os.sandbox import (
+    SandboxError,
+    SandboxMode,
+    SandboxSpec,
+    contain,
+    process_limit_preexec,
+)
 
 LOG = logging.getLogger("research_os.runtime.executors")
 
 LOCAL = "local"
 SLURM = "slurm"
+
+
+class ContainmentUnavailableError(ResearchOSError):
+    """Raised when an execution requires containment this host cannot provide.
+
+    Distinct from :class:`ExecutorError` because the responses differ and one of
+    them is wrong. `EXECUTOR_FAILED` is `REPAIR`, which puts the work item back
+    on the queue; no repair makes a kernel offer user namespaces. This maps to
+    `CAPABILITY_DENIED`, which is terminal, which is the honest answer.
+    """
 
 
 class ExecutorError(ResearchOSError):
@@ -190,25 +206,40 @@ class LocalExecutor:
         stdout_path = run_dir / "logs" / "stdout.txt"
         stderr_path = run_dir / "logs" / "stderr.txt"
         try:
-            prepared = contain(
-                spec.argv,
-                spec=SandboxSpec(
-                    workdir=Path(spec.cwd),
-                    # The frozen run directory is where declared outputs are
-                    # collected from, so the command has to be able to write it.
-                    writable=(run_dir,),
-                    network=False,
-                    wall_seconds=spec.timeout_seconds,
-                    # Only the seeds the spec froze. Not `os.environ`: an
-                    # experiment that reads a provider key from the environment
-                    # is an experiment whose result depends on something that is
-                    # not in its provenance.
-                    environment=dict(spec.env),
-                ),
-                mode=self.sandbox_mode,
+            workdir = Path(spec.cwd)
+            sandbox_spec = SandboxSpec(
+                workdir=workdir,
+                # The frozen run directory is where declared outputs are
+                # collected from, so the command has to be able to write it.
+                writable=(run_dir,),
+                # The two things inside the checkout a declared experiment must
+                # not be able to write, whatever else it may.
+                #
+                # The workdir *is* the project checkout -- that is where an
+                # experiment's code and data are, so it has to be writable --
+                # and an adversarial review showed what that granted: `.git/
+                # hooks` and `.research/` were writable inside "containment",
+                # a `post-checkout` hook produced zero drift from
+                # `canonical_fingerprint`, and the next `git worktree add` ran
+                # it on the host.
+                protected=(workdir / ".git", workdir / ".research"),
+                network=False,
+                wall_seconds=spec.timeout_seconds,
+                # Only the seeds the spec froze. Not `os.environ`: an
+                # experiment that reads a provider key from the environment
+                # is an experiment whose result depends on something that is
+                # not in its provenance.
+                environment=dict(spec.env),
             )
+            prepared = contain(spec.argv, spec=sandbox_spec, mode=self.sandbox_mode)
         except SandboxError as exc:
-            raise ExecutorError(str(exc)) from None
+            # A refusal, not an executor malfunction. `EXECUTOR_FAILED` is
+            # `REPAIR`, so classifying it that way put the work item back on the
+            # queue and invited a repair worker to react to "this host cannot
+            # provide containment" -- which no repair can change. The coding
+            # path already raises this distinction; an adversarial review found
+            # that this one did not.
+            raise ContainmentUnavailableError(str(exc)) from None
         try:
             with stdout_path.open("wb") as out, stderr_path.open("wb") as err:
                 completed = subprocess.run(
@@ -220,6 +251,21 @@ class LocalExecutor:
                     stderr=err,
                     timeout=spec.timeout_seconds,
                     check=False,
+                    # A session of its own, so the command has no controlling
+                    # terminal and cannot write to the researcher's. The
+                    # contained path gets this from `--new-session`; the
+                    # uncontained path -- the live one on a host with no
+                    # containment -- had nothing, and an adversarial review
+                    # executed `open("/dev/tty","w")` from an acceptance
+                    # command and repainted the terminal.
+                    start_new_session=True,
+                    # Only when contained. See `process_limit_preexec`:
+                    # `RLIMIT_NPROC` counts the researcher's whole session
+                    # outside a user namespace, so setting it there stops the
+                    # child creating its first thread.
+                    preexec_fn=process_limit_preexec(
+                        sandbox_spec, contained=prepared.contained
+                    ),
                 )
         except subprocess.TimeoutExpired:
             return ExecutionHandle(
@@ -229,6 +275,11 @@ class LocalExecutor:
                 finished=True,
                 exit_code=None,
                 detail=f"timed out after {spec.timeout_seconds}s",
+                # Recorded here too. It defaulted to False, so a run that *was*
+                # contained and then timed out was recorded as uncontained --
+                # understating rather than overstating, but still wrong.
+                contained=prepared.contained,
+                containment=f"{prepared.technology}: {prepared.detail}",
             )
         except OSError as exc:
             raise ExecutorError(f"could not run {spec.name}: {exc}") from None
@@ -351,6 +402,25 @@ class SlurmExecutor:
 
     name: str = SLURM
     settings: object | None = None
+    sandbox_mode: SandboxMode = SandboxMode.PREFERRED
+    """What containment the caller demanded, so this executor can refuse.
+
+    Nothing in this process can contain a process on another machine.
+    :func:`research_os.sandbox.contain` wraps an argv this host is about to
+    execute; a batch script runs on a compute node whose kernel, namespace
+    permissions and installed tooling are not visible from here, and probing
+    them would mean submitting a job to find out.
+
+    So the mode is not *implemented* here, it is *honoured by refusal*. An
+    adversarial review pointed out that the alternative was worse than a gap:
+    with ``required`` in force for local work, writing ``executor: slurm`` in a
+    plan was a one-word route around it, and the resulting job was recorded with
+    no containment field at all. At ``required`` this executor raises
+    :class:`ContainmentUnavailableError`, which is
+    ``WAITING_FOR_EXTERNAL_DEPENDENCY`` rather than a repairable failure,
+    because the missing thing really is external: cluster-side containment that
+    Research OS does not configure. See ``docs/RUNTIME.md``.
+    """
 
     def _inner(self) -> object:
         from research_os.experiment.config import SlurmSettings
@@ -373,6 +443,16 @@ class SlurmExecutor:
         lines = [
             "#!/bin/bash",
             f"#SBATCH --job-name={job_name}",
+            # sbatch's default is `--export=ALL`: the submitting process's whole
+            # environment is copied into the job. The submitting process is the
+            # runtime daemon, whose environment holds provider API keys, the
+            # PostgreSQL DSN and whatever else the operator exported -- and the
+            # job's stdout, its `env` if it ever prints one, and any node-shared
+            # diagnostic then carry them. An adversarial review found this;
+            # nothing in the runtime ever asked for that propagation, and the
+            # spec's own `env` (exported explicitly below) is the complete set of
+            # values an experiment is entitled to.
+            "#SBATCH --export=NONE",
         ]
         for directive, key in (
             ("partition", "partition"),
@@ -397,12 +477,22 @@ class SlurmExecutor:
                 "",
             ]
         )
+        # With `--export=NONE` the only environment the payload gets is what
+        # these lines put there, which is the frozen spec and nothing else.
         for key, value in sorted(spec.env.items()):
             lines.append(f"export {key}={shlex.quote(value)}")
         lines.append(" ".join(shlex.quote(token) for token in spec.argv))
         return "\n".join(lines) + "\n"
 
     def submit(self, spec: ExecutionSpec, *, run_dir: Path) -> ExecutionHandle:
+        if self.sandbox_mode is SandboxMode.REQUIRED:
+            raise ContainmentUnavailableError(
+                "containment is required and this build cannot contain a Slurm "
+                "job: the payload runs on a compute node, and Research OS "
+                "neither configures nor probes containment there. Run this "
+                "experiment locally, or configure cluster-side containment and "
+                "record it in the project's experiments.yaml command"
+            )
         digest = spec_digest(spec)
         job_name = f"ros-{spec.name}"[:64]
         script_path = run_dir / "batch.sh"
@@ -471,6 +561,8 @@ def build_executors(
     # mode, because there a person is at the keyboard.
     mode = SandboxMode.REQUIRED if autonomy == "high" else _configured_sandbox_mode()
     executors: dict[str, object] = {LOCAL: LocalExecutor(sandbox_mode=mode)}
+    # The same mode reaches the Slurm executor, which honours it by refusing.
+    # Passing only the local one is how `required` became optional.
     try:
         experiment_config = load_experiment_config()
     except ResearchOSError as exc:
@@ -478,7 +570,7 @@ def build_executors(
         return executors
     settings = experiment_config.slurm_for(project_id)
     if probe(settings).available:
-        executors[SLURM] = SlurmExecutor(settings=settings)
+        executors[SLURM] = SlurmExecutor(settings=settings, sandbox_mode=mode)
     return executors
 
 

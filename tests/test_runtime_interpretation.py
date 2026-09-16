@@ -35,7 +35,7 @@ from research_os.runtime.actions.experiments import (
 from research_os.runtime.db import Database
 from research_os.runtime.failures import FailureClass
 from research_os.runtime.models import ExternalJobStatus, InterpretationStatus
-from research_os.runtime.store import RuntimeStore
+from research_os.runtime.store import RuntimeStateError, RuntimeStore
 from tests.runtime_graph_helpers import make_capsule, make_context
 
 SCRIPTS = Path(__file__).parent / "runtime_scripts"
@@ -570,3 +570,308 @@ def test_a_new_interpreter_version_reads_the_experiment_again(
     assert first is not None
     assert second.interpretation_id != first.interpretation_id
     assert len(env["store"].list_interpretations(project_id="alpha-project")) == 2
+
+
+# ------------------------------- what the adversarial audit executed --------
+def test_a_replay_cannot_be_handed_criteria_designed_after_the_result(
+    env: dict[str, Any],
+) -> None:
+    """The most serious defect an adversarial review found, as a test.
+
+    ``spec_digest`` covers the *execution* and says nothing about the criteria,
+    which live beside it in the preregistration record. So two design passes
+    over one declared command store two preregistrations with the same digest
+    and different primary endpoints — and a lookup by digest has to choose.
+
+    It chose the newest. Which permits exactly this: read an experiment, crash
+    before recording it, design again with a different endpoint, and the retry
+    compares the same result against the new criteria while reporting
+    ``criteria_were_fixed_before_results: True``. A post-hoc primary-endpoint
+    change with no recorded Decision — the gate ``docs/RUNTIME.md`` calls the
+    most important in the system, defeated by a query.
+
+    The criteria are now resolved once, when the interpretation is claimed, and
+    the artifact that carried them is named on the row.
+    """
+
+    job = _preregistered_job(env, digest="a" * 64, endpoint="the mean of column A")
+    context = _context(env)
+
+    # A reading begins and is interrupted before it completes.
+    claim, created = env["store"].claim_interpretation(
+        job_id=job.job_id,
+        project_id="alpha-project",
+        spec_digest=job.spec_digest,
+        interpreter_version=INTERPRETER_VERSION,
+        run_id=env["run"].run_id,
+        preregistration_artifact_id=None,
+    )
+    assert created is True
+    # Bind it the way the handler does.
+    first = interpret_results(
+        env["state"], context, {"parameters": {"job_id": job.job_id}}
+    )
+    assert first.ok, first.detail
+    assert first.data["primary_endpoint"] == "the mean of column A"
+
+    # Now a *second* preregistration for the same execution, with a different
+    # endpoint, designed after the result is known.
+    _preregistered_job(
+        env,
+        digest="a" * 64,
+        endpoint="a different endpoint chosen after the result",
+        prereg=True,
+    )
+
+    again = interpret_results(
+        env["state"], _context(env), {"parameters": {"job_id": job.job_id}}
+    )
+    assert again.ok, again.detail
+    assert again.data["reused"] is True, "the completed reading was redone"
+    assert again.data["interpretation_id"] == claim.interpretation_id
+    # And the recorded interpretation still names the criteria it was compared
+    # against, not the ones designed since.
+    stored = env["store"].get_interpretation(
+        job_id=job.job_id, interpreter_version=INTERPRETER_VERSION
+    )
+    assert stored is not None
+    body = json.loads(_context(env).artifacts.get_text(str(stored.artifact_id)))
+    assert body["criteria"]["primary_endpoint"] == "the mean of column A"
+
+
+def test_two_preregistrations_that_disagree_are_refused_rather_than_chosen(
+    env: dict[str, Any],
+) -> None:
+    """ "Which of these two did we commit to" is not a question to answer by picking.
+
+    The same digest with different criteria is an ambiguity a person has to
+    resolve. Choosing either one silently is how a result gets compared against
+    a commitment nobody made.
+    """
+
+    job = _preregistered_job(env, digest="a" * 64, endpoint="endpoint one")
+    _preregistered_job(env, digest="a" * 64, endpoint="endpoint two")
+
+    outcome = interpret_results(
+        env["state"], _context(env), {"parameters": {"job_id": job.job_id}}
+    )
+    assert not outcome.ok
+    assert outcome.failure_class is FailureClass.ARTIFACT_MISSING
+    assert "no preregistration found" in outcome.detail
+    # Still owed a reading: the ambiguity is fixable and marking it read would
+    # hide it permanently.
+    stored = env["store"].get_interpretation(
+        job_id=job.job_id, interpreter_version=INTERPRETER_VERSION
+    )
+    assert stored is not None
+    assert stored.status is InterpretationStatus.IN_PROGRESS
+
+
+def test_a_worker_whose_claim_was_reaped_for_age_still_records_its_reading(
+    env: dict[str, Any],
+) -> None:
+    """The loss an adversarial review executed, and it was permanent.
+
+    The recovery pass has no way to tell a slow worker from a dead one, so it
+    abandons a claim on age alone. ``complete_interpretation`` was guarded on
+    ``IN_PROGRESS``, so the worker's update matched nothing and the artifact it
+    had just written was attached to nothing. The job stayed eligible, and
+    every later cycle re-read the same experiment, re-wrote the same artifact,
+    reported success, and never advanced.
+    """
+
+    job = _preregistered_job(env, digest="a" * 64, endpoint="A")
+    claim, _created = env["store"].claim_interpretation(
+        job_id=job.job_id,
+        project_id="alpha-project",
+        spec_digest=job.spec_digest,
+        interpreter_version=INTERPRETER_VERSION,
+        run_id=env["run"].run_id,
+    )
+    # The recovery pass reaps it while the worker is still going.
+    with env["db"].tx() as conn:
+        conn.execute(
+            "update experiment_interpretations set created_at = now() - interval "
+            "'1 day' where interpretation_id = %s",
+            (claim.interpretation_id,),
+        )
+    env["store"].abandon_stale_interpretations(older_than_seconds=60)
+
+    written = _context(env).artifacts.put_text(
+        "the reading this worker produced", media_type="application/json"
+    )
+    completed = env["store"].complete_interpretation(
+        claim.interpretation_id,
+        artifact_id=written.artifact_id,
+        detail="finished anyway",
+    )
+    assert completed.status is InterpretationStatus.COMPLETED
+    assert completed.artifact_id == written.artifact_id, "the reading was lost"
+    assert completed.completed_at is not None
+
+    # And the job is no longer owed a reading, so no cycle re-reads it.
+    assert (
+        env["store"].eligible_job_for_interpretation(
+            project_id="alpha-project", interpreter_version=INTERPRETER_VERSION
+        )
+        is None
+    )
+
+
+def test_completing_an_interpretation_never_reports_a_reading_it_did_not_record(
+    env: dict[str, Any],
+) -> None:
+    """It used to fall back to a bare re-read, and hand back an ABANDONED row.
+
+    The caller then reported ``interpreted: True`` with ``artifact_id: None``.
+    "I could not record this reading" is a fact a caller has to handle, not a
+    value to interpret.
+    """
+
+    job = _preregistered_job(env, digest="a" * 64, endpoint="A")
+    claim, _created = env["store"].claim_interpretation(
+        job_id=job.job_id,
+        project_id="alpha-project",
+        spec_digest=job.spec_digest,
+        interpreter_version=INTERPRETER_VERSION,
+    )
+    context = _context(env)
+    mine = context.artifacts.put_text("the first reading")
+    theirs = context.artifacts.put_text("a later reading")
+    first = env["store"].complete_interpretation(
+        claim.interpretation_id, artifact_id=mine.artifact_id
+    )
+    # A second caller gets the completed row, with the first artifact.
+    second = env["store"].complete_interpretation(
+        claim.interpretation_id, artifact_id=theirs.artifact_id
+    )
+    assert second.artifact_id == first.artifact_id == mine.artifact_id
+    assert second.completed_at == first.completed_at
+
+    with pytest.raises(RuntimeStateError, match="no such interpretation"):
+        env["store"].complete_interpretation("XINT-20260101T000000Z-deadbeef")
+
+
+# -- selecting and claiming are one transaction ----------------------------
+def test_two_workers_do_not_both_take_the_same_job(
+    runtime_db: Database, pg_dsn: str
+) -> None:
+    """Select-then-claim was a check-then-act with a window between the calls.
+
+    Both workers selected the oldest eligible job and both did the whole
+    reading; the second one's work was discarded at the end by the unique
+    constraint. Nothing incorrect was recorded, and the duplicated work is
+    still real.
+
+    Genuinely concurrent, because a sequential pair proves nothing here: the
+    first transaction commits before the second begins, so the lock is gone and
+    the second worker re-selects the same job on the recovery path. The other
+    connection holds a real ``for update`` on the job row for the duration.
+    """
+
+    store = RuntimeStore(runtime_db)
+    store.upsert_project(project_id="race", repo_path="/tmp/race")
+    run = store.create_run(project_id="race", objective="read them")
+    jobs = []
+    for index in range(2):
+        job = store.create_external_job(
+            project_id="race",
+            run_id=run.run_id,
+            executor="local",
+            spec_digest=f"{index:064d}",
+            run_dir=f"/tmp/race/{index}",
+        )
+        store.update_external_job(
+            job.job_id, status=ExternalJobStatus.COMPLETED, exit_code=0
+        )
+        jobs.append(job.job_id)
+
+    with Database(pg_dsn) as other, other.tx() as held:
+        # A competing worker, mid-transaction, holding the oldest job.
+        locked = held.execute(
+            "select job_id from external_jobs where project_id = %s "
+            "order by finished_at nulls last, job_id limit 1 for update",
+            ("race",),
+        ).fetchone()
+        assert locked is not None
+        taken = store.claim_next_interpretation(
+            project_id="race", interpreter_version="probe@1"
+        )
+
+    assert taken is not None
+    assert taken[0].job_id != str(locked["job_id"]), (
+        "the second worker took the job the first one was holding"
+    )
+    assert taken[0].job_id in jobs
+    assert taken[2] is True
+
+
+def test_an_in_progress_claim_stays_recoverable(runtime_db: Database) -> None:
+    """A claim whose worker died must not be stranded.
+
+    Eligibility excludes a *completed* interpretation, not any interpretation,
+    so a later worker re-selects the job and gets `created=False` -- which is
+    the recovery path and has to keep working now that the select and the claim
+    are in one transaction.
+    """
+
+    store = RuntimeStore(runtime_db)
+    store.upsert_project(project_id="recover", repo_path="/tmp/recover")
+    run = store.create_run(project_id="recover", objective="read it")
+    job = store.create_external_job(
+        project_id="recover",
+        run_id=run.run_id,
+        executor="local",
+        spec_digest="c" * 64,
+        run_dir="/tmp/recover/run",
+    )
+    store.update_external_job(
+        job.job_id, status=ExternalJobStatus.COMPLETED, exit_code=0
+    )
+
+    first = store.claim_next_interpretation(
+        project_id="recover", interpreter_version="probe@1"
+    )
+    assert first is not None and first[2] is True
+
+    again = store.claim_next_interpretation(
+        project_id="recover", interpreter_version="probe@1"
+    )
+    assert again is not None
+    assert again[0].job_id == job.job_id
+    assert again[2] is False
+    assert again[1].interpretation_id == first[1].interpretation_id
+
+
+def test_the_claim_names_the_preregistration_it_was_resolved_against(
+    runtime_db: Database,
+) -> None:
+    """The callback runs between the lock and the insert, once."""
+
+    store = RuntimeStore(runtime_db)
+    store.upsert_project(project_id="bound", repo_path="/tmp/bound")
+    run = store.create_run(project_id="bound", objective="read it")
+    job = store.create_external_job(
+        project_id="bound",
+        run_id=run.run_id,
+        executor="local",
+        spec_digest="d" * 64,
+        run_dir="/tmp/bound/run",
+    )
+    store.update_external_job(
+        job.job_id, status=ExternalJobStatus.COMPLETED, exit_code=0
+    )
+    seen: list[str] = []
+
+    def resolve(found: object) -> str | None:
+        seen.append(str(getattr(found, "job_id", "")))
+        return None
+
+    taken = store.claim_next_interpretation(
+        project_id="bound",
+        interpreter_version="probe@1",
+        preregistration_for=resolve,
+    )
+
+    assert taken is not None
+    assert seen == [job.job_id]

@@ -19,7 +19,11 @@ from research_os.runtime.models import (
     RunStatus,
     TerminalState,
 )
-from research_os.runtime.store import RuntimeStateError, RuntimeStore
+from research_os.runtime.store import (
+    RuntimeStateError,
+    RuntimeStore,
+    SuccessorExistsError,
+)
 
 
 @pytest.fixture
@@ -441,3 +445,108 @@ def test_a_settled_reservation_cannot_be_reopened(
         project_id=runtime_project,
     )
     assert status == "CREATED"
+
+
+def test_a_run_may_have_only_one_successor(runtime_db: Database) -> None:
+    """The invariant `lock_run` claimed to enforce and did not.
+
+    `lock_run` took a transaction-scoped advisory lock inside its own
+    transaction, so it was released before the caller's next statement. The
+    check-then-act it was supposed to serialise -- `has_successor` then
+    `start_cycle` -- was never serialised at all. The guard is now a partial
+    unique index, which does not care when the second inserter arrives.
+    """
+
+    store = RuntimeStore(runtime_db)
+    store.upsert_project(project_id="lineage", repo_path="/tmp/lineage")
+    parent = store.create_run(project_id="lineage", objective="keep going")
+    first = store.create_run(
+        project_id="lineage",
+        objective="keep going",
+        parent_run_id=parent.run_id,
+        cycle_index=1,
+    )
+
+    with pytest.raises(SuccessorExistsError, match="already has a successor"):
+        store.create_run(
+            project_id="lineage",
+            objective="keep going",
+            parent_run_id=parent.run_id,
+            cycle_index=1,
+        )
+
+    # And the loser did not take the winner's row with it.
+    assert store.has_successor(parent.run_id) is True
+    assert store.require_run(first.run_id).parent_run_id == parent.run_id
+
+
+def test_two_runs_with_no_parent_do_not_collide(runtime_db: Database) -> None:
+    """The index is partial, and this is why it has to be.
+
+    Every run a researcher starts has `parent_run_id = null`. A total unique
+    index would let a project have exactly one run, ever.
+    """
+
+    store = RuntimeStore(runtime_db)
+    store.upsert_project(project_id="roots", repo_path="/tmp/roots")
+    one = store.create_run(project_id="roots", objective="first")
+    two = store.create_run(project_id="roots", objective="second")
+    assert one.run_id != two.run_id
+
+
+def test_a_proposal_link_separates_what_was_offered_from_what_was_cited(
+    runtime_db: Database,
+) -> None:
+    """Eight findings shown, two cited, and the table says which.
+
+    It used to say the proposal rested on all eight, because the writer was
+    given the packet and nothing else. See
+    `sql/0011_proposal_link_citation.sql`.
+    """
+
+    store = RuntimeStore(runtime_db)
+    store.upsert_project(project_id="grounding", repo_path="/tmp/grounding")
+    findings = []
+    for index in range(4):
+        finding, _created = store.record_finding(
+            RuntimeFinding(
+                project_id="grounding",
+                kind=FindingKind.FRONTIER,
+                summary=f"observation {index}",
+            )
+        )
+        findings.append(finding.finding_id)
+
+    store.link_proposal_findings(
+        proposal_id="PROP-19700101T000000Z-cccccccc",
+        finding_ids=tuple(findings),
+        cited_ids=(findings[1],),
+    )
+
+    offered = store.proposal_findings("PROP-19700101T000000Z-cccccccc")
+    cited = store.proposal_findings("PROP-19700101T000000Z-cccccccc", cited_only=True)
+    assert {item.finding_id for item in offered} == set(findings)
+    assert [item.finding_id for item in cited] == [findings[1]]
+
+
+def test_a_proposal_cannot_cite_a_finding_it_was_not_offered(
+    runtime_db: Database,
+) -> None:
+    """The two sets are computed in one place; disagreeing means a defect."""
+
+    store = RuntimeStore(runtime_db)
+    store.upsert_project(project_id="stray", repo_path="/tmp/stray")
+    finding, _created = store.record_finding(
+        RuntimeFinding(
+            project_id="stray",
+            kind=FindingKind.FRONTIER,
+            summary="the only one that was offered",
+        )
+    )
+
+    with pytest.raises(RuntimeStateError, match="cites finding"):
+        store.link_proposal_findings(
+            proposal_id="PROP-19700101T000000Z-dddddddd",
+            finding_ids=(finding.finding_id,),
+            cited_ids=("FIND-19700101T000000Z-eeeeeeee",),
+        )

@@ -51,3 +51,50 @@ FATAL_INFRASTRUCTURE_ERROR         something broke and named itself
 
 None of these is faked. A pilot with one provider family produces a run report
 that says its review was not independent.
+
+## The closed-loop pilot
+
+```bash
+pilots/run_closed_loop.sh <project-path> "<objective>" [cycles]
+pilots/run_second_pilot.sh <project-path> "<objective>" [cycles]   # same thing
+```
+
+`run_pilot.sh` demonstrates "launch once, then no manual choreography" and
+**fails if the project moved**. This one has to exercise the human scientific
+gate, and a promotion writes a capsule file — so it works on a **copy** of the
+capsule inside the pilot sandbox. The researcher's repository is read once,
+hashed before and after, and never written.
+
+```text
+phase 1   autonomous cycles -> findings -> a grounded proposal
+          -> WAITING_FOR_SCIENTIFIC_DECISION, with no successor
+phase 2   the human scientific act, stood in for
+phase 3   researchd observes -> CAPSULE_CHANGED, once -> a successor cycle
+phase 4   a second daemon over the same state: no duplicate cycle
+```
+
+Then it asserts eleven properties from the durable record alone and prints a
+verdict: one `CAPSULE_CHANGED`, no run with two successors, one objective, a
+successor that exists, a frontier that moved, every cycle terminal, exactly one
+logical proposal, exactly one canonical promotion, grounding in runtime
+findings, those findings quoted in the proposal, and a recorded scientific
+basis.
+
+### Phase 2 is a stand-in, and is labelled as one
+
+It writes a capsule object through the capsule layout, exactly as `researchctl
+propose promote` does. It does **not** invoke that command: `AGENTS.md` forbids
+an automated agent from invoking it or answering its confirmation prompt, and
+the command requires an interactive terminal for that reason.
+
+The promotion path is v1 code with its own tests. What had never been shown is
+that the runtime *notices* a promotion nobody told it about and continues on its
+own — that is phase 3, and phase 2 is its premise.
+
+### What a pilot on this host cannot reach
+
+`edit_in_worktree` and `run_local_experiment` execute code a model wrote or
+chose, and at `high` autonomy the runtime requires OS-level containment for
+both. This host can provide none, so both are refused. A pilot that lowered the
+policy to reach them would be demonstrating that the release runs model-written
+code with the researcher's credentials when its declared containment is absent.

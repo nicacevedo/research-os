@@ -221,6 +221,24 @@ def prepare_promotion(
     )
 
 
+def _actor() -> str:
+    """Who is recorded as having promoted this, from the operating system.
+
+    The real user and host, not a hopeful constant. `runtime approve` learned
+    this lesson first: a hard-coded ``decided_by="researcher"`` is a fabricated
+    attribution on a scientific-authority record.
+    """
+
+    import getpass
+    import socket
+
+    try:
+        user = getpass.getuser()
+    except Exception:  # noqa: BLE001 - no user is a fact, not a failure
+        user = "unknown"
+    return f"{user}@{socket.gethostname()}"
+
+
 def write_promotion(prepared: PreparedPromotion) -> PromotionRecord:
     """Write the prepared draft into the capsule, atomically, once.
 
@@ -255,6 +273,12 @@ def write_promotion(prepared: PreparedPromotion) -> PromotionRecord:
         tmp.unlink(missing_ok=True)
 
     return PromotionRecord(
+        # Stated rather than defaulted. The field used to default to the literal
+        # string "human" and `write_promotion` never set it, so any record --
+        # including one written by something that is not a person -- claimed a
+        # human had done it. The same fabricated attribution `runtime approve`
+        # was fixed for.
+        promoted_by=_actor(),
         proposal_id=prepared.proposal.proposal_id,
         item_id=prepared.item.item_id,
         object_id=prepared.obj.id,
@@ -264,6 +288,49 @@ def write_promotion(prepared: PreparedPromotion) -> PromotionRecord:
         written_path=prepared.relative_target,
         basis=prepared.item.basis,
         note=("promoted as a draft; a human must still complete and accept it"),
+    )
+
+
+#: Finding kinds whose existence means the outcome is already known.
+#:
+#: A finding of either kind is a statement about a result. An item that claims
+#: to be *prospective* while resting on one is claiming to be a prediction made
+#: before an answer it cites. That is the transformation this module refuses,
+#: arrived at from the other direction: the declared basis says prospective and
+#: the grounding says otherwise, and the grounding is the checkable one.
+RETROSPECTIVE_FINDING_KINDS: frozenset[str] = frozenset(
+    {"interpretation", "experiment"}
+)
+
+
+def contradicted_prospective_basis(
+    item: ProposedItem, proposal: ResearchProposal
+) -> tuple[str, ...]:
+    """Findings that contradict an item's claim to be prospective.
+
+    Empty unless the item says ``prospective`` *and* cites a finding whose kind
+    means the outcome was known. An adversarial review executed the gap: an
+    experiment item marked ``prospective``, grounded in an ``interpretation``
+    finding reading "The completed 20N bench run shows deformation per newton
+    falling by 34%; p = 0.004", was promoted **with its decision rule in the
+    preregistration field**. One human status change from ``draft`` and R0 reads
+    it as an ex-ante commitment.
+
+    The module already refuses the case the worker *declares*
+    (``basis: historical``). The runtime has the information to refuse the case
+    the worker mis-declares, and did not use it.
+    """
+
+    if item.basis is not EvidenceBasis.PROSPECTIVE:
+        return ()
+    if not item.grounded_in_findings:
+        return ()
+    by_id = {entry.finding_id: entry for entry in proposal.supplied_findings}
+    return tuple(
+        f"{finding_id} ({by_id[finding_id].kind})"
+        for finding_id in item.grounded_in_findings
+        if finding_id in by_id
+        and str(by_id[finding_id].kind) in RETROSPECTIVE_FINDING_KINDS
     )
 
 
@@ -318,11 +385,16 @@ def _build_payload(
         if (
             item.basis is EvidenceBasis.PROSPECTIVE
             and (item.decision_rule or "").strip()
+            and not contradicted_prospective_basis(item, proposal)
         ):
             # A prospective proposal may carry its decision rule into the draft,
             # because it was written before the answer was known. A historical
             # one may not: the same sentence, added after the results exist, is
             # a description wearing a preregistration's clothes.
+            #
+            # And an item that *says* prospective while citing a finding about a
+            # finished result may not either. The declared basis is the worker's
+            # word; the grounding is checkable.
             payload["decision_rule"] = item.decision_rule.strip()
     return payload
 
@@ -361,6 +433,45 @@ def _provenance_note(item: ProposedItem, proposal: ResearchProposal) -> str:
     if item.expected_direction:
         lines.extend(
             ["", "Expected direction as proposed:", item.expected_direction.strip()]
+        )
+    contradicted = contradicted_prospective_basis(item, proposal)
+    if contradicted:
+        lines.extend(
+            [
+                "",
+                (
+                    "This item was proposed as PROSPECTIVE and cites finding(s) "
+                    "about work whose results were already known: "
+                    + ", ".join(contradicted)
+                    + ". It has therefore been promoted WITHOUT preregistration "
+                    "fields, on the same reasoning as a historical item: a "
+                    "decision rule is a prediction or it is a description, and "
+                    "the grounding says which."
+                ),
+            ]
+        )
+        if (item.decision_rule or "").strip():
+            lines.extend(
+                [
+                    "",
+                    "Decision rule as proposed (not a preregistration):",
+                    item.decision_rule.strip(),
+                ]
+            )
+    if item.grounded_in_findings:
+        # The chain `capsule object -> runtime finding -> artifact` used to stop
+        # at the proposal: `_provenance_note` had a branch for retrieved works
+        # and none for findings, so a reader of the capsule could not get back
+        # to what the draft actually rested on.
+        lines.extend(
+            [
+                "",
+                (
+                    "Grounded in runtime findings (noncanonical; see "
+                    "`researchctl runtime findings`):"
+                ),
+                ", ".join(item.grounded_in_findings),
+            ]
         )
     if item.grounded_in_literature:
         lines.extend(

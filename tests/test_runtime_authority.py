@@ -84,7 +84,15 @@ def test_no_runtime_module_promotes_a_proposal() -> None:
     import it or call either of its two functions.
     """
 
-    forbidden = {"write_promotion", "prepare_promotion"}
+    # `record_promotion` is here because an adversarial review showed the guard
+    # could not see it. It is a `ProposalStore` method, so it needs no import of
+    # `research_os.proposal.promote` -- and the runtime already holds the store
+    # as `ProposalOutcome.store`. One call writes a `PromotionRecord`, and
+    # afterwards `propose show` prints "PROMOTED -> HYP-0002 (draft)",
+    # `propose events` prints an `item_promoted` entry, and `propose list` says
+    # "1 promoted". No capsule file exists. That is a fabricated *appearance* of
+    # a promotion, which is the thing this test exists to make impossible.
+    forbidden = {"write_promotion", "prepare_promotion", "record_promotion"}
     offenders: list[str] = []
     for path in _runtime_sources():
         tree = ast.parse(path.read_text(encoding="utf-8"))

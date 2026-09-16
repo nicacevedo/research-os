@@ -208,6 +208,20 @@ def _promote(args: argparse.Namespace) -> int:
         print()
     elif not basis.checkable:
         print(f"BASIS NOT CHECKED: {basis.reason}\n")
+    elif basis.unchecked:
+        # Fresh on everything this command can verify, and explicit about what
+        # it cannot. A runtime proposal's grounding is runtime findings, and
+        # recomputing their digest needs the operational database -- which the
+        # scientific layers deliberately do not depend on, so this command
+        # cannot do it and says so rather than implying it passed.
+        print("BASIS PARTIALLY CHECKED:")
+        print(f"  verified: {basis.reason}")
+        for item in basis.unchecked:
+            print(f"  NOT verified: {item}")
+        print(
+            "  `researchctl runtime findings` shows what they say. Read them "
+            "before deciding.\n"
+        )
 
     prepared = prepare_promotion(
         proposal,

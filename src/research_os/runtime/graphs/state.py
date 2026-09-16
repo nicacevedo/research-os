@@ -49,6 +49,10 @@ class CycleState(TypedDict, total=False):
     # --- perform_action ---------------------------------------------------
     action_result: dict[str, Any]
     action_reused: bool
+    #: The citable finding this action's outcome became, when it produced an
+    #: observation. None for actions whose output is an ask rather than a
+    #: claim about the world -- see `FINDING_FOR_ACTION`.
+    finding_id: str | None
 
     # --- deterministic_check ----------------------------------------------
     check_result: dict[str, Any]

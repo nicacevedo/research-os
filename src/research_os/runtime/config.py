@@ -235,13 +235,23 @@ def load_config(path: Path | None = None) -> RuntimeConfig:
     )
 
 
-def redact_dsn(dsn: str) -> str:
-    """Return ``dsn`` with any password replaced, for logs and reports.
+#: Connection parameters whose value is a secret, lowercased.
+#:
+#: libpq accepts a password in the URI *query string* as well as in the
+#: authority, and the previous version of :func:`redact_dsn` handled only the
+#: authority -- so `postgresql://host/db?password=hunter2` was returned
+#: unchanged, and the daemon's own startup line and `runtime doctor` printed it.
+#: Four of six real DSN forms leaked. An adversarial review executed all six.
+_SECRET_PARAMETERS: frozenset[str] = frozenset({"password", "sslpassword"})
 
-    Deliberately crude and deliberately fail-safe: anything between ``://`` and
-    the last ``@`` of the authority is replaced wholesale. A DSN this does not
-    recognise is returned with its authority removed entirely rather than
-    printed hopefully.
+
+def redact_dsn(dsn: str) -> str:
+    """Return ``dsn`` with every password replaced, for logs and reports.
+
+    Three places libpq will take one, and all three are covered: the authority's
+    userinfo, the URI query string, and a keyword/value token. Deliberately
+    crude and deliberately fail-safe -- a DSN whose shape is not recognised has
+    its authority removed rather than being printed hopefully.
     """
 
     if not dsn:
@@ -252,14 +262,29 @@ def redact_dsn(dsn: str) -> str:
         for token in dsn.split():
             key, sep, _ = token.partition("=")
             parts.append(
-                f"{key}=***" if sep and key.strip().lower() == "password" else token
+                f"{key}=***"
+                if sep and key.strip().lower() in _SECRET_PARAMETERS
+                else token
             )
         return " ".join(parts)
+
     scheme, _, rest = dsn.partition("://")
     authority, slash, tail = rest.partition("/")
-    if "@" not in authority:
-        return dsn
-    userinfo, _, hostport = authority.rpartition("@")
-    user, sep, _password = userinfo.partition(":")
-    shown = f"{user}:***" if sep else user
-    return f"{scheme}://{shown}@{hostport}{slash}{tail}"
+    path, question, query = tail.partition("?")
+
+    if query:
+        redacted: list[str] = []
+        for pair in query.split("&"):
+            key, sep, _value = pair.partition("=")
+            redacted.append(
+                f"{key}=***"
+                if sep and key.strip().lower() in _SECRET_PARAMETERS
+                else pair
+            )
+        query = "&".join(redacted)
+
+    if "@" in authority:
+        userinfo, _, hostport = authority.rpartition("@")
+        user, sep, _password = userinfo.partition(":")
+        authority = f"{user}:***@{hostport}" if sep else f"{user}@{hostport}"
+    return f"{scheme}://{authority}{slash}{path}{question}{query}"

@@ -60,6 +60,7 @@ from research_os.errors import (
     ProposalError,
     ProposalGroundingError,
     ProposalValidationError,
+    ProviderInvocationError,
     ProviderUnavailableError,
     ResearchOSError,
 )
@@ -185,6 +186,20 @@ def reservation_key_for(state: Mapping[str, Any]) -> str:
     return f"propose_capsule_change:{state['run_id']}:{state['cycle_index']}"
 
 
+def _cited_findings(proposal: Any) -> tuple[str, ...]:
+    """The finding ids this proposal's items are actually grounded in.
+
+    Read off the validated proposal, so it is the worker's own citations and not
+    the caller's guess at them. The validator has already refused anything
+    outside the allowlist, so every id here is one the packet offered.
+    """
+
+    cited: set[str] = set()
+    for item in getattr(proposal, "items", ()):
+        cited.update(str(one) for one in getattr(item, "grounded_in_findings", ()))
+    return tuple(sorted(cited))
+
+
 def reconcile_reserved_proposal(
     state: Mapping[str, Any], context: CycleContext, plan: Mapping[str, Any]
 ) -> dict[str, Any] | None:
@@ -194,17 +209,28 @@ def reconcile_reserved_proposal(
     proposal store on disk. ``None`` means the effect did not take hold and the
     action may proceed.
 
-    Deliberately consults the *directory*, not the reservation row. The row says
-    an id was reserved; only the directory says a proposal exists, and a crash
-    between reserving and calling the worker leaves the first without the
-    second.
+    The *existence* question is put to the directory, not to the reservation
+    row. The row says an id was reserved; only the directory says a proposal
+    exists, and a crash between reserving and calling the worker leaves the
+    first without the second.
+
+    The *identity* comes from the row when there is one. An adversarial review
+    pointed out that re-deriving it here made the reconciler correct only for
+    as long as two functions agreed: bump the derivation inside
+    ``reserved_proposal_id``, or change what ``reservation_key_for`` includes,
+    and this starts asking about a directory that was never created -- finds
+    nothing, returns ``None``, and the action writes a second proposal for the
+    same cycle. Deriving is the fallback for a key with no row, which is the
+    case where nothing was reserved and there is nothing to find.
     """
 
     from research_os.errors import ProposalNotFoundError, ProposalStoreError
     from research_os.proposal.store import ProposalStore, reserved_proposal_id
 
     del plan  # the identity comes from the cycle, never from the planner
-    reserved = reserved_proposal_id(reservation_key=reservation_key_for(state))
+    key = reservation_key_for(state)
+    row = context.store.reserved_proposal(key)
+    reserved = row[0] if row is not None else reserved_proposal_id(reservation_key=key)
     try:
         store = ProposalStore.open(reserved)
         proposal = store.load()
@@ -214,6 +240,9 @@ def reconcile_reserved_proposal(
     return {
         "ok": True,
         "detail": f"recovered proposal {reserved} created by an earlier attempt",
+        # The recovered proposal's own citations, so the caller can write the
+        # citation edges for a proposal it did not create.
+        "cited_findings": _cited_findings(proposal),
         "data": _payload(
             _RecoveredOutcome(
                 proposal=proposal,
@@ -275,6 +304,13 @@ def _payload(outcome: Any, *, packet: FindingPacket) -> dict[str, Any]:
             }
             for action in proposal.next_actions
         ],
+        # Stated as its own boolean rather than left to be inferred from a
+        # null. A proposal that reached a person without the independent
+        # assessment is a weaker thing than one that passed it, and the first
+        # closed-loop pilot produced exactly that -- the assessor exhausted its
+        # structured-output retries after the proposal had been stored. Nothing
+        # said so where a reader would look.
+        "assessed": assessment is not None,
         "assessment": (
             {
                 "verdict": str(assessment.verdict),
@@ -297,6 +333,50 @@ def _payload(outcome: Any, *, packet: FindingPacket) -> dict[str, Any]:
             f"`propose promote {proposal.proposal_id} --item PR-001` if you agree"
         ),
     }
+
+
+def _equivalent_pending_proposal(
+    *, project_id: str, packet: FindingPacket, context: CycleContext
+) -> str | None:
+    """A pending proposal of this project grounded in exactly these findings.
+
+    Matched on the *grounding* digest rather than on the text, because the text
+    is a model's and two runs of one worker over one packet will not produce
+    identical prose while proposing the same thing. `supplied_findings_digest`
+    is what the basis snapshot already records, so the comparison needs nothing
+    new stored.
+
+    Only pending. A proposal the researcher promoted is science now, and one
+    they declined is answered; re-offering either would be arguing with a
+    decision.
+    """
+
+    from research_os.errors import ProposalStoreError
+    from research_os.proposal.store import ProposalStore
+
+    del context
+    wanted = packet.digest
+    if wanted is None:
+        return None
+    try:
+        known = ProposalStore.list_proposal_ids()
+    except ResearchOSError:  # pragma: no cover - the root may not exist yet
+        return None
+    for proposal_id in reversed(known):
+        try:
+            store = ProposalStore.open(proposal_id)
+            proposal = store.load()
+        except (ResearchOSError, ProposalStoreError):
+            continue
+        if proposal.project_id != project_id:
+            continue
+        basis = proposal.scientific_basis
+        if basis is None or basis.finding_packet_digest != wanted:
+            continue
+        if store.promotions():
+            continue
+        return proposal_id
+    return None
 
 
 def propose_capsule_change(
@@ -345,6 +425,34 @@ def propose_capsule_change(
 
     from research_os.proposal.store import reserved_proposal_id
 
+    # An equivalent proposal already waiting for a decision is not a second
+    # decision. The reservation makes one *cycle* produce one proposal; it says
+    # nothing about two cycles over the same findings, which
+    # `_work_advance_objective` produces whenever any unrelated capsule change
+    # moves the frontier while a proposal sits undecided. An adversarial review
+    # executed it: two proposals, identical items, identical grounding digest,
+    # two independent assessments, both pending.
+    #
+    # The nomination path has had this check since it was written; this is the
+    # same check, and it is deliberately narrow -- only *pending* proposals, so
+    # a promoted or declined one is never re-offered, because both are answered.
+    existing = _equivalent_pending_proposal(
+        project_id=project_id, packet=packet, context=context
+    )
+    if existing is not None:
+        return ActionOutcome.succeeded(
+            f"an equivalent proposal is already waiting for your decision: {existing}",
+            data={
+                "proposed": False,
+                "reason": "an equivalent pending proposal exists",
+                "proposal_id": existing,
+                "grounded_in_findings": list(packet.ids),
+                "finding_packet_digest": packet.digest,
+                "promoted": False,
+                "requires_human_promotion": True,
+            },
+        )
+
     reservation_key = reservation_key_for(state)
     proposal_id = reserved_proposal_id(reservation_key=reservation_key)
     stored_id, _status, _created = context.store.reserve_proposal(
@@ -385,16 +493,45 @@ def propose_capsule_change(
         context.store.link_proposal_findings(
             proposal_id=outcome.proposal.proposal_id,
             finding_ids=packet.ids,
+            # The citation edges, taken from the proposal's own items rather
+            # than from the packet. An adversarial review pointed out that
+            # linking the packet alone made the table say a proposal rested on
+            # every finding the worker was shown -- eight offered, two cited,
+            # six rows asserting a dependence that does not exist. Both facts
+            # are kept and they are distinguishable; see
+            # `sql/0011_proposal_link_citation.sql`.
+            cited_ids=_cited_findings(outcome.proposal),
             run_id=str(state["run_id"]),
         )
+        assessed = outcome.assessment is not None
         return {
             "ok": True,
             "detail": (
                 f"proposal {outcome.proposal.proposal_id} "
                 f"({len(outcome.proposal.items)} item(s)) is waiting for you"
+                + (
+                    ""
+                    if assessed
+                    else "; it has NO independent assessment, so read it more "
+                    "carefully than one that passed"
+                )
             ),
             "data": _payload(outcome, packet=packet),
         }
+
+    # A completed invocation whose proposal has since been deleted is a
+    # decision, not a result to replay. Reopened so the action runs again rather
+    # than reporting a directory that is not there.
+    remembered = context.ledger.get(key)
+    if remembered is not None and _proposal_is_gone(
+        str((remembered.result or {}).get("data", {}).get("proposal_id") or proposal_id)
+    ):
+        LOG.info(
+            "the proposal this cycle produced has been deleted; reopening %s so "
+            "the action is not reported from a stale record",
+            key[:16],
+        )
+        context.ledger.reopen(key)
 
     try:
         result = context.ledger.run(
@@ -411,45 +548,80 @@ def propose_capsule_change(
                 state, context, plan
             ),
         )
-    except ProposalGroundingError as exc:
+    except (ProposalError, ProviderInvocationError) as exc:
+        # **Look before failing, for every exception raised after the store.**
+        #
+        # `ProposalController` creates the proposal directory and *then* runs
+        # the independent assessment, so anything the assessor raises arrives
+        # with the valuable artifact already on disk. There is more than one
+        # such exception: a provider that does not answer raises
+        # `ProviderInvocationError`, and a provider that answers *wrongly* --
+        # well-formed JSON with a verdict the schema does not know -- raises
+        # `ProposalValidationError`. The second is the likelier one, and an
+        # earlier version of this handler covered only the first: an
+        # adversarial review executed it and found a valid, promotable proposal
+        # on disk with the action reporting failure, the reservation FAILED and
+        # no finding links written.
+        #
+        # So the recovery is attempted once, here, for all of them, and the
+        # per-class failure returns below are reached only when there is really
+        # nothing to recover.
+        recovered = reconcile_reserved_proposal(state, context, plan)
+        if recovered is not None:
+            # The links, written on this path too. They are written inside
+            # `perform` on the ordinary path, which never ran to completion
+            # here -- so a recovered proposal used to be reported as grounded
+            # in nothing, with a real-looking digest of the empty packet.
+            context.store.link_proposal_findings(
+                proposal_id=str(recovered["data"]["proposal_id"]),
+                finding_ids=packet.ids,
+                cited_ids=tuple(recovered.get("cited_findings") or ()),
+                run_id=str(state["run_id"]),
+            )
+            context.store.settle_proposal_reservation(
+                reservation_key,
+                status="CREATED",
+                detail=f"stored; the assessment failed: {str(exc)[:300]}",
+            )
+            payload = dict(recovered.get("data") or {})
+            payload["assessed"] = False
+            payload["assessment_error"] = str(exc)[:500]
+            payload["grounded_in_findings"] = list(packet.ids)
+            payload["finding_packet_digest"] = packet.digest
+            return ActionOutcome.succeeded(
+                f"proposal {payload.get('proposal_id')} is waiting for you, and "
+                f"it has NO independent assessment: {exc}. Read it more "
+                f"carefully than one that passed.",
+                data=payload,
+            )
+
         context.store.settle_proposal_reservation(
             reservation_key, status="FAILED", detail=str(exc)[:500]
         )
-        return ActionOutcome.failed(
-            f"the proposal cited something this cycle did not supply and the one "
-            f"bounded correction did not repair it: {exc}",
-            # Terminal, not retried. The correction has already happened once;
-            # asking again would be a model being asked repeatedly until it
-            # happens to produce something that passes, which is how a
-            # grounding gate stops meaning anything.
-            failure_class=FailureClass.MODEL_OUTPUT_INVALID_REPEATED,
-        )
-    except ProposalBudgetError as exc:
-        context.store.settle_proposal_reservation(
-            reservation_key, status="FAILED", detail=str(exc)[:500]
-        )
-        return ActionOutcome.failed(
-            str(exc), failure_class=FailureClass.BUDGET_EXHAUSTED
-        )
-    except ProposalValidationError as exc:
-        context.store.settle_proposal_reservation(
-            reservation_key, status="FAILED", detail=str(exc)[:500]
-        )
-        return ActionOutcome.failed(
-            f"the proposal worker's output is not a valid proposal: {exc}",
-            failure_class=FailureClass.MODEL_OUTPUT_INVALID,
-        )
-    except ProviderUnavailableError as exc:
-        context.store.settle_proposal_reservation(
-            reservation_key, status="FAILED", detail=str(exc)[:500]
-        )
-        return ActionOutcome.failed(
-            str(exc), failure_class=FailureClass.PROVIDER_UNAVAILABLE
-        )
-    except ProposalError as exc:
-        context.store.settle_proposal_reservation(
-            reservation_key, status="FAILED", detail=str(exc)[:500]
-        )
+        if isinstance(exc, ProposalGroundingError):
+            return ActionOutcome.failed(
+                f"the proposal cited something this cycle did not supply and the "
+                f"one bounded correction did not repair it: {exc}",
+                # Terminal, not retried. The correction has already happened
+                # once; asking again would be a model being asked repeatedly
+                # until it happens to produce something that passes, which is
+                # how a grounding gate stops meaning anything.
+                failure_class=FailureClass.MODEL_OUTPUT_INVALID_REPEATED,
+            )
+        if isinstance(exc, ProposalBudgetError):
+            return ActionOutcome.failed(
+                str(exc), failure_class=FailureClass.BUDGET_EXHAUSTED
+            )
+        if isinstance(exc, ProposalValidationError):
+            return ActionOutcome.failed(
+                f"the proposal worker's output is not a valid proposal: {exc}",
+                failure_class=FailureClass.MODEL_OUTPUT_INVALID,
+            )
+        if isinstance(exc, ProviderUnavailableError | ProviderInvocationError):
+            return ActionOutcome.failed(
+                f"the proposal worker failed: {exc}",
+                failure_class=FailureClass.PROVIDER_UNAVAILABLE,
+            )
         return ActionOutcome.failed(
             f"the proposal could not be produced: {exc}",
             failure_class=FailureClass.CODE_EXCEPTION,
@@ -461,3 +633,31 @@ def propose_capsule_change(
         str(result.result.get("detail") or "a proposal is waiting for you"),
         data=payload,
     )
+
+
+def _proposal_is_gone(proposal_id: str) -> bool:
+    """Whether a proposal the ledger remembers has since been deleted.
+
+    Deleting a proposal is a legitimate human act -- ``proposal/store.py`` says
+    in its first paragraph that a proposal directory can be removed and loses
+    nothing scientific -- and it means "I have decided about this".
+
+    The ledger does not know that. An adversarial review executed the
+    consequence: with the invocation `COMPLETED`, `perform` is never called
+    again, so the stale payload was returned verbatim. The action reported
+    "proposal PROP-... is waiting for you" with a directory that no longer
+    existed, `conclude` parked the objective at
+    `WAITING_FOR_SCIENTIFIC_DECISION`, and the follow-up command it printed
+    raised `ProposalNotFoundError`. The objective never moved again.
+    """
+
+    from research_os.errors import ProposalNotFoundError, ProposalStoreError
+    from research_os.proposal.store import ProposalStore
+
+    if not proposal_id:
+        return False
+    try:
+        ProposalStore.open(proposal_id).load()
+    except (ProposalNotFoundError, ProposalStoreError):
+        return True
+    return False

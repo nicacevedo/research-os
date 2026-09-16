@@ -1,0 +1,28 @@
+-- Make "which preregistration froze this spec" an indexed equality lookup.
+--
+-- The preregistration guard is the most important one in the system: it is what
+-- establishes that the criteria a result is read against were fixed before the
+-- result existed. It was implemented as a scan. `spec_digest` lives inside the
+-- preregistration *record*, and the record is content-addressed, so its
+-- artifact id is the hash of the whole document and not of the spec -- there
+-- was nothing in the database to match on. So both readers took this project's
+-- `role = 'preregistration'` artifacts, newest first, `limit 500`, and compared
+-- each one's `spec_digest` in Python.
+--
+-- An adversarial review named the consequence. 500 is a horizon, not a bound: a
+-- project that accumulates more than 500 preregistrations loses the older ones
+-- from the window, and the older ones are exactly the ones whose experiments
+-- are still waiting to be interpreted. The failure is closed -- the
+-- interpretation refuses rather than inventing criteria -- but it refuses
+-- permanently and reports "no preregistration found for this spec", which is
+-- false. The record is there and the query stopped looking.
+--
+-- The fix is to put the digest where it can be matched. From here the artifact
+-- and its run link both carry `role = 'preregistration:<spec digest>'`, so the
+-- lookup is an equality match on an indexed column with no window and no
+-- per-row artifact read. Records written before this keep the bare
+-- `preregistration` role and are still found by the bounded scan, which is why
+-- the readers ask both questions; the scan is legacy-only and shrinks to
+-- nothing on any project started from here.
+create index if not exists artifacts_role_idx on artifacts(role);
+create index if not exists artifact_links_role_idx on artifact_links(role);

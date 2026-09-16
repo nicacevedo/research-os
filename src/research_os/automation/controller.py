@@ -110,7 +110,7 @@ from research_os.errors import (
     SymlinkScopeError,
 )
 from research_os.runlock import run_lock
-from research_os.sandbox import SandboxMode
+from research_os.sandbox import SandboxError, SandboxMode
 
 PLANNER_TIMEOUT_SECONDS = 600
 REVIEWER_TIMEOUT_SECONDS = 600
@@ -261,6 +261,29 @@ class AutomationController:
         #: would be changing what every other run does.
         self.sandbox_mode = sandbox_mode
 
+    def _require_containment(self) -> None:
+        """Refuse a run that must be contained on a host that cannot contain it.
+
+        Only under ``required``. ``preferred`` runs and records the absence on
+        every command result, and ``off`` was a deliberate choice.
+        """
+
+        from research_os.sandbox import SandboxMode, available_backend
+
+        mode = self.sandbox_mode or self.config.sandbox.mode
+        if mode is not SandboxMode.REQUIRED or available_backend() is not None:
+            return
+        from research_os.sandbox import unavailable_reason
+
+        raise PreflightError(
+            "this run executes code a model writes, and the policy in force "
+            "requires OS-level containment, which this host cannot provide. "
+            f"{unavailable_reason()}. Either make a mechanism available, or "
+            "lower the policy deliberately -- `sandbox.mode` in automation.yaml "
+            "for a run you start yourself, or a lower `--autonomy` for a "
+            "runtime cycle, which is what raises it to `required`."
+        )
+
     # -- run creation ----------------------------------------------------
 
     def start(
@@ -303,6 +326,13 @@ class AutomationController:
         goal = goal.strip()
         if not goal:
             raise PreflightError("a run goal must contain at least one character")
+        # Containment, checked before a worktree exists rather than when the
+        # first acceptance command runs. This pipeline's whole purpose is to
+        # execute code a model wrote, so a policy that requires containment on a
+        # host that has none has nothing to offer this run -- and discovering
+        # that halfway through leaves a worktree, a branch and a non-terminal
+        # run for somebody to clean up.
+        self._require_containment()
         # Checked before anything is resolved or probed. A malformed identity is
         # a caller defect, and reporting it as one beats reporting whatever the
         # first unrelated failure downstream happens to be.
@@ -413,7 +443,13 @@ class AutomationController:
             for order in list(run.work_orders):
                 run = self._review_order(store, run, order.task_id)
             run = self._finish(store, run)
-        except AutomationError as exc:
+        except (AutomationError, SandboxError) as exc:
+            # `SandboxError` is not an `AutomationError` -- it belongs to a
+            # module that knows nothing about runs -- and without it here a
+            # containment refusal raised from inside a check left the run
+            # EXECUTING forever, with a worktree nobody would clean up. The
+            # preflight above makes that unreachable for the `required` case;
+            # this covers a mode that changed under a long-running run.
             if not store.load().terminal:
                 run = self._fail(store, store.load(), str(exc))
             raise

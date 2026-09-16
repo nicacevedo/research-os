@@ -21,7 +21,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from research_os.runtime.findings import FindingKind
+from research_os.runtime.findings import FindingKind, FindingRefKind
 
 
 class RunStatus(StrEnum):
@@ -348,6 +348,15 @@ class ExperimentInterpretation(_Record):
     spec_digest: str
     interpreter_version: str
     artifact_id: str | None = None
+    preregistration_artifact_id: str | None = None
+    """The artifact whose criteria this interpretation was compared against.
+
+    Named on the row rather than re-queried by ``spec_digest``, because that
+    digest covers the execution and not the criteria -- so a lookup by digest
+    can be handed a *different* set of criteria designed after the result was
+    known. Resolved once, at claim time. See
+    ``sql/0010_interpretation_preregistration.sql``.
+    """
     status: InterpretationStatus
     detail: str | None = None
     created_at: datetime
@@ -422,6 +431,21 @@ class ProviderHealth(_Record):
 
 #: Every ``check`` constraint in the schema that mirrors an enum above, keyed by
 #: constraint name. Read by the schema-agreement test.
+class ProposalReservationStatus(StrEnum):
+    """The life of one caller-reserved proposal identity.
+
+    Mirrored by ``runtime_proposal_reservations_status_ck``. ``RESERVED`` is
+    written before the v1 proposal controller is called; exactly one of
+    ``CREATED`` or ``FAILED`` settles it afterwards, and the store refuses to
+    move a row out of ``CREATED``, because a settled proposal is a thing a
+    person may already have read.
+    """
+
+    RESERVED = "RESERVED"
+    CREATED = "CREATED"
+    FAILED = "FAILED"
+
+
 ENUM_CONSTRAINTS: dict[str, frozenset[str]] = {
     "research_runs_status_ck": frozenset(s.value for s in RunStatus),
     "research_runs_terminal_ck": frozenset(s.value for s in TerminalState),
@@ -437,4 +461,18 @@ ENUM_CONSTRAINTS: dict[str, frozenset[str]] = {
         s.value for s in InterpretationStatus
     ),
     "runtime_findings_kind_ck": frozenset(s.value for s in FindingKind),
+    "runtime_finding_refs_kind_ck": frozenset(s.value for s in FindingRefKind),
+    "runtime_proposal_reservations_status_ck": frozenset(
+        s.value for s in ProposalReservationStatus
+    ),
 }
+"""Every value-list check constraint in the schema, and the Python enum it
+mirrors.
+
+``tests/test_runtime_schema.py`` checks this in both directions. Forwards: each
+constraint named here allows exactly the enum's values. Backwards -- and this is
+the half that was missing -- every ``in (...)`` check constraint the live
+database actually has appears here. The two constraints added immediately above
+are the ones that omission hid: both were written in SQL, neither had a Python
+enum, and the forward-only proof reported success while not looking at them.
+"""

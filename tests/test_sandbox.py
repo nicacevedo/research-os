@@ -413,3 +413,252 @@ def test_an_acceptance_command_under_required_reports_the_refusal(
             sandbox_mode=SandboxMode.REQUIRED,
         )
         assert result.contained is True
+
+
+def test_a_required_run_is_refused_before_a_worktree_exists(tmp_path: Path) -> None:
+    """A refusal halfway through leaves a worktree, a branch and a stuck run.
+
+    `SandboxError` is not an `AutomationError`, so a containment refusal raised
+    from inside an acceptance command escaped the handler that fails a run
+    cleanly and left it EXECUTING forever. The preflight makes that unreachable:
+    the whole point of this pipeline is to execute code a model wrote, so a
+    policy that requires containment on a host with none has nothing to offer
+    the run and should say so before creating anything.
+    """
+
+    from research_os.automation.config import AutomationConfig
+    from research_os.automation.controller import AutomationController
+    from research_os.errors import PreflightError
+    from tests.proposal_helpers import fake_config
+
+    config: AutomationConfig = fake_config()
+    controller = AutomationController(
+        providers={}, config=config, sandbox_mode=SandboxMode.REQUIRED
+    )
+    if BACKEND is None:
+        with pytest.raises(PreflightError, match="requires OS-level containment"):
+            controller.start(project_path=tmp_path, goal="do something")
+        # Nothing was created. The message names the remedy rather than being a
+        # wall.
+        assert not (tmp_path / ".git").exists()
+    else:
+        # On a host that can contain, the preflight is not what refuses -- the
+        # project not being a repository is.
+        with pytest.raises(PreflightError):
+            controller.start(project_path=tmp_path, goal="do something")
+
+
+def test_a_preferred_run_is_not_refused_by_the_preflight(tmp_path: Path) -> None:
+    """`preferred` runs and records the absence; only `required` refuses."""
+
+    from research_os.automation.controller import AutomationController
+    from research_os.errors import PreflightError
+    from tests.proposal_helpers import fake_config
+
+    controller = AutomationController(
+        providers={}, config=fake_config(), sandbox_mode=SandboxMode.PREFERRED
+    )
+    with pytest.raises(PreflightError) as raised:
+        controller.start(project_path=tmp_path, goal="do something")
+    assert "requires OS-level containment" not in str(raised.value), (
+        "a preferred run was refused for a reason that only applies to required"
+    )
+
+
+# -- the program itself has to exist inside --------------------------------
+def _flags(argv: list[str], spec: SandboxSpec) -> list[str]:
+    """The bubblewrap invocation, built without needing a working bwrap.
+
+    The host this was developed on cannot create user namespaces, so every
+    test that *runs* a contained command is skipped here. The flag
+    construction is still deterministic and is still where the mistakes are,
+    so it is tested directly.
+    """
+
+    from research_os.sandbox import SandboxProbe, _bubblewrap
+
+    backend = SandboxProbe(
+        technology="bubblewrap",
+        available=True,
+        executable="/usr/bin/bwrap",
+        detail="assumed for a construction test",
+    )
+    return list(_bubblewrap(argv, spec=spec, backend=backend, environment={}).argv)
+
+
+def _setenv(flags: list[str], name: str) -> str | None:
+    for index, token in enumerate(flags):
+        if token == "--setenv" and flags[index + 1] == name:
+            return flags[index + 2]
+    return None
+
+
+def test_a_program_outside_the_os_allowlist_is_bound_in(tmp_path: Path) -> None:
+    """Containment must not make the command disappear.
+
+    `uv` -- what every acceptance command in this repository starts with --
+    installs to `~/.local/bin`, which is neither in the read-only OS binds nor
+    on the sandbox PATH. A contained `uv run pytest` exited 127 with
+    "uv: not found", recorded as an acceptance failure of the code the worker
+    had just written.
+    """
+
+    program = tmp_path / "tools" / "faketool"
+    program.parent.mkdir(parents=True)
+    program.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    program.chmod(0o755)
+    workdir = tmp_path / "project"
+    workdir.mkdir()
+
+    flags = _flags([str(program), "--version"], SandboxSpec(workdir=workdir))
+
+    assert ["--ro-bind", str(program), str(program)] == [
+        flags[flags.index(str(program)) - 1],
+        flags[flags.index(str(program))],
+        flags[flags.index(str(program)) + 1],
+    ]
+    path = _setenv(flags, "PATH")
+    assert path is not None and path.split(":")[0] == str(program.parent)
+
+
+def test_a_system_program_adds_no_binding(tmp_path: Path) -> None:
+    """The common case costs nothing: /bin/sh is already bound read-only."""
+
+    workdir = tmp_path / "project"
+    workdir.mkdir()
+    flags = _flags(["/bin/sh", "-c", "true"], SandboxSpec(workdir=workdir))
+    assert flags.count("--ro-bind") == len(
+        [token for token in flags if token == "--ro-bind"]
+    )
+    assert "/bin/sh" not in [
+        flags[index + 1]
+        for index, token in enumerate(flags)
+        if token == "--ro-bind" and index + 1 < len(flags)
+    ]
+    path = _setenv(flags, "PATH")
+    assert path is not None and not path.startswith("/bin:")
+
+
+def test_uv_gets_its_cache_and_interpreter_directories(monkeypatch, tmp_path) -> None:
+    """A contained `uv run` still has to be able to open uv's own cache."""
+
+    from research_os.automation.checks import uv_support_paths
+
+    home = tmp_path / "home"
+    (home / ".cache" / "uv").mkdir(parents=True)
+    (home / ".local" / "share" / "uv").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("UV_CACHE_DIR", raising=False)
+    monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+
+    paths = uv_support_paths(["uv", "run", "--frozen", "pytest"])
+
+    assert home / ".cache" / "uv" in paths
+    assert home / ".local" / "share" / "uv" in paths
+    # Only for uv. Every other program's needs are the caller's to declare.
+    assert uv_support_paths(["pytest"]) == ()
+    assert uv_support_paths([]) == ()
+
+
+def test_an_explicit_uv_cache_directory_is_honoured(monkeypatch, tmp_path) -> None:
+    explicit = tmp_path / "shared-cache"
+    explicit.mkdir()
+    monkeypatch.setenv("UV_CACHE_DIR", str(explicit))
+    monkeypatch.setenv("HOME", str(tmp_path / "empty-home"))
+
+    from research_os.automation.checks import uv_support_paths
+
+    assert explicit in uv_support_paths(["uv", "run", "pytest"])
+
+
+# -- Slurm is not contained by this process --------------------------------
+def test_a_slurm_job_does_not_inherit_the_daemons_environment(tmp_path) -> None:
+    """sbatch defaults to `--export=ALL`, which copies the runtime's secrets in."""
+
+    from research_os.runtime.executors import ExecutionSpec, SlurmExecutor
+
+    spec = ExecutionSpec(
+        name="probe",
+        argv=("echo", "hello"),
+        cwd=str(tmp_path),
+        env={"SEED": "17"},
+        resources={"partition": "short"},
+        timeout_seconds=60,
+    )
+    script = SlurmExecutor().build_script(spec, run_dir=tmp_path, job_name="ros-probe")
+
+    assert "#SBATCH --export=NONE" in script
+    # And the only environment the payload gets is the frozen spec's.
+    assert "export SEED='17'" in script or "export SEED=17" in script
+
+
+def test_choosing_slurm_is_not_a_way_around_required_containment(tmp_path) -> None:
+    """`executor: slurm` was a one-word bypass of `required`."""
+
+    from research_os.runtime.executors import (
+        ContainmentUnavailableError,
+        ExecutionSpec,
+        SlurmExecutor,
+    )
+
+    spec = ExecutionSpec(
+        name="probe",
+        argv=("echo", "hello"),
+        cwd=str(tmp_path),
+        timeout_seconds=60,
+    )
+    executor = SlurmExecutor(sandbox_mode=SandboxMode.REQUIRED)
+    with pytest.raises(ContainmentUnavailableError, match="compute node"):
+        executor.submit(spec, run_dir=tmp_path)
+
+
+# -- the process cap is uid-scoped, so it must never reach an uncontained child
+def test_the_process_cap_is_not_applied_to_an_uncontained_command(
+    tmp_path: Path,
+) -> None:
+    """`RLIMIT_NPROC` counts the researcher's whole session, not a process tree.
+
+    This repository has made this mistake twice. First `LimitNPROC=256` in a
+    `systemd-run` probe ("fork: Resource temporarily unavailable"); then
+    `process_limit_preexec` on the *uncontained* acceptance path, where the
+    ceiling of 512 sat below this user's existing 1119 threads, so `uv` could
+    not create its first thread and aborted with SIGABRT before running
+    anything. Seventeen tests that shell out to a real `uv run` failed with
+    "required acceptance commands failed".
+    """
+
+    from research_os.sandbox import process_limit_preexec
+
+    spec = SandboxSpec(workdir=tmp_path, max_processes=512)
+
+    assert process_limit_preexec(spec, contained=False) is None
+    assert process_limit_preexec(spec, contained=True) is not None
+    # And no ceiling means no preexec either way.
+    unlimited = SandboxSpec(workdir=tmp_path, max_processes=None)
+    assert process_limit_preexec(unlimited, contained=True) is None
+
+
+def test_an_uncontained_acceptance_command_actually_runs(tmp_path: Path) -> None:
+    """The end-to-end form of the above, with a real child process.
+
+    A unit test on the preexec factory would have passed while the acceptance
+    path was broken, because the bug was at the call site. This one spawns
+    something.
+    """
+
+    from research_os.automation.checks import run_acceptance_command
+
+    work = tmp_path / "project"
+    work.mkdir()
+    result = run_acceptance_command(
+        AcceptanceCommand(argv=["sh", "-c", "exec true"], required=True),
+        cwd=work,
+        timeout_seconds=60,
+        sandbox_mode=SandboxMode.PREFERRED,
+    )
+
+    assert result.exit_code == 0, (
+        f"an uncontained acceptance command did not run: exit {result.exit_code}, "
+        f"{result.error}"
+    )

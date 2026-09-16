@@ -78,6 +78,7 @@ from research_os.proposal.planner import (
     GroundingViolation,
     build_grounding_correction_prompt,
     build_proposal_prompt,
+    clipped_statement,
     grounding_violations,
     parse_proposal,
     render_supplied_findings,
@@ -281,6 +282,13 @@ class ProposalController:
                 f"than that is not grounding, it is a corpus, and a worker "
                 f"handed a corpus of identifiers cites from it decoratively"
             )
+        # Clipped to what the prompt will actually show, so the stored
+        # statement and the text the worker read are the same string. See
+        # `clipped_statement`.
+        findings = tuple(
+            item.model_copy(update={"statement": clipped_statement(item.statement)})
+            for item in findings
+        )
         supplied_ids = [item.finding_id for item in findings]
         if len(set(supplied_ids)) != len(supplied_ids):
             raise ProposalValidationError(
@@ -336,6 +344,7 @@ class ProposalController:
             context=context,
             literature_data=literature_data,
             findings_data=render_supplied_findings(findings) or None,
+            grounding_finding_ids=supplied_ids,
         )
         self._assert_affordable(invocations, max_model_calls, "the proposal worker")
         invocation, result = self._invoke(
@@ -381,7 +390,7 @@ class ProposalController:
             return parsed.model_copy(
                 update={
                     "scientific_basis": scientific_basis(
-                        referenced_object_ids(parsed),
+                        referenced_object_ids(parsed, root=root),
                         root=root,
                         project_id=context.project_id,
                         literature_keys=literature_keys,

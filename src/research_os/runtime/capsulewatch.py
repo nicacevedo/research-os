@@ -69,7 +69,10 @@ LOG = logging.getLogger("research_os.runtime.capsulewatch")
 UNREADABLE_PREFIX = "unreadable:"
 
 
-def capsule_digest(kernel: ScientificKernelAdapter) -> str:
+def capsule_digest(
+    kernel: ScientificKernelAdapter,
+    report: object | None = None,
+) -> str:
     """Hash everything canonical about one project's science.
 
     Over ``(id, status, subject_digest)`` for every object, plus the charter and
@@ -85,7 +88,7 @@ def capsule_digest(kernel: ScientificKernelAdapter) -> str:
     """
 
     try:
-        report = kernel.validate()
+        report = kernel.validate() if report is None else report
         if report.project is None:
             return f"{UNREADABLE_PREFIX}no project identity"
         project_id = str(report.project.id)
@@ -121,25 +124,54 @@ def capsule_digest(kernel: ScientificKernelAdapter) -> str:
 def kernel_digest(
     kernel: ScientificKernelAdapter, *, project_id: str, obj: object
 ) -> str:
-    """One object's project-scoped semantic digest, through the kernel's own code.
+    """One object's contribution to the capsule digest.
 
-    Delegated rather than reimplemented. A second implementation of a scientific
-    digest would eventually disagree with the kernel's, and the one that
-    disagreed quietly would be the one that failed to notice a change.
+    For a reviewable object this is the kernel's own project-scoped
+    ``subject_digest`` -- delegated rather than reimplemented, because a second
+    implementation of a scientific digest would eventually disagree with the
+    kernel's, and the one that disagreed quietly would be the one that failed to
+    notice a change.
+
+    **A Review is not reviewable, and that blind spot was a real defect.**
+    ``Reviewable`` is every scientific object *except* ``Review``, so
+    ``subject_digest`` raises for one — and returning a constant marker for it
+    meant a Review contributed only its id and status. An adversarial review
+    executed the consequence: a researcher changing a Review's verdict from
+    ``revise`` to ``approve`` — the highest-authority act in the system — moved
+    ``claims_with_stale_review`` and the frontier digest, and left the capsule
+    digest byte-identical. The watcher saw nothing, emitted nothing, and stored
+    the new frontier while reporting no change. Permanently.
+
+    So a Review is hashed from the fields that decide an acceptance:
+    ``claim_approval`` reads ``reviewer_kind``, ``verdict``, ``subject``,
+    ``subject_digest`` and the evidence and experiment digests, and all of them
+    are here. Anything else unreviewable keeps the marker, which is honest: its
+    identity and status are still in the hash, so adding one is visible.
     """
 
     from research_os.digests import subject_digest
+    from research_os.models import Review
 
     del kernel
+    if isinstance(obj, Review):
+        return json.dumps(
+            {
+                "reviewer_kind": str(obj.reviewer_kind),
+                "verdict": str(obj.verdict),
+                "subject": str(obj.subject),
+                "subject_digest": str(obj.subject_digest),
+                "evidence_digests": dict(sorted((obj.evidence_digests or {}).items())),
+                "experiment_digests": dict(
+                    sorted((obj.experiment_digests or {}).items())
+                ),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
     try:
         return subject_digest(obj, project_id=project_id)  # type: ignore[arg-type]
     except (TypeError, ValueError) as exc:
-        # Not every capsule object type is reviewable, and `subject_digest`
-        # raises TypeError for the ones that are not. Their identity and status
-        # still belong in the hash, so a stable marker is used rather than
-        # dropping the object -- dropping it would make adding an unreviewable
-        # object invisible.
-        del exc
+        LOG.debug("object %r is not reviewable: %s", getattr(obj, "id", "?"), exc)
         return "not-reviewable"
 
 
@@ -154,19 +186,39 @@ def _document_digest(kernel: ScientificKernelAdapter, name: str) -> str:
 def observed_digests(repo_path: object) -> tuple[str, str]:
     """Return ``(capsule_digest, frontier_digest)`` for one repository.
 
-    Both from one read of the capsule, so the two cannot describe different
-    moments -- which they could if the daemon computed them in separate passes
-    and a promotion landed in between.
+    **From one validation of the capsule.** The previous version said so and did
+    not do it: ``capsule_digest(kernel)`` called ``kernel.validate()`` and
+    ``kernel.frontier()`` called it again, so the two digests came from two
+    independent reads of the working tree. An adversarial review pointed out
+    what lands in between -- a researcher's ``git commit`` of a promotion, which
+    is precisely the event this function exists to notice -- and the resulting
+    row would pair a capsule digest from before the commit with a frontier from
+    after it.
+
+    Now the report is read once here and passed to both. What that does *not*
+    buy is atomicity against a concurrent ``git checkout``: the report reads
+    many files, and the charter and state documents are read again inside
+    :func:`capsule_digest`. A torn read is still possible and its consequence is
+    bounded in the safe direction -- the pair recorded is ``(capsule at A,
+    frontier at B)``, the next observation reads ``(B, frontier at B)``, the
+    capsule digest differs, and the change is recorded one observation late.
+    Never missed, because the capsule digest of the later moment can only equal
+    the earlier one if nothing canonical changed.
     """
 
     from research_os.runtime.graphs.cycle import frontier_digest
 
     kernel = ScientificKernelAdapter(repo_path)  # type: ignore[arg-type]
-    capsule = capsule_digest(kernel)
+    try:
+        report = kernel.validate()
+    except ResearchOSError as exc:
+        LOG.debug("capsule unreadable at %s: %s", kernel.repo_path, exc)
+        return f"{UNREADABLE_PREFIX}{exc}", ""
+    capsule = capsule_digest(kernel, report)
     if capsule.startswith(UNREADABLE_PREFIX):
         return capsule, ""
     try:
-        return capsule, frontier_digest(kernel.frontier())
+        return capsule, frontier_digest(kernel.frontier(report))
     except ResearchOSError as exc:
         LOG.debug("frontier unavailable at %s: %s", kernel.repo_path, exc)
         return capsule, ""

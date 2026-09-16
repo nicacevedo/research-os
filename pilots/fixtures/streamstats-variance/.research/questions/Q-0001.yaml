@@ -1,0 +1,10 @@
+id: Q-0001
+type: question
+schema_version: 1
+status: open
+title: Does the one-pass variance estimator survive a large additive offset?
+statement: >-
+  The one-pass estimator in this repository accumulates the raw sum of squares.
+  On values of unit-scale spread sitting on a large offset, that form is known to
+  lose significant digits to cancellation. Whether it does so at the offsets this
+  project cares about, and by how much, has not been measured here.
