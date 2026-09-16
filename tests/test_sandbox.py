@@ -662,3 +662,29 @@ def test_an_uncontained_acceptance_command_actually_runs(tmp_path: Path) -> None
         f"an uncontained acceptance command did not run: exit {result.exit_code}, "
         f"{result.error}"
     )
+
+
+def test_a_relative_program_resolves_against_the_sandbox_workdir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`./run.sh` means the same thing inside as it does to the caller.
+
+    Resolving it in this process's working directory would bind whatever
+    happened to sit beside the daemon under that name.
+    """
+
+    workdir = tmp_path / "project"
+    workdir.mkdir()
+    script = workdir / "run.sh"
+    script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    script.chmod(0o755)
+    decoy = tmp_path / "elsewhere"
+    decoy.mkdir()
+    (decoy / "run.sh").write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    monkeypatch.chdir(decoy)
+
+    flags = _flags(["./run.sh"], SandboxSpec(workdir=workdir))
+
+    # Inside the workdir, which is already bound, so it needs no bind of its own
+    # and must not have picked up the decoy.
+    assert str(decoy / "run.sh") not in flags

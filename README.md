@@ -96,8 +96,17 @@ operational PostgreSQL database, a work queue with leases, an idempotency
 ledger, a content-addressed artifact store, bounded resumable reasoning cycles,
 and `researchd` — a control-plane daemon that ingests events, claims due work,
 recovers what dead workers were holding, polls the cluster, enforces budgets and
-surfaces the decisions that are genuinely yours. In progress;
-`docs/RUNTIME.md` is its live specification.
+surfaces the decisions that are genuinely yours. `docs/RUNTIME.md` is its live
+specification.
+
+Its current state, in one word, is **beta** —
+`docs/RELEASE_CANDIDATE_REPORT.md` says why, in detail, and the short version is
+that the loop is closed and demonstrated on real work while three of the
+production-hardening axes cannot be validated on the machine it was built on:
+this host permits no OS containment, has no Slurm, and has one model provider
+family. High-autonomy execution of model-written code is therefore *refused*
+here rather than run unprotected, which is the correct behaviour and also a
+statement about what has not been exercised.
 
 The point of R5 is one sentence:
 

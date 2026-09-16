@@ -439,6 +439,63 @@ exactly what it was asked for. A proposal that reached a person without the
 independent assessment is a weaker thing than one that passed, and nothing said
 so where a reader would look.
 
+## 6a. The second pilot, and the checksum guard catching its author
+
+`pilots/run_second_pilot.sh` against `pilots/fixtures/streamstats-variance`.
+Same machinery as the closed-loop pilot; a different frontier shape, which is
+the reason it exists. Fourteen migrations applied from empty, the project's
+declared `bench-variance` experiment visible to the runtime, one actionable
+untested hypothesis and one open question.
+
+### What the planner did with a frontier CCAO cannot present
+
+Unprompted, `claude-opus-5` read the new shape correctly and said so:
+
+> The frontier shows HYP-0001 actionable but without tests, Q-0001 open, zero
+> pending experiments, zero claims (so nothing to interpret, review, referee, or
+> audit), and zero validation errors [...] Because this runtime cannot write
+> canonical scientific state -- it cannot register a test for HYP-0001 or record
+> an experiment -- the only action that changes anything is to convert the
+> existing finding into a noncanonical capsule change proposal.
+
+The ten-item proposal that followed is worth reading for one item in
+particular. `PR-001` is typed `evidence_interpretation` with basis `historical`,
+and its statement begins: *"The single available finding records an inspection
+of the project at HEAD a6a522b9 [...] It contains no measurement, no error
+values, no offset sweep."* The worker was handed one finding and said, in the
+durable record, that the finding establishes nothing empirical. `PR-003` then
+proposes a *better* hypothesis than the capsule's own -- that the error is
+governed by the offset-to-spread ratio rather than by the offset -- and `PR-010`
+is a candidate claim explicitly marked not yet assertable.
+
+**What it did not do**, recorded because §17 of the brief asked for structurally
+different handlers: it did not select `design_experiment`, which the policy
+permits at every autonomy level (`A0`, `READ_REPO`). Its reason was the one
+quoted above, and it is defensible. So the second pilot demonstrates the loop on
+a second frontier and does *not* demonstrate `design_experiment` end to end.
+
+### The guard that refused its own author
+
+The first attempt at this pilot failed in phase 4, and the failure is worth
+keeping:
+
+```text
+migration 0014 (one_successor_per_run) was applied with a different checksum.
+An applied migration must never be edited; add a new one instead.
+```
+
+Phases 1 to 3 had run against `0014` as originally written. Between phase 3 and
+phase 4, this session edited `0014` to add the duplicate-successor precheck --
+and the pilot's own disposable database had already applied the original. The
+checksum guard did exactly what it exists to do, to the person who wrote it,
+inside their own sandbox.
+
+Two things follow. The mechanism is not decorative: it caught an edit made
+minutes earlier by someone who knew the rule. And the operational lesson is
+narrow and real -- a long-running pilot holds a migrated database across its
+phases, so a migration edited mid-pilot invalidates it. The rerun was on a
+stable schema.
+
 ## 7. The scientific-authority audit, stated as things a reader can check
 
 Not a promise. Each row names the file to read or the test to run.

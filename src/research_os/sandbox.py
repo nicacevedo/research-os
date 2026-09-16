@@ -632,13 +632,22 @@ def _program_binding(
     program = argv[0] if argv else ""
     if not program:
         return (), None
-    located = shutil.which(program) if os.sep not in str(program) else str(program)
-    if not located:
-        # Not resolvable out here either. The caller reports "not on PATH"
-        # against the host, which is the accurate diagnosis; inventing a bind
-        # for a path that does not exist would turn it into a bwrap error.
-        return (), None
-    real = Path(located).resolve()
+    if os.sep in str(program):
+        # A path, which a relative one resolves against the *sandbox's* working
+        # directory and not this process's. `./run.sh` means the same thing
+        # inside as it does to the caller writing the spec, and resolving it
+        # here against `os.getcwd()` would bind whatever happens to sit beside
+        # the daemon.
+        real = (spec.workdir / program).resolve()
+    else:
+        located = shutil.which(program)
+        if not located:
+            # Not resolvable out here either. The caller reports "not on PATH"
+            # against the host, which is the accurate diagnosis; inventing a
+            # bind for a path that does not exist would turn it into a bwrap
+            # error.
+            return (), None
+        real = Path(located).resolve()
     if not real.exists():
         return (), None
     already = [Path(item) for item in _OS_PATHS]

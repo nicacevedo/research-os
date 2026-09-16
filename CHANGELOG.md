@@ -5,7 +5,12 @@ All notable changes to Research OS. Dates are release dates.
 ## [Unreleased] — integration/autonomous-runtime-vnext
 
 **Not released.** Not merged, not tagged. The package version is deliberately
-not advanced here. This entry converges two lines that were developed in
+not advanced here. The release-candidate closure report is
+`docs/RELEASE_CANDIDATE_REPORT.md`, and its verdict is
+`AUTONOMOUS_RUNTIME_BETA` rather than release candidate: the loop is closed and
+demonstrated on real work, and three production-hardening axes -- OS
+containment, Slurm, a second provider family -- cannot be validated on this
+host at all. §I of that report says what would move it. This entry converges two lines that were developed in
 parallel on top of v1.0.0 and had never met: the v1.1 autonomy release
 candidate (`release/v1.1.0-autonomy`) and the R5 autonomous runtime
 (`r5/autonomous-runtime`). Both sets of changes are below, unedited except for
