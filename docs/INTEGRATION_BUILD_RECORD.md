@@ -377,7 +377,24 @@ and phase 2 is its premise.
 
 ### What the first run produced, and the two defects it found
 
-Real provider, real capsule, four model calls, 0.364 USD.
+Real provider, real capsule. The run that *passed* -- the second, after the two
+defects below were fixed -- cost **6 recorded model calls and 0.5242 USD**,
+against a limit of 12 calls and 6 USD, and its own report says the figure is a
+floor because one call reported no cost. Eleven assertions from the durable
+record.
+
+Two corrections to that number, both of which the number's own provenance
+explains:
+
+- An earlier revision of this document said "four model calls, 0.364 USD". That
+  was the *first* run's figure, the one that found the two defects, carried
+  forward when the rerun replaced it. `pilots/runs/.../costs.txt` is the source
+  and it says 6 and 0.5242.
+- Even 6 is low. Two more calls were made -- the proposal worker and its
+  assessor, `INV-0001` and `INV-0002` in the proposal directory -- through the
+  v1 controller, which at the time did not report to the runtime's ledger at
+  all. The real count is **8**. That gap is a defect in its own right and is
+  fixed; see §6b.
 
 Ten of eleven checks passed on the first run. The two that mattered are worth
 recording in full, because both are the kind of thing only a real run finds.

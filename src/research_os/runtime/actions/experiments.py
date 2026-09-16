@@ -865,29 +865,6 @@ def _preregistered_criteria(
     return candidates[-1]
 
 
-def _eligible_job(context: CycleContext, *, project_id: str) -> Any | None:
-    """The terminal job this reader version still owes an interpretation.
-
-    Oldest eligible first, and eligibility is "no *completed* interpretation at
-    :data:`INTERPRETER_VERSION`". Both halves matter and both replace something
-    that was wrong:
-
-    - the old query took ``order by finished_at desc limit 1``, so which
-      experiment was interpreted depended on the order two jobs happened to be
-      reaped in, and the same job was re-interpreted on every later cycle;
-    - excluding a job because *any* interpretation row exists would strand a job
-      whose reader crashed mid-reading, since that leaves ``IN_PROGRESS``.
-
-    The query lives in the store so the ordering and the ``not exists`` clause
-    are testable without a graph.
-    """
-
-    job = context.store.eligible_job_for_interpretation(
-        project_id=project_id, interpreter_version=INTERPRETER_VERSION
-    )
-    return job
-
-
 def _bound_preregistration(
     context: CycleContext, *, job: Any, project_id: str
 ) -> str | None:

@@ -133,13 +133,18 @@ limit 1
 """The eligibility query, in one place so the locked and unlocked readers
 cannot drift apart.
 
-Two callers format it: :meth:`RuntimeStore.eligible_job_for_interpretation`
-with no lock, for reporting and for callers that only want to know whether
-anything is waiting, and :meth:`RuntimeStore.claim_next_interpretation` with
-``for update of j skip locked``, which is the one that then claims what it
-found. Having written the predicate twice is how the ordering and the
-``not exists`` clause would end up differing between "what the doctor says is
-waiting" and "what a worker actually takes".
+Two callers format it. :meth:`RuntimeStore.claim_next_interpretation` adds
+``for update of j skip locked`` and is the one production readers reach:
+`interpret_results` selects and claims in one transaction.
+:meth:`RuntimeStore.eligible_job_for_interpretation` formats it with no lock
+and answers the weaker question -- "is anything waiting" -- which is what the
+interpretation tests assert against and what a read-only reporting caller would
+want; no production path calls it today.
+
+Sharing the predicate is the point. Written twice, the ordering and the
+``not exists`` clause would drift, and the two questions would stop having the
+same answer: a test asserting that a job is eligible would stop meaning that a
+worker will take it.
 """
 
 

@@ -462,9 +462,9 @@ release/v1.1.0-autonomy, before the merge            2605 passed
 r5/autonomous-runtime, before the merge              3006 passed
 after the merge, before any new work                 3249 passed
 after loop closure                                   3453 passed, 18 skipped
-after the audit repairs                              FULL_SUITE_AFTER_AUDITS
-runtime suites only, forward order                    RUNTIME_FORWARD
-runtime suites only, reverse order                    RUNTIME_REVERSE
+after the audit repairs and the budget fix           3510 passed, 18 skipped
+runtime suites only, forward order                     476 passed
+runtime suites only, reverse order                     476 passed
 slurm_live                                            8 collected, 0 executed
 ```
 
@@ -525,8 +525,18 @@ by default, and has never been executed.
 ### Pilot outcomes
 
 **Pilot 1 — `ccao-covariance-regressivity`, a real research capsule.** Real
-provider, four model calls, 0.364 USD. Eleven assertions from the durable record
-alone. The first run passed ten and found two defects that only a real run
+provider. The passing run recorded **6 model calls and 0.5242 USD** against a
+limit of 12 and 6 USD, and its report says that is a floor because one call
+reported no cost — and the true count is **8**, because two calls (the proposal
+worker and its assessor) went through the v1 controller, which did not report to
+the runtime's ledger at all. Eleven assertions from the durable record alone.
+
+An earlier revision of this report said "four model calls, 0.364 USD", which was
+the *first* run's figure carried forward when the rerun replaced it.
+`pilots/runs/.../costs.txt` is the source of the corrected number, and the
+under-count is the subject of the budget defect in §D.
+
+The first run passed ten of eleven and found two defects that only a real run
 finds:
 
 1. *The continuation refused at the exact moment the wait had ended.*
@@ -685,6 +695,29 @@ by the same hand that wrote the runtime.
 ```text
 AUTONOMOUS_RUNTIME_BETA
 ```
+
+Against the acceptance criteria the brief sets, item by item, because a verdict
+that is checkable beats a verdict that is argued.
+
+`AUTONOMOUS_RUNTIME_BETA` requires five things, and all five are met:
+
+| requirement | met | evidence |
+|---|---|---|
+| a unified v1.x + R5 line | yes | §B; one integration branch, both histories preserved, 3249 tests at the merge with none lost |
+| experiment identity fixed | yes | §C; schema 0006 and 0010, the claim binds one preregistration artifact, crash determinism shown with real process death |
+| a grounded proposal loop working | yes | §C and §E; a proposal citing a runtime finding, quoting it, with a recorded basis, on two real capsules |
+| automatic continuation after a human scientific change | yes | §E; `CAPSULE_CHANGED` once, a successor cycle with lineage, on both pilots |
+| a closed-loop real CCAO pilot | yes | §E, pilot 1; eleven assertions from the durable record, source project byte-for-byte unchanged |
+
+`AUTONOMOUS_RUNTIME_RELEASE_CANDIDATE` requires five more, and two are not met:
+
+| requirement | met | why |
+|---|---|---|
+| real Slurm validation, if Slurm is in the intended production topology | **no** | no scheduler on this host; the harness is written and has never run (§H) |
+| high-autonomy execution containment | **no** | no containment technology works here, so high-autonomy execution is *refused* rather than contained (§D) |
+| a required critical-review independence policy | policy yes, capability no | `require` exists and refuses every critical review here, because one provider family is installed |
+| docs / schema / release convergence | yes | fourteen migrations with a declared version the suite checks, both changelog lines preserved, historical build records left historical |
+| an adversarial audit with no unresolved critical or high findings | yes | four independent audits; every finding resolved or explicitly reported, and the one left open is documented as a divergence, not a defect (§I below) |
 
 **Why not `AUTONOMOUS_RUNTIME_RELEASE_CANDIDATE`.** The loop is closed and was
 demonstrated twice on real runs with a real provider, the authority boundary is
