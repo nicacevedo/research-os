@@ -391,7 +391,17 @@ means the configuration permitted it, not that anyone benchmarked it."*
 
 Reserve → execute → reconcile, with `reserved` money promised and `spent` money
 certainly gone, so two concurrent workers cannot both be told there is room for
-the last call. Failure classes drive routing: `POLICY_REFUSED` and
+the last call — **for the calls the runtime's own router makes.** It makes none
+of the calls inside a delegated action, and that gap is the most substantive
+defect the second pilot found: `runtime run` reported one model call for a cycle
+that made four, and a run started with `--max-cost-usd 6` reported a tenth of
+what it had spent, because `propose_capsule_change` and the coding action hand
+the work to v1 controllers that own their own providers and their own per-action
+ceilings. Nothing was unbounded; the *cost* cap simply did not apply to those
+calls. `BudgetLedger.charge_all` now records a delegated spend after the fact,
+past the limit when it must, and reports which budgets it broke — so the cap
+bites on the call after the overrun. That is weaker than a reservation and it is
+the strongest thing that is true once the money is gone. Failure classes drive routing: `POLICY_REFUSED` and
 `CAPABILITY_DENIED` are terminal and are *not* repaired, because retrying a
 refusal burns the attempt budget real transient failures need — and repairing
 "this host cannot contain" would run the same escaping code again.

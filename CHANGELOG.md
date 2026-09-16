@@ -218,6 +218,34 @@ feature. `docs/RUNTIME.md` §16 has the full table; the substantive repairs:
   enum**, tested in both directions. Two constraints had escaped the
   forward-only proof.
 
+#### What the second pilot found, which nothing else did
+
+Three attempts, three real findings, none of them from a test or an audit:
+
+- **Delegated model calls did not reach the runtime's budget ledger.**
+  `runtime run` reported one model call for a cycle that made four, and a run
+  started with `--max-cost-usd 6` reported a tenth of what it had spent. The
+  router reserves before every call it makes and makes none of the calls inside
+  a delegated action: `propose_capsule_change` hands the work to the v1
+  `ProposalController` and the coding action to `AutomationController`, both of
+  which own their own providers. Nothing was unbounded — each action passes a
+  ceiling — and the *cost* cap did not apply to those calls at all.
+  `BudgetLedger.charge_all` records a spend that already happened, past the
+  limit when it must, and reports which budgets it broke; `charge_delegated_spend`
+  calls it with the invocation records the controllers return, on the success
+  path and the failure path both, because a failed proposal's calls cost what a
+  successful one's do. `ProposalController` now attaches those records to its
+  exceptions, not only their count.
+- **A legitimate planner decision killed the pilot harness.** The proposal
+  worker put a capsule id where a proposed item id belongs, the validator
+  refused it correctly, and the script died at phase 2 with no verdict because
+  "no proposal to promote" exits non-zero under `set -o pipefail`. It now
+  reports and explains that outcome, re-verifies that the researcher's project
+  is unchanged, and exits with that code.
+- **The migration checksum guard refused this session's own edit** to `0014`,
+  between phase 3 and phase 4 of a pilot whose disposable database had already
+  applied the original. Working as designed, on the person who wrote the rule.
+
 #### Known divergence, reported rather than closed
 
 v1.1 moved validation-check resolution into the controller: `researchctl

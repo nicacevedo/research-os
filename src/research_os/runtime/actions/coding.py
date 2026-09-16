@@ -73,7 +73,7 @@ from typing import Any
 from research_os.automation import gitutil
 from research_os.automation.models import Budget, RunState
 from research_os.errors import ResearchOSError
-from research_os.runtime.actions.base import ActionOutcome
+from research_os.runtime.actions.base import ActionOutcome, charge_delegated_spend
 from research_os.runtime.context import CycleContext
 from research_os.runtime.failures import FailureClass
 from research_os.runtime.idempotency import idempotency_key
@@ -400,6 +400,16 @@ def run_coding_task(
                 reserved_run_id=reserved_run_id,
             )
         final = controller.execute(store)
+        # What the delegated automation run spent, into the runtime's ledger.
+        # `Budget(max_model_calls=...)` above bounds the v1 side; it does not
+        # tell the runtime what happened, so a coding cycle reported none of its
+        # builder, reviewer or repair calls. See `charge_delegated_spend`.
+        charge_delegated_spend(
+            state,
+            context,
+            getattr(final, "invocations", ()),
+            action="edit_in_worktree",
+        )
 
         after = canonical_fingerprint(repo)
         if after != before:

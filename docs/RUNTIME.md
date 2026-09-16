@@ -958,6 +958,51 @@ did not support.
 | two constraints the proof did not cover | `test_each_status_constraint_matches_its_python_enum` is parametrized over `ENUM_CONSTRAINTS`, so a constraint absent from the dictionary was never checked. `runtime_finding_refs_kind_ck` and `runtime_proposal_reservations_status_ck` had no enum. The reverse test now asks the database what value lists it has. |
 | the reconciler recomputed the id | correct only for as long as two functions agreed. It reads the reservation row and derives only when there is none. |
 
+### What the second pilot found, which no audit and no test did
+
+The second pilot ran three times before it produced a verdict, and each failure
+was a real finding.
+
+**The budget was silent about what the run cost.** `runtime run` reported *one*
+model call for a cycle that had made four, and a run started with
+`--max-cost-usd 6` reported a tenth of what it had spent. The router reserves
+`MODEL_CALLS` and `MODEL_COST_USD` before every call *it* makes; it makes none
+of the calls inside a delegated action. `propose_capsule_change` hands the work
+to the v1 `ProposalController` and the coding action to `AutomationController`,
+both of which own their own providers and their own per-action call ceilings,
+and neither had ever touched the runtime's ledger.
+
+Nothing was unbounded -- each delegated action passes a ceiling -- and the
+*cost* cap did not apply to those calls at all, which is what makes this a
+defect rather than a reporting nit. `BudgetLedger.charge_all` records a spend
+that has already happened, past the limit when it has to, and reports which
+budgets it broke; `charge_delegated_spend` calls it with the invocation records
+the v1 controllers return, on the success path and on the failure path both,
+because a failed proposal's model calls cost exactly as much as a successful
+one's. It cannot refuse -- the money is gone -- so the cap now bites on the call
+*after* the overrun, which is weaker than a reservation and is the strongest
+thing that is true.
+
+Found by reading a pilot's run report next to its provider invocations. Nothing
+asserted that the two agreed, and three adversarial audits did not look.
+
+**A legitimate planner decision killed the harness.** Attempt two: the planner
+chose `propose_capsule_change`, the worker's output put a capsule id
+(`HYP-0001`) where a proposed item id belongs, the validator refused it -- which
+is exactly what `test_proposal_grounding_correction.py` exists to assert -- and
+the action failed correctly. The pilot script then died at phase 2 under
+`set -o pipefail`, with no verdict, because "phase 1 produced no proposal" exits
+3. A harness that a legal outcome kills is a harness that can only report the
+outcome it expected. It now reports and explains it, verifies the researcher's
+project is still unchanged, and exits with that code.
+
+**The checksum guard refused its own author.** Attempt one reached phase 4 and
+stopped on `migration 0014 was applied with a different checksum`: this session
+had edited `0014` between phase 3 and phase 4, and the pilot's disposable
+database had already applied the original. The mechanism worked, on the person
+who wrote the rule, minutes after writing it. The operational lesson is narrow
+and real -- a long-running pilot holds a migrated database across its phases.
+
 ### A suggestion that was wrong, and why
 
 The review proposed passing `role=` to `authorize` so `ROLE_PERMISSIONS` would

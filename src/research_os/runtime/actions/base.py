@@ -18,13 +18,20 @@ for manufacturing positive results, and this is where that would have to start.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from decimal import Decimal
 from typing import Any, Protocol
 
+from research_os.errors import ResearchOSError
+from research_os.runtime.budgets import Dimension
 from research_os.runtime.context import CycleContext
 from research_os.runtime.failures import FailureClass
 from research_os.runtime.interfaces import ArtifactRef
+from research_os.runtime.models import ModelCallStatus
+
+LOG = logging.getLogger("research_os.runtime.actions")
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,3 +142,90 @@ def latest_artifact(
             {"project_id": project_id, "prefix": f"{role_prefix}%"},
         ).fetchone()
     return str(row["artifact_id"]) if row else None
+
+
+def charge_delegated_spend(
+    state: Mapping[str, Any],
+    context: CycleContext,
+    invocations: Any,
+    *,
+    action: str,
+) -> None:
+    """Record, after the fact, what a delegated v1 controller spent.
+
+    The runtime's router reserves ``MODEL_CALLS`` and ``MODEL_COST_USD`` before
+    every call it makes itself. It makes none of the calls in here: this handler
+    delegates to a v1 controller which owns its own providers, bounds itself
+    with its own per-action ceiling, and has never touched the runtime's ledger.
+
+    So a cycle that made four model calls reported one, and a run started with
+    ``--max-cost-usd 6`` reported a tenth of what it had spent. The budget was
+    not wrong about what it had *reserved*; it was silent about what the run had
+    *cost*, which is the number a researcher reads. Found by reading a real
+    pilot's run report next to its provider invocations, not by a test --
+    nothing asserted that the two agreed.
+
+    This cannot refuse, because the calls already happened. What it does is make
+    the ledger and the run report true, so the *next* reservation sees the
+    spend: the cap bites on the following call rather than on the one that
+    overran. `BudgetLedger.charge_all` says the same thing at more length.
+
+    A provider that reports no cost is charged for the call and not for the
+    money, and the model-call row records ``None`` rather than zero -- a spend
+    recorded as zero because the number was unavailable is the accounting error
+    that compounds.
+    """
+
+    records = list(invocations or ())
+    if not records:
+        return
+    run_id = str(state["run_id"])
+    project_id = str(state["project_id"])
+    work_id = state.get("work_id")
+    cost = sum(
+        Decimal(str(item.total_cost_usd))
+        for item in records
+        if getattr(item, "total_cost_usd", None) is not None
+    )
+    for item in records:
+        try:
+            context.store.record_model_call(
+                provider=str(getattr(item, "provider", "unknown")),
+                role=str(getattr(item, "role", action)),
+                status=(
+                    ModelCallStatus.OK
+                    if getattr(item, "ok", False)
+                    else ModelCallStatus.FAILED
+                ),
+                run_id=run_id,
+                work_id=work_id,
+                model=getattr(item, "model", None),
+                # Not the runtime's own prompt versions: these are v1 worker
+                # prompts and saying otherwise would make `runtime run`'s
+                # prompt column a guess.
+                prompt_version=f"delegated:{action}",
+                tokens_in=getattr(item, "input_tokens", None),
+                tokens_out=getattr(item, "output_tokens", None),
+                cost_usd=getattr(item, "total_cost_usd", None),
+                latency_ms=getattr(item, "duration_ms", None),
+                error=getattr(item, "error", None),
+            )
+        except ResearchOSError as exc:
+            # Recording the spend is not worth failing the action over; the
+            # budget charge below is the part that must happen.
+            LOG.warning("could not record a delegated model call: %s", exc)
+    context.budgets.charge_all(
+        dimension=Dimension.MODEL_CALLS,
+        amount=len(records),
+        run_id=run_id,
+        project_id=project_id,
+        work_id=work_id,
+    )
+    if cost > 0:
+        context.budgets.charge_all(
+            dimension=Dimension.MODEL_COST_USD,
+            amount=cost,
+            run_id=run_id,
+            project_id=project_id,
+            work_id=work_id,
+        )

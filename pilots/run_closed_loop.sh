@@ -149,6 +149,16 @@ ros researchctl propose list | tee "$PILOT/proposals-phase1.txt" || true
 # --- phase 2: the human scientific act, stood in for ------------------------
 echo
 echo "== phase 2: the human scientific act (STAND-IN -- see this script's header)"
+# `|| true` on the pipeline, and the exit code read from PIPESTATUS below.
+#
+# `set -o pipefail` makes a pipeline return its rightmost non-zero status, so
+# the "phase 1 produced no proposal" exit of 3 aborted the whole script under
+# `set -e` -- and that is a *legitimate planner decision*, not a harness error.
+# It happened: the planner chose `propose_capsule_change`, the worker's output
+# failed validation, the action failed correctly, and the pilot died at phase 2
+# with no verdict instead of reporting what had occurred. A harness that a
+# legal outcome kills is a harness that only reports the outcome it expected.
+set +e
 ros python - "$WORK" "$PILOT" <<'PY' | tee "$PILOT/phase2.txt"
 """Promote one proposed item the way a person would, without being one.
 
@@ -208,7 +218,31 @@ print(f"              {record.written_path}")
     f"{record.object_id} {record.object_type} {record.written_path}\n", encoding="utf-8"
 )
 PY
-PROMOTED=$?
+PROMOTED=${PIPESTATUS[0]}
+set -e
+
+if [[ "$PROMOTED" -ne 0 ]]; then
+    echo
+    echo "== phases 3 and 4 are unreachable, and this is the pilot's result"
+    echo "   phase 2 exited $PROMOTED: no proposed item was promoted, so there is"
+    echo "   no canonical scientific change for the runtime to observe. Phase 3"
+    echo "   asserts that it observes one; with nothing to observe there is"
+    echo "   nothing to assert, and reporting a pass here would be reporting a"
+    echo "   property nothing was tested."
+    echo
+    echo "   Read $PILOT/phase2.txt and the run reports. If phase 1 produced no"
+    echo "   proposal at all, the planner made a decision -- check its rationale"
+    echo "   in \`researchctl runtime run <id>\` before assuming a defect."
+    fingerprint_source > "$PILOT/source-after.txt"
+    if ! diff -u "$PILOT/source-before.txt" "$PILOT/source-after.txt" \
+            > "$PILOT/source-diff.txt"; then
+        echo "!! FAIL: the pilot modified the researcher's real project:" >&2
+        cat "$PILOT/source-diff.txt" >&2
+        exit 1
+    fi
+    echo "   the researcher's project is unchanged (verified)"
+    exit "$PROMOTED"
+fi
 
 git -C "$WORK" add -A
 git -C "$WORK" commit -q -m "promote one proposed item (human act, stood in for)" || true

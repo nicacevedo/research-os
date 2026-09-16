@@ -364,6 +364,84 @@ class BudgetLedger:
                 (Decimal(row["amount"]), row["budget_id"]),
             )
 
+    def charge_all(
+        self,
+        *,
+        dimension: Dimension,
+        amount: Decimal | float,
+        run_id: str,
+        project_id: str,
+        work_id: str | None = None,
+    ) -> tuple[str, ...]:
+        """Record a spend that has **already happened**, past the limit if need be.
+
+        Returns the ids of any budgets this pushed over their limit.
+
+        Every other path here is reserve-then-settle, and that is the right
+        shape for a spend this process is about to make: the ``where`` clause is
+        the check, so two workers cannot both be told there is room for the last
+        call. This is for the case that shape cannot express -- a spend made by
+        a subsystem the runtime *delegated to*, discovered after the fact.
+
+        `propose_capsule_change` and the coding action call v1 controllers,
+        which own their own providers and their own per-action call ceilings and
+        never touch this ledger. So a cycle started with ``--max-cost-usd 6``
+        could report having spent 0.10 while a delegated proposal worker had
+        made three calls, and `runtime run` showed one model call for a cycle
+        that made four. The budget was not wrong about what it had reserved; it
+        was silent about what the run had cost.
+
+        Refusing to record an overrun is not an option, because the money is
+        already gone. So this records it and *reports* which budgets it broke,
+        and the next `reserve` sees the spend -- the cap bites on the following
+        call rather than the one that overran. That is weaker than a
+        reservation and it is the strongest thing that is true.
+        """
+
+        spend = Decimal(str(amount))
+        if spend <= 0:
+            return ()
+        over: list[str] = []
+        scopes = (
+            (BudgetScope.RUN, run_id),
+            (BudgetScope.PROJECT, project_id),
+            (BudgetScope.SYSTEM, "system"),
+        )
+        with self._db.tx() as conn:
+            for scope, scope_id in scopes:
+                row = conn.execute(
+                    """
+                    update budgets
+                    set spent = spent + %(amount)s, updated_at = now()
+                    where scope = %(scope)s and scope_id = %(scope_id)s
+                      and dimension = %(dimension)s
+                    returning budget_id, spent, reserved, limit_value
+                    """,
+                    {
+                        "amount": spend,
+                        "scope": str(scope),
+                        "scope_id": scope_id,
+                        "dimension": str(dimension),
+                    },
+                ).fetchone()
+                if row is None:
+                    # No budget at this scope means unlimited at this scope,
+                    # which is what an absent row means everywhere here.
+                    continue
+                if Decimal(row["spent"]) + Decimal(row["reserved"]) > Decimal(
+                    row["limit_value"]
+                ):
+                    over.append(str(row["budget_id"]))
+        if over:
+            LOG.warning(
+                "a delegated %s spend of %s pushed %d budget(s) past their limit: %s",
+                dimension,
+                spend,
+                len(over),
+                ", ".join(over),
+            )
+        return tuple(over)
+
     def settle_all(
         self, grants: tuple[Grant, ...], *, actual: Decimal | float | None = None
     ) -> None:

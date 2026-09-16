@@ -412,3 +412,94 @@ def test_an_empty_grant_is_safe_to_pass_around() -> None:
         scope_id="r",
     )
     assert grant.reservation_id == ""
+
+
+# -- what a delegated controller spent must reach this ledger ---------------
+def test_a_delegated_spend_is_recorded_even_past_the_limit(
+    runtime_db: Database,
+) -> None:
+    """The money is already gone; refusing to record it is the worse error.
+
+    `propose_capsule_change` and the coding action call v1 controllers that own
+    their own providers and never touch this ledger, so a cycle that made four
+    model calls reported one and a run started with `--max-cost-usd 6` reported
+    a tenth of what it had spent. Found by reading a pilot's run report next to
+    its provider invocations; nothing asserted the two agreed.
+    """
+
+    store = RuntimeStore(runtime_db)
+    store.upsert_project(project_id="spend", repo_path="/tmp/spend")
+    run = store.create_run(project_id="spend", objective="cost me something")
+    ledger = BudgetLedger(runtime_db)
+    ledger.set_limit(
+        scope=BudgetScope.RUN,
+        scope_id=run.run_id,
+        dimension=Dimension.MODEL_COST_USD,
+        limit_value=Decimal("1.00"),
+    )
+
+    under = ledger.charge_all(
+        dimension=Dimension.MODEL_COST_USD,
+        amount=Decimal("0.40"),
+        run_id=run.run_id,
+        project_id="spend",
+    )
+    assert under == (), "0.40 of a 1.00 budget is not an overrun"
+    budget = ledger.get(
+        scope=BudgetScope.RUN,
+        scope_id=run.run_id,
+        dimension=Dimension.MODEL_COST_USD,
+    )
+    assert budget is not None and budget.spent == Decimal("0.40")
+
+    # And past the limit it records the spend and *reports* the overrun.
+    over = ledger.charge_all(
+        dimension=Dimension.MODEL_COST_USD,
+        amount=Decimal("0.90"),
+        run_id=run.run_id,
+        project_id="spend",
+    )
+    assert over, "an overrun must be reported, not swallowed"
+    budget = ledger.get(
+        scope=BudgetScope.RUN,
+        scope_id=run.run_id,
+        dimension=Dimension.MODEL_COST_USD,
+    )
+    assert budget is not None and budget.spent == Decimal("1.30")
+
+    # The next reservation sees it, which is where the cap bites.
+    with pytest.raises(BudgetExhaustedError):
+        ledger.reserve(
+            scope=BudgetScope.RUN,
+            scope_id=run.run_id,
+            dimension=Dimension.MODEL_COST_USD,
+            amount=Decimal("0.10"),
+        )
+
+
+def test_charging_a_dimension_with_no_budget_is_a_no_op(runtime_db: Database) -> None:
+    """An absent budget means unlimited, here as everywhere else in this file."""
+
+    store = RuntimeStore(runtime_db)
+    store.upsert_project(project_id="unbounded", repo_path="/tmp/unbounded")
+    run = store.create_run(project_id="unbounded", objective="no limits set")
+    ledger = BudgetLedger(runtime_db)
+
+    assert (
+        ledger.charge_all(
+            dimension=Dimension.MODEL_CALLS,
+            amount=7,
+            run_id=run.run_id,
+            project_id="unbounded",
+        )
+        == ()
+    )
+    assert (
+        ledger.charge_all(
+            dimension=Dimension.MODEL_CALLS,
+            amount=0,
+            run_id=run.run_id,
+            project_id="unbounded",
+        )
+        == ()
+    )

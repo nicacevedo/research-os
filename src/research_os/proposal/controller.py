@@ -211,6 +211,12 @@ class ProposalController:
             )
         except (ProposalError, ProviderInvocationError) as failure:
             failure.model_calls = len(spent)
+            # And the records themselves, not only the count. A caller that
+            # accounts for what a delegated run cost needs the per-invocation
+            # cost, and a failed proposal's calls cost exactly as much as a
+            # successful one's. `model_calls` alone let the runtime charge the
+            # calls and not the money on every failure.
+            failure.model_invocations = tuple(spent)
             raise
 
     def _propose(

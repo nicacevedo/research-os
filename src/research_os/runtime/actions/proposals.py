@@ -64,7 +64,7 @@ from research_os.errors import (
     ProviderUnavailableError,
     ResearchOSError,
 )
-from research_os.runtime.actions.base import ActionOutcome
+from research_os.runtime.actions.base import ActionOutcome, charge_delegated_spend
 from research_os.runtime.context import CycleContext
 from research_os.runtime.failures import FailureClass
 from research_os.runtime.findings import FindingPacket, RuntimeFinding, packet_from
@@ -486,6 +486,13 @@ def propose_capsule_change(
             findings=_supplied(packet.findings),
             proposal_id=proposal_id,
         )
+        # What the delegated worker spent, into the runtime's own ledger. It
+        # makes these calls through v1's providers, which never touch that
+        # ledger, so `runtime run` reported one model call for a cycle that made
+        # four. See `charge_delegated_spend`.
+        charge_delegated_spend(
+            state, context, outcome.invocations, action="propose_capsule_change"
+        )
         # Written before the result is returned, so the links exist whenever the
         # proposal does. A proposal a person can read whose grounding this
         # database cannot name is the state this whole mechanism exists to
@@ -566,6 +573,15 @@ def propose_capsule_change(
         # So the recovery is attempted once, here, for all of them, and the
         # per-class failure returns below are reached only when there is really
         # nothing to recover.
+        # The failed attempt's calls cost the same as a successful one's, so
+        # they are charged before anything else happens on this path. v1
+        # attaches the records to the exception for exactly this.
+        charge_delegated_spend(
+            state,
+            context,
+            getattr(exc, "model_invocations", ()),
+            action="propose_capsule_change",
+        )
         recovered = reconcile_reserved_proposal(state, context, plan)
         if recovered is not None:
             # The links, written on this path too. They are written inside
