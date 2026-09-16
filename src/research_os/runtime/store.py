@@ -108,6 +108,23 @@ class RuntimeStateError(ResearchOSError):
 SUCCESSOR_INDEX = "research_runs_one_successor_idx"
 
 
+def _violated_constraint(exc: BaseException) -> str:
+    """The constraint or index name a unique violation names, or ``""``.
+
+    Read from the driver's diagnostics rather than by searching the message
+    text. A substring test over `str(exc)` also matches a *value* that happens
+    to contain the name -- and an objective, a goal or a finding summary can
+    contain anything, because a model wrote it.
+    """
+
+    for candidate in (exc, exc.__cause__, exc.__context__):
+        diag = getattr(candidate, "diag", None)
+        name = getattr(diag, "constraint_name", None)
+        if name:
+            return str(name)
+    return ""
+
+
 class SuccessorExistsError(RuntimeStateError):
     """Raised when a parent run already has the successor a caller is opening.
 
@@ -232,7 +249,7 @@ class RuntimeStore:
             # `research_runs_one_successor_idx`, not any unique violation: a
             # collision on the run id itself is a different fact and must not
             # be reported as "somebody else advanced this objective".
-            if parent_run_id and SUCCESSOR_INDEX in str(exc):
+            if parent_run_id and _violated_constraint(exc) == SUCCESSOR_INDEX:
                 raise SuccessorExistsError(
                     f"{parent_run_id} already has a successor; another pass "
                     f"advanced this objective"
@@ -1394,6 +1411,15 @@ class RuntimeStore:
         error, not a row to write: the proposal validator already refuses a
         citation outside the allowlist, so reaching here means the two were
         computed from different sets.
+
+        The upsert **replaces** ``cited`` rather than OR-ing it. Proposal ids
+        are deliberately stable across retries, so an attempt citing
+        ``{F-1, F-2}`` followed by a retry citing only ``{F-1}`` left both rows
+        ``cited`` under the OR -- re-acquiring exactly the padding
+        ``sql/0011_proposal_link_citation.sql`` exists to remove, on the one
+        path designed to run twice. The last writer's citation set is the
+        proposal's citation set, because the last writer is the attempt whose
+        proposal is on disk.
         """
 
         stray = set(cited_ids) - set(finding_ids)
@@ -1413,7 +1439,7 @@ class RuntimeStore:
                         (proposal_id, finding_id, run_id, work_id, cited)
                     values (%s, %s, %s, %s, %s)
                     on conflict (proposal_id, finding_id) do update
-                        set cited = runtime_proposal_links.cited or excluded.cited
+                        set cited = excluded.cited
                     """,
                     (proposal_id, finding_id, run_id, work_id, finding_id in cited),
                 )

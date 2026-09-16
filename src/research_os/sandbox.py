@@ -632,6 +632,14 @@ def _program_binding(
     program = argv[0] if argv else ""
     if not program:
         return (), None
+    # No `..` segment, ever. `Path("/work") / "../../etc/shadow"` resolves out
+    # of the workdir, and `.resolve()` follows symlinks with no root check, so a
+    # final adversarial review got `--ro-bind /etc/shadow` and `--ro-bind /` out
+    # of this function by controlling argv[0]. On the acceptance path the
+    # command policy's literal allowlist closed it; the local experiment
+    # executor has no such policy.
+    if ".." in Path(program).parts:
+        return (), None
     if os.sep in str(program):
         # A path, which a relative one resolves against the *sandbox's* working
         # directory and not this process's. `./run.sh` means the same thing
@@ -648,7 +656,11 @@ def _program_binding(
             # error.
             return (), None
         real = Path(located).resolve()
-    if not real.exists():
+    # A regular, executable file. Not a directory (`argv[0] = "/"` bound the
+    # whole filesystem read-only), not a device, not a dangling symlink.
+    # Binding something this process cannot even execute buys nothing and is
+    # exactly how an arbitrary path gets inside.
+    if not real.is_file() or not os.access(real, os.X_OK):
         return (), None
     already = [Path(item) for item in _OS_PATHS]
     already.extend(spec.resolved_readable())

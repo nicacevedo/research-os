@@ -251,6 +251,22 @@ def _reconcile_worktree(
     }
 
 
+def _loaded_run(store: Any) -> Any:
+    """The automation run as persisted, or ``None`` if it cannot be read.
+
+    Used on the failure path, where the controller raised and there is no return
+    value. Reading must not be able to replace the original exception, so every
+    failure here is swallowed: a charge that cannot be computed is a lost charge,
+    and a lost charge is better than a lost error.
+    """
+
+    try:
+        return store.load()
+    except Exception as exc:  # noqa: BLE001 - must not mask the cause
+        LOG.warning("could not read the automation run to charge its spend: %s", exc)
+        return None
+
+
 def _run_payload(run: Any, store: Any) -> dict[str, Any]:
     """The small, structured record of a coding run that goes into graph state.
 
@@ -399,17 +415,29 @@ def run_coding_task(
                 attempt=key[-8:],
                 reserved_run_id=reserved_run_id,
             )
-        final = controller.execute(store)
-        # What the delegated automation run spent, into the runtime's ledger.
-        # `Budget(max_model_calls=...)` above bounds the v1 side; it does not
-        # tell the runtime what happened, so a coding cycle reported none of its
-        # builder, reviewer or repair calls. See `charge_delegated_spend`.
-        charge_delegated_spend(
-            state,
-            context,
-            getattr(final, "invocations", ()),
-            action="edit_in_worktree",
-        )
+        # `finally`, because `AutomationController.execute` fails the run on
+        # disk and then **re-raises**, so a charge placed after the call is
+        # unreachable on every ordinary failure path -- a reviewer returning
+        # FAIL, required acceptance commands failing, an order producing no
+        # changes, any `ProviderInvocationError`. All of those happen *after*
+        # model calls. A final adversarial review executed it: two invocations
+        # made, `spent=0` on both dimensions, zero `model_calls` rows, and
+        # `CODE_EXCEPTION` maps to REPAIR so the uncharged spend repeats per
+        # attempt. The proposal path was given exactly this repair and this one
+        # was not, while the changelog claimed both.
+        #
+        # The invocations are read from the *store* rather than from `final`,
+        # because on the raising path there is no `final` -- `_fail` has already
+        # persisted the run, invocations included.
+        try:
+            final = controller.execute(store)
+        finally:
+            charge_delegated_spend(
+                state,
+                context,
+                getattr(_loaded_run(store), "invocations", ()),
+                action="edit_in_worktree",
+            )
 
         after = canonical_fingerprint(repo)
         if after != before:

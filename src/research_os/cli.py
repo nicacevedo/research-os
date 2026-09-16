@@ -56,6 +56,7 @@ from research_os.review import (
 )
 from research_os.runtime.commands import add_runtime_parser
 from research_os.runtime.commands import dispatch as runtime_dispatch
+from research_os.textsafe import terminal_safe
 
 
 def _doctor(args: argparse.Namespace) -> int:
@@ -292,6 +293,21 @@ def _render_packet(packet: ReviewPacket) -> str:
 
     Digests print in full: the digest is the artifact being bound, and an
     abbreviated hash invites a false sense of having checked it.
+
+    **Escaped through :func:`~research_os.textsafe.terminal_safe`, like every
+    other renderer in this package -- and unlike this one until now.** A final
+    adversarial review found that this module contained no use of it at all,
+    which made the *acceptance gate* the one unescaped screen in the system:
+    `claim.statement` is model-written text that reached a capsule file through
+    a human promotion, `_dump` writes it with `allow_unicode=True`, and this
+    function interpolated it raw immediately above the `approve/revise/reject`
+    prompt. A statement ending in `\x1b[1A\x1b[2K` erases and rewrites the line
+    above it, so the sentence on screen when the reviewer answers is not the
+    sentence being digested -- while the digest prints underneath telling them
+    it is.
+
+    That is the exact inverse of what the authority model is for. Every report
+    module wrapped its output; the highest-authority screen did not.
     """
 
     claim = packet.claim
@@ -339,7 +355,7 @@ def _render_packet(packet: ReviewPacket) -> str:
             "",
         ]
     )
-    return "\n".join(lines) + "\n"
+    return terminal_safe("\n".join(lines) + "\n")
 
 
 def _render_evidence(heading: str, entries: Sequence[EvidenceEntry]) -> list[str]:
@@ -399,7 +415,9 @@ def _validation_human(findings: Sequence[Finding], *, ok: bool) -> str:
     lines = [_format_finding(item) for item in findings]
     if ok:
         lines.append("OK")
-    return "\n".join(lines) + "\n"
+    # `Finding.message` quotes object ids and file paths from the capsule, which
+    # is model-written where a promotion put it there.
+    return terminal_safe("\n".join(lines) + "\n")
 
 
 def _format_finding(item: Finding) -> str:
@@ -413,7 +431,10 @@ def _validation_json(findings: Sequence[Finding], *, ok: bool) -> str:
         "ok": ok,
         "findings": [_finding_dict(item) for item in findings],
     }
-    return json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2)
+    # `ensure_ascii=True`, like every other JSON output in this tree. This was
+    # the only one emitting raw non-ASCII, so a bidi control in a validation
+    # message reached a terminal through `--json` as itself.
+    return json.dumps(payload, ensure_ascii=True, sort_keys=True, indent=2)
 
 
 def _finding_dict(item: Finding) -> dict[str, str | None]:

@@ -61,12 +61,37 @@ echo "   objective      $OBJECTIVE"
 echo "   sandbox        $PILOT"
 
 # --- the source project is read once, and proven untouched afterwards -------
+# The project's *own* state, and nothing enclosing it.
+#
+# This read `git rev-parse HEAD` and `git status --porcelain` unconditionally,
+# which for a project vendored inside another repository -- which
+# `pilots/fixtures/` is -- reports the *enclosing* repository's HEAD and dirty
+# file list. A pilot then failed with "the pilot modified the researcher's real
+# project" because a commit had landed in the outer repository while it ran,
+# while every `.research` hash was byte-for-byte identical. A guard that cries
+# wolf about the wrong repository is a guard nobody will believe the third time.
+#
+# Git state is included only when the source really is its own work-tree root.
+# The file hashes are the check that matters either way: they are what says the
+# capsule did not move.
 fingerprint_source() {
     (
         cd "$SOURCE_PROJECT"
-        git rev-parse HEAD 2>/dev/null || echo "no-head"
-        git status --porcelain
+        if [[ "$(git rev-parse --show-toplevel 2>/dev/null || true)" == "$PWD" ]]; then
+            git rev-parse HEAD 2>/dev/null || echo "no-head"
+            git status --porcelain
+        else
+            echo "not a git work-tree root; file hashes only"
+        fi
         find .research -type f -print0 2>/dev/null | sort -z | xargs -0 -r sha256sum
+        # Everything else the project ships, so a pilot that wrote into the
+        # source tree outside `.research` is caught too. Build artefacts are
+        # excluded for the same reason the copy excludes them.
+        find . -type f \
+            -not -path "./.git/*" -not -path "./.research/*" \
+            -not -path "*/__pycache__/*" -not -path "./.venv/*" \
+            -not -path "*/.pytest_cache/*" -not -path "*/.ruff_cache/*" \
+            -print0 2>/dev/null | sort -z | xargs -0 -r sha256sum
     )
 }
 fingerprint_source > "$PILOT/source-before.txt"

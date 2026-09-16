@@ -24,5 +24,10 @@
 -- `preregistration` role and are still found by the bounded scan, which is why
 -- the readers ask both questions; the scan is legacy-only and shrinks to
 -- nothing on any project started from here.
+-- One index, on the column the lookup actually filters.
+--
+-- `artifact_links_role_idx` was created here too and nothing in the package
+-- filters `artifact_links.role` -- the join is on `artifact_id` and `run_id`,
+-- and the role predicate is on `artifacts`. A final adversarial review pointed
+-- out it was write amplification on every artifact link. Not created.
 create index if not exists artifacts_role_idx on artifacts(role);
-create index if not exists artifact_links_role_idx on artifact_links(role);

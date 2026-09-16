@@ -986,6 +986,40 @@ thing that is true.
 Found by reading a pilot's run report next to its provider invocations. Nothing
 asserted that the two agreed, and three adversarial audits did not look.
 
+The size of it, measured on the second pilot after the fix: twelve calls and
+2.3888 USD, of which five rows marked `delegated:propose_capsule_change` account
+for 1.6478. The same run under the previous code would have reported 0.7410 --
+a 3.2x under-report on a cycle with no failures in it.
+
+**The cross-cycle proposal dedup had never once matched anything.** The check
+compared `FindingPacket.digest` against the `finding_packet_digest` a proposal
+stores in its basis snapshot, and those are two different functions over
+different material -- the runtime's hashes `(finding_id, RuntimeFinding.digest)`
+and v1's `supplied_findings_digest` hashes `(finding_id, kind, statement,
+rests_on)` under its own prefix. They cannot be equal, so the comparison
+returned `None` every time and the mechanism was decoration. It now compares
+v1's digest against v1's, which is the one the proposal stores and the one a
+promotion re-checks; the two values also stopped sharing a name in the run
+payload, because one name for two digests is how a run report and a stored basis
+came to disagree about "the" digest.
+
+Two things follow from it working. **A promotion is not an answer to the items
+it did not touch:** the pilot promoted one of nine items, the dedup skipped the
+proposal because it "had a promotion", and the successor cycle re-asked the
+other eight over an unchanged packet. The predicate is now "still has items
+nobody has acted on". And **this cycle's own reserved id is excluded**, because
+a crashed earlier attempt of the same cycle leaves exactly that directory and it
+has to reach the recovery path -- which settles the reservation and writes the
+finding links -- rather than being reported as somebody else's equivalent
+proposal.
+
+A third thing follows that is *not* fixed here: **there is no record of a
+decline.** `ProposalStore` writes promotions and nothing else, so a researcher
+who reads a proposal and rejects it cannot say so, and it stays pending forever.
+An earlier docstring asserted that "one they declined is answered", describing a
+state the system cannot represent. `docs/RELEASE_CANDIDATE_REPORT.md` §J records
+the gap.
+
 **A legitimate planner decision killed the harness.** Attempt two: the planner
 chose `propose_capsule_change`, the worker's output put a capsule id
 (`HYP-0001`) where a proposed item id belongs, the validator refused it -- which
@@ -996,12 +1030,58 @@ the action failed correctly. The pilot script then died at phase 2 under
 outcome it expected. It now reports and explains it, verifies the researcher's
 project is still unchanged, and exits with that code.
 
+**The project-untouched guard cried wolf about the wrong repository.**
+`fingerprint_source` read `git rev-parse HEAD` and `git status --porcelain`
+unconditionally, which for a project vendored *inside* another repository
+reports the enclosing repository's HEAD and dirty-file list. Attempt three
+passed all four phases and then failed with "the pilot modified the
+researcher's real project" -- because a commit had landed in the outer
+repository while it ran. Every `.research` hash was byte-for-byte identical. Git
+state is now included only when the source really is its own work-tree root, and
+the file hashes -- extended to cover the whole project, not only `.research` --
+are the check either way.
+
 **The checksum guard refused its own author.** Attempt one reached phase 4 and
 stopped on `migration 0014 was applied with a different checksum`: this session
 had edited `0014` between phase 3 and phase 4, and the pilot's disposable
 database had already applied the original. The mechanism worked, on the person
 who wrote the rule, minutes after writing it. The operational lesson is narrow
 and real -- a long-running pilot holds a migrated database across its phases.
+
+### The fourth review: the final adversarial pass
+
+An independent review of the finished branch, told to attack this release's own
+report rather than the diff. It found two escapes, and one of them was the worst
+defect in the release.
+
+| severity | finding | what it was |
+|---|---|---|
+| critical | the acceptance gate had no display boundary | `src/research_os/cli.py` contained **no use of `terminal_safe` at all**, so `researchctl review` -- the one command that records human acceptance of a Claim -- interpolated `claim.statement` raw immediately above the `approve/revise/reject` prompt. Model text reaches a capsule file through a promotion, `_dump` writes it with `allow_unicode=True`, and a statement ending `\x1b[1A\x1b[2K` erases and rewrites the line above it: the sentence on screen when the reviewer answers is not the sentence being digested, while the digest prints underneath saying it is. Every report module wrapped its output; the highest-authority screen did not. |
+| critical | containment granted host code execution | `uv_support_paths` put `~/.cache/uv` and `~/.local/share/uv` in **`writable`**, so they were bound `--bind`, not `--ro-bind`. The managed interpreter there is what nine virtual environments on this machine execute and its `lib/python3.12` is writable by this user, so contained model-written code could drop a `sitecustomize.py` and the next `uv run` *anywhere on the host* would execute it outside the sandbox. Strictly worse than the `.git`-hook escape: `canonical_fingerprint` sees none of it, nothing has to be checked out, and it reaches every project on the machine. Introduced by this release, three hours before the review. |
+| high | a failed coding run charged nothing | `AutomationController.execute` fails the run on disk and re-raises, so the charge placed after it was unreachable on every ordinary failure -- a reviewer returning FAIL, acceptance commands failing, any `ProviderInvocationError`. `CODE_EXCEPTION` maps to REPAIR, so the uncharged spend repeated per attempt. `try/finally`, reading the invocations from the store. |
+| high | `UV_CACHE_DIR` chose an arbitrary bind | the variable was read from the daemon's environment and used verbatim as a path, with no absolute or `..` check: `UV_CACHE_DIR=/` bound the whole filesystem read-write. Closed by the same change that made the uv paths read-only. |
+| high | 0014's precheck was not atomic with its index build | two statements in READ COMMITTED with no `lock table`, so a successor committed between them is invisible to the precheck and fatal to the build -- the operator gets verbatim the raw error the precheck exists to replace. `lock table research_runs in share mode` first. |
+| medium | 0013's FK rebuild could not finish under load | ACCESS EXCLUSIVE against a pooled `lock_timeout=30s`, in one transaction with 0011-0014, so one daemon tick's row lock rolled back the whole upgrade. `set local lock_timeout = '0'`. |
+| medium | `redact_dsn` printed the password in full | for a libpq URI with no path component (`postgresql://host?password=...`) the query string was swallowed into the authority and never parsed; a quoted keyword value leaked its tail. Both reach `researchd`'s startup log. |
+| medium | a parameter could choose the program | `_argv_is_plain` checks the *unsubstituted* argv, so a command declared `argv: ["{tool}", ...]` passed the bare-name rule and substitution then put a supplied value in argv[0] -- defeating the rule's stated purpose. Re-checked after substitution. |
+| medium | `_program_binding` would bind an arbitrary path | `argv[0] = "/"` produced `--ro-bind /`; `./../../../../etc/shadow` produced `--ro-bind /etc/shadow`. Closed by rejecting `..` and requiring a regular executable file. |
+| medium | `DECEPTIVE_CHARS` missed thirteen ranges | including `U+2064`, which reproduces the *exact* identifier collision the set's own docstring describes, and `U+E0100`-`U+E01EF`, the variation selector supplement -- the tag range stopped one code point short of it. |
+| medium | `research/report.py` escaped per-field and incompletely | `section`, `read_paths`, `allowed_paths` and the *keys* of `experiment_parameters` were raw. `allowed_paths` is the line a researcher reads to learn what an autonomous task may write. |
+| low | several | `charge_all` took a `work_id` it never used and both callers discarded its return; the `cited` upsert OR-ed across retries, re-acquiring the padding `0011` removes; two indexes had no reader that could use them; `0014`'s `if not exists` matched on name only; `render_approval` escaped values and not keys; the notifier logged unescaped; `insight search --packet` silently folded characters away. |
+
+**What it did not find, having tried:** no authority escape, no double-charge in
+the new budget accounting, no orphan-row or weakened-FK defect in 0013's
+rebuild, no second module reaching the capsule, and no `A2` action with a
+handler. It independently re-derived that the migration upgrade test's split at
+`0005` is correct, and confirmed the full-suite count.
+
+**One finding is reported and not fixed.** `artifact_links.run_id` is part of
+that table's primary key, so it cannot be made nullable without a key
+migration -- and the preregistration guard scopes its lookup through that table.
+Pruning a run therefore still makes the guard refuse permanently. The refusal
+message was corrected to say the link is unreachable instead of claiming no
+preregistration exists; the migration carries the warning;
+`docs/RELEASE_CANDIDATE_REPORT.md` §J carries the work.
 
 ### A suggestion that was wrong, and why
 

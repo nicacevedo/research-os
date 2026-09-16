@@ -670,7 +670,15 @@ def render_approval(approval: Approval) -> str:
                 if isinstance(value, list)
                 else str(value)
             )
-            parts.append(f"  {key:26} {_safe(listed or '(none)', limit=200)}\n")
+            # The key too. This module's docstring says outright that "all of
+            # them now go through `_safe`", and the key did not: the packet is
+            # stored as jsonb and this renderer is deliberately written to
+            # tolerate a foreign packet shape, so its keys are not guaranteed
+            # to be the three literals the only current writer uses.
+            parts.append(
+                f"  {_safe(str(key), limit=26):26} "
+                f"{_safe(listed or '(none)', limit=200)}\n"
+            )
     alternatives = packet.get("alternatives")
     if isinstance(alternatives, list) and alternatives:
         parts.append("\nWHAT HAPPENS AFTER EACH CHOICE\n")

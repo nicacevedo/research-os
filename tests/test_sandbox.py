@@ -539,10 +539,23 @@ def test_a_system_program_adds_no_binding(tmp_path: Path) -> None:
     assert path is not None and not path.startswith("/bin:")
 
 
-def test_uv_gets_its_cache_and_interpreter_directories(monkeypatch, tmp_path) -> None:
-    """A contained `uv run` still has to be able to open uv's own cache."""
+def test_uv_reads_its_interpreters_and_writes_nothing_on_the_host(
+    monkeypatch, tmp_path
+) -> None:
+    """The uv directories are read-only, and the cache is not bound at all.
 
-    from research_os.automation.checks import uv_support_paths
+    An earlier version of this put both in `writable`, which was a host
+    code-execution escape: the managed interpreter's stdlib directory is
+    writable by this user and is what nine venvs on this machine execute, so
+    contained model-written code could drop a `sitecustomize.py` there and the
+    next `uv run` anywhere on the host would execute it outside the sandbox.
+
+    The cache is excluded rather than made read-only because a read-only cache
+    does not work -- measured: `Failed to initialize cache ... Permission
+    denied`. uv gets the sandbox's own tmpfs HOME instead.
+    """
+
+    from research_os.automation.checks import uv_readonly_paths
 
     home = tmp_path / "home"
     (home / ".cache" / "uv").mkdir(parents=True)
@@ -552,24 +565,55 @@ def test_uv_gets_its_cache_and_interpreter_directories(monkeypatch, tmp_path) ->
     monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
     monkeypatch.delenv("XDG_DATA_HOME", raising=False)
 
-    paths = uv_support_paths(["uv", "run", "--frozen", "pytest"])
+    paths = uv_readonly_paths(["uv", "run", "--frozen", "pytest"])
 
-    assert home / ".cache" / "uv" in paths
-    assert home / ".local" / "share" / "uv" in paths
+    assert paths == (home / ".local" / "share" / "uv",)
+    assert home / ".cache" / "uv" not in paths, "the package cache must not be bound"
     # Only for uv. Every other program's needs are the caller's to declare.
-    assert uv_support_paths(["pytest"]) == ()
-    assert uv_support_paths([]) == ()
+    assert uv_readonly_paths(["pytest"]) == ()
+    assert uv_readonly_paths([]) == ()
 
 
-def test_an_explicit_uv_cache_directory_is_honoured(monkeypatch, tmp_path) -> None:
-    explicit = tmp_path / "shared-cache"
-    explicit.mkdir()
-    monkeypatch.setenv("UV_CACHE_DIR", str(explicit))
-    monkeypatch.setenv("HOME", str(tmp_path / "empty-home"))
+def test_the_uv_directories_never_reach_the_writable_set(tmp_path) -> None:
+    """The property that matters, asserted where the spec is built.
 
-    from research_os.automation.checks import uv_support_paths
+    A unit test on `uv_readonly_paths` would pass while the call site put its
+    result in `writable`, which is exactly the bug that happened.
+    """
 
-    assert explicit in uv_support_paths(["uv", "run", "pytest"])
+    from research_os.automation.checks import run_acceptance_command
+
+    captured: dict[str, object] = {}
+    real_contain = __import__(
+        "research_os.automation.checks", fromlist=["contain"]
+    ).contain
+
+    def spy(argv, *, spec, mode):
+        captured["writable"] = tuple(str(p) for p in spec.resolved_writable())
+        captured["readable"] = tuple(str(p) for p in spec.resolved_readable())
+        return real_contain(argv, spec=spec, mode=mode)
+
+    import research_os.automation.checks as checks_module
+
+    work = tmp_path / "project"
+    work.mkdir()
+    environment = tmp_path / "env"
+    original = checks_module.contain
+    checks_module.contain = spy  # type: ignore[assignment]
+    try:
+        run_acceptance_command(
+            AcceptanceCommand(argv=["uv", "--version"], required=True),
+            cwd=work,
+            timeout_seconds=60,
+            uv_project_environment=environment,
+            sandbox_mode=SandboxMode.PREFERRED,
+        )
+    finally:
+        checks_module.contain = original  # type: ignore[assignment]
+
+    writable = captured.get("writable") or ()
+    offenders = [path for path in writable if "/uv" in path and "env" not in path]
+    assert offenders == [], f"uv host directories reached the writable set: {offenders}"
 
 
 # -- Slurm is not contained by this process --------------------------------

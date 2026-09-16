@@ -657,7 +657,7 @@ def test_two_preregistrations_that_disagree_are_refused_rather_than_chosen(
     )
     assert not outcome.ok
     assert outcome.failure_class is FailureClass.ARTIFACT_MISSING
-    assert "no preregistration found" in outcome.detail
+    assert "no preregistration is reachable" in outcome.detail
     # Still owed a reading: the ambiguity is fixable and marking it read would
     # hide it permanently.
     stored = env["store"].get_interpretation(

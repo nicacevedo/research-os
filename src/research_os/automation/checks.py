@@ -113,46 +113,42 @@ def check_overrides(
     return overrides
 
 
-def uv_support_paths(argv: Sequence[str]) -> tuple[Path, ...]:
-    """The directories ``uv`` needs to write, for a contained ``uv`` command.
+def uv_readonly_paths(argv: Sequence[str]) -> tuple[Path, ...]:
+    """The directories a contained ``uv`` command needs to **read**.
 
-    ``uv run`` does not only read a project environment. It reads and writes its
-    package cache, and on a project whose ``.python-version`` names an
-    interpreter it manages, it reads that interpreter out of its own data
-    directory. Both live under the researcher's home, which the sandbox replaces
-    with an empty tmpfs -- so a contained ``uv run --frozen pytest`` with a
-    complete project environment still failed, because the first thing uv does
-    is open its cache.
+    One: uv's data directory, which holds the interpreters it manages. A project
+    whose ``.python-version`` names one of those needs it present, and needs
+    only to read it.
 
-    The honest reading of what this grants: uv's cache and managed-interpreter
-    directories become writable inside the sandbox. They are already writable by
-    this user outside it, and nothing secret lives there. What the sandbox is
-    keeping out of reach is the researcher's environment, their credentials,
-    their ``.git`` and ``.research``, and the network; a package cache is not on
-    that list, and pretending otherwise would mean containment that cannot run
-    the checks it exists to contain.
+    **This used to return the package cache too, and put both in
+    ``writable``.** A final adversarial review executed what that granted, and
+    it was the worst defect in this release: ``--bind`` (read-write) on
+    ``~/.local/share/uv``, whose managed interpreter is what nine virtual
+    environments on this machine execute, with its ``lib/python3.12`` directory
+    writable by this user. Contained model-written code drops a
+    ``sitecustomize.py`` there and the next ``uv run`` *anywhere on the host* --
+    the daemon's own, ``researchctl`` itself, the researcher's shell -- executes
+    it outside the sandbox with the full environment. Strictly worse than the
+    ``.git``-hook escape an earlier review found, because
+    ``canonical_fingerprint`` sees none of it, nothing has to be checked out for
+    it to fire, and it reaches every project on the machine.
 
-    Only for ``uv``. Every other program gets nothing, because every other
-    program's needs are the caller's to declare.
+    The cache is gone from this list entirely rather than made read-only,
+    because a read-only cache does not work: measured, uv exits with
+    ``Failed to initialize cache ... Permission denied`` before running
+    anything. What it gets instead is the sandbox's own ``HOME``, a tmpfs, where
+    its default cache location is writable, isolated and disposable -- verified
+    to work from empty with ``UV_OFFLINE=1``. The cost is a cold cache per
+    contained run. That is the correct price.
     """
 
     if not argv or argv[0] != UV_PROGRAM:
         return ()
-    located = shutil.which(UV_PROGRAM)
-    if located is None:
+    if shutil.which(UV_PROGRAM) is None:
         return ()
-    # uv's own documented locations, resolved the way uv resolves them: the
-    # explicit variable first, then the XDG directory, then the default.
-    explicit = os.environ.get("UV_CACHE_DIR")
-    if explicit:
-        cache_dir = Path(explicit)
-    else:
-        xdg_cache = os.environ.get("XDG_CACHE_HOME")
-        base = Path(xdg_cache) if xdg_cache else Path.home() / ".cache"
-        cache_dir = base / "uv"
     xdg_data = os.environ.get("XDG_DATA_HOME")
     data_dir = (Path(xdg_data) if xdg_data else Path.home() / ".local" / "share") / "uv"
-    return tuple(path for path in (cache_dir, data_dir) if path.exists())
+    return (data_dir,) if data_dir.exists() else ()
 
 
 def run_acceptance_command(
@@ -230,11 +226,12 @@ def run_acceptance_command(
         # every `uv run` check would fail for a reason that has nothing to do
         # with the project.
         writable.append(uv_project_environment)
-    writable.extend(uv_support_paths(argv))
     spec = SandboxSpec(
         workdir=cwd,
         writable=tuple(writable),
-        readable=tuple(sandbox_readable),
+        # uv's managed interpreters, read-only. Never writable: see
+        # `uv_readonly_paths`.
+        readable=(*sandbox_readable, *uv_readonly_paths(argv)),
         network=sandbox_network,
         wall_seconds=timeout_seconds,
         # The controller's *decisions*, not the researcher's environment.

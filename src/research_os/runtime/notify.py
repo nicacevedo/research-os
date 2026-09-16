@@ -21,6 +21,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from research_os.paths import state_home
+from research_os.textsafe import terminal_safe
 
 LOG = logging.getLogger("research_os.runtime.notify")
 
@@ -45,7 +46,19 @@ class LogNotifier:
         urgent: bool = False,
     ) -> None:
         level = logging.WARNING if urgent else logging.INFO
-        LOG.log(level, "%s%s: %s", subject, f" [{run_id}]" if run_id else "", body)
+        # Escaped, because this reaches a terminal. A notification body carries
+        # cycle notes, which quote provider-reported error strings, and
+        # `researchd` in the foreground is the documented way to run the control
+        # plane -- so this is a display boundary even though it is a log call.
+        # `runtime/commands.py` already escaped the same strings when printing
+        # them; a final adversarial review found this path did not.
+        LOG.log(
+            level,
+            "%s%s: %s",
+            terminal_safe(subject),
+            f" [{run_id}]" if run_id else "",
+            terminal_safe(body),
+        )
 
 
 class FileNotifier:

@@ -236,6 +236,23 @@ def resolve_command(
         whole = PLACEHOLDER_RE.fullmatch(token)
         argv.append(resolved[whole.group(1)] if whole is not None else token)
 
+    # The program rule again, on the *substituted* argv.
+    #
+    # `_argv_is_plain` checks `spec.argv[0]`, which for a command declared as
+    # `argv: ["{tool}", ...]` is the placeholder -- it contains no `/` and
+    # passes. Substitution then puts a supplied value there, and a final
+    # adversarial review pointed out that this defeats the rule the validator
+    # exists to state: "what runs is resolved on PATH rather than by a path in
+    # a configuration file". A parameter value cannot be allowed to name the
+    # program by path, whoever supplied it.
+    program = argv[0] if argv else ""
+    if "/" in program or program.startswith("-") or not program:
+        raise ExperimentSpecError(
+            f"command {spec.name!r} resolved to {program!r} as its program. A "
+            f"parameter may not decide what binary runs: declare the program "
+            f"literally in experiments.yaml and parameterise its arguments"
+        )
+
     return ResolvedCommand(
         name=spec.name,
         argv=tuple(argv),

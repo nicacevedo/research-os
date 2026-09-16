@@ -278,6 +278,11 @@ def _payload(outcome: Any, *, packet: FindingPacket) -> dict[str, Any]:
     proposal = outcome.proposal
     assessment = outcome.assessment
     return {
+        # Symmetric with the two refusal paths, which set it False. It was
+        # present only when it was False, so "was a proposal written" could not
+        # be asked of the payload uniformly -- a caller had to know which shape
+        # it was holding. `adopted` says whether *this* attempt wrote it.
+        "proposed": True,
         "proposal_id": proposal.proposal_id,
         "proposal_directory": str(outcome.store.directory),
         "adopted": bool(getattr(outcome, "adopted", False)),
@@ -294,7 +299,17 @@ def _payload(outcome: Any, *, packet: FindingPacket) -> dict[str, Any]:
             for item in proposal.items
         ],
         "grounded_in_findings": list(packet.ids),
-        "finding_packet_digest": packet.digest,
+        # Two digests, two names, because they are two values and giving them
+        # one name made a run report and a stored basis disagree about "the"
+        # digest. `finding_packet_digest` is what the proposal *stores* -- v1's
+        # `supplied_findings_digest`, which is what a promotion re-checks
+        # against -- and `runtime_packet_digest` is this packet's own identity.
+        "finding_packet_digest": (
+            proposal.scientific_basis.finding_packet_digest
+            if proposal.scientific_basis is not None
+            else None
+        ),
+        "runtime_packet_digest": packet.digest,
         "uncertainties": len(proposal.uncertainties),
         "next_actions": [
             {
@@ -336,7 +351,11 @@ def _payload(outcome: Any, *, packet: FindingPacket) -> dict[str, Any]:
 
 
 def _equivalent_pending_proposal(
-    *, project_id: str, packet: FindingPacket, context: CycleContext
+    *,
+    project_id: str,
+    packet: FindingPacket,
+    context: CycleContext,
+    exclude: str = "",
 ) -> str | None:
     """A pending proposal of this project grounded in exactly these findings.
 
@@ -346,16 +365,45 @@ def _equivalent_pending_proposal(
     is what the basis snapshot already records, so the comparison needs nothing
     new stored.
 
-    Only pending. A proposal the researcher promoted is science now, and one
-    they declined is answered; re-offering either would be arguing with a
-    decision.
+    "Pending" means **it still has items nobody has acted on**, and getting that
+    predicate right took a real pilot. It was "has no promotions at all", and
+    the second pilot showed what that permits: a nine-item proposal, one item
+    promoted by the researcher, eight left undecided -- and the successor cycle,
+    holding the *same single finding*, wrote a second proposal. Same grounding
+    digest, no new evidence, eight questions re-asked. The pilot's own assertion
+    "exactly one logical proposal" is what caught it.
+
+    A promotion is not an answer to the items it did not touch. So the test is
+    the difference between the proposal's item ids and the item ids its
+    promotion records name; an empty difference means the researcher has acted
+    on all of it and a repeat would be arguing with a decision.
+
+    **There is no record of a decline.** `ProposalStore` writes promotions and
+    nothing else, so a researcher who reads a proposal and rejects it has no way
+    to say so, and this function will treat it as pending forever. An earlier
+    version of this docstring asserted that "one they declined is answered",
+    which described a state the system cannot represent. The gap is real and is
+    recorded in `docs/RELEASE_CANDIDATE_REPORT.md` §J rather than papered over
+    with a guess at what a decline would mean.
     """
 
     from research_os.errors import ProposalStoreError
     from research_os.proposal.store import ProposalStore
 
     del context
-    wanted = packet.digest
+    # **v1's digest, not the runtime's.** The two are different functions over
+    # different material: `FindingPacket.digest` hashes
+    # `(finding_id, RuntimeFinding.digest)` and `supplied_findings_digest`
+    # hashes `(finding_id, kind, statement, rests_on)` with its own prefix. What
+    # the proposal *stores* in its basis snapshot is v1's, because v1 wrote it.
+    # Comparing the runtime's against the stored one can never match, so this
+    # function returned `None` unconditionally and the cross-cycle dedup it
+    # implements did nothing at all. The second real pilot found it: two
+    # proposals over one unchanged finding packet, caught by the pilot's own
+    # "exactly one logical proposal" assertion rather than by any test.
+    from research_os.proposal.planner import supplied_findings_digest
+
+    wanted = supplied_findings_digest(_supplied(packet.findings))
     if wanted is None:
         return None
     try:
@@ -363,6 +411,14 @@ def _equivalent_pending_proposal(
     except ResearchOSError:  # pragma: no cover - the root may not exist yet
         return None
     for proposal_id in reversed(known):
+        if proposal_id == exclude:
+            # This cycle's own reserved id. A crashed earlier attempt of *this*
+            # cycle leaves exactly that directory, and it has to reach the
+            # recovery path -- which settles the reservation and writes the
+            # finding links -- rather than being reported as somebody else's
+            # equivalent proposal. Found by the crash-recovery test the moment
+            # this comparison started working.
+            continue
         try:
             store = ProposalStore.open(proposal_id)
             proposal = store.load()
@@ -373,7 +429,12 @@ def _equivalent_pending_proposal(
         basis = proposal.scientific_basis
         if basis is None or basis.finding_packet_digest != wanted:
             continue
-        if store.promotions():
+        decided = {record.item_id for record in store.promotions()}
+        undecided = [
+            item.item_id for item in proposal.items if item.item_id not in decided
+        ]
+        if not undecided:
+            # Every item acted on. Re-offering it would argue with a decision.
             continue
         return proposal_id
     return None
@@ -425,6 +486,10 @@ def propose_capsule_change(
 
     from research_os.proposal.store import reserved_proposal_id
 
+    # Derived before the dedup runs, because the dedup has to exclude it.
+    reservation_key = reservation_key_for(state)
+    proposal_id = reserved_proposal_id(reservation_key=reservation_key)
+
     # An equivalent proposal already waiting for a decision is not a second
     # decision. The reservation makes one *cycle* produce one proposal; it says
     # nothing about two cycles over the same findings, which
@@ -437,11 +502,15 @@ def propose_capsule_change(
     # same check, and it is deliberately narrow -- only *pending* proposals, so
     # a promoted or declined one is never re-offered, because both are answered.
     existing = _equivalent_pending_proposal(
-        project_id=project_id, packet=packet, context=context
+        project_id=project_id,
+        packet=packet,
+        context=context,
+        exclude=proposal_id,
     )
     if existing is not None:
         return ActionOutcome.succeeded(
-            f"an equivalent proposal is already waiting for your decision: {existing}",
+            f"an equivalent proposal is already waiting for your decision, and "
+            f"it rests on exactly these findings: {existing}",
             data={
                 "proposed": False,
                 "reason": "an equivalent pending proposal exists",
@@ -453,8 +522,6 @@ def propose_capsule_change(
             },
         )
 
-    reservation_key = reservation_key_for(state)
-    proposal_id = reserved_proposal_id(reservation_key=reservation_key)
     stored_id, _status, _created = context.store.reserve_proposal(
         reservation_key=reservation_key,
         proposal_id=proposal_id,

@@ -573,3 +573,46 @@ def test_start_foreground_runs_a_cycle_inline(
         f"notes were: {[n for n in store.list_events(run_id=run.run_id)]}; "
         f"detail={run.detail!r}"
     )
+
+
+# -- a DSN password must not reach a log or a report -----------------------
+@pytest.mark.parametrize(
+    "dsn",
+    [
+        # No path component, so the query string was never parsed: this printed
+        # the password in full. libpq accepts the form and reads the secret.
+        "postgresql://host?password=LEAKME",
+        "postgresql://u:s3cr3t@host?sslpassword=LEAKME",
+        # A quoted keyword value is one value and two whitespace tokens, so the
+        # tail survived verbatim.
+        "host=/run/pg dbname=db password='two words'",
+        "postgresql://u:s3cr3t@host:5432/db?sslmode=require&password=LEAKME",
+        "postgresql://u:s3cr3t@host/db",
+        "host=/run/pg dbname=db password=LEAKME",
+    ],
+)
+def test_no_dsn_form_prints_its_secret(dsn: str) -> None:
+    """Every libpq form this runtime accepts, checked for the secret's bytes.
+
+    `redact_dsn` reaches `researchd`'s startup log, `runtime doctor` and one
+    other report. A final adversarial review found two forms leaking, both
+    because the parse assumed a shape libpq does not require.
+    """
+
+    from research_os.runtime.config import redact_dsn
+
+    redacted = redact_dsn(dsn)
+    for secret in ("LEAKME", "s3cr3t", "two words"):
+        assert secret not in redacted, f"{secret!r} survived in {redacted!r}"
+    assert "***" in redacted
+
+
+def test_a_dsn_with_no_secret_is_left_readable() -> None:
+    """Redaction must not make an innocent DSN unreadable for diagnosis."""
+
+    from research_os.runtime.config import redact_dsn
+
+    assert (
+        redact_dsn("postgresql:///db?host=/run/pg") == "postgresql:///db?host=/run/pg"
+    )
+    assert redact_dsn("") == ""

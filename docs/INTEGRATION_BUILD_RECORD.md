@@ -491,6 +491,61 @@ permits at every autonomy level (`A0`, `READ_REPO`). Its reason was the one
 quoted above, and it is defensible. So the second pilot demonstrates the loop on
 a second frontier and does *not* demonstrate `design_experiment` end to end.
 
+### Three attempts, and what each failure was
+
+The completed run: all four phases, 12 recorded model calls, 2.3888 USD, a
+nine-item proposal grounded in and quoting one finding with a checkable and
+fresh basis, `Q-0002` promoted, `CAPSULE_CHANGED` exactly once
+(`916823516a07 -> 937ea97dccd7`), a successor cycle with lineage, and a second
+daemon over the same state ingesting nothing. **Ten of eleven assertions
+passed.**
+
+The eleventh -- "exactly one logical proposal" -- failed, and finding out why
+turned up three defects in one mechanism:
+
+1. **The cross-cycle dedup had never matched anything.** It compared
+   `FindingPacket.digest` against the `finding_packet_digest` a proposal stores,
+   and those are different functions over different material: the runtime hashes
+   `(finding_id, RuntimeFinding.digest)`, v1's `supplied_findings_digest` hashes
+   `(finding_id, kind, statement, rests_on)` under its own prefix. Never equal,
+   so the check returned `None` every time. It had been written, reviewed by
+   three audits, and was decoration. Only a second real cycle over one unchanged
+   packet could show it, which is exactly what §17 asks a second pilot for.
+2. **A promotion is not an answer to the items it did not touch.** With the
+   comparison working, the predicate "has no promotions" was wrong: the
+   researcher promoted one item of nine, so the proposal counted as answered and
+   the successor re-asked the other eight.
+3. **The dedup must exclude this cycle's own reserved id.** A crashed earlier
+   attempt of the same cycle leaves exactly that directory; it has to reach the
+   recovery path, which settles the reservation and writes the finding links,
+   rather than being reported as somebody else's equivalent proposal. The
+   crash-recovery test caught this the moment the comparison started working.
+
+And one gap that is **not** fixed, recorded rather than guessed at: there is no
+record of a decline. `ProposalStore` writes promotions and nothing else, so a
+proposal somebody read and rejected stays pending forever, and now that the
+dedup works the runtime will never propose about those findings again. An
+earlier docstring asserted that "one they declined is answered" -- a state the
+system cannot represent.
+
+### The guard that reported the wrong repository
+
+Attempt three passed all four phases and then failed with `!! FAIL: the pilot
+modified the researcher's real project`. It had not. Every `.research` hash was
+byte-for-byte identical; the diff was `git rev-parse HEAD` moving from `aee48c7`
+to `8a56dba` and a dirty-file list emptying -- a commit this session made to the
+*enclosing* repository while the pilot ran.
+
+`fingerprint_source` ran `git rev-parse HEAD` and `git status --porcelain`
+unconditionally, so for a project vendored inside another repository it
+fingerprinted the outer one. Same root cause as the `git archive HEAD` bug
+fixed earlier in the same script: both assumed `$SOURCE_PROJECT` is a Git work
+tree root. Git state is now read only when it actually is, and the file hashes
+cover the whole project rather than only `.research`.
+
+A guard that cries wolf about the wrong repository is worse than no guard,
+because the third time it fires nobody reads the diff.
+
 ### The guard that refused its own author
 
 The first attempt at this pilot failed in phase 4, and the failure is worth

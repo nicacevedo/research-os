@@ -805,3 +805,95 @@ def test_a_successful_proposal_reports_that_it_was_assessed(
     assert outcome.data["assessed"] is True
     assert outcome.data["assessment"]["verdict"]
     assert "NO independent assessment" not in outcome.detail
+
+
+# -- a promotion of one item does not answer the other eight ---------------
+def test_a_partly_promoted_proposal_is_still_waiting(env: dict[str, Any]) -> None:
+    """The shape the second real pilot produced, and the assertion that caught it.
+
+    Nine items, the researcher promoted one, eight left undecided -- and the
+    successor cycle, holding the same single finding, wrote a *second* proposal.
+    Same grounding digest, no new evidence, eight questions re-asked. The dedup
+    skipped the first proposal because it had "a promotion", which is not an
+    answer to the items it did not touch.
+    """
+
+    from research_os.proposal.models import PromotionRecord
+    from research_os.proposal.store import ProposalStore
+
+    finding = _finding(env)
+    _install_controller(
+        env,
+        proposal=proposal_payload(
+            items=[
+                item(item_id="PR-001", grounded_in_findings=[finding.finding_id]),
+                item(item_id="PR-002", grounded_in_findings=[finding.finding_id]),
+            ]
+        ),
+    )
+    first = propose_capsule_change(env["state"], _context(env), {})
+    assert first.ok and first.data["proposed"] is True
+    proposal_id = str(first.data["proposal_id"])
+
+    # The researcher promotes one of the two, exactly as `propose promote` does.
+    store = ProposalStore.open(proposal_id)
+    store.record_promotion(
+        PromotionRecord(
+            proposal_id=proposal_id,
+            item_id="PR-001",
+            object_id="Q-0002",
+            object_type="question",
+            object_status="open",
+            project_path=str(env["repo"]),
+            written_path=".research/questions/Q-0002.yaml",
+        )
+    )
+
+    # A later cycle, same finding packet, nothing new. It must not propose again.
+    later = dict(env["state"])
+    later["cycle_index"] = int(env["state"]["cycle_index"]) + 1
+    second = propose_capsule_change(later, _context(env), {})
+
+    assert second.ok
+    assert second.data["proposed"] is False, (
+        "a second proposal was written over an unchanged finding packet while "
+        "PR-002 was still waiting for a decision"
+    )
+    assert second.data["proposal_id"] == proposal_id
+    assert len(ProposalStore.list_proposal_ids()) == 1
+
+
+def test_a_fully_promoted_proposal_is_not_re_offered(env: dict[str, Any]) -> None:
+    """The other side: every item acted on, so a repeat argues with a decision."""
+
+    from research_os.proposal.models import PromotionRecord
+    from research_os.proposal.store import ProposalStore
+
+    finding = _finding(env)
+    _install_controller(
+        env,
+        proposal=proposal_payload(
+            items=[item(item_id="PR-001", grounded_in_findings=[finding.finding_id])]
+        ),
+    )
+    first = propose_capsule_change(env["state"], _context(env), {})
+    proposal_id = str(first.data["proposal_id"])
+    ProposalStore.open(proposal_id).record_promotion(
+        PromotionRecord(
+            proposal_id=proposal_id,
+            item_id="PR-001",
+            object_id="Q-0002",
+            object_type="question",
+            object_status="open",
+            project_path=str(env["repo"]),
+            written_path=".research/questions/Q-0002.yaml",
+        )
+    )
+
+    later = dict(env["state"])
+    later["cycle_index"] = int(env["state"]["cycle_index"]) + 1
+    second = propose_capsule_change(later, _context(env), {})
+
+    # A new proposal, because the old one is entirely answered. Two directories.
+    assert second.ok and second.data["proposed"] is True
+    assert second.data["proposal_id"] != proposal_id

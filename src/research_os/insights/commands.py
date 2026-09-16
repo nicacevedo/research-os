@@ -49,6 +49,7 @@ from research_os.insights.store import (
     make_insight_id,
     make_nomination_id,
 )
+from research_os.textsafe import terminal_safe
 
 
 def add_insight_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -299,7 +300,19 @@ def _search(args: argparse.Namespace) -> int:
         packet = build_insight_packet(
             args.query, matches, receiving_project=args.for_project
         )
-        print(render_insight_packet(packet))
+        # `--packet` shows the prompt as a model receives it, which is the whole
+        # point of the flag -- so the fold `prompt_safe` applies is correct here
+        # and the reader has to be told it happened. A final adversarial review
+        # noted that a bidi control and a zero-width space simply vanished from
+        # this output with nothing saying a character had been removed, which
+        # inverts the display boundary's stated principle of making the
+        # untrusted byte visible rather than hiding it.
+        print(
+            "# This is the prompt block as a model receives it. Control "
+            "and invisible\n# characters have already been replaced with "
+            "spaces; the stored insight is unchanged.\n"
+        )
+        print(terminal_safe(render_insight_packet(packet)))
     else:
         print(render_matches(matches, query=args.query), end="")
     return EXIT_OK

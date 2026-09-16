@@ -311,3 +311,45 @@ def test_the_prompt_boundary_replaces_them_with_spaces() -> None:
 
     assert RLO not in prompt_safe(f"the effect is {RLO}real")
     assert ZWSP not in prompt_safe(f"EXP{ZWSP}-0001")
+
+
+def test_the_invisible_ranges_an_earlier_version_missed() -> None:
+    """Each one reproduces the module's own identifier-collision scenario.
+
+    `U+200D` was escaped and `U+2064` was not, although the docstring named
+    exactly that attack. The tag range stopped immediately before the variation
+    selector supplement, which is the current channel for smuggling ASCII into
+    one rendered glyph.
+    """
+
+    for code in (
+        0x2064,  # INVISIBLE PLUS
+        0x206A,  # INHIBIT SYMMETRIC SWAPPING (deprecated)
+        0x180E,  # MONGOLIAN VOWEL SEPARATOR
+        0x034F,  # COMBINING GRAPHEME JOINER
+        0x115F,  # HANGUL CHOSEONG FILLER
+        0x3164,  # HANGUL FILLER
+        0x17B4,  # KHMER VOWEL INHERENT AQ
+        0xFE0F,  # VARIATION SELECTOR-16
+        0xE0101,  # VARIATION SELECTOR-18
+        0x1D173,  # MUSICAL SYMBOL BEGIN BEAM
+        0x1BCA0,  # SHORTHAND FORMAT LETTER OVERLAP
+    ):
+        forged = f"exp-000{chr(code)}42"
+        rendered = terminal_safe(forged)
+        assert chr(code) not in rendered, f"U+{code:04X} survived as itself"
+        assert rendered != forged
+
+
+def test_letters_are_not_escaped_however_they_reorder() -> None:
+    """The scope limit, asserted so it cannot be widened by accident.
+
+    UAX#9 reorders a neutral run around any strong RTL *letter*, with nothing
+    escaped. Escaping letters to prevent that would make a reviewer's Hebrew
+    title unreadable, which is why the set contains controls only -- and why the
+    docstring no longer claims that escaping makes a rendered line equal its
+    archived bytes.
+    """
+
+    reordering = "holdout \u05de\u05d0\u05d2\u05e8 0.42 0.91 baseline"
+    assert terminal_safe(reordering) == reordering

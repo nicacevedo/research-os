@@ -26,6 +26,16 @@
 alter table runtime_proposal_links
     add column if not exists cited boolean not null default false;
 
--- The citation edges alone, which is what a reader of one proposal wants.
-create index if not exists runtime_proposal_links_cited_idx
-    on runtime_proposal_links(proposal_id) where cited;
+-- No index for the `cited` filter.
+--
+-- A partial index `on runtime_proposal_links(proposal_id) where cited` was
+-- created here and a final adversarial review showed, by `explain` with
+-- `enable_seqscan = off`, that its only reader could never use it: the reader's
+-- predicate is `(not %(cited_only)s or cited)`, a parameterised expression the
+-- planner cannot match against a partial index's `where cited`. It was pure
+-- write amplification.
+--
+-- The primary key already covers `(proposal_id, finding_id)`, so the filter is
+-- applied to the handful of rows one proposal has. If a reader ever wants the
+-- citation edges across many proposals, it should say `and cited` literally and
+-- get its index then.

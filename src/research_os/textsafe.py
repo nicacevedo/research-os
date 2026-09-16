@@ -66,11 +66,20 @@ CONTROL_CHARS: frozenset[str] = frozenset(
 #:   characters ``\U000e0000``-``\U000e007f``, both of which carry text that
 #:   renders as nothing.
 #:
-#: Deliberately *not* included: combining marks, emoji modifiers, and the
-#: general category Cf beyond the list above. Those appear in legitimate text --
-#: a reviewer quoting a Hebrew title, a finding naming a file with an accent --
-#: and escaping them would make honest content unreadable to force an attack
-#: that the four groups above already cover.
+#: Deliberately *not* included, and this is the important half: **letters**.
+#: Combining marks, emoji modifiers, confusables, and every strong
+#: right-to-left *letter* pass through unchanged. A reviewer quoting a Hebrew
+#: title or a finding naming an accented file must stay readable.
+#:
+#: The consequence is stated plainly because an earlier version of this comment
+#: overstated what escaping buys. UAX#9 reorders a neutral run around any
+#: character of `Bidi_Class` R or AL -- no override required -- so
+#: ``holdout <hebrew> 0.42 0.91 baseline`` displays with the two numbers
+#: swapped, with nothing escaped and the archived bytes unchanged. Escaping the
+#: explicit *controls* is what this set does; it does not and cannot make a
+#: rendered line equal its archived bytes in general. A renderer that wants that
+#: guarantee has to wrap each untrusted field in ``U+2066``/``U+2069``, whose
+#: forgery is prevented by their being in this set.
 DECEPTIVE_CHARS: frozenset[str] = frozenset(
     (
         "\u061c",
@@ -82,10 +91,38 @@ DECEPTIVE_CHARS: frozenset[str] = frozenset(
         "\u2028",
         "\u2029",
         *(chr(code) for code in range(0x202A, 0x202F)),
-        *(chr(code) for code in range(0x2066, 0x206A)),
         *(chr(code) for code in range(0x200B, 0x200E)),
         *(chr(code) for code in range(0xFFF9, 0xFFFC)),
-        *(chr(code) for code in range(0xE0000, 0xE0080)),
+        # Invisible operators, deprecated format characters, and the isolate
+        # controls. `range(0x2061, 0x2070)` covers `U+2061`-`U+2064` (invisible
+        # times, function application, separator, plus), `U+2065` (unassigned),
+        # `U+2066`-`U+2069` (the isolates) and `U+206A`-`U+206F` (deprecated).
+        # A second adversarial review built `exp-00042` with `U+2064` inside it
+        # -- the module's own stated scenario, two ids rendering identically --
+        # and `U+200D` was escaped while `U+2064` was not.
+        *(chr(code) for code in range(0x2061, 0x2070)),
+        # Mongolian free variation selectors and the vowel separator.
+        *(chr(code) for code in range(0x180B, 0x1810)),
+        # Zero-width glyphs that are not classed as format characters:
+        # COMBINING GRAPHEME JOINER, the Hangul fillers, Khmer vowel inherent
+        # signs. Each renders as nothing and each is accepted in an identifier.
+        chr(0x034F),
+        chr(0x115F),
+        chr(0x1160),
+        chr(0x3164),
+        chr(0xFFA0),
+        chr(0x17B4),
+        chr(0x17B5),
+        # Variation selectors. `range(0xE0000, 0xE0080)` escaped the tag block
+        # and stopped immediately before `U+E0100`-`U+E01EF`, the variation
+        # selector supplement in the same plane -- which is the current channel
+        # for smuggling arbitrary ASCII into a single rendered glyph. The whole
+        # plane goes, along with the BMP selectors at `U+FE00`-`U+FE0F`.
+        *(chr(code) for code in range(0xFE00, 0xFE10)),
+        *(chr(code) for code in range(0xE0000, 0xE1000)),
+        # Musical and Duployan format controls, both zero-width.
+        *(chr(code) for code in range(0x1BCA0, 0x1BCA4)),
+        *(chr(code) for code in range(0x1D173, 0x1D17B)),
     )
 )
 

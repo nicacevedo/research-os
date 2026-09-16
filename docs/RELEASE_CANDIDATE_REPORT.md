@@ -312,9 +312,16 @@ running, and both would have mattered on a first real submission:
 ### Sandbox
 
 **This host cannot contain, and that is reported as a release blocker for
-high-autonomy execution rather than papered over.** The probe *runs* each
-technology rather than checking for its binary, which is the whole reason the
-answer is trustworthy:
+high-autonomy execution rather than papered over.**
+
+How each row below was established, because an earlier revision of this section
+said "the probe *runs* each technology" and a final adversarial review checked:
+`probe_bubblewrap` genuinely executes `bwrap` and is the row that matters;
+`probe_ineffective_systemd_run` is a `shutil.which` plus a recorded measurement,
+not a live run; `podman` and `docker` are binary-presence checks; and
+**`apptainer` and `unshare` are not probed at all** — those two lines were
+measured once by hand at a shell and are reported here as history, not as probe
+output. `researchctl runtime doctor` prints four sandbox rows, not six.
 
 ```text
 bubblewrap     /usr/bin/bwrap present, not setuid; every namespace variant fails
@@ -401,7 +408,13 @@ ceilings. Nothing was unbounded; the *cost* cap simply did not apply to those
 calls. `BudgetLedger.charge_all` now records a delegated spend after the fact,
 past the limit when it must, and reports which budgets it broke — so the cap
 bites on the call after the overrun. That is weaker than a reservation and it is
-the strongest thing that is true once the money is gone. Failure classes drive routing: `POLICY_REFUSED` and
+the strongest thing that is true once the money is gone.
+
+**Measured, on the second pilot's own database.** Twelve model calls, 2.3888
+USD, of which five rows carry `prompt_version = delegated:propose_capsule_change`
+and total **1.6478 USD**. Under the previous code those five were invisible, so
+the run would have reported 0.7410 USD — a **3.2× under-report** of what the
+researcher was actually charged, on an ordinary cycle with no failures. Failure classes drive routing: `POLICY_REFUSED` and
 `CAPABILITY_DENIED` are terminal and are *not* repaired, because retrying a
 refusal burns the attempt budget real transient failures need — and repairing
 "this host cannot contain" would run the same escaping code again.
@@ -463,8 +476,9 @@ r5/autonomous-runtime, before the merge              3006 passed
 after the merge, before any new work                 3249 passed
 after loop closure                                   3453 passed, 18 skipped
 after the audit repairs and the budget fix           3510 passed, 18 skipped
-runtime suites only, forward order                     476 passed
-runtime suites only, reverse order                     476 passed
+after the final adversarial review's repairs         3521 passed, 18 skipped
+runtime suites only, forward order                     487 passed
+runtime suites only, reverse order                     487 passed
 slurm_live                                            8 collected, 0 executed
 ```
 
@@ -512,7 +526,8 @@ scripts that are launched as subprocesses and killed at a chosen point:
 | the citable id list is not reachable from inside a fence | `tests/test_proposal_grounding_correction.py::test_the_findings_catalogue_is_outside_the_fenced_block` checks every fence's span against the catalogue's offset |
 | the stored statement is the text the worker read | `test_the_stored_statement_is_what_the_worker_actually_read`; the prompt clipped at 1500 and the record kept 4000, so a conclusion past the cut appeared in `propose show` and never reached the worker |
 | a terminal cannot be repainted from a finding | `textsafe.terminal_safe` escapes every control character; the acceptance path also uses `start_new_session=True`, because an adversarial review opened `/dev/tty` from a check and repainted the terminal while stdout captured something innocuous |
-| a finding cannot read differently from what is archived | `DECEPTIVE_CHARS` escapes bidi, zero-width, separator and tag characters — not control characters, handled perfectly correctly by every terminal, and able to reverse the sentence a researcher is about to decide from |
+| explicit bidi and invisible **controls** are made visible | `DECEPTIVE_CHARS` escapes bidi overrides and isolates, zero-width and invisible characters, separators, interlinear annotation, tag characters and variation selectors. Not control characters, handled correctly by every terminal, and able to change what a researcher reads. **Narrower than "a finding cannot read differently from what is archived"**, which an earlier revision of this row claimed: UAX#9 reorders a neutral run around any strong RTL *letter*, with nothing escaped and the bytes unchanged, so one legitimate-looking Hebrew corpus name can swap two numbers in a rendered line. Escaping letters would make honest content unreadable; a renderer that wants the strong guarantee must wrap each untrusted field in `U+2066`/`U+2069`, which is forgery-proof because those are in the set |
+| the acceptance gate escapes its output | `cli.py::_render_packet` wraps the whole review packet. It did not until the final review: this module contained no use of `terminal_safe` at all, making the one screen that records human scientific authority the one unescaped screen in the system |
 | git is not influenced by the researcher's config | `automation/gitutil.py` neutralises `core.fsmonitor`, `core.hooksPath`, `core.sshCommand`, `protocol.ext.allow` and `uploadpack.packObjectsHook`, points `GIT_CONFIG_GLOBAL/SYSTEM` at `/dev/null`, and injects `--no-ext-diff` per subcommand (measured: `-c diff.external=` makes git *run* the empty string) |
 | a DSN password does not reach a log | `config.redact_dsn`, covering query-string `password` and `sslpassword` as well as the authority |
 | a sandbox does not receive `os.environ` | `check_overrides` returns the controller's *deltas*; `check_environment` returns `dict(os.environ)` plus them and is used only on the uncontained path, where `subprocess.run` needs a complete environment |
@@ -563,19 +578,65 @@ finds:
 **Pilot 2 — `pilots/fixtures/streamstats-variance`, a second frontier shape.**
 Fourteen migrations applied from empty, the project's declared experiment
 visible to the runtime, and a frontier of one actionable-but-untested hypothesis
-plus one open question where CCAO has one contested claim. Results:
-SECOND_PILOT_RESULT
+plus one open question where CCAO has one contested claim.
+
+**It took three attempts and each failure was a real finding.** The run that
+completed: all four phases, 12 recorded model calls, 2.3888 USD, a nine-item
+proposal grounded in and quoting one runtime finding with a checkable and fresh
+basis, `Q-0002` promoted as `question/open`, `CAPSULE_CHANGED` exactly once
+(`916823516a07 -> 937ea97dccd7`), a successor cycle with recorded lineage, and a
+second daemon over the same state producing no duplicate (`events_ingested: 0`).
+**Ten of the eleven assertions passed.**
+
+One qualification on how they were obtained, because it bears on what they
+prove: the harness aborted at its project-untouched check (a defect of its own,
+below) *before* reaching the verdict block, so the eleven assertions were run
+afterwards by extracting that block and executing it against the pilot's own
+still-live database. Same script, same data, same run — but not the harness
+end to end, and this pilot's `verdict.txt` was written from that execution
+rather than by `run_closed_loop.sh`.
+
+The eleventh — "exactly one logical proposal" — failed, and it was right to:
+
+- Two proposals existed over **one unchanged finding packet**, because the
+  cross-cycle dedup had never matched anything. It compared the runtime's
+  `FindingPacket.digest` against the `finding_packet_digest` v1 stores, and
+  those are different functions over different material, so the comparison
+  returned nothing every time. The mechanism was decoration for as long as it
+  had existed, and only a real second cycle over one packet could show it.
+- With it working, a second bug surfaced immediately: the predicate was "has no
+  promotions", and the researcher had promoted one item of nine. A promotion is
+  not an answer to the items it did not touch, so the other eight were re-asked.
+- And a third, from the crash-recovery test the moment the comparison started
+  working: the dedup must exclude *this cycle's own* reserved id, because a
+  crashed earlier attempt leaves exactly that directory and it has to reach the
+  recovery path rather than be reported as somebody else's proposal.
+
+The three earlier attempts failed on: the migration checksum guard refusing this
+session's own mid-pilot edit to `0014`; a legitimate planner decision (the
+worker put a capsule id where a proposed item id belongs, the validator refused
+it correctly) aborting the harness under `set -o pipefail`; and
+`fingerprint_source` reporting the *enclosing* repository's Git state for a
+vendored project, so a passing run was reported as having modified the
+researcher's project while every `.research` hash was identical. All three are
+fixed and all three are recorded in `docs/RUNTIME.md` §16.
 
 What pilot 2 did **not** do, stated because §17 asked for structurally different
 handlers and this is what actually happened: the planner did not select
 `design_experiment`, although the policy permits it at every autonomy level
-(`A0`, `READ_REPO`). Its stated reason was that the runtime cannot register a
-test for `HYP-0001` or record an experiment, so a design it cannot run produces
-no new information, and converting the finding into a proposal a person can
-decide on is the only act that changes anything. That reasoning is defensible
-and it means **the second pilot demonstrates the loop on a different frontier
-and does not demonstrate `design_experiment` end to end.** That handler's
-coverage is unit tests, and this report does not claim more.
+(`A0`, `READ_REPO`). It considered it explicitly and said why not:
+
+> `design_experiment` is the closest read-only alternative, but an experiment
+> this runtime designs cannot be recorded, so the design would be lost; the
+> productive move is to carry that design inside the proposal instead.
+
+That is a correct reading of its own constraints on this host, and it means
+**the second pilot demonstrates the loop on a different frontier and does not
+demonstrate `design_experiment` end to end.** That handler's coverage is unit
+tests, and this report does not claim more. The proposal it wrote instead
+carried the design: three of the nine items are experiment specifications with
+stated pass/fail endpoints, and one is a candidate claim marked not yet
+assertable.
 
 ---
 
@@ -706,7 +767,7 @@ that is checkable beats a verdict that is argued.
 | a unified v1.x + R5 line | yes | §B; one integration branch, both histories preserved, 3249 tests at the merge with none lost |
 | experiment identity fixed | yes | §C; schema 0006 and 0010, the claim binds one preregistration artifact, crash determinism shown with real process death |
 | a grounded proposal loop working | yes | §C and §E; a proposal citing a runtime finding, quoting it, with a recorded basis, on two real capsules |
-| automatic continuation after a human scientific change | yes | §E; `CAPSULE_CHANGED` once, a successor cycle with lineage, on both pilots |
+| automatic continuation after a human scientific change | yes | §E; `CAPSULE_CHANGED` once and a successor cycle with recorded lineage on both pilots. Asserted by the harness on pilot 1; on pilot 2 by running the same assertion block against the pilot's database after the harness aborted on an unrelated check of its own |
 | a closed-loop real CCAO pilot | yes | §E, pilot 1; eleven assertions from the durable record, source project byte-for-byte unchanged |
 
 `AUTONOMOUS_RUNTIME_RELEASE_CANDIDATE` requires five more, and two are not met:
@@ -828,7 +889,32 @@ needs somebody else's project, and it is the highest-value *scientific*
 validation remaining — as distinct from the highest-value engineering work,
 which is item 1.
 
-**5. Two smaller things worth doing before they are load-bearing.**
+**5. A researcher cannot decline a proposal.** `ProposalStore` records
+promotions and nothing else, so "I read this and I do not want it" has no
+representation. The consequences are concrete now that the cross-cycle dedup
+works: a declined proposal stays pending forever, so the runtime will keep
+treating it as the answer to any cycle with the same grounding and will never
+propose about those findings again. A decline record is small — a JSONL line
+beside `promotions.jsonl`, and a `propose decline` command that refuses a
+non-TTY exactly as `promote` does — and it is a human-authority surface, so it
+needs the same care: a decline is a scientific decision and the runtime must
+not be able to write one.
+
+**6. Three cascade decisions 0013 did not make.** `tool_invocations` (the
+idempotency ledger, whose header says every externally visible side effect is
+claimed there before it happens), `model_calls` (which carries `cost_usd`) and
+`artifact_links` (the only row pointing at content-addressed bytes on disk) all
+still cascade from `research_runs`, so pruning a run destroys all three. 0013
+narrowed `external_jobs` only, and an earlier revision of its comment wrongly
+claimed it was the only cascading external-effect relation in the schema.
+`artifact_links` is the consequential one: the preregistration guard scopes its
+lookup through it, so a pruned run makes the guard refuse permanently. Fixing it
+needs a primary-key migration — `run_id` is part of `artifact_links`' key and so
+cannot be nullable — plus a backfilled `project_id`. Not done here; the refusal
+message was corrected to stop asserting "no preregistration found" when the
+truth is "no link is reachable".
+
+**7. Two smaller things worth doing before they are load-bearing.**
 `LEGACY_PREREGISTRATION_WINDOW` is a documented horizon that shrinks to nothing
 on projects started from schema 0012 and does not shrink on older ones; and the
 `runtime_findings` dedupe index makes a finding's identity permanent per

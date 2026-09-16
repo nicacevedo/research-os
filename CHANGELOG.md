@@ -245,6 +245,69 @@ Three attempts, three real findings, none of them from a test or an audit:
 - **The migration checksum guard refused this session's own edit** to `0014`,
   between phase 3 and phase 4 of a pilot whose disposable database had already
   applied the original. Working as designed, on the person who wrote the rule.
+- **The cross-cycle proposal dedup had never matched anything.** It compared the
+  runtime's `FindingPacket.digest` against the `finding_packet_digest` v1 stores
+  in a proposal's basis snapshot, and those are different functions over
+  different material, so the comparison returned nothing every time. Two
+  proposals over one unchanged finding packet, caught by the pilot's own
+  "exactly one logical proposal" assertion. With the comparison working, two
+  more bugs surfaced at once: a promotion of one item was treated as an answer
+  to the other eight, and the dedup had to be taught to exclude *this cycle's
+  own* reserved id so a crashed attempt still reaches the recovery path. The
+  two digests also stopped sharing a name in the run payload.
+- **The project-untouched guard reported the wrong repository.**
+  `fingerprint_source` read `git rev-parse HEAD` and `git status --porcelain`
+  unconditionally, so for a project vendored inside another repository it
+  reported the *enclosing* repository's state: a passing run was reported as
+  having modified the researcher's project while every `.research` hash was
+  byte-for-byte identical. Git state is now read only when the source is its own
+  work-tree root, and the file hashes cover the whole project.
+
+Not fixed, and recorded as remaining work: **a researcher cannot decline a
+proposal.** `ProposalStore` records promotions and nothing else, so now that the
+dedup works, a proposal somebody read and rejected stays pending forever and the
+runtime will never propose about those findings again.
+
+#### What the final adversarial review found
+
+An independent review of the finished branch, told to attack this release's own
+report. `docs/RUNTIME.md` §16 has the table; the two that matter:
+
+- **The acceptance gate had no display boundary.** `src/research_os/cli.py`
+  contained no use of `terminal_safe` at all, so `researchctl review` — the one
+  command that records human acceptance of a Claim — printed model-written
+  `claim.statement` raw immediately above the approve/reject prompt. A statement
+  ending `\x1b[1A\x1b[2K` rewrites the line above it, so the sentence on screen
+  when the reviewer answers is not the sentence being digested. Every report
+  module wrapped its output; the highest-authority screen did not. Fixed, along
+  with the only `ensure_ascii=False` on a display path in the tree.
+- **Containment granted host code execution.** `uv_support_paths` put uv's
+  cache and data directories in `writable`, so they were bound read-write. The
+  managed interpreter there is what nine virtual environments on this machine
+  execute, and its stdlib directory is writable by this user — so contained
+  model-written code could drop a `sitecustomize.py` and the next `uv run`
+  anywhere on the host would execute it outside the sandbox, seen by no
+  fingerprint. Introduced earlier the same day by the fix for "containment makes
+  the command vanish". The cache is now not bound at all (a read-only cache
+  makes uv exit before running anything — measured) and the data directory is
+  read-only; uv gets the sandbox's own tmpfs `HOME`.
+
+Also: a failed coding run charged nothing to the budget ledger (the charge sat
+after a call that re-raises); `UV_CACHE_DIR` from the environment selected an
+arbitrary read-write bind; 0014's duplicate precheck was not atomic with its
+index build; 0013's FK rebuild could not finish under a pooled `lock_timeout`;
+`redact_dsn` printed the password in full for a libpq URI with no path
+component; an experiment parameter could choose the program that runs;
+`_program_binding` would bind an arbitrary host path; `DECEPTIVE_CHARS` missed
+thirteen ranges including the one its own docstring describes; and
+`research/report.py` left four model-written fields raw, one of them the line
+stating what an autonomous task may write.
+
+**Reported and not fixed:** `artifact_links.run_id` is part of that table's
+primary key, so it cannot be nullable without a key migration, and the
+preregistration guard scopes its lookup through that table — so pruning a run
+still makes the guard refuse permanently. The refusal message now says the link
+is unreachable rather than claiming no preregistration exists.
 
 #### Known divergence, reported rather than closed
 

@@ -607,7 +607,7 @@ def test_a_job_with_no_preregistration_cannot_be_interpreted(
     )
     assert not outcome.ok
     assert outcome.failure_class is FailureClass.ARTIFACT_MISSING
-    assert "no preregistration found" in outcome.detail
+    assert "no preregistration is reachable" in outcome.detail
     assert outcome.data["interpreted"] is False
 
 

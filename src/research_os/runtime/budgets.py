@@ -375,6 +375,11 @@ class BudgetLedger:
     ) -> tuple[str, ...]:
         """Record a spend that has **already happened**, past the limit if need be.
 
+        ``work_id`` is accepted and recorded in the log line only. There is no
+        work-item budget scope in use, and an earlier version took the argument
+        and never referenced it at all, which made the signature promise an
+        attribution that did not exist.
+
         Returns the ids of any budgets this pushed over their limit.
 
         Every other path here is reserve-then-settle, and that is the right
@@ -428,15 +433,19 @@ class BudgetLedger:
                     # No budget at this scope means unlimited at this scope,
                     # which is what an absent row means everywhere here.
                     continue
-                if Decimal(row["spent"]) + Decimal(row["reserved"]) > Decimal(
-                    row["limit_value"]
-                ):
+                # `spent` alone, not `spent + reserved`. A reservation is
+                # money *promised* and another worker's in-flight HELD row can
+                # be released, so including it warned about budgets that were
+                # not overspent and might never be. What this reports is the
+                # fact it has: this charge took recorded spend past the limit.
+                if Decimal(row["spent"]) > Decimal(row["limit_value"]):
                     over.append(str(row["budget_id"]))
         if over:
             LOG.warning(
-                "a delegated %s spend of %s pushed %d budget(s) past their limit: %s",
+                "a delegated %s spend of %s%s pushed %d budget(s) past their limit: %s",
                 dimension,
                 spend,
+                f" (work {work_id})" if work_id else "",
                 len(over),
                 ", ".join(over),
             )

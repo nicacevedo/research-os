@@ -257,20 +257,38 @@ def redact_dsn(dsn: str) -> str:
     if not dsn:
         return ""
     if "://" not in dsn:
-        # keyword/value form: postgresql "host=... password=..."
-        parts = []
+        # Keyword/value form: `host=... password=...`.
+        #
+        # Split on whitespace, which libpq also allows to be quoted --
+        # `password='two words'` is one value and two tokens. A final
+        # adversarial review found the second token surviving verbatim, so the
+        # tail of a quoted secret was printed. An unterminated quote now
+        # swallows the rest of the string rather than leaking it, which is the
+        # fail-safe direction this function's docstring promises.
+        parts: list[str] = []
+        redacting_quoted = False
         for token in dsn.split():
-            key, sep, _ = token.partition("=")
-            parts.append(
-                f"{key}=***"
-                if sep and key.strip().lower() in _SECRET_PARAMETERS
-                else token
-            )
+            if redacting_quoted:
+                if token.endswith(("'", '"')):
+                    redacting_quoted = False
+                continue
+            key, sep, value = token.partition("=")
+            if sep and key.strip().lower() in _SECRET_PARAMETERS:
+                parts.append(f"{key}=***")
+                if value[:1] in {"'", '"'} and not value.endswith(value[0]):
+                    redacting_quoted = True
+            else:
+                parts.append(token)
         return " ".join(parts)
 
     scheme, _, rest = dsn.partition("://")
-    authority, slash, tail = rest.partition("/")
-    path, question, query = tail.partition("?")
+    # The query is split off **first**. `rest.partition("/")` swallowed a whole
+    # query string into `authority` whenever the URI had no path component --
+    # `postgresql://host?password=LEAKME` -- so the query was never parsed and
+    # the secret was printed in full. libpq accepts that form and reads the
+    # password from it.
+    before_query, question, query = rest.partition("?")
+    authority, slash, path = before_query.partition("/")
 
     if query:
         redacted: list[str] = []

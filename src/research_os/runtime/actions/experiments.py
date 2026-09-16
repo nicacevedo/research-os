@@ -1077,9 +1077,12 @@ def interpret_results(
         # still owed an interpretation -- the missing preregistration is the
         # thing to fix -- and marking it read would hide that permanently.
         return ActionOutcome.failed(
-            f"no preregistration found for {job.job_id} (spec "
+            f"no preregistration is reachable for {job.job_id} (spec "
             f"{job.spec_digest[:12]}), so there are no prespecified criteria to "
-            f"compare the result against",
+            f"compare the result against. If research runs have been pruned "
+            f"from this database, the preregistration artifact may still exist "
+            f"with no link naming it: the lookup is scoped through "
+            f"artifact_links, whose rows are deleted with their run",
             failure_class=FailureClass.ARTIFACT_MISSING,
             data={
                 "interpreted": False,

@@ -38,6 +38,22 @@
 -- runs they are. Deleting one is a decision about a research run and its
 -- checkpoints, which is the operator's to make and not a migration's; what this
 -- can do is make the decision an informed one.
+-- The lock `create unique index` needs anyway, taken *before* the precheck.
+--
+-- Without it the two statements are a check-then-act with a window between
+-- them, in READ COMMITTED, and a final adversarial review executed the race: a
+-- successor committed by the daemon between the precheck and the build is
+-- invisible to the first and fatal to the second, so the operator gets
+-- verbatim the raw `could not create unique index ... Key (parent_run_id)=(...)
+-- is duplicated` that the message below exists to replace. The window is real,
+-- because `migrate()` runs at every daemon startup and the daemon opens
+-- successors on its own schedule.
+--
+-- SHARE mode is exactly what the index build takes: it blocks writers, permits
+-- readers, and holding it from here makes the precheck's answer still true when
+-- the index is built.
+lock table research_runs in share mode;
+
 do $$
 declare
     offenders text;
@@ -71,3 +87,33 @@ end $$;
 
 create unique index if not exists research_runs_one_successor_idx
     on research_runs(parent_run_id) where parent_run_id is not null;
+
+-- And prove it is the index this migration means.
+--
+-- `if not exists` matches on *name*, so a pre-existing index called
+-- `research_runs_one_successor_idx` with any other definition -- non-unique,
+-- on a different column, unpartialled -- makes the statement above report
+-- success while the first line of this file ("Enforced by the database") is
+-- untrue, with nothing detecting it. A final adversarial review pointed that
+-- out. Asserting it here costs one catalogue read at migration time.
+do $$
+declare
+    definition text;
+begin
+    select indexdef into definition
+      from pg_indexes
+     where schemaname = current_schema() and indexname = 'research_runs_one_successor_idx';
+    if definition is null then
+        raise exception 'research_runs_one_successor_idx was not created';
+    end if;
+    if definition not like '%UNIQUE%'
+       or definition not like '%parent_run_id%'
+       or definition not like '%WHERE%' then
+        raise exception
+            E'an index named research_runs_one_successor_idx already existed '
+            'with a different definition, so "one successor per run" is NOT '
+            'enforced:\n  %\n'
+            'Drop it and migrate again.',
+            definition;
+    end if;
+end $$;

@@ -143,7 +143,7 @@ def render_run(run: ResearchRun, *, events: list[dict[str, Any]] | None = None) 
     if step:
         lines.extend(["", THIN, "what happens next", THIN, *_wrapped(step)])
     lines.append("")
-    return "\n".join(lines)
+    return terminal_safe("\n".join(lines))
 
 
 def render_status(run: ResearchRun) -> str:
@@ -168,7 +168,7 @@ def render_status(run: ResearchRun) -> str:
             + f"{unfinished[0].task_id} [{unfinished[0].kind}] "
             + terminal_safe(unfinished[0].title)
         )
-    return "\n".join(lines)
+    return terminal_safe("\n".join(lines))
 
 
 def render_run_list(runs: list[ResearchRun]) -> str:
@@ -180,7 +180,7 @@ def render_run_list(runs: list[ResearchRun]) -> str:
     for run in runs:
         lines.append(f"  {run.run_id}  {run.state:<18} {terminal_safe(run.goal)[:44]}")
     lines.append("")
-    return "\n".join(lines)
+    return terminal_safe("\n".join(lines))
 
 
 def _budget_lines(run: ResearchRun) -> list[str]:
@@ -213,6 +213,13 @@ def _spend(run: ResearchRun) -> str:
 
 
 def _task_lines(task: ResearchTask) -> list[str]:
+    # Escaped by the three `render_*` exits above, which wrap the whole joined
+    # output. This was per-field and incomplete: an adversarial review found
+    # `section`, both `read_paths` and `allowed_paths`, and the *keys* of
+    # `experiment_parameters` interpolated raw -- and `allowed_paths` is the
+    # line a researcher reads to learn what an autonomous task may write.
+    # `safe_relative_path` rejects control characters and accepts `U+202E`, so
+    # "may write src/research_os/<RLO>" rendered as something else.
     depends = f"  after {', '.join(task.depends_on)}" if task.depends_on else ""
     lines = [
         "",

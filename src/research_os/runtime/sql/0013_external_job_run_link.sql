@@ -1,11 +1,23 @@
 -- A submitted job outlives the run that submitted it.
 --
--- `external_jobs.run_id` cascaded on delete, and it was the only external-effect
--- relation in the schema that did. Every other one -- `experiment_interpretations`,
--- `runtime_findings`, `runtime_proposal_links`, `runtime_proposal_reservations` --
--- uses `on delete set null`, for the reason the pattern exists: a run is a unit
--- of *work*, and deleting the work record must not delete the record of an
--- effect that happened outside this database.
+-- `external_jobs.run_id` cascaded on delete. Every relation *added after 0001* --
+-- `experiment_interpretations`, `runtime_findings`, `runtime_proposal_links`,
+-- `runtime_proposal_reservations` -- uses `on delete set null`, for the reason
+-- that pattern exists: a run is a unit of *work*, and deleting the work record
+-- must not delete the record of an effect that happened outside this database.
+--
+-- **This migration changes one relation, not the schema's whole policy.** An
+-- earlier version of this comment said `external_jobs.run_id` was "the only
+-- external-effect relation in the schema" that cascaded, and a final
+-- adversarial review checked: 0001 has seven cascading FKs to `research_runs`,
+-- and three of them record effects by the same standard used here --
+-- `tool_invocations` (the idempotency ledger, whose own header says every
+-- externally visible side effect is claimed there *before* it happens),
+-- `model_calls` (which carries `cost_usd`: money spent with a provider), and
+-- `artifact_links` (the only row pointing at content-addressed bytes on disk).
+-- Deleting a run still destroys all three. Narrowing them is a separate
+-- decision with its own data migration, and it is recorded as remaining work
+-- rather than smuggled in here.
 --
 -- An adversarial review of the interpretation relation traced where the outlier
 -- led. `experiment_interpretations.job_id` cascades from `external_jobs`, which
@@ -17,11 +29,43 @@
 -- can be recomputed; it is the identity of one scientific reading of one
 -- experiment, which is the whole reason `0006` created the table.
 --
+-- **What pruning a run still loses, and why this migration does not fix it.**
+-- The preregistration guard scopes its lookup by joining `artifact_links` to
+-- `research_runs`, and `artifact_links.run_id` is part of that table's primary
+-- key -- so it is implicitly `not null` and cannot be made `on delete set
+-- null` without restructuring the key. Deleting a run therefore still deletes
+-- its preregistration *links*, and the guard then refuses the experiment
+-- permanently. The artifact is still on disk; nothing can find it.
+--
+-- A final adversarial review executed that sequence. It is not fixed here
+-- because the fix is a primary-key migration on `artifact_links` plus a
+-- backfilled `project_id`, which is a separate change with its own risk, and
+-- because no code path in `src/` deletes a run. What is done here instead: the
+-- refusal message no longer claims "no preregistration found" -- it says the
+-- link is unreachable and names pruning as a cause -- and
+-- `docs/RELEASE_CANDIDATE_REPORT.md` §J carries the work.
+--
 -- Deleting a *project* still removes everything, because every one of these
 -- tables cascades on `project_id`. That is the intended erasure and
 -- `tests/test_runtime_schema.py` proves it. What this changes is only the
 -- narrower path: deleting a run now orphans its jobs from that run rather than
 -- destroying them.
+-- No `lock_timeout` for this one statement pair.
+--
+-- Dropping and re-adding a foreign key needs ACCESS EXCLUSIVE on
+-- `external_jobs`, every pooled connection is pinned with `lock_timeout=30s`
+-- (`runtime/db.py`), and `migrate()` applies every pending file in **one**
+-- transaction -- so one daemon tick holding an `update external_jobs` row lock
+-- made this fail with `canceling statement due to lock timeout` and rolled back
+-- 0011 through 0014 together. A final adversarial review executed it with a 2s
+-- timeout.
+--
+-- `set local` reverts at the end of the transaction, so nothing outside this
+-- migration loses the timeout. An upgrade should still be done with the daemon
+-- stopped: this waits rather than failing, and while it queues for ACCESS
+-- EXCLUSIVE it blocks every tick behind it. `docs/OPERATIONS.md` says so.
+set local lock_timeout = '0';
+
 alter table external_jobs drop constraint if exists external_jobs_run_id_fkey;
 alter table external_jobs
     add constraint external_jobs_run_id_fkey
