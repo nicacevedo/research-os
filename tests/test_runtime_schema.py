@@ -137,6 +137,57 @@ def test_a_leased_row_must_have_an_owner_and_a_deadline(runtime_db: Database) ->
         )
 
 
+def test_an_upgrade_over_a_database_the_race_already_happened_in_says_what_to_do(
+    throwaway_dsn: str,
+) -> None:
+    """0014 cannot build its index over rows that already violate it.
+
+    The race `lock_run` failed to serialise was real, so an upgraded database
+    may already hold two runs naming one parent. PostgreSQL's own message for
+    that is `could not create unique index`, with a DETAIL naming one key and no
+    instruction -- on a forward-only migration the operator cannot edit. The
+    migration finds the duplicates first and names them.
+    """
+
+    from research_os.runtime.db import Database
+
+    files = discover()
+    before = [m for m in files if m.version < "0014"]
+    with Database(throwaway_dsn) as db:
+        with db.tx() as conn:
+            conn.execute(
+                "create table if not exists schema_migrations ("
+                "version text primary key, checksum text not null, "
+                "applied_at timestamptz not null default now())"
+            )
+            for migration in before:
+                conn.execute(migration.sql)
+                conn.execute(
+                    "insert into schema_migrations (version, checksum) values (%s, %s)",
+                    (migration.version, migration.checksum),
+                )
+        store = RuntimeStore(db)
+        store.upsert_project(project_id="raced", repo_path="/tmp/raced")
+        parent = store.create_run(project_id="raced", objective="advance me")
+        # Two successors, which only the *absent* index made possible. Written
+        # through the store, so this is the state the old code really produced.
+        for _ in range(2):
+            store.create_run(
+                project_id="raced",
+                objective="advance me",
+                parent_run_id=parent.run_id,
+                cycle_index=1,
+            )
+
+        with pytest.raises(RuntimeDatabaseError) as raised:
+            migrate(db)
+
+    message = str(raised.value)
+    assert "more than one successor" in message
+    assert parent.run_id in message, "the message must name the run to look at"
+    assert "delete the" in message
+
+
 def test_deleting_a_run_does_not_delete_the_interpretations_of_its_experiments(
     runtime_db: Database,
 ) -> None:

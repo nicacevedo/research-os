@@ -24,5 +24,50 @@
 --
 -- Partial, because `parent_run_id is null` for every run a researcher starts
 -- and those must not be unique with respect to each other.
+--
+-- ## Upgrading a database the race already happened in
+--
+-- The race was real, so a deployment that ran the previous build may already
+-- hold two runs naming one parent -- and then this index cannot be built. Left
+-- alone, the operator sees `could not create unique index
+-- "research_runs_one_successor_idx"` with a DETAIL naming one duplicated key,
+-- on a forward-only checksum-verified migration they cannot edit, and no
+-- instruction about what to do.
+--
+-- So the duplicates are found first and reported as an error that says which
+-- runs they are. Deleting one is a decision about a research run and its
+-- checkpoints, which is the operator's to make and not a migration's; what this
+-- can do is make the decision an informed one.
+do $$
+declare
+    offenders text;
+begin
+    select string_agg(
+               format('%s -> %s', parent_run_id, children), E'\n  '
+               order by parent_run_id
+           )
+      into offenders
+      from (
+          select parent_run_id,
+                 string_agg(run_id, ', ' order by created_at, run_id) as children
+            from research_runs
+           where parent_run_id is not null
+           group by parent_run_id
+          having count(*) > 1
+      ) as duplicated;
+    if offenders is not null then
+        raise exception
+            E'this database holds runs with more than one successor, which the '
+            'index this migration creates forbids:\n  %\n'
+            'That state was reachable in earlier builds -- `lock_run` released '
+            'its advisory lock before the check it was meant to serialise -- so '
+            'finding it here is expected on an upgrade. Decide which successor '
+            'to keep (`researchctl runtime run <id>` shows each one), delete the '
+            'other and its checkpoints, and migrate again. A migration will not '
+            'choose between two research runs for you.',
+            offenders;
+    end if;
+end $$;
+
 create unique index if not exists research_runs_one_successor_idx
     on research_runs(parent_run_id) where parent_run_id is not null;

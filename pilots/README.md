@@ -59,6 +59,16 @@ pilots/run_closed_loop.sh <project-path> "<objective>" [cycles]
 pilots/run_second_pilot.sh <project-path> "<objective>" [cycles]   # same thing
 ```
 
+The two entry points run identical machinery. `run_second_pilot.sh` exists so
+that "we ran the loop against two differently shaped frontiers" is a command
+rather than a claim; see `pilots/fixtures/README.md` for the second frontier and
+for what a fixture is and is not.
+
+If the project ships an `experiments.yaml.example`, the script installs it into
+the *pilot's* disposable config home so the project's declared experiments are
+reachable. It is never read from the repository: a worker confined to a worktree
+must not be able to add an experiment command or widen one.
+
 `run_pilot.sh` demonstrates "launch once, then no manual choreography" and
 **fails if the project moved**. This one has to exercise the human scientific
 gate, and a promotion writes a capsule file — so it works on a **copy** of the
