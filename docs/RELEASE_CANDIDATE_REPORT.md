@@ -119,14 +119,25 @@ The full table, including the one finding **reported rather than closed** (the
 runtime coding path still bypasses v1.1's check-profile resolution), is
 `docs/INTEGRATION_BUILD_RECORD.md` §3.
 
-**Final integrated SHAs.**
+**Final integrated SHAs**, in order, all on
+`integration/autonomous-runtime-vnext`:
 
 ```text
 641863c  Converge the v1.1 autonomy line with the R5 autonomous runtime
 f6707a8  Close the autonomous research loop, and repair what the merged tree broke
 270677c  Repair what three independent adversarial audits found
 b42897f  Make 0014 upgradeable over a database the race already happened in
+aee48c7  Write the release-candidate closure report, and call it beta
+1d78ab3  Charge what a delegated controller spends to the runtime's budget
+8a56dba  Correct the pilot's cost figure, and remove a helper the atomic claim replaced
+4e1d5e6  Close the two escapes the final adversarial review found
 ```
+
+Pushed to `origin/integration/autonomous-runtime-vnext` as a **new** branch. No
+published history was rewritten or force-pushed, nothing was merged into `main`,
+and `main`, `r5/autonomous-runtime` and `release/v1.1.0-autonomy` are at the
+same SHAs §A recorded. There is no pull request: opening one is a request for
+review, and that is the researcher's to make.
 
 ---
 
