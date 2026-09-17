@@ -339,6 +339,87 @@ passes and running it for them does not.
 units installed a reboot leaves the control plane stopped until the next login.
 That is the researcher's decision to change and is documented in both units.
 
+### E.4 The singleton lock, verified against the running daemon
+
+```text
+$ RESEARCH_OS_RUNTIME_DSN=… researchd --once
+A Research OS control plane is already attached to postgresql://postgres:***@/research_os?…
+Nothing was started, and the running one is unaffected. …
+exit code: 0
+```
+
+The first daemon kept running throughout.
+
+---
+
+## E.5 Automatic continuation, on a real change
+
+The daemon was started deliberately, with the researcher's authorisation, while
+the capsule change in §E.1 was still unobserved. What it did, in full:
+
+```text
+15:31:24  researchd starting
+15:31:24  cg-sparse-regression: canonical scientific state changed
+          (6e7f556470ad -> 1a62908e5bfc)
+
+events    CAPSULE_CHANGED   dedup=capsule-changed:cg-sparse-regression:6e7f556470ad26cc->1a62908e5bfcdfb9
+          RESEARCH_RUN_REQUESTED  RRUN-20260917T183124Z-2b6d7477  parent=227d00d8  cyc=1
+work      WORK-20260917T183124Z-68148bf0  advance_objective
+observer  changes_seen 0 -> 1, stored digest advanced to the observed one
+```
+
+Exactly one deduplicated event, whose dedup key is the digest transition
+itself. Exactly one successor per parked objective. Nothing was manually
+enqueued and the stored observer baseline was not edited — it advanced on its
+own, and the value it advanced *to* is the one the daemon computed.
+
+**The fan-out is per objective, not per project.** One `CAPSULE_CHANGED`
+advanced two different parked objectives, one successor each. That is
+`parked_objectives`' contract — `distinct on (objective)`, so several runs of
+one objective share a single successor — and `research_runs_one_successor_idx`
+is what holds each parent to one. Every parent in the live database has exactly
+one child. Nothing tested the fan-out before; a test does now.
+
+### E.6 Two fixes validated in production rather than only in tests
+
+**`planner@4` received the three-category context.** From the archived prompt
+artifact of the live call:
+
+```text
+NONCANONICAL CENSUS: 1 completed finding(s), 1 shown; 1 proposal(s) already
+                     awaiting a human decision, 1 shown
+
+COMPLETED FINDINGS:
+----- BEGIN RUNTIME FINDINGS (UNTRUSTED AUTONOMOUS OUTPUT) -----
+{ "finding_id": "FIND-20260917T095202Z-f63a6014",
+  "noncanonical": true,
+  "already_cited_by_proposals": ["PROP-19700101T000000Z-b9c26fcd"], … }
+```
+
+And the canonical frontier it was given reflects the real promotion:
+`actionable_hypotheses` is now `HYP-0002/0003/0004/0006/0007` — `HYP-0001` and
+`HYP-0005` are gone.
+
+**`design_experiment` succeeded.** The action that failed twice on the absolute
+path:
+
+```text
+cycle.design_experiment  ok=True
+  preregistered a test of HYP-0002 using the declared command
+  adjudicate-pricing (90dcfc0e4052)
+
+  "out": "results/2026/adjudicate_pricing_seed10000.json"   <- relative, in-tree
+```
+
+The preregistration is also better science than the loop it replaced: it
+prespecifies `INCONCLUSIVE` as an outcome distinct from support — "one branch
+is unobserved … that direction of the iff is untested, not confirmed" — and
+gives secondary endpoints for branch coverage. `experimentalist@2` wrote that
+with no human in the loop.
+
+Cost of the whole continuation: project spend moved from $2.53 to roughly
+$3.35, against a $300 ceiling.
+
 ---
 
 ## F. Human authority
@@ -387,10 +468,13 @@ PR-006 is a preregistered experiment, and a preregistered experiment must exist
 as a capsule object before the runtime will run it. That gate is the design
 working, not an obstacle to route around.
 
-**Not demonstrated.** Automatic post-promotion continuation. The mechanism is
-tested in `tests/test_runtime_daemon.py`, and there is now a real unobserved
-capsule change to exercise it against, but it has not been run on a real human
-decision because no human decision has been made.
+**Partly demonstrated.** §E.5 shows the continuation mechanism working on a
+real canonical change, end to end, with no manual step. What is *not*
+demonstrated is that change being a **promotion**: the change it reacted to was
+the researcher's own sixteen commits, not a `propose promote`. The distinction
+matters because promotion is the path this architecture exists to protect, and
+asserting it works on the strength of a different trigger would be the kind of
+claim this report is supposed to avoid.
 
 **Untouched by this pass.** Containment (this kernel refuses unprivileged user
 namespaces; `bwrap` fails on loopback, `systemd-run`'s user-scope sandboxing is
