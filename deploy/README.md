@@ -6,6 +6,12 @@ into a system location, enables a service, or reloads a service manager.
 | file | what it is |
 |---|---|
 | `researchd.service` | a systemd **user** unit for the control plane. Its own header has the install steps. |
+| `researchd-db.service` | a systemd **user** unit for the disposable local PostgreSQL. Only for a development or single-workstation setup; a production runtime points at a PostgreSQL somebody backs up and does not install this. |
+
+Installing both, plus `loginctl enable-linger`, is what makes a reboot not
+require the researcher to remember anything. Without linger the control plane
+stays stopped until the next login; without `researchd-db` it comes back and
+retries against a cluster nobody started. Neither is installed for you.
 
 Two boundaries worth restating, both from `AGENTS.md` and `SECURITY.md`:
 

@@ -61,10 +61,22 @@ class LockClass(IntEnum):
     #: thread; nothing else in the design prevented it, because the run's
     #: status transition is not a guard (RUNNING -> RUNNING succeeds).
     RESEARCH_RUN = 4
+    #: One control plane per operational database. Not a correctness guard --
+    #: work claiming is `for update skip locked`, leases expire, and event
+    #: ingestion is deduplicated, so two daemons would not duplicate work --
+    #: but it makes starting the daemon *idempotent*, which is what a service
+    #: manager needs. `systemctl --user start researchd` twice, or a manual
+    #: `researchd` beside an enabled unit, should be a no-op with a clear
+    #: message rather than a second loop competing for the same rows.
+    DAEMON = 5
 
 
 class RepositoryBusyError(ResearchOSError):
     """Raised when another worker is already mutating this repository."""
+
+
+class DaemonAlreadyRunningError(ResearchOSError):
+    """Raised when a control plane is already attached to this database."""
 
 
 def _key(lock_class: LockClass, subject: str) -> int:
@@ -175,6 +187,16 @@ def research_run_lock(db: Database, run_id: str, *, wait: bool = False):
     return advisory_lock(
         db, lock_class=LockClass.RESEARCH_RUN, subject=run_id, wait=wait
     )
+
+
+def daemon_lock(db: Database, *, subject: str = "control-plane"):
+    """Hold the one-control-plane-per-database lock.
+
+    Never waits. A second daemon should say so and exit, not queue behind the
+    first for as long as the first runs.
+    """
+
+    return advisory_lock(db, lock_class=LockClass.DAEMON, subject=subject, wait=False)
 
 
 def held_locks(db: Database) -> tuple[tuple[int, int], ...]:

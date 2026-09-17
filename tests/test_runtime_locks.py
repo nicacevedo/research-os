@@ -125,3 +125,60 @@ def test_held_locks_reports_only_this_runtimes_namespace(runtime_db: Database) -
     before = len(held_locks(runtime_db))
     with repository_lock(runtime_db, "/repos/counted"):
         assert len(held_locks(runtime_db)) == before + 1
+
+
+# --- one control plane per database -----------------------------------------
+def test_a_second_daemon_cannot_take_the_control_plane_lock(
+    runtime_db: Database,
+) -> None:
+    """What makes `systemctl --user start researchd` idempotent.
+
+    Not a correctness guard -- work claiming is ``for update skip locked``,
+    leases expire and are recovered, and event ingestion is deduplicated, so
+    two daemons would compete rather than corrupt. It is what lets a second
+    start say so and exit zero instead of quietly running a second loop against
+    the same rows, which is what a service manager needs and what a researcher
+    who has forgotten whether the daemon is running needs more.
+    """
+
+    from research_os.runtime.locks import RepositoryBusyError, daemon_lock
+
+    with (
+        daemon_lock(runtime_db),
+        pytest.raises(RepositoryBusyError, match="daemon lock"),
+        daemon_lock(runtime_db),
+    ):
+        pass  # pragma: no cover - the raise above is the assertion
+
+    # Released with the block, so the next start succeeds.
+    with daemon_lock(runtime_db):
+        pass
+
+
+def test_the_control_plane_lock_does_not_collide_with_the_other_classes(
+    runtime_db: Database,
+) -> None:
+    """A new lock class must not silently share a key with an existing one."""
+
+    from research_os.runtime.locks import (
+        LockClass,
+        capsule_lock,
+        daemon_lock,
+        repository_lock,
+        research_run_lock,
+    )
+
+    assert LockClass.DAEMON not in {
+        LockClass.REPOSITORY_MUTATION,
+        LockClass.PROJECT_CAPSULE,
+        LockClass.DERIVED_INDEX,
+        LockClass.RESEARCH_RUN,
+    }
+    # Every other lock, on the same subject string, is still available.
+    with (
+        daemon_lock(runtime_db),
+        repository_lock(runtime_db, "control-plane"),
+        capsule_lock(runtime_db, "control-plane"),
+        research_run_lock(runtime_db, "control-plane"),
+    ):
+        pass

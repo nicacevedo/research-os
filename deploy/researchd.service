@@ -22,14 +22,34 @@
 # home directory, which is a worse answer to every question.
 #
 # `loginctl enable-linger <user>` if you want it to keep running while you are
-# logged out. That is also your decision.
+# logged out, and if you want it to come back after a reboot without you
+# logging in first. That is also your decision, and without it a reboot leaves
+# the control plane stopped until your next login.
+#
+# If the runtime's database is the disposable local one, install
+# `researchd-db.service` too -- otherwise a reboot leaves this unit retrying
+# against a cluster nobody started.
 
 [Unit]
 Description=Research OS autonomous-runtime control plane
-Documentation=file://%h/research/research-os/docs/RUNTIME.md
+Documentation=file://%h/research/research-os-rc/docs/RUNTIME.md
 # The daemon degrades gracefully when the database is absent -- it retries --
 # so this is a preference, not a hard requirement.
 After=network-online.target
+# Ordering only, and `Wants` rather than `Requires`: a runtime pointed at a
+# real PostgreSQL has no researchd-db unit installed, and a missing wanted unit
+# must not stop the control plane from starting.
+Wants=researchd-db.service
+After=researchd-db.service
+
+# A crash loop must end somewhere a person can see. Without a start limit,
+# `Restart=on-failure` retries a permanently broken configuration every ten
+# seconds forever, and `systemctl --user status` reports "activating" rather
+# than the truth. Six failures inside ten minutes is a real fault: the unit
+# enters `failed`, stays there, and `systemctl --user reset-failed researchd`
+# is the deliberate way back.
+StartLimitIntervalSec=600
+StartLimitBurst=6
 
 [Service]
 Type=simple
@@ -39,9 +59,15 @@ Type=simple
 EnvironmentFile=%h/.config/research-os/researchd.env
 
 # uv run, so the daemon uses the project environment the tests ran against
-# rather than whatever happens to be on PATH.
-WorkingDirectory=%h/research/research-os
-ExecStart=/usr/bin/env uv run --extra runtime researchd --log-level INFO
+# rather than whatever happens to be on PATH. `--frozen` so a service start can
+# never silently resolve a different dependency set than the one that was
+# tested.
+#
+# Change WorkingDirectory to whichever checkout you actually run. It is a real
+# choice, not boilerplate: this machine has ten worktrees of this repository,
+# and the daemon runs the code in the one named here.
+WorkingDirectory=%h/research/research-os-rc
+ExecStart=/usr/bin/env uv run --frozen --extra runtime researchd --log-level INFO
 
 # SIGTERM asks the loop to finish its current pass. A pass is short, and the
 # work it was running keeps its lease, which expires and is recovered -- so a
@@ -52,6 +78,12 @@ TimeoutStopSec=90
 Restart=on-failure
 RestartSec=10s
 
+# Starting twice is safe. The daemon takes a PostgreSQL advisory lock for the
+# database it is attached to, and a second control plane finds the lock held,
+# says so, and exits zero without starting a loop. So `systemctl --user start
+# researchd` beside a daemon already running in a terminal is a no-op rather
+# than two loops competing for the same work rows.
+
 # Hardening. The daemon reads and writes the researcher's repositories and XDG
 # directories and nothing else, so most of the filesystem can be hidden from it.
 # Note what is NOT locked down: it runs project acceptance commands, which means
@@ -60,7 +92,19 @@ RestartSec=10s
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
-ProtectHome=read-only
+
+# ProtectHome is deliberately NOT `read-only` here, and that was a bug rather
+# than a hardening decision. The control plane creates Git worktrees for
+# automation runs, and `git worktree add` writes into the *source* repository's
+# `.git/worktrees/`, which lives under the researcher's project directory. With
+# `ProtectHome=read-only` every write task fails on a read-only filesystem, and
+# a control plane that cannot run a write task is not a control plane.
+#
+# So home stays writable and the paths below are documentation rather than a
+# boundary. If you want a real boundary, list your project repositories in
+# ReadWritePaths and set ProtectHome=tmpfs with BindPaths for each -- and read
+# the next paragraph first, because it limits what that would buy you.
+ProtectHome=false
 ReadWritePaths=%h/.local/state/research-os %h/.local/share/research-os %h/.cache/research-os
 ProtectKernelTunables=true
 ProtectKernelModules=true

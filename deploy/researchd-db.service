@@ -1,0 +1,47 @@
+# The disposable local PostgreSQL the control plane talks to, as a systemd
+# *user* unit.
+#
+# This file is shipped, not installed. See deploy/README.md.
+#
+# Why it exists: `researchd` degrades gracefully when its database is absent --
+# it retries -- but retrying forever is not the same as working. After a reboot
+# the pgserver cluster under ~/.local/state/research-os/devdb is not running,
+# so an enabled `researchd` would sit in a retry loop and the researcher would
+# have to remember `researchctl runtime dev-db start`. Remembering a special
+# research continuation command after every reboot is exactly what the runtime
+# is supposed to remove.
+#
+# Only for a development or single-workstation setup. A production runtime
+# should point RESEARCH_OS_RUNTIME_DSN at a PostgreSQL that somebody backs up,
+# and should not install this unit at all.
+#
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/researchd-db.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now researchd-db
+#   systemctl --user status researchd-db
+
+[Unit]
+Description=Research OS disposable local PostgreSQL (development)
+Before=researchd.service
+
+[Service]
+# `oneshot` with `RemainAfterExit`, because pgserver starts the postmaster as
+# its own process and returns: there is nothing for systemd to supervise in the
+# foreground. The unit's job is ordering and idempotent start/stop, not
+# supervision. The postmaster's own liveness is what
+# `researchctl runtime dev-db status` reports.
+Type=oneshot
+RemainAfterExit=yes
+
+WorkingDirectory=%h/research/research-os-rc
+ExecStart=/usr/bin/env uv run --frozen --extra runtime researchctl runtime dev-db start
+ExecStop=/usr/bin/env uv run --frozen --extra runtime researchctl runtime dev-db stop
+
+# Starting twice is a no-op: `devdb.start` attaches to an existing cluster
+# rather than initialising a second one, so `systemctl --user start` is safe to
+# repeat and safe to run beside a cluster a terminal started.
+TimeoutStartSec=180
+
+[Install]
+WantedBy=default.target

@@ -122,3 +122,96 @@ def test_the_declared_schema_version_is_the_highest_shipped_migration() -> None:
     from research_os.runtime.migrations import discover
 
     assert RUNTIME_SCHEMA_VERSION == max(m.version for m in discover())
+
+
+# --- the shipped service units ----------------------------------------------
+DEPLOY = Path(__file__).resolve().parents[1] / "deploy"
+
+
+def test_the_shipped_units_are_not_installed_by_anything() -> None:
+    """Enabling a persistent service is the researcher's decision.
+
+    AGENTS.md rule 13. Checked here because "we ship it, we never install it"
+    is the kind of promise that decays silently: the units are useless unless
+    somebody copies them, and the temptation is to make that automatic.
+    """
+
+    import ast
+
+    source = Path(__file__).resolve().parents[1] / "src"
+    installers = []
+    for module in sorted(source.rglob("*.py")):
+        tree = ast.parse(module.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+                continue
+            value = node.value
+            # An argv element rather than a mention: the daemon's own error
+            # message tells a researcher to run `systemctl --user status`, and
+            # telling someone a command is not running it.
+            if value == "systemctl" or "systemd/user" in value:
+                installers.append(f"{module.relative_to(source)}: {value!r}")
+    assert installers == []
+
+
+def test_the_control_plane_unit_can_write_the_researchers_repositories() -> None:
+    """A regression, and it cost every write task on a service-run daemon.
+
+    The unit shipped with ``ProtectHome=read-only``, which reads like good
+    hardening and is not: ``git worktree add`` writes into the *source*
+    repository's ``.git/worktrees/``, under the researcher's project directory.
+    Every automation write task on a systemd-run daemon would have failed on a
+    read-only filesystem, and the failure would have looked like a Git problem.
+    """
+
+    unit = (DEPLOY / "researchd.service").read_text(encoding="utf-8")
+    directives = _directives(unit)
+    assert directives.get("ProtectHome") == "false"
+    # The rest of the hardening is still expected to be there.
+    for name in ("NoNewPrivileges", "ProtectKernelTunables", "RestrictSUIDSGID"):
+        assert directives.get(name) == "true", name
+    assert directives.get("ProtectSystem") == "strict"
+
+
+def test_a_crash_looping_control_plane_reaches_an_explicit_failure() -> None:
+    """`Restart=on-failure` with no start limit retries a broken config forever.
+
+    Which leaves `systemctl --user status` reporting "activating" rather than
+    the truth, and nothing for a person to notice.
+    """
+
+    directives = _directives((DEPLOY / "researchd.service").read_text(encoding="utf-8"))
+    assert directives.get("Restart") == "on-failure"
+    assert int(directives["StartLimitBurst"]) > 0
+    assert int(directives["StartLimitIntervalSec"].removesuffix("s")) > 0
+
+
+def test_the_units_run_frozen_so_a_service_start_matches_what_was_tested() -> None:
+    for name in ("researchd.service", "researchd-db.service"):
+        text = (DEPLOY / name).read_text(encoding="utf-8")
+        for line in text.splitlines():
+            if line.startswith(("ExecStart=", "ExecStop=")) and "uv run" in line:
+                assert "--frozen" in line, f"{name}: {line}"
+
+
+def test_the_database_unit_is_ordered_before_the_control_plane() -> None:
+    """Otherwise a reboot brings the daemon up against no database."""
+
+    control = _directives((DEPLOY / "researchd.service").read_text(encoding="utf-8"))
+    assert "researchd-db.service" in control.get("Wants", "")
+    # `Wants`, not `Requires`: a runtime pointed at a real PostgreSQL has no
+    # such unit installed, and a missing wanted unit must not block startup.
+    assert "researchd-db.service" not in control.get("Requires", "")
+
+
+def _directives(unit: str) -> dict[str, str]:
+    """Parse a unit file's ``Key=Value`` lines, last one winning."""
+
+    found: dict[str, str] = {}
+    for line in unit.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith(("#", ";", "[")):
+            continue
+        key, _, value = stripped.partition("=")
+        found[key.strip()] = value.strip()
+    return found

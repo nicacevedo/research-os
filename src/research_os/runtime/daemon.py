@@ -64,6 +64,7 @@ from research_os.runtime.failures import FailureClass
 from research_os.runtime.idempotency import InvocationLedger, worker_identity
 from research_os.runtime.interfaces import ModelProvider, Notifier
 from research_os.runtime.leases import LeaseKeeper
+from research_os.runtime.locks import RepositoryBusyError, daemon_lock
 from research_os.runtime.migrations import migrate
 from research_os.runtime.models import (
     Autonomy,
@@ -1392,22 +1393,51 @@ def main(argv: list[str] | None = None) -> None:
         print(str(exc), file=sys.stderr)
         raise SystemExit(EXIT_ERROR) from None
 
-    LOG.info("researchd starting; database %s", redact_dsn(config.dsn))
+    # One control plane per operational database, held for the whole run.
+    #
+    # Not a correctness guard -- work claiming is `for update skip locked`,
+    # leases expire and are recovered, and event ingestion is deduplicated, so
+    # two daemons would compete rather than corrupt. It is what makes *starting*
+    # idempotent, which is what a service manager needs: `systemctl --user
+    # start researchd` when one is already running, or a manual `researchd`
+    # beside an enabled unit, now says so and exits zero instead of quietly
+    # running a second loop against the same rows. The lock lives on the
+    # connection, so it is released when this process dies however it dies.
+    # The database outlives the lock: `daemon_lock` releases by running
+    # `pg_advisory_unlock` on a pooled connection, so closing the pool inside
+    # the block would make every clean shutdown log a failed unlock.
+    try:
+        try:
+            with daemon_lock(database):
+                LOG.info("researchd starting; database %s", redact_dsn(config.dsn))
+                _install_signal_handlers(daemon)
+                if args.once:
+                    report = daemon.tick()
+                    LOG.info("one pass: %s", report.payload())
+                else:
+                    total = daemon.run_forever(max_ticks=args.max_ticks)
+                    LOG.info("researchd stopping: %s", total.payload())
+        finally:
+            database.close()
+    except RepositoryBusyError:
+        print(
+            "A Research OS control plane is already attached to "
+            f"{redact_dsn(config.dsn)}. Nothing was started, and the running "
+            "one is unaffected. `researchctl runtime status` shows what it is "
+            "doing; `systemctl --user status researchd` shows whether it is a "
+            "service.",
+            file=sys.stderr,
+        )
+        raise SystemExit(EXIT_OK) from None
+    raise SystemExit(EXIT_OK)
+
+
+def _install_signal_handlers(daemon: object) -> None:
+    """SIGINT and SIGTERM ask the loop to finish its current pass."""
 
     def handle_signal(signum: int, _frame: FrameType | None) -> None:
         LOG.info("signal %s received; finishing the current pass", signum)
-        daemon.stop()
+        daemon.stop()  # type: ignore[attr-defined]
 
     for signal_name in (signal.SIGINT, signal.SIGTERM):
         signal.signal(signal_name, handle_signal)
-
-    try:
-        if args.once:
-            report = daemon.tick()
-            LOG.info("one pass: %s", report.payload())
-        else:
-            total = daemon.run_forever(max_ticks=args.max_ticks)
-            LOG.info("researchd stopping: %s", total.payload())
-    finally:
-        database.close()
-    raise SystemExit(EXIT_OK)
