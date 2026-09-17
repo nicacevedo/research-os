@@ -953,7 +953,11 @@ def test_a_coding_run_that_reaches_the_canonical_checkout_is_caught(
     repo = chaos["repo"]
     before = canonical_fingerprint(repo)
     assert any(key.startswith(".research/") for key in before)
-    assert "<git-refs>" in before
+    # One entry per ref rather than one hash of all of them, so a refusal can
+    # name what moved and an exemption can be scoped to one namespace. The
+    # single `<git-refs>` digest could do neither, which is why it flagged the
+    # pipeline's own worktree branch -- see `tests/test_runtime_coding_pipeline.py`.
+    assert any(key.startswith("<git-ref> refs/heads/") for key in before)
 
     class EscapingController:
         """Stands in for a pipeline whose acceptance command escaped."""

@@ -83,12 +83,49 @@ from research_os.sandbox import SandboxError, SandboxMode
 LOG = logging.getLogger("research_os.runtime.actions.coding")
 
 
-def canonical_fingerprint(repo: Path) -> dict[str, str]:
-    """Hash the canonical capsule and every Git ref.
+def owned_ref_prefix(automation_run_id: str) -> str:
+    """The ref namespace one automation run is entitled to create.
 
-    The two things a coding run must not touch. Refs rather than just HEAD,
+    ``worktree.branch_name`` is ``automation/<run id>/<task id>``, lowercased and
+    deterministic, so a run's branches live under exactly one prefix and that
+    prefix is computable *before* the pipeline starts. Which is what makes it
+    usable as an exemption rather than as an excuse: the namespace is named in
+    advance from the reserved identity, and a ref outside it is still an escape,
+    including one under another run's namespace.
+    """
+
+    return f"refs/heads/automation/{automation_run_id.lower()}/"
+
+
+def canonical_fingerprint(
+    repo: Path, *, owned_ref_prefixes: tuple[str, ...] = ()
+) -> dict[str, str]:
+    """Hash the canonical capsule and every Git ref this run must not touch.
+
+    The two things a coding run must not change. Refs rather than just HEAD,
     because a push or a branch write is as much of an escape as a commit, and
     ``show-ref`` lists all of them in one call.
+
+    **One ref per key, not one hash of all of them.** The first version hashed
+    ``show-ref``'s whole output into a single ``<git-refs>`` entry, and that was
+    wrong in two directions at once. It could not say *which* ref moved, so a
+    real escape was reported as the opaque string ``<git-refs>``; and, worse, it
+    could not distinguish a ref the run was entitled to create from one it was
+    not -- so it flagged the pipeline's own worktree branch.
+
+    That second half was not a theoretical weakness. ``AutomationController``
+    creates a Git worktree on a new branch in the canonical repository, because
+    that is what worktree isolation *is*. Every real coding run therefore ended
+    with a ref the fingerprint had not seen, and the handler failed it as
+    ``POLICY_REFUSED`` -- "the coding run changed the canonical checkout" --
+    with the branch, the diff and a perfectly good review already on disk. The
+    runtime's only code-writing capability could not succeed. It survived
+    review because the only test that drove the handler substituted a controller
+    that creates no worktree, so the guard had never met a real pipeline.
+
+    ``owned_ref_prefixes`` is the narrow, named exemption: refs under a prefix
+    this run reserved before it started. Anything else -- a new branch outside
+    it, a moved existing ref, a deleted one -- still fails, and now says which.
 
     One deliberate blind spot: ``.research/runtime/`` is excluded. It is
     gitignored scratch space that the capsule specification reserves and nothing
@@ -96,7 +133,8 @@ def canonical_fingerprint(repo: Path) -> dict[str, str]:
     command that writes only to that directory is not detected, which is the
     correct trade and is recorded here so it is not a surprise.
 
-    Cheap: a capsule is a few dozen small YAML files.
+    Cheap: a capsule is a few dozen small YAML files and a repository has tens
+    of refs.
     """
 
     import hashlib
@@ -111,11 +149,17 @@ def canonical_fingerprint(repo: Path) -> dict[str, str]:
                 ).hexdigest()
     try:
         refs = gitutil.git(["show-ref"], cwd=repo, check=False)
-        found["<git-refs>"] = hashlib.sha256(
-            (refs.stdout or "").encode("utf-8")
-        ).hexdigest()
     except ResearchOSError as exc:  # pragma: no cover - a repo with no refs
         found["<git-refs>"] = f"unreadable: {exc}"
+        return found
+    for line in (refs.stdout or "").splitlines():
+        parts = line.split(maxsplit=1)
+        if len(parts) != 2:
+            continue
+        sha, ref = parts[0].strip(), parts[1].strip()
+        if any(ref.startswith(prefix) for prefix in owned_ref_prefixes):
+            continue
+        found[f"<git-ref> {ref}"] = sha
     return found
 
 
@@ -397,11 +441,18 @@ def run_coding_task(
     # same id.
     reserved_run_id = reserved_automation_run_id(reservation_key=key)
 
+    # The one ref namespace this run is allowed to add to, named before it
+    # starts. `reserved_run_id` is derived from the idempotency key, so a retry
+    # exempts exactly the same namespace its predecessor used -- and a crashed
+    # attempt's branch is therefore not read as an escape by the attempt that
+    # adopts it.
+    owned = (owned_ref_prefix(reserved_run_id),)
+
     def perform() -> dict[str, Any]:
         # What the canonical checkout looks like before anything runs. Compared
         # afterwards, because the acceptance commands execute code the builder
         # just wrote and nothing here can stop them reaching the repository.
-        before = canonical_fingerprint(repo)
+        before = canonical_fingerprint(repo, owned_ref_prefixes=owned)
 
         # The repository lock covers preflight and worktree creation -- the part
         # that touches the canonical checkout. It is released before the builder
@@ -439,7 +490,7 @@ def run_coding_task(
                 action="edit_in_worktree",
             )
 
-        after = canonical_fingerprint(repo)
+        after = canonical_fingerprint(repo, owned_ref_prefixes=owned)
         if after != before:
             drift = _describe_drift(before, after)
             LOG.error(

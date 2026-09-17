@@ -75,6 +75,8 @@ from research_os.automation.planner import (
     MODEL_CALLS_PER_CODING_TASK,
     PLAN_SCHEMA,
     PlanDocument,
+    PlannedCommand,
+    PlannedTask,
     build_planner_prompt,
     parse_plan,
     plan_to_work_orders,
@@ -103,9 +105,12 @@ from research_os.errors import (
     AnalystOutputError,
     AutomationError,
     BudgetExceededError,
+    CommandPolicyError,
+    PlanValidationError,
     PreflightError,
     ProviderInvocationError,
     ProviderUnavailableError,
+    ResearchOSError,
     SnapshotMutationError,
     SymlinkScopeError,
 )
@@ -596,6 +601,7 @@ class AutomationController:
         """Turn a validated plan into work orders. One path, however it arrived."""
 
         store.write_json("plan/plan.json", plan.model_dump(mode="json"))
+        plan = self._apply_project_check_profiles(store, run, plan)
         orders = plan_to_work_orders(
             plan,
             project_path=Path(run.project_path),
@@ -616,6 +622,114 @@ class AutomationController:
             minimum_model_calls=minimum_model_calls(orders),
         )
         return self._transition(store, run, RunState.PLAN_READY)
+
+    def _apply_project_check_profiles(
+        self,
+        store: RunStore,
+        run: AutomationRun,
+        plan: PlanDocument,
+    ) -> PlanDocument:
+        """Make the project's declared checks the gate on every path into here.
+
+        v1.1 gave a project a way to say what validates it --
+        ``projects.<id>.check_profiles`` in ``automation.yaml`` -- and only one
+        caller honoured it. ``ResearchController`` resolved a task's named
+        checks against the project's profiles; anything that reached this
+        controller *without* a plan got acceptance commands a planner had
+        written, authorised against the command policy and otherwise unrelated
+        to what the researcher declared. Same project, same goal, two gates: the
+        autonomous runtime's coding action ran one and ``researchctl research
+        run`` ran the other, and a researcher could only find out by reading two
+        run directories.
+
+        This is the one place every plan becomes work orders, whoever wrote it,
+        so it is the only place the substitution can be made once. The rule:
+
+        **If this project explicitly configures check profiles, a coder order's
+        acceptance commands are drawn from those profiles and nothing else.**
+
+        A plan whose commands are already a subset of the configured argv is
+        left exactly as it is, which is what preserves the research layer's
+        narrowing: a task that named ``required_checks: [tests]`` had them
+        resolved by :func:`resolve_required_checks` from these same profiles, so
+        its one command is a subset and stands. A planner-authored ``["uv",
+        "run", "pytest", "-q", "tests/test_thing.py"]`` is not a subset of
+        anything the researcher declared, so it is replaced by the declared set.
+
+        Deliberately *only* explicit configuration. Discovery is this module's
+        guess at an unconfigured project, and a guess has no business
+        overruling a planner that narrowed a command to the change it made. The
+        invariant a researcher can rely on is about what they declared.
+
+        Resolution is by repository path, through
+        :func:`resolve_project_from_path`, because a path is the only thing
+        every caller into this controller has. Nothing here re-implements the
+        resolution: it calls the same function the research layer calls.
+        """
+
+        from research_os.automation.projectcontext import resolve_project_from_path
+
+        coders = [task for task in plan.tasks if not task.is_analysis]
+        if not coders:
+            return plan
+        try:
+            project = resolve_project_from_path(
+                project_path=Path(run.project_path), config=self.config
+            )
+        except CommandPolicyError:
+            # A declared command the policy forbids. Raised with the policy's own
+            # message, which names the offending argv and lists the supported
+            # forms -- wrapping it would replace the only text that says how to
+            # fix the configuration.
+            raise
+        except ResearchOSError as exc:
+            # Anything else that stopped the resolution is a configuration
+            # defect the researcher should hear about, not a reason to fall
+            # through to a planner's commands. Falling through is exactly the
+            # divergence this exists to close.
+            raise PlanValidationError(
+                f"could not resolve this project's check profiles: {exc}"
+            ) from exc
+        if not project.configured:
+            return plan
+
+        declared = {tuple(item.argv) for item in project.check_profiles}
+        substituted = [
+            PlannedCommand(
+                argv=list(item.argv),
+                description=f"project check profile {item.check_id!r} ({item.source})",
+                required=item.required,
+            )
+            for item in project.check_profiles
+        ]
+        tasks: list[PlannedTask] = []
+        changed: list[str] = []
+        for task in plan.tasks:
+            if task.is_analysis:
+                tasks.append(task)
+                continue
+            asked = {tuple(command.argv) for command in task.acceptance_commands}
+            if asked and asked <= declared:
+                tasks.append(task)
+                continue
+            changed.append(task.id)
+            tasks.append(task.model_copy(update={"acceptance_commands": substituted}))
+        if not changed:
+            return plan
+
+        plan = plan.model_copy(update={"tasks": tasks})
+        store.write_json("plan/plan.effective.json", plan.model_dump(mode="json"))
+        store.append_event(
+            "checks_substituted",
+            tasks=changed,
+            check_ids=[item.check_id for item in project.check_profiles],
+            argv=[list(item.argv) for item in project.check_profiles],
+            detail=(
+                "this project declares check_profiles, so the declared commands "
+                "are the gate; plan/plan.json holds what the plan asked for"
+            ),
+        )
+        return plan
 
     def _execute_order(
         self,

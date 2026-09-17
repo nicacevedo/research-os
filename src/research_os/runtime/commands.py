@@ -725,30 +725,29 @@ def _sandbox_lines() -> list[str]:
 
 
 def _coding_profile_lines() -> list[str]:
-    """State a known divergence rather than leave it to be discovered.
+    """Report which commands a coding cycle would actually gate on.
 
-    v1.1 moved validation-check resolution into the controller: a research run
-    resolves ``projects.<id>.check_profiles`` from ``automation.yaml`` and runs
-    the argv the *researcher* declared. The runtime's coding action dispatches
-    through ``AutomationController`` without a plan, so its acceptance commands
-    come from the automation planner instead.
+    This row used to be a divergence warning. v1.1 moved validation-check
+    resolution into the controller, ``researchctl research run`` honoured
+    ``projects.<id>.check_profiles`` from ``automation.yaml``, and the runtime's
+    coding action -- which dispatches through ``AutomationController`` with no
+    plan -- ran whatever the automation planner had written instead. Same
+    project, same goal, two gates.
 
-    Same project, same goal, two different gates. It is not a correctness or
-    authority defect -- every resolved argv still passes the same command policy,
-    and nothing merges or pushes either way -- but a researcher who has declared
-    check profiles should not have to find out by reading two run directories
-    that one path ignored them. Closing it means threading the project profile
-    through ``AutomationController``, which is v1 work this integration
-    deliberately did not take on; ``docs/INTEGRATION_BUILD_RECORD.md`` records
-    the seam.
+    Closed in ``AutomationController._accept_plan``, which is the one place a
+    plan becomes work orders however it arrived. A project that declares check
+    profiles now gates every path on the declared commands, and this row says so
+    by naming them, because "it is unified" is worth less to a researcher than
+    the argv they can compare against their own configuration.
     """
 
     from research_os.automation.config import load_config as load_automation_config
 
     try:
-        configured = sorted(load_automation_config().projects)
+        config = load_automation_config()
     except ResearchOSError:
         return []
+    configured = sorted(config.projects)
     if not configured:
         return [
             (
@@ -756,13 +755,20 @@ def _coding_profile_lines() -> list[str]:
                 "discovery decides everywhere\n"
             )
         ]
-    return [
-        f"  WARN  checks        {len(configured)} project(s) declare "
-        f"check_profiles ({', '.join(configured[:4])}"
-        + ("..." if len(configured) > 4 else "")
-        + "). `researchctl research run` honours them; a `runtime` cycle's "
-        "coding action does not yet and uses planner-authored commands.\n"
+    lines = [
+        (
+            f"  OK    checks        {len(configured)} project(s) declare "
+            f"check_profiles; every path resolves the same set\n"
+        )
     ]
+    for project_id in configured[:4]:
+        names = sorted(config.for_project(project_id).check_profiles)
+        lines.append(
+            f"        {project_id}: {', '.join(names) if names else '(none)'}\n"
+        )
+    if len(configured) > 4:
+        lines.append(f"        ... and {len(configured) - 4} more\n")
+    return lines
 
 
 def _migrate(args: argparse.Namespace) -> int:
