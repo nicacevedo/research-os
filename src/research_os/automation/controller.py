@@ -560,7 +560,7 @@ class AutomationController:
                 budget=run.budget,
                 allowed_programs=self.config.allowed_check_programs,
             )
-            return self._accept_plan(store, run, plan, resolved)
+            return self._accept_plan(store, run, plan, resolved, supplied=True)
         planner = resolved.roles["planner"]
         prompt = build_planner_prompt(
             goal=run.goal,
@@ -597,11 +597,13 @@ class AutomationController:
         run: AutomationRun,
         plan: PlanDocument,
         resolved: ResolvedRoles,
+        *,
+        supplied: bool = False,
     ) -> AutomationRun:
         """Turn a validated plan into work orders. One path, however it arrived."""
 
         store.write_json("plan/plan.json", plan.model_dump(mode="json"))
-        plan = self._apply_project_check_profiles(store, run, plan)
+        plan = self._apply_project_check_profiles(store, run, plan, supplied=supplied)
         orders = plan_to_work_orders(
             plan,
             project_path=Path(run.project_path),
@@ -628,6 +630,8 @@ class AutomationController:
         store: RunStore,
         run: AutomationRun,
         plan: PlanDocument,
+        *,
+        supplied: bool,
     ) -> PlanDocument:
         """Make the project's declared checks the gate on every path into here.
 
@@ -709,7 +713,7 @@ class AutomationController:
                 tasks.append(task)
                 continue
             asked = {tuple(command.argv) for command in task.acceptance_commands}
-            if asked and asked <= declared:
+            if supplied and asked and asked <= declared:
                 tasks.append(task)
                 continue
             changed.append(task.id)

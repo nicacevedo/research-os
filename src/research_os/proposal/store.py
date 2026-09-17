@@ -320,6 +320,21 @@ class ProposalStore:
     def record_decline(self, record: DeclineRecord) -> DeclineRecord:
         """Append one decline. Append-only, exactly like a promotion.
 
+        **The interactive-terminal check is here, in the writer, not only in
+        the command.** An adversarial review pointed out that the structural
+        test guarding this -- an AST scan of the runtime package for a call
+        named ``record_decline`` -- is defeated by ``getattr(store, "record_" +
+        "decline")`` or by ``operator.methodcaller``, and that the runtime
+        already holds a live ``ProposalStore`` for the deduplication read. A
+        guard that can be stepped around by spelling the name differently is a
+        lint, not a guarantee. This makes it a guarantee: the writer itself
+        refuses when nobody is at a terminal, so the only way to author a
+        decline is for a person to be there, whatever the caller is called.
+
+        The structural test is kept because it is still worth knowing if a
+        runtime module starts reaching for this at all; it is now
+        defence-in-depth rather than the whole defence.
+
         Beside ``promotions.jsonl`` rather than inside it, because the two are
         different facts and a reader that had to look at a ``kind`` field to
         tell them apart is a reader that can get it wrong. Both are appended,
@@ -328,6 +343,14 @@ class ProposalStore:
         the honest history, not a mutation of it.
         """
 
+        from research_os.cli import _is_interactive
+
+        if not _is_interactive():
+            raise ProposalStoreError(
+                "a proposal decline is a human scientific decision and this "
+                "process has no interactive terminal. Nothing was written. "
+                "Run `researchctl propose decline` yourself."
+            )
         line = json.dumps(record.model_dump(mode="json"), sort_keys=True) + "\n"
         try:
             with self.declines_file.open("a", encoding="utf-8") as handle:

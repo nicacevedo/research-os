@@ -155,6 +155,19 @@ def test_the_proposal_action_writes_no_capsule_file() -> None:
 def test_no_runtime_module_declines_a_proposal() -> None:
     """A decline is a scientific decision, and "no" is as much a decision as "yes".
 
+    **Defence in depth, not the defence.** An adversarial review showed this
+    check is defeated by `getattr(store, "record_" + "decline")` or by
+    `operator.methodcaller`, because `node.func` is then itself a Call and
+    neither `id` nor `attr` exists -- and the runtime already holds a live
+    `ProposalStore` for its deduplication read, so the writer is in scope and
+    one line away. The guarantee therefore lives in
+    `ProposalStore.record_decline`, which refuses without an interactive
+    terminal whatever the caller is called; see
+    `test_the_decline_writer_itself_refuses_without_a_terminal`. This test is
+    kept because it is still worth knowing if a runtime module starts reaching
+    for the writer at all, and it now bans the *name in any string* as well as
+    the direct call.
+
     The runtime *reads* declines -- `_equivalent_pending_proposal` asks whether
     a person has acted on an item, and a decline is one of the two ways they
     can have -- and it must not be able to write one. The consequence if it
@@ -170,7 +183,19 @@ def test_no_runtime_module_declines_a_proposal() -> None:
     forbidden = {"record_decline"}
     offenders: list[str] = []
     for path in _runtime_sources():
-        tree = ast.parse(path.read_text(encoding="utf-8"))
+        source = path.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        prose = {
+            id(item.body[0].value)
+            for item in ast.walk(tree)
+            if isinstance(
+                item, ast.Module | ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef
+            )
+            and item.body
+            and isinstance(item.body[0], ast.Expr)
+            and isinstance(item.body[0].value, ast.Constant)
+            and isinstance(item.body[0].value.value, str)
+        }
         for node in ast.walk(tree):
             if isinstance(node, ast.Call):
                 name = getattr(node.func, "id", None) or getattr(
@@ -178,6 +203,24 @@ def test_no_runtime_module_declines_a_proposal() -> None:
                 )
                 if name in forbidden:
                     offenders.append(f"{path.name}:{node.lineno}: calls {name}()")
+                # Not a blanket ban on `getattr`: the runtime reads attributes
+                # off v1 objects defensively in forty places and all of them
+                # are legitimate. What is banned is the *name*, in any string,
+                # which is checked below and covers
+                # `getattr(store, "record_decline")` and
+                # `methodcaller("record_decline")` alike.
+            # The name as a *string*, however it is assembled -- but not in
+            # prose. Docstrings discuss these writers at length and must, so
+            # they are collected first and excluded by identity.
+            if (
+                isinstance(node, ast.Constant)
+                and isinstance(node.value, str)
+                and id(node) not in prose
+                and ("record_decline" in node.value or "record_promotion" in node.value)
+            ):
+                offenders.append(
+                    f"{path.name}:{node.lineno}: names a human writer in a string"
+                )
             if isinstance(node, ast.ImportFrom) and node.module in {
                 "research_os.proposal.commands"
             }:
@@ -187,6 +230,43 @@ def test_no_runtime_module_declines_a_proposal() -> None:
     assert offenders == [], (
         "the runtime must never record a proposal decline: " + "; ".join(offenders)
     )
+
+
+def test_the_decline_writer_itself_refuses_without_a_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Enforced in the writer, not only linted at the call site.
+
+    The AST guard above is defeated by spelling the name differently, and the
+    runtime already holds a live `ProposalStore` for its deduplication read. So
+    the terminal check lives in `record_decline`, where no amount of
+    indirection gets past it.
+    """
+
+    from research_os.errors import ProposalStoreError
+    from research_os.proposal.models import DeclineRecord
+    from research_os.proposal.store import ProposalStore
+
+    for name, subdirectory in (
+        ("RESEARCH_OS_STATE_HOME", "state"),
+        ("RESEARCH_OS_CONFIG_HOME", "config"),
+        ("RESEARCH_OS_DATA_HOME", "data"),
+        ("RESEARCH_OS_CACHE_HOME", "cache"),
+    ):
+        path = tmp_path / subdirectory
+        path.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setenv(name, str(path))
+
+    directory = tmp_path / "state" / "proposals" / "PROP-19700101T000000Z-aaaaaaaa"
+    directory.mkdir(parents=True)
+    store = ProposalStore(directory)
+    record = DeclineRecord(proposal_id=store.proposal_id, item_id="PR-001", reason="no")
+    with pytest.raises(ProposalStoreError, match="interactive terminal"):
+        store.record_decline(record)
+    # And the indirection that defeats the AST check does not defeat this.
+    with pytest.raises(ProposalStoreError, match="interactive terminal"):
+        getattr(store, "record_" + "decline")(record)
+    assert not store.declines_file.exists()
 
 
 def test_declining_refuses_a_non_interactive_terminal() -> None:

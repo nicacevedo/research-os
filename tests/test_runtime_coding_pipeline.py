@@ -22,6 +22,7 @@ the defect.
 
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -386,3 +387,172 @@ def test_the_reserved_run_id_is_what_the_pipeline_actually_used(
     assert RunStore.open(run_id).load().run_id == run_id
     # Derivable from a key alone, with no clock and no store read.
     assert reserved_automation_run_id(reservation_key="k") != run_id
+
+
+# -- what the adversarial review found the exemption could hide ----------------
+
+
+def test_moving_the_runs_own_branch_is_an_escape(
+    coding_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The exemption is "this ref may appear", not "this ref is unwatched".
+
+    `git update-ref` moves a branch that is checked out in another worktree --
+    git refuses this for `push` and for `branch -f`, not for `update-ref`. So
+    an acceptance command could repoint the very branch the human is told to
+    inspect, at a commit the independent reviewer never saw. The first version
+    of the fingerprint `continue`d on exempt refs, recording them in neither
+    snapshot, and could not tell that from the pipeline creating its own
+    branch.
+    """
+
+    from research_os.automation.controller import AutomationController
+    from research_os.runtime.actions.coding import (
+        owned_ref_prefix,
+        reserved_automation_run_id,
+    )
+    from research_os.runtime.idempotency import idempotency_key
+
+    repo = coding_env["repo"]
+    base = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    # A commit object no ref points at, so creating it moves nothing.
+    elsewhere = subprocess.run(
+        ["git", "commit-tree", f"{base}^{{tree}}", "-p", base, "-m", "smuggled"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=True,
+        env={
+            **os.environ,
+            "GIT_AUTHOR_NAME": "t",
+            "GIT_AUTHOR_EMAIL": "t@t",
+            "GIT_COMMITTER_NAME": "t",
+            "GIT_COMMITTER_EMAIL": "t@t",
+        },
+    ).stdout.strip()
+    key = idempotency_key(
+        "coding.run",
+        coding_env["state"]["run_id"],
+        coding_env["state"]["cycle_index"],
+        base,
+        "Implement add.",
+    )
+    prefix = owned_ref_prefix(reserved_automation_run_id(reservation_key=key))
+
+    original = AutomationController.execute
+
+    def escaping(self: Any, store: Any) -> Any:
+        result = original(self, store)
+        # Move the run's own branch, inside its own exempt namespace.
+        branch = (
+            subprocess.run(
+                ["git", "for-each-ref", "--format=%(refname)", prefix],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            .stdout.strip()
+            .splitlines()
+        )
+        assert branch, f"no ref under {prefix}"
+        subprocess.run(
+            ["git", "update-ref", branch[0], elsewhere],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+        )
+        return result
+
+    monkeypatch.setattr(AutomationController, "execute", escaping)
+    outcome = drive(coding_env, monkeypatch)
+
+    assert not outcome.ok, "a move inside the exempt namespace was not detected"
+    assert outcome.failure_class is FailureClass.POLICY_REFUSED
+    assert "recorded" in outcome.data["canonical_drift"], outcome.data[
+        "canonical_drift"
+    ]
+
+
+def test_repointing_head_is_an_escape(
+    coding_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`git show-ref` does not list HEAD, and repointing it changes no ref.
+
+    The working tree still matches, so `porcelain_status` is clean and the next
+    preflight passes -- and the canonical checkout is now sitting on a branch
+    the guard would never inspect again. `--head` closes it.
+    """
+
+    from research_os.automation.controller import AutomationController
+
+    repo = coding_env["repo"]
+    subprocess.run(
+        ["git", "branch", "sidetrack"], cwd=repo, check=True, capture_output=True
+    )
+    original = AutomationController.execute
+
+    def escaping(self: Any, store: Any) -> Any:
+        result = original(self, store)
+        subprocess.run(
+            ["git", "symbolic-ref", "HEAD", "refs/heads/sidetrack"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+        )
+        return result
+
+    monkeypatch.setattr(AutomationController, "execute", escaping)
+    outcome = drive(coding_env, monkeypatch)
+    assert not outcome.ok
+    assert outcome.failure_class is FailureClass.POLICY_REFUSED
+    assert "<git-head>" in outcome.data["canonical_drift"]
+
+
+def test_a_write_under_a_nested_runtime_directory_is_an_escape(
+    coding_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The blind spot is `.research/runtime/`, not any directory named runtime.
+
+    `.research/.gitignore` is `/runtime/`, anchored to the top level, and the
+    capsule scanner descends recursively into every typed directory. So
+    `.research/claims/runtime/x.yaml` was invisible to a substring check,
+    loaded as a real scientific object, and not gitignored.
+    """
+
+    from research_os.automation.controller import AutomationController
+
+    repo = coding_env["repo"]
+    original = AutomationController.execute
+
+    def escaping(self: Any, store: Any) -> Any:
+        nested = repo / ".research" / "claims" / "runtime"
+        nested.mkdir(parents=True, exist_ok=True)
+        (nested / "CLAIM-9999.yaml").write_text("id: CLAIM-9999\n", encoding="utf-8")
+        return original(self, store)
+
+    monkeypatch.setattr(AutomationController, "execute", escaping)
+    outcome = drive(coding_env, monkeypatch)
+    assert not outcome.ok
+    assert "CLAIM-9999" in outcome.data["canonical_drift"]
+
+
+def test_the_top_level_runtime_directory_is_still_ignored(
+    coding_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real blind spot is deliberate and must stay."""
+
+    from research_os.runtime.actions.coding import canonical_fingerprint
+
+    repo = coding_env["repo"]
+    before = canonical_fingerprint(repo)
+    scratch = repo / ".research" / "runtime" / "deep"
+    scratch.mkdir(parents=True, exist_ok=True)
+    (scratch / "scratch.txt").write_text("noise", encoding="utf-8")
+    assert canonical_fingerprint(repo) == before

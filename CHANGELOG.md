@@ -87,10 +87,67 @@ closing the first of them exposed.
   ceiling; the ceiling then ratchets to the largest observed cost, bounding the
   excess by one call instead of repeating it.
 
+### Fixed, after an independent adversarial review of this branch
+
+Three HIGH findings, four MEDIUM. The first is a regression this branch
+introduced and is the most serious thing in it.
+
+- **A cheap first objective bricked the project.** Deriving the standing
+  project cost ceiling from the first objective's `--max-cost-usd` made
+  `runtime start --max-cost-usd 0.50` write a 6 USD *lifetime* ceiling; the
+  ceiling is created once, `spent` never resets, and nothing could raise it, so
+  every later objective on that project failed `BUDGET_EXHAUSTED`, terminally.
+  The safest command a researcher could type was the one that bricked their
+  project. The ceiling now comes from the configuration, is raised and never
+  lowered, and `researchctl runtime budget` exists so it can be changed at all.
+- **The ref exemption hid moves, not just creations.** `git update-ref`
+  repoints a branch that is checked out in another worktree -- `push` and
+  `branch -f` refuse this; `update-ref` does not -- so an acceptance command
+  could leave the branch the human is told to inspect pointing at a commit the
+  reviewer never saw. Exempt refs are recorded rather than dropped, and
+  `branch_drift` cross-checks each order's branch against the head commit the
+  controller recorded. The second is what closes it: a create and a
+  create-then-move give the same two snapshots.
+- **HEAD was outside the fingerprint.** `show-ref` does not list it and
+  `--head` lists it by resolved sha, so repointing HEAD at another branch at
+  the same commit was invisible while moving the canonical checkout onto a
+  branch the guard would never inspect again. `git symbolic-ref -q HEAD` is now
+  included.
+- **The subset exemption let a planner skip a declared check.** A project
+  declaring `tests` and `lint`, and a planner emitting only the `tests` argv,
+  satisfied "a subset stands" -- so lint never ran and nothing recorded it. The
+  exemption now applies only to controller-supplied plans, which is the
+  distinction `_plan` already knew and was discarding.
+- **The capsule blind spot was a substring match.** `.research/claims/runtime/`
+  was invisible to the fingerprint, loaded by the capsule scanner as a real
+  scientific object, and not gitignored. Exact top-level match now.
+- **The planner call was uncharged when `start` raised.** `controller.start`
+  makes the planner call and can raise, and the charge only wrapped `execute` --
+  the same hole fixed for `execute` in the previous release. `start` is inside
+  the `try` now.
+- **The decline guard was a lint.** `getattr(store, "record_" + "decline")`
+  defeats an AST scan for the call, and the runtime already holds a live
+  `ProposalStore`. The interactive-terminal check moved into
+  `ProposalStore.record_decline`, so it is enforced whatever the caller is
+  called; the AST scan is kept as defence in depth and now bans the name in any
+  string.
+
+Six findings are recorded and not fixed, with reasons, in `docs/RUNTIME.md`
+§15b. The one worth naming here: **a decline can be forged by appending a line
+to `declines.jsonl`**, which lives outside every repository and is covered by
+no fingerprint. Closed under `SandboxMode.REQUIRED`; open otherwise; the fix is
+tamper-evidence over the whole proposal ledger and should be designed for
+promotions and declines together.
+
 ### Changed
 
-- `runtime doctor`'s check-profile row was a divergence warning and is now a
-  report of the resolved commands per project.
+- `runtime doctor`'s check-profile row was a divergence warning, then briefly
+  an overclaim ("every path resolves the same set"), and is now a report of
+  the resolved commands per project and of which plans keep their own subset.
+- `researchctl runtime budget <project> [--max-cost-usd X] [--force]` shows or
+  sets a project's standing ceiling. It refuses to set one at or below what has
+  already been spent unless forced, because that stops all further work
+  immediately.
 - `RUNTIME_SCHEMA_VERSION` is `0015`.
 
 ### Tests

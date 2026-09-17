@@ -33,6 +33,7 @@ import argparse
 import json
 import socket
 import sys
+from decimal import Decimal
 from pathlib import Path
 
 from research_os.errors import EXIT_ERROR, EXIT_OK, ResearchOSError
@@ -142,6 +143,31 @@ def add_runtime_parser(subparsers: argparse._SubParsersAction) -> None:
     costs.add_argument("--run", dest="run_id", default=None)
     costs.add_argument("--json", action="store_true")
 
+    budget = actions.add_parser(
+        "budget",
+        help=(
+            "Show or set a project's standing cost ceiling. Without "
+            "--max-cost-usd it only reports."
+        ),
+    )
+    budget.add_argument("project", metavar="PROJECT", help="Project id or path.")
+    budget.add_argument(
+        "--max-cost-usd",
+        type=float,
+        default=None,
+        help=(
+            "The project's lifetime provider-spend ceiling. Raising it is how "
+            "a project that has hit its ceiling is unblocked; lowering it "
+            "below what has already been spent stops further work at once and "
+            "is refused unless --force is given."
+        ),
+    )
+    budget.add_argument(
+        "--force",
+        action="store_true",
+        help="Allow setting a ceiling at or below what has already been spent.",
+    )
+
     findings = actions.add_parser(
         "findings",
         help=(
@@ -195,6 +221,7 @@ def dispatch(args: argparse.Namespace) -> int:
         "decline": _decline,
         "jobs": _jobs,
         "costs": _costs,
+        "budget": _budget,
         "findings": _findings,
         "events": _events,
         "cancel": _cancel,
@@ -765,10 +792,16 @@ def _coding_profile_lines() -> list[str]:
     project, same goal, two gates.
 
     Closed in ``AutomationController._accept_plan``, which is the one place a
-    plan becomes work orders however it arrived. A project that declares check
-    profiles now gates every path on the declared commands, and this row says so
-    by naming them, because "it is unified" is worth less to a researcher than
-    the argv they can compare against their own configuration.
+    plan becomes work orders however it arrived. This row names the resolved
+    argv per project, because the argv a researcher can compare against their
+    own configuration is worth more than the word "unified".
+
+    An earlier version of this row said "every path resolves the same set",
+    which an adversarial review pointed out was false at the time: the subset
+    exemption applied to planner-authored plans too, so a planner emitting one
+    of two declared commands skipped the other and no event recorded it. The
+    exemption is now restricted to controller-supplied plans, and the wording
+    says which is which rather than claiming they are identical.
     """
 
     from research_os.automation.config import load_config as load_automation_config
@@ -788,7 +821,9 @@ def _coding_profile_lines() -> list[str]:
     lines = [
         (
             f"  OK    checks        {len(configured)} project(s) declare "
-            f"check_profiles; every path resolves the same set\n"
+            f"check_profiles. A planner-authored plan is gated on the declared "
+            f"set; a plan supplied by a controller keeps the subset it already "
+            f"resolved from the same profiles\n"
         )
     ]
     for project_id in configured[:4]:
@@ -799,6 +834,75 @@ def _coding_profile_lines() -> list[str]:
     if len(configured) > 4:
         lines.append(f"        ... and {len(configured) - 4} more\n")
     return lines
+
+
+def _budget(args: argparse.Namespace) -> int:
+    """Show or set the project's standing cost ceiling.
+
+    This command exists because the ceiling did not have one. It is created
+    once per project by ``apply_default_budgets``, ``spent`` accumulates over
+    the project's whole lifetime, and until now nothing could change it -- so a
+    project that reached it was permanently unable to do autonomous work, with
+    no recourse. An adversarial review found that, and found that an earlier
+    version of this release made it reachable by typing a small
+    ``--max-cost-usd`` on the first objective.
+    """
+
+    from research_os.runtime.models import BudgetScope
+
+    config = load_config()
+    with _database(config) as db:
+        migrate(db)
+        project_id, _repo = _resolve_project(args.project)
+        ledger = BudgetLedger(db)
+        current = ledger.get(
+            scope=BudgetScope.PROJECT,
+            scope_id=project_id,
+            dimension=Dimension.MODEL_COST_USD,
+        )
+        if args.max_cost_usd is not None:
+            wanted = Decimal(str(args.max_cost_usd))
+            spent = Decimal(current.spent) if current else Decimal(0)
+            if wanted <= spent and not args.force:
+                print(
+                    f"refusing: {project_id} has already spent {spent} USD, so a "
+                    f"ceiling of {wanted} would stop all further work "
+                    f"immediately. Use --force if that is what you want."
+                )
+                return EXIT_ERROR
+            current = ledger.set_limit(
+                scope=BudgetScope.PROJECT,
+                scope_id=project_id,
+                dimension=Dimension.MODEL_COST_USD,
+                limit_value=wanted,
+            )
+        if current is None:
+            print(
+                f"{project_id} has no standing cost ceiling yet; one is created "
+                f"when its first objective starts."
+            )
+            return EXIT_OK
+        available = (
+            Decimal(current.limit_value)
+            - Decimal(current.reserved)
+            - Decimal(current.spent)
+        )
+        print(f"project        {project_id}")
+        print(f"ceiling        {current.limit_value} USD")
+        print(f"spent          {current.spent} USD")
+        print(f"reserved       {current.reserved} USD")
+        print(f"available      {available} USD")
+        if available <= 0:
+            print()
+            print(
+                "This project is at its ceiling, so every autonomous cycle will "
+                "end BUDGET_EXHAUSTED. Raise it with:"
+            )
+            print(
+                f"     researchctl runtime budget {project_id} "
+                f"--max-cost-usd {Decimal(current.limit_value) * 2}"
+            )
+    return EXIT_OK
 
 
 def _migrate(args: argparse.Namespace) -> int:

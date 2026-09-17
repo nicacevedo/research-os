@@ -144,12 +144,37 @@ def canonical_fingerprint(
     capsule = repo / ".research"
     if capsule.is_dir():
         for path in sorted(capsule.rglob("*")):
-            if path.is_file() and "runtime" not in path.relative_to(capsule).parts:
+            relative = path.relative_to(capsule)
+            # `relative.parts[0] == "runtime"`, not `"runtime" in parts`.
+            #
+            # The blind spot is meant to be `.research/runtime/`, which
+            # `.research/.gitignore` ignores as `/runtime/` -- anchored, so
+            # only the top level. The substring form excluded *any* path with a
+            # component named `runtime` at any depth, and the capsule scanner
+            # descends recursively into every typed directory. So
+            # `.research/claims/runtime/x.yaml` was invisible here, loaded as a
+            # real scientific object by the validator, and not gitignored --
+            # caught only by the *next* run's dirty-tree preflight, as
+            # "uncommitted changes" rather than as an escape.
+            if path.is_file() and relative.parts[:1] != ("runtime",):
                 found[str(path.relative_to(repo))] = hashlib.sha256(
                     path.read_bytes()
                 ).hexdigest()
+    # HEAD's *symbolic target*, which no listing of refs contains.
+    #
+    # `show-ref` does not list HEAD at all, and `show-ref --head` lists it by
+    # resolved sha -- so repointing HEAD at another branch that happens to be
+    # at the same commit changes nothing either of them reports. The working
+    # tree still matches, `porcelain_status` is clean, the next preflight
+    # passes, and the canonical checkout is now on a branch the guard will
+    # never inspect again while the branch it left silently stops advancing.
     try:
-        refs = gitutil.git(["show-ref"], cwd=repo, check=False)
+        symbolic = gitutil.git(["symbolic-ref", "-q", "HEAD"], cwd=repo, check=False)
+        found["<git-head>"] = (symbolic.stdout or "").strip() or "detached"
+    except ResearchOSError as exc:  # pragma: no cover
+        found["<git-head>"] = f"unreadable: {exc}"
+    try:
+        refs = gitutil.git(["show-ref", "--head"], cwd=repo, check=False)
     except ResearchOSError as exc:  # pragma: no cover - a repo with no refs
         found["<git-refs>"] = f"unreadable: {exc}"
         return found
@@ -159,14 +184,102 @@ def canonical_fingerprint(
             continue
         sha, ref = parts[0].strip(), parts[1].strip()
         if any(ref.startswith(prefix) for prefix in owned_ref_prefixes):
+            # **Recorded, not dropped.** An exempt ref is allowed to come into
+            # existence and is not allowed to be anything else.
+            #
+            # The first version of this `continue`d, so an exempt ref appeared
+            # in neither `before` nor `after` and the comparison could not tell
+            # "the pipeline created its worktree branch" from "something moved
+            # that branch to a commit the reviewer never saw". An adversarial
+            # review showed `git update-ref refs/heads/automation/<run>/<task>
+            # <any commit>` succeeds even while that branch is checked out in a
+            # worktree -- git refuses this for `push` and `branch -f`, not for
+            # `update-ref` -- so an acceptance command could repoint the very
+            # branch the human is told to review, and the fingerprint saw
+            # nothing.
+            #
+            # Recording them under a marker means a *creation* is tolerated
+            # (the key is absent before and present after, which `_describe_
+            # drift` reports and the caller permits, below) while a *move* or a
+            # *deletion* of one changes an existing key and fails.
+            found[f"<owned-ref> {ref}"] = sha
             continue
         found[f"<git-ref> {ref}"] = sha
     return found
 
 
+def branch_drift(repo: Path, run: Any) -> str:
+    """Refs the run says it produced that are not where it says they are.
+
+    The snapshot comparison cannot answer this, and it took an adversarial
+    review and a failing test to see why. A worktree branch is *created* during
+    the window, so it is absent from ``before`` and present in ``after``
+    whatever its final value is -- a create and a create-then-move are the same
+    two snapshots. Permitting creation therefore permits moving it afterwards,
+    which is precisely the escape: `git update-ref` repoints a branch that is
+    checked out in another worktree (git refuses this for `push` and for
+    `branch -f`, not for `update-ref`), so an acceptance command can leave the
+    branch the human is told to inspect pointing at a commit the independent
+    reviewer never saw.
+
+    What closes it is not a better snapshot but a different question: the run
+    *records* each order's branch and head commit, so ask Git whether they
+    still agree. Any disagreement is the branch having moved after the
+    controller wrote down where it was.
+    """
+
+    drifted: list[str] = []
+    for order in getattr(run, "work_orders", ()):
+        branch = getattr(order, "branch", None)
+        recorded = getattr(order, "head_commit", None)
+        if not branch or not recorded:
+            continue
+        try:
+            actual = gitutil.git(
+                ["rev-parse", "--verify", f"{branch}^{{commit}}"],
+                cwd=repo,
+                check=False,
+            ).stdout.strip()
+        except ResearchOSError as exc:  # pragma: no cover
+            drifted.append(f"{branch}: unreadable: {exc}")
+            continue
+        if actual and actual != recorded:
+            drifted.append(f"{branch}: recorded {recorded[:12]}, now {actual[:12]}")
+        elif not actual:
+            drifted.append(f"{branch}: gone")
+    return ", ".join(drifted)
+
+
+def escaped(before: dict[str, str], after: dict[str, str]) -> bool:
+    """Whether the difference between two fingerprints is an escape.
+
+    One thing is permitted and exactly one: an ``<owned-ref>`` key that did not
+    exist before and does now. That is the pipeline creating its own worktree
+    branch, which is what worktree isolation *is*.
+
+    Everything else fails -- a capsule file changed, any other ref created,
+    moved or deleted, and an owned ref that existed before and now points
+    somewhere else. The last of those is the one the first version could not
+    express, and it is the one an attacker would use.
+    """
+
+    for key in set(before) | set(after):
+        if before.get(key) == after.get(key):
+            continue
+        if key.startswith("<owned-ref> ") and key not in before:
+            continue
+        return True
+    return False
+
+
 def _describe_drift(before: dict[str, str], after: dict[str, str]) -> str:
+    """Name what changed, excluding the one change that is permitted."""
+
     changed = sorted(
-        key for key in set(before) | set(after) if before.get(key) != after.get(key)
+        key
+        for key in set(before) | set(after)
+        if before.get(key) != after.get(key)
+        and not (key.startswith("<owned-ref> ") and key not in before)
     )
     return ", ".join(changed[:12]) + ("..." if len(changed) > 12 else "")
 
@@ -480,14 +593,46 @@ def run_coding_task(
         # that touches the canonical checkout. It is released before the builder
         # runs, because a coding task can take many minutes and holding the lock
         # would serialise every other cycle on this repository behind it.
-        with repository_lock(context.db, str(repo)):
-            store, _run = controller.start(
-                project_path=repo,
-                goal=goal,
-                budget=budget,
-                attempt=key[-8:],
-                reserved_run_id=reserved_run_id,
-            )
+        # `start` is inside the `try` whose `finally` charges, because `start`
+        # makes the **planner** call and then can raise. `_plan` invokes the
+        # planner, `_accept_plan` resolves the project's check profiles, and
+        # either can raise an `AutomationError` that `_fail` re-raises -- and a
+        # charge placed after the call was unreachable on all of those paths.
+        # The identical hole was fixed for `execute` in the previous release
+        # and left open around `start`; an adversarial review pointed out that
+        # this release's own check-profile resolution adds two new ways to
+        # raise there (`CommandPolicyError` and `PlanValidationError`, both
+        # persistent configuration errors that would be retried).
+        #
+        # `store` may not exist if `start` raised before `RunStore.create`, so
+        # the charge reads it out of a holder rather than a local.
+        created: list[Any] = []
+        try:
+            with repository_lock(context.db, str(repo)):
+                store, _run = controller.start(
+                    project_path=repo,
+                    goal=goal,
+                    budget=budget,
+                    attempt=key[-8:],
+                    reserved_run_id=reserved_run_id,
+                )
+            created.append(store)
+        except BaseException:
+            from research_os.automation.store import RunStore
+
+            try:
+                recovered = RunStore.open(reserved_run_id)
+            except ResearchOSError:
+                recovered = None
+            if recovered is not None:
+                charge_delegated_spend(
+                    state,
+                    context,
+                    getattr(_loaded_run(recovered), "invocations", ()),
+                    action="edit_in_worktree",
+                    authority=authority,
+                )
+            raise
         # `finally`, because `AutomationController.execute` fails the run on
         # disk and then **re-raises**, so a charge placed after the call is
         # unreachable on every ordinary failure path -- a reviewer returning
@@ -514,8 +659,11 @@ def run_coding_task(
             )
 
         after = canonical_fingerprint(repo, owned_ref_prefixes=owned)
-        if after != before:
-            drift = _describe_drift(before, after)
+        moved = branch_drift(repo, final)
+        if escaped(before, after) or moved:
+            drift = "; ".join(
+                part for part in (_describe_drift(before, after), moved) if part
+            )
             LOG.error(
                 "a coding run changed the canonical checkout of %s: %s", repo, drift
             )

@@ -209,10 +209,28 @@ def apply_default_budgets(
     bound an objective. ``should_continue`` deliberately ignores run scope when
     deciding to continue -- the successor gets a fresh run budget -- so without
     this, one objective's exposure was ``max_cycles_per_objective`` times the
-    per-run cost. It is now derived from the *effective* per-cycle cost limit
-    rather than from the default, so a 6 USD objective gets a 72 USD project
-    ceiling instead of 300, and it is set only if absent, so a researcher who
-    has chosen their own ceiling keeps it.
+    per-run cost.
+
+    **It is derived from the configuration default and never lowered, and an
+    earlier version of this function got that wrong in a way that was worse
+    than the gap it closed.** That version derived the ceiling from the first
+    objective's own ``--max-cost-usd``. The ceiling is created once, per
+    project, and ``spent`` accumulates over the project's whole lifetime with
+    nothing to reset it -- so ``runtime start --max-cost-usd 0.50``, the
+    sensible first smoke run, wrote a 6 USD lifetime ceiling and every
+    subsequent objective on that project hit it and failed
+    ``BUDGET_EXHAUSTED``, which is terminal and not repaired. The safest
+    command a researcher could type was the one that bricked their project,
+    and there was no command to raise it again. An independent adversarial
+    review found it.
+
+    Two changes: the ceiling comes from the configuration, which is a
+    *project*-scale number rather than one objective's; and it is raised, never
+    lowered, when an objective legitimately needs more than it. Lowering it is
+    ``researchctl runtime budget``, which is explicit and reversible.
+
+    The per-objective bound is not this. It is the run-scope limit, inherited
+    down the successor chain by the paragraph above.
 
     **What is still true and is not hidden:** ``--max-cost-usd X`` bounds one
     cycle, and an objective may run up to ``max_cycles_per_objective`` of them.
@@ -238,20 +256,26 @@ def apply_default_budgets(
     def limit_for(dimension: Dimension, fallback: float) -> Decimal:
         return inherited.get(dimension, Decimal(str(fallback)))
 
-    effective_cost = limit_for(Dimension.MODEL_COST_USD, defaults.max_model_cost_usd)
+    cycles = Decimal(config.settings.max_cycles_per_objective)
+    wanted_ceiling = max(
+        Decimal(str(defaults.max_model_cost_usd)) * cycles,
+        limit_for(Dimension.MODEL_COST_USD, defaults.max_model_cost_usd) * cycles,
+    )
     if project_id is not None:
         existing = ledger.get(
             scope=BudgetScope.PROJECT,
             scope_id=project_id,
             dimension=Dimension.MODEL_COST_USD,
         )
-        if existing is None:
+        # Raised, never lowered. Lowering is `researchctl runtime budget`,
+        # which is explicit and reversible; doing it implicitly from one
+        # objective's cap is what bricked a project.
+        if existing is None or Decimal(existing.limit_value) < wanted_ceiling:
             ledger.set_limit(
                 scope=BudgetScope.PROJECT,
                 scope_id=project_id,
                 dimension=Dimension.MODEL_COST_USD,
-                limit_value=effective_cost
-                * Decimal(config.settings.max_cycles_per_objective),
+                limit_value=wanted_ceiling,
             )
     for dimension, fallback in (
         (Dimension.MODEL_CALLS, defaults.max_model_calls),

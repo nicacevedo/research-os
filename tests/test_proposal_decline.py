@@ -73,6 +73,20 @@ def make_proposal(
     )
 
 
+@pytest.fixture(autouse=True)
+def at_a_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`record_decline` refuses when nobody is at a terminal, by design.
+
+    These tests exercise the store as the human command does, so they stand in
+    for the human. `test_the_decline_writer_itself_refuses_without_a_terminal`
+    in `tests/test_runtime_authority.py` is the test of the refusal.
+    """
+
+    from research_os import cli
+
+    monkeypatch.setattr(cli, "_is_interactive", lambda: True)
+
+
 @pytest.fixture
 def stored(automation_home: Path, tmp_path: Path) -> ProposalStore:
     proposal = make_proposal(
@@ -197,7 +211,7 @@ def test_the_event_ledger_records_the_decline(stored: ProposalStore) -> None:
 
 
 def test_the_command_refuses_a_non_interactive_terminal(
-    stored: ProposalStore,
+    stored: ProposalStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The guard `promote` has, for an authority that is different but not lesser.
 
@@ -208,6 +222,10 @@ def test_the_command_refuses_a_non_interactive_terminal(
     in it.
     """
 
+    from research_os import cli
+
+    # Opt out of the `at_a_terminal` fixture: this test is about the refusal.
+    monkeypatch.setattr(cli, "_is_interactive", lambda: False)
     with pytest.raises(PromotionRefusedError, match="interactive terminal"):
         propose_commands._decline(
             argparse.Namespace(

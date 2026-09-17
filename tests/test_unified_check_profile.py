@@ -512,3 +512,40 @@ def _run_runtime_coding(env: dict[str, Any]) -> Any:
 
     assert outcome.ok, outcome.detail
     return RunStore.open(outcome.data["automation_run_id"]).load()
+
+
+def test_a_planner_emitting_a_declared_subset_does_not_skip_the_rest(
+    automation_home: Path, tmp_path: Path
+) -> None:
+    """The de-escalation an adversarial review found, as a test.
+
+    The subset rule was "a plan whose commands are already a subset of the
+    declared argv stands", for any plan. So a project declaring two checks and
+    a planner emitting only one of them satisfied it -- the other never ran,
+    and no `checks_substituted` event recorded that it had not. That needs no
+    adversarial intent: it fires whenever a planner writes a command the
+    researcher also declared, which for the canonical `pytest -q` shape is the
+    likely case rather than the corner one.
+
+    The exemption is now restricted to controller-supplied plans, which is the
+    distinction that was available and being discarded.
+    """
+
+    from tests.automation_helpers import plan_payload
+    from tests.test_auto_controller import scripted as scripted_with
+
+    repo = profiled_repo(tmp_path / "project")
+    # The planner emits exactly one of the two declared commands.
+    provider = scripted_with(plan=plan_payload(argv=tuple(DECLARED_TESTS)))
+    controller = AutomationController(
+        providers={"fake": provider}, config=profiled_config()
+    )
+    store, run = controller.start(project_path=repo, goal="Implement add.")
+
+    assert planned_argv(run) == DECLARED, (
+        "a planner naming one declared check skipped the other"
+    )
+    events = [
+        item for item in store.iter_events() if item["event"] == "checks_substituted"
+    ]
+    assert len(events) == 1, "the substitution must be recorded, not silent"

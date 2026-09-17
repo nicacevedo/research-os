@@ -588,14 +588,22 @@ def test_a_successor_cycle_inherits_the_objectives_explicit_cap(
     )
 
 
-def test_the_project_ceiling_follows_the_objectives_cap(
+def test_the_project_ceiling_does_not_follow_a_cap_downwards(
     runtime_db: Database, tmp_path: Any
 ) -> None:
-    """A 6 USD objective must not buy a 300 USD project ceiling.
+    """This test previously asserted the opposite, and the opposite was a bug.
 
-    The ceiling exists to bound an objective, and deriving it from the
-    configuration default rather than from the researcher's number made it
-    bound the wrong thing.
+    It read: "a 6 USD objective must not buy a 300 USD project ceiling", and
+    asserted `ceiling < 300`. That looked like tightening and was a
+    project-lifetime wedge -- the ceiling is written once, `spent` never
+    resets, and nothing could raise it. The per-objective bound is the
+    run-scope limit, inherited down the successor chain; the project ceiling is
+    a different instrument with a different job and it is not derived from one
+    objective's number.
+
+    Kept, inverted, rather than deleted, because the wrong version passed and
+    the assertion it made is the one a future change is most likely to
+    re-introduce.
     """
 
     from research_os.runtime.cycles import apply_default_budgets
@@ -626,9 +634,13 @@ def test_the_project_ceiling_follows_the_objectives_cap(
         dimension=Dimension.MODEL_COST_USD,
     )
     assert ceiling is not None
-    expected = Decimal(6) * Decimal(config.settings.max_cycles_per_objective)
+    expected = Decimal(str(config.budget.max_model_cost_usd)) * Decimal(
+        config.settings.max_cycles_per_objective
+    )
     assert Decimal(ceiling.limit_value) == expected
-    assert Decimal(ceiling.limit_value) < Decimal(300)
+    assert Decimal(ceiling.limit_value) > Decimal(6) * Decimal(
+        config.settings.max_cycles_per_objective
+    )
 
 
 def test_applying_the_defaults_twice_does_not_reset_a_cap(
@@ -696,3 +708,116 @@ def test_an_unconstrained_objective_still_gets_the_defaults(
     )
     assert limit is not None
     assert Decimal(limit.limit_value) == Decimal(str(config.budget.max_model_cost_usd))
+
+
+def test_a_cheap_first_objective_does_not_brick_the_project(
+    runtime_db: Database, tmp_path: Any
+) -> None:
+    """The regression an earlier version of this branch introduced.
+
+    The project cost ceiling is created once, `spent` accumulates over the
+    project's whole lifetime, and nothing resets it. Deriving it from the first
+    objective's `--max-cost-usd` therefore made
+    `runtime start --max-cost-usd 0.50` -- the sensible first smoke run --
+    write a 6 USD *lifetime* ceiling, after which every objective on that
+    project failed BUDGET_EXHAUSTED, which is terminal and not repaired. The
+    safest command a researcher could type was the one that bricked their
+    project, and nothing could raise it again.
+
+    Found by an independent adversarial review of this branch.
+    """
+
+    from research_os.runtime.cycles import apply_default_budgets
+    from tests.runtime_graph_helpers import make_config
+
+    config = make_config(dsn="", artifacts_root=tmp_path / "artifacts")
+    ledger = BudgetLedger(runtime_db)
+    store = RuntimeStore(runtime_db)
+    store.upsert_project(project_id="not-bricked", repo_path=str(tmp_path))
+
+    cheap = store.create_run(project_id="not-bricked", objective="smoke")
+    ledger.set_limit(
+        scope=BudgetScope.RUN,
+        scope_id=cheap.run_id,
+        dimension=Dimension.MODEL_COST_USD,
+        limit_value=Decimal("0.5"),
+    )
+    apply_default_budgets(
+        ledger,
+        config=config,
+        run_id=cheap.run_id,
+        project_id="not-bricked",
+        inherit_from_run_id=cheap.run_id,
+    )
+
+    # The objective's own cap is honoured ...
+    run_limit = ledger.get(
+        scope=BudgetScope.RUN,
+        scope_id=cheap.run_id,
+        dimension=Dimension.MODEL_COST_USD,
+    )
+    assert run_limit is not None
+    assert Decimal(run_limit.limit_value) == Decimal("0.5")
+
+    # ... and the project is not narrowed to six dollars for ever.
+    ceiling = ledger.get(
+        scope=BudgetScope.PROJECT,
+        scope_id="not-bricked",
+        dimension=Dimension.MODEL_COST_USD,
+    )
+    assert ceiling is not None
+    expected = Decimal(str(config.budget.max_model_cost_usd)) * Decimal(
+        config.settings.max_cycles_per_objective
+    )
+    assert Decimal(ceiling.limit_value) == expected
+
+
+def test_a_larger_later_objective_raises_the_project_ceiling(
+    runtime_db: Database, tmp_path: Any
+) -> None:
+    """Raised, never lowered. Lowering is an explicit command."""
+
+    from research_os.runtime.cycles import apply_default_budgets
+    from tests.runtime_graph_helpers import make_config
+
+    config = make_config(dsn="", artifacts_root=tmp_path / "artifacts")
+    ledger = BudgetLedger(runtime_db)
+    store = RuntimeStore(runtime_db)
+    store.upsert_project(project_id="raised", repo_path=str(tmp_path))
+    default = Decimal(str(config.budget.max_model_cost_usd)) * Decimal(
+        config.settings.max_cycles_per_objective
+    )
+
+    first = store.create_run(project_id="raised", objective="small")
+    apply_default_budgets(
+        ledger,
+        config=config,
+        run_id=first.run_id,
+        project_id="raised",
+        inherit_from_run_id=first.run_id,
+    )
+    second = store.create_run(project_id="raised", objective="large")
+    generous = Decimal(str(config.budget.max_model_cost_usd)) * 4
+    ledger.set_limit(
+        scope=BudgetScope.RUN,
+        scope_id=second.run_id,
+        dimension=Dimension.MODEL_COST_USD,
+        limit_value=generous,
+    )
+    apply_default_budgets(
+        ledger,
+        config=config,
+        run_id=second.run_id,
+        project_id="raised",
+        inherit_from_run_id=second.run_id,
+    )
+    ceiling = ledger.get(
+        scope=BudgetScope.PROJECT,
+        scope_id="raised",
+        dimension=Dimension.MODEL_COST_USD,
+    )
+    assert ceiling is not None
+    assert Decimal(ceiling.limit_value) > default
+    assert Decimal(ceiling.limit_value) == generous * Decimal(
+        config.settings.max_cycles_per_objective
+    )

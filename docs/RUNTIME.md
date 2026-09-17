@@ -918,6 +918,91 @@ see. The residual is that no provider quotes a price before it bills, so one
 call can exceed its ceiling; the ceiling then ratchets to the largest observed
 cost, bounding the excess by one call rather than repeating it.
 
+## 15b. What the third adversarial review found, and what was left open
+
+Two independent read-only reviewers were run against this branch: one on the
+mathematics of the scientific pilot, one on this diff. The architecture review
+returned three HIGH findings, four MEDIUM and three LOW. Six are fixed in
+§15a and above. The rest are recorded here rather than silently carried,
+because a finding nobody wrote down is a finding that gets re-found.
+
+**Fixed, and each one is a test.**
+
+- The project cost ceiling was derived from the first objective's
+  `--max-cost-usd` and could never be raised, so `runtime start
+  --max-cost-usd 0.50` wrote a 6 USD *lifetime* ceiling and bricked the
+  project. This branch introduced that. The ceiling now comes from the
+  configuration, is raised and never lowered, and `researchctl runtime budget`
+  exists so that it can be changed at all.
+- Exempt refs were dropped from the fingerprint entirely, so a *move* of the
+  run's own branch was invisible -- and `git update-ref` moves a branch that is
+  checked out in another worktree, which `push` and `branch -f` refuse. Two
+  changes: exempt refs are recorded rather than skipped, and `branch_drift`
+  asks Git whether each order's branch is still where the controller wrote down
+  that it was. The second is what actually closes it, because a create and a
+  create-then-move give the same two snapshots.
+- `git show-ref` does not list HEAD, and `--head` lists it by resolved sha, so
+  repointing HEAD at another branch at the same commit changed nothing either
+  reported while moving the canonical checkout onto a branch the guard would
+  never inspect again. `git symbolic-ref -q HEAD` is now in the fingerprint.
+- The subset exemption applied to planner-authored plans, so a planner emitting
+  one of two declared checks skipped the other with no event recorded. It now
+  applies only to controller-supplied plans, and `runtime doctor` no longer
+  claims "every path resolves the same set".
+- The capsule exclusion was a substring match, so `.research/claims/runtime/`
+  was invisible to the fingerprint, loaded by the capsule scanner as a real
+  scientific object, and not gitignored. Exact top-level match now.
+- `charge_delegated_spend` could not run when `controller.start` raised -- and
+  `start` makes the planner call, and this branch added two new ways for it to
+  raise afterwards. It is inside the `try` now.
+- The decline authority guard was an AST scan for a call named
+  `record_decline`, which `getattr(store, "record_" + "decline")` defeats while
+  the runtime already holds a live `ProposalStore`. The terminal check moved
+  **into** `ProposalStore.record_decline`, so it is enforced rather than
+  linted; the AST scan is kept as defence in depth and now also bans the name
+  in any string.
+
+**Open, recorded, not fixed.**
+
+- **A decline can be forged by appending one line to `declines.jsonl`.** The
+  file is under `~/.local/state/`, outside every repository, so neither
+  `canonical_fingerprint` nor `git status` covers it, and `declines()`
+  validates JSON shape only. On an uncontained host, code executed during
+  acceptance commands could mark every item of every proposal decided. Closed
+  under `SandboxMode.REQUIRED`, which is what high autonomy sets and what this
+  host cannot provide. The fix is a signature or a digest chain over the
+  ledger, which is a design decision about how much of the runtime's state is
+  tamper-evident, and it should be made for promotions and declines together
+  rather than for one of them in a hurry.
+- **`--max-cost-usd` bounds a cycle, not an objective.** The successor chain
+  inherits it, so the exposure is the cap times
+  `max_cycles_per_objective`, and both numbers are printed. Making it bound the
+  whole objective means one budget shared by every cycle in the chain, which is
+  a change to the reservation path in `routing.py` and `spend.py`.
+- **`charge_delegated_spend` reconciles with two scalars and clamps at zero.**
+  A negative residue -- the authority and the invocation record disagreeing --
+  is information, and it is being discarded. Not reachable today: the wrapped
+  registry is constructed inline per action and never escapes, so there is no
+  path by which the authority sees a call the record does not.
+- **`_equivalent_pending_proposal` opens and validates every proposal on the
+  machine, every cycle.** O(all proposals ever created) with no index and no
+  bound before the load.
+- **Nothing in `src/` deletes a `research_runs` row.** 0015 traded three
+  foreign keys and their insert-time validation for a retention capability that
+  exists only as an operator running SQL by hand. That may still be the right
+  call -- the provenance loss it prevents is real and was demonstrated -- but
+  the migration's framing of pruning as "an ordinary retention action" is
+  stronger than the codebase supports.
+- **`run_local_experiment` refuses correctly and the refusal is not fed back.**
+  Observed on a real objective: the planner chose `run_local_experiment`, the
+  action refused with `policy_refused` and the exact remedy in its detail
+  ("no preregistered design to run; design_experiment must come first"), and
+  the successor cycle -- a new LangGraph thread seeded only with identity --
+  planned the identical action again. The guard is right; the feedback path is
+  missing. This is the "seven cycles, one cycle's worth of information" failure
+  of §16 in a new form, and the fix is to carry the previous cycle's failed
+  action and its detail into the successor's planning prompt.
+
 ## 16. What two adversarial reviews and a real pilot changed
 
 Recorded here because the findings are more useful than the fixes, and because
