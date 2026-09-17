@@ -87,6 +87,7 @@ class ActionKind(StrEnum):
     PARSE_LITERATURE = "parse_literature"
     PROPOSE_HYPOTHESES = "propose_hypotheses"
     CRITIQUE_HYPOTHESES = "critique_hypotheses"
+    DERIVE_MATHEMATICS = "derive_mathematics"
     DESIGN_EXPERIMENT = "design_experiment"
     INTERPRET_RESULTS = "interpret_results"
     REVIEW_SCIENCE = "review_science"
@@ -185,6 +186,15 @@ ACTIONS: dict[ActionKind, ActionPolicy] = {
     ),
     ActionKind.CRITIQUE_HYPOTHESES: ActionPolicy(
         AutonomyLevel.A0, frozenset({Permission.READ_REPO}), "Produces findings only."
+    ),
+    # A0 for the same reason `critique_hypotheses` is: it reads the capsule,
+    # asks a model, and writes an artifact plus a noncanonical finding. A
+    # derivation is not a proof the project holds -- it is a document a person
+    # may promote to one, by exactly the route every other finding takes.
+    ActionKind.DERIVE_MATHEMATICS: ActionPolicy(
+        AutonomyLevel.A0,
+        frozenset({Permission.READ_REPO}),
+        "Derives; establishes nothing until a person accepts it.",
     ),
     ActionKind.DESIGN_EXPERIMENT: ActionPolicy(
         AutonomyLevel.A0,
@@ -364,6 +374,9 @@ ROLE_PERMISSIONS: dict[ModelRole, frozenset[Permission]] = {
     # question about them; it has no business reaching a repository, and
     # the knowledge it judges is about to be offered to *other* projects.
     ModelRole.NOMINATOR: frozenset(),
+    # Reads the capsule, because a derivation that does not quote the
+    # assumption it rests on is a derivation of nothing. Writes nothing.
+    ModelRole.DERIVER: frozenset({Permission.READ_REPO}),
 }
 
 #: What the runtime may hold at each configured autonomy setting. The *setting*

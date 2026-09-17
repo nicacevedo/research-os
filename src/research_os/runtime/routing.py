@@ -112,6 +112,9 @@ _ADAPTER_ROLE: dict[ModelRole, AutomationRole] = {
     ModelRole.EXTRACTOR: AutomationRole.LITERATURE,
     ModelRole.FRONTIER: AutomationRole.PLANNER,
     ModelRole.NOMINATOR: AutomationRole.REVIEWER,
+    # ANALYST, not REVIEWER: a derivation is produced work, and routing it as
+    # review would put it in the pool the *critique* of it must come from.
+    ModelRole.DERIVER: AutomationRole.ANALYST,
 }
 
 

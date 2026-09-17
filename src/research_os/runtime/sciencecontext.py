@@ -62,6 +62,16 @@ MAX_PLANNER_FINDINGS = 12
 #: is in the finding, which the proposal layer reads in full.
 MAX_PLANNER_SUMMARY_CHARS = 600
 
+#: Characters of each excerpt the planner is shown.
+#:
+#: Shorter than the proposal layer's allowance, and shorter on purpose. The
+#: planner picks a *verb*; it does not weigh evidence. What it needs from an
+#: excerpt is enough to tell "the literature audit found eight works on
+#: working-set methods" from "the literature audit found nothing", which is a
+#: sentence, not a document. The proposal worker -- the one actually asked to
+#: ground a conclusion -- reads the longer form.
+MAX_PLANNER_EXCERPT_CHARS = 400
+
 #: The most outstanding proposals the planner is shown.
 MAX_PLANNER_PROPOSALS = 6
 
@@ -153,12 +163,22 @@ def finding_view(
         "produced_by_action": finding.source_action or "",
         "cycle": finding.source_cycle if finding.source_cycle is not None else -1,
         "summary": summary[:MAX_PLANNER_SUMMARY_CHARS] + ("..." if truncated else ""),
+        "excerpt": _clipped(finding.excerpt, MAX_PLANNER_EXCERPT_CHARS),
         "rests_on_artifacts": list(finding.artifact_ids),
         "rests_on_capsule_objects": list(finding.capsule_refs),
         "rests_on_literature": list(finding.literature_keys),
         "experiment_job_id": finding.experiment_job_id or "",
         "already_cited_by_proposals": list(cited_by),
     }
+
+
+def _clipped(text: str, limit: int) -> str:
+    """Clip visibly, so a planner can tell short from shortened."""
+
+    stripped = text.strip()
+    if len(stripped) <= limit:
+        return stripped
+    return stripped[:limit] + "..."
 
 
 def preregistration_view(

@@ -87,7 +87,7 @@ MODEL_CALL_COLUMNS = (
     "status, error, created_at"
 )
 FINDING_COLUMNS = (
-    "finding_id, project_id, kind, summary, source_run_id, source_cycle, "
+    "finding_id, project_id, kind, summary, excerpt, source_run_id, source_cycle, "
     "source_work_id, source_action, experiment_job_id, spec_digest, digest, created_at"
 )
 INTERPRETATION_COLUMNS = (
@@ -1284,13 +1284,13 @@ class RuntimeStore:
             inserted = conn.execute(
                 f"""
                 insert into runtime_findings
-                    (finding_id, project_id, kind, summary, source_run_id,
+                    (finding_id, project_id, kind, summary, excerpt, source_run_id,
                      source_cycle, source_work_id, source_action,
                      experiment_job_id, spec_digest, digest)
                 values (%(finding_id)s, %(project_id)s, %(kind)s, %(summary)s,
-                        %(source_run_id)s, %(source_cycle)s, %(source_work_id)s,
-                        %(source_action)s, %(experiment_job_id)s, %(spec_digest)s,
-                        %(digest)s)
+                        %(excerpt)s, %(source_run_id)s, %(source_cycle)s,
+                        %(source_work_id)s, %(source_action)s,
+                        %(experiment_job_id)s, %(spec_digest)s, %(digest)s)
                 on conflict (project_id, digest) do nothing
                 returning {FINDING_COLUMNS}
                 """,
@@ -1299,6 +1299,7 @@ class RuntimeStore:
                     "project_id": finding.project_id,
                     "kind": str(finding.kind),
                     "summary": finding.summary,
+                    "excerpt": finding.excerpt,
                     "source_run_id": finding.source_run_id,
                     "source_cycle": finding.source_cycle,
                     "source_work_id": finding.source_work_id,
@@ -2134,6 +2135,7 @@ def _finding_from(row: Any, refs: Any = ()) -> RuntimeFinding:
         project_id=str(row["project_id"]),
         kind=FindingKind(str(row["kind"])),
         summary=str(row["summary"]),
+        excerpt=str(row["excerpt"] or ""),
         source_run_id=row["source_run_id"],
         source_cycle=row["source_cycle"],
         source_work_id=row["source_work_id"],

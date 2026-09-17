@@ -204,7 +204,7 @@ def test_a_finding_does_not_resolve_the_frontier_it_discusses(
     _result, router = run_cycle(env, ActionKind.ASSESS_FRONTIER)
     prompt = planner_prompt(router)
 
-    frontier = block_json(prompt, "FRONTIER", until="COMPLETED FINDINGS:")
+    frontier = block_json(prompt, "FRONTIER", until="ADJUDICATION:")
     assert frontier["hypotheses_without_tests"] == ["HYP-0001"]
     assert env["store"].list_findings(project_id=PROJECT, limit=5)
 
@@ -261,7 +261,7 @@ def test_once_a_person_promotes_the_canonical_view_supersedes(
     run_cycle(env, ActionKind.INSPECT_REPOSITORY)
     _result, before_router = run_cycle(env, ActionKind.ASSESS_FRONTIER)
     before = block_json(
-        planner_prompt(before_router), "FRONTIER", until="COMPLETED FINDINGS:"
+        planner_prompt(before_router), "FRONTIER", until="ADJUDICATION:"
     )
     assert before["hypotheses_without_tests"] == ["HYP-0001"]
 
@@ -273,7 +273,7 @@ def test_once_a_person_promotes_the_canonical_view_supersedes(
 
     _result, after_router = run_cycle(env, ActionKind.ASSESS_FRONTIER)
     after_prompt = planner_prompt(after_router)
-    after = block_json(after_prompt, "FRONTIER", until="COMPLETED FINDINGS:")
+    after = block_json(after_prompt, "FRONTIER", until="ADJUDICATION:")
     assert after["hypotheses_without_tests"] == [], (
         "the canonical frontier did not follow the promotion"
     )
@@ -374,13 +374,17 @@ def test_the_planner_template_declares_the_new_context(env: dict[str, Any]) -> N
     """A version bump, because a prompt is code and its identity is provenance."""
 
     del env
-    assert PLANNER.identity == "planner@5"
+    # planner@6 added the adjudication block: an unresolved target is not
+    # automatically an experiment, and the planner is told which instrument
+    # could settle each one.
+    assert PLANNER.identity == "planner@6"
     assert "noncanonical_census" in PLANNER.fields
     declared = {name for name, _fence in PLANNER.blocks}
     assert {
         "completed_findings",
         "outstanding_proposals",
         "preregistered_designs",
+        "adjudication",
     } <= declared
 
 
@@ -527,9 +531,7 @@ def test_an_unreferenced_document_is_not_thereby_canonical(
     assert after == before
 
     _result, router = run_cycle(env, ActionKind.ASSESS_FRONTIER)
-    frontier = block_json(
-        planner_prompt(router), "FRONTIER", until="COMPLETED FINDINGS:"
-    )
+    frontier = block_json(planner_prompt(router), "FRONTIER", until="ADJUDICATION:")
     assert frontier["hypotheses_without_tests"] == ["HYP-0001"], (
         "a document claiming a hypothesis is settled must not settle it"
     )

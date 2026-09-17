@@ -236,6 +236,32 @@ def clipped_statement(statement: str) -> str:
     return prompt_safe(statement, limit=MAX_FINDING_CHARS)
 
 
+#: Characters of one finding's excerpt that reach the proposal worker.
+#:
+#: Matching :data:`MAX_FINDING_CHARS`, and matched deliberately: the statement
+#: and the excerpt are both "what this finding says", and giving the quotation
+#: a larger allowance than the assertion it supports would invert which one the
+#: worker weighs.
+#:
+#: With :data:`research_os.runtime.findings.MAX_PACKET_FINDINGS` at twelve, the
+#: worst case is twelve statements and twelve excerpts -- bounded, and bounded
+#: by a number that is checked rather than assumed; see
+#: ``tests/test_runtime_science_context.py``.
+MAX_EXCERPT_IN_PROMPT = MAX_FINDING_CHARS
+
+
+def clipped_excerpt(excerpt: str) -> str:
+    """One finding's excerpt, clipped exactly as the prompt will clip it.
+
+    The same guarantee :func:`clipped_statement` gives, for the same reason and
+    after the same adversarial finding: what ``propose show`` displays and what
+    the worker read must be one string, or a reader attributes the proposal's
+    reasoning to text that never reached it.
+    """
+
+    return prompt_safe(excerpt, limit=MAX_EXCERPT_IN_PROMPT)
+
+
 def supplied_findings_digest(
     findings: Sequence[SuppliedFinding],
 ) -> str | None:
@@ -256,7 +282,17 @@ def supplied_findings_digest(
         return None
     material = json.dumps(
         sorted(
-            [item.finding_id, item.kind, item.statement, sorted(item.rests_on)]
+            [
+                item.finding_id,
+                item.kind,
+                item.statement,
+                # In the digest for the same reason the statement is: a finding
+                # whose excerpt has been superseded by one saying something else
+                # is not the finding that was cited, and a promotion resting on
+                # the old reading must fail closed rather than proceed.
+                item.excerpt,
+                sorted(item.rests_on),
+            ]
             for item in findings
         ),
         sort_keys=True,
@@ -292,6 +328,14 @@ def render_supplied_findings(findings: Sequence[SuppliedFinding]) -> str:
             f"[{prompt_safe(finding.kind, limit=MAX_LABEL_CHARS)}]"
         )
         lines.append(f"    {prompt_safe(finding.statement, limit=MAX_FINDING_CHARS)}")
+        if finding.excerpt:
+            # Each line of the excerpt separately, so a multi-line quotation
+            # arrives as a list rather than as one run-on paragraph, and so
+            # `prompt_safe` neutralises every line rather than only the first.
+            lines.append("    excerpt (NONCANONICAL, produced by this runtime,")
+            lines.append("    accepted by nobody, not a claim):")
+            for entry in clipped_excerpt(finding.excerpt).splitlines():
+                lines.append(f"        {prompt_safe(entry, limit=MAX_FINDING_CHARS)}")
         if finding.rests_on:
             shown = finding.rests_on[:MAX_LISTED_IDENTIFIERS]
             lines.append(

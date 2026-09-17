@@ -47,7 +47,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from langgraph.graph import END, START, StateGraph
@@ -55,6 +55,12 @@ from langgraph.runtime import Runtime
 from langgraph.types import interrupt
 
 from research_os.errors import ResearchOSError
+from research_os.runtime.actions.base import EXCERPT_KEY
+from research_os.runtime.adjudication import (
+    AdjudicationKind,
+    adjudication_view,
+    unresolved_adjudications,
+)
 from research_os.runtime.budgets import BudgetExhaustedError
 from research_os.runtime.findings import (
     MAX_REFS_PER_KIND,
@@ -217,6 +223,24 @@ def plan_one_action(
     science = noncanonical_science(
         context.store, project_id=state["project_id"], artifacts=context.artifacts
     )
+    # What kind of work could settle each unresolved target.
+    #
+    # Over the frontier's own unresolved lists, so the block and the frontier
+    # describe the same moment and the same objects. Deterministic, derived
+    # from capsule text, and explicitly noncanonical in every entry: it says
+    # which *instrument* fits a target, never what is true of it.
+    unresolved = (
+        *frontier.get("actionable_hypotheses", ()),
+        *frontier.get("hypotheses_without_tests", ()),
+        *frontier.get("open_questions", ()),
+        *frontier.get("contested_claims", ()),
+    )
+    adjudication = [
+        adjudication_view(object_id, verdict)
+        for object_id, verdict in unresolved_adjudications(
+            context.kernel, tuple(dict.fromkeys(unresolved))
+        )
+    ]
     prompt = PLANNER.render(
         fields={
             "objective": state["objective"],
@@ -229,6 +253,9 @@ def plan_one_action(
         },
         blocks={
             "frontier": [json.dumps(frontier, indent=2, sort_keys=True)],
+            "adjudication": [
+                json.dumps(entry, indent=2, sort_keys=True) for entry in adjudication
+            ],
             "completed_findings": [
                 json.dumps(entry, indent=2, sort_keys=True)
                 for entry in science.findings
@@ -272,6 +299,130 @@ def plan_one_action(
     return {
         "plan": plan,
         "notes": note(state, f"planned: {plan.get('action')}"),
+    }
+
+
+#: Actions whose adjudication kind decides whether they are the right instrument.
+#:
+#: Only two, and the asymmetry is deliberate. ``design_experiment`` is refused
+#: for a target no experiment can decide; ``derive_mathematics`` is refused for
+#: a target already derived. Every other action -- inspecting, critiquing,
+#: searching literature, proposing to a person -- is useful whatever kind the
+#: target is, and gating them would turn a routing fix into a straitjacket.
+_ADJUDICATION_GATED = (
+    ActionKind.DESIGN_EXPERIMENT,
+    ActionKind.DERIVE_MATHEMATICS,
+)
+
+
+def _adjudication_refusal(
+    state: CycleState,
+    context: CycleContext,
+    action: ActionKind,
+    plan: Mapping[str, Any],
+) -> str | None:
+    """Why this action is the wrong instrument for what it addresses, or None.
+
+    **Refuses only on a positive determination.** UNDETERMINED never refuses,
+    MIXED never refuses on its own, and a plan addressing nothing classifiable
+    never refuses. A target this build cannot classify behaves exactly as it did
+    before adjudication existed -- which is the property that makes a heuristic
+    safe to put in front of a deterministic gate.
+
+    **And only when *every* addressed target agrees.** A plan addressing one
+    mathematical proposition and one empirical hypothesis has a legitimate
+    empirical half, and refusing it would make a mixed plan unplannable. The
+    refusal fires when nothing the plan addresses could be settled the way the
+    action would settle it.
+    """
+
+    addressed = tuple(str(item) for item in plan.get("addresses", ()) if item)
+    if not addressed:
+        return None
+
+    # Repeat-work suppression first, and deliberately *not* behind the
+    # classification. Whether a derivation has already been done for a target
+    # is a fact about this project's findings; it does not become unknown
+    # because the target's text carries no adjudication signal. An earlier
+    # version checked it after the UNDETERMINED filter, which meant a
+    # hypothesis worded without any of the signal vocabulary could be derived
+    # over and over -- the exact loop this guard exists to close, reachable
+    # through the one door that was left open.
+    if action is ActionKind.DERIVE_MATHEMATICS:
+        derived = _already_derived(context, state, addressed)
+        if derived:
+            return (
+                f"derive_mathematics has already been run for "
+                f"{', '.join(sorted(derived))} in this project, and the "
+                f"derivation is in the findings this cycle was shown. A second "
+                f"derivation of the same proposition costs a model call and "
+                f"moves nothing: what an unaccepted derivation is waiting for "
+                f"is a person, not another derivation. Choose "
+                f"'critique_hypotheses' to attack the one that exists, or "
+                f"'propose_capsule_change' to put it in front of the researcher."
+            )
+        return None
+
+    verdicts = unresolved_adjudications(context.kernel, addressed)
+    classified = [
+        (object_id, verdict)
+        for object_id, verdict in verdicts
+        if verdict.kind is not AdjudicationKind.UNDETERMINED
+    ]
+    if not classified:
+        return None
+
+    if action is ActionKind.DESIGN_EXPERIMENT:
+        if any(verdict.settles_by_measurement for _id, verdict in classified):
+            return None
+        names = ", ".join(
+            f"{object_id} ({verdict.kind})" for object_id, verdict in classified
+        )
+        first = classified[0][1]
+        return (
+            f"design_experiment cannot settle {names}. Nothing this plan "
+            f"addresses is decided by measurement -- {first.reason()} -- so a "
+            f"specification would freeze a test whose result could not close "
+            f"the target. Use 'derive_mathematics' for a proposition that needs "
+            f"a derivation or a counterexample, or 'search_literature' / "
+            f"'fetch_literature' for a question about what is already published. "
+            f"A numerical run may later *witness* such a result; it cannot "
+            f"establish it, and the witness is worth designing only once the "
+            f"derivation says what it would witness."
+        )
+
+    return None
+
+
+def _already_derived(
+    context: CycleContext, state: CycleState, addressed: Sequence[str]
+) -> set[str]:
+    """Targets this project already holds a derivation finding for.
+
+    By ``source_action`` and capsule reference rather than by artifact digest,
+    for exactly the reason ``planner@5`` had to stop deduplicating
+    preregistrations by spec digest: two derivations of one proposition differ
+    in wording and hash differently, and a digest comparison would call them
+    distinct work forever. What makes them the same work is the proposition
+    they are about.
+    """
+
+    wanted = {str(item) for item in addressed}
+    try:
+        findings = context.store.list_findings(
+            project_id=str(state["project_id"]), limit=200
+        )
+    except ResearchOSError as exc:
+        # Fail open. This guard prevents waste, not harm, and a store that
+        # cannot answer must not be able to block a cycle.
+        LOG.warning("could not check for prior derivations: %s", exc)
+        return set()
+    return {
+        ref
+        for item in findings
+        if item.source_action == str(ActionKind.DERIVE_MATHEMATICS)
+        for ref in item.capsule_refs
+        if ref in wanted
     }
 
 
@@ -331,6 +482,20 @@ def validate_plan(state: CycleState, runtime: Runtime[CycleContext]) -> dict[str
             "plan_refusal": str(exc),
             "notes": note(state, f"plan refused: {exc}"),
         }
+
+    # Last, and after every authority check, because this is the only refusal
+    # here that is about *scientific fit* rather than about permission. An
+    # action the policy forbids should say so in the policy's words; this one
+    # says something different -- the action is allowed and would not answer
+    # the question -- and a refusal that conflated the two would send a planner
+    # looking for a permission it already has.
+    if action in _ADJUDICATION_GATED:
+        misrouted = _adjudication_refusal(state, context, action, plan)
+        if misrouted:
+            return {
+                "plan_refusal": misrouted,
+                "notes": note(state, f"plan refused: {action} is the wrong instrument"),
+            }
     return {"notes": note(state, f"plan validated: {action}")}
 
 
@@ -479,6 +644,13 @@ FINDING_FOR_ACTION: dict[ActionKind, FindingKind] = {
     ActionKind.PARSE_LITERATURE: FindingKind.LITERATURE,
     ActionKind.PROPOSE_HYPOTHESES: FindingKind.OTHER,
     ActionKind.CRITIQUE_HYPOTHESES: FindingKind.REVIEW,
+    # OTHER rather than a new FindingKind. The kinds are about provenance --
+    # where an observation came from -- and adding `DERIVATION` would need a
+    # schema check-constraint change to record that a model was asked a
+    # question, which is what OTHER already says. What distinguishes a
+    # derivation from any other OTHER finding is `source_action`, which is
+    # recorded, indexed and what `_prior_derivations` filters on.
+    ActionKind.DERIVE_MATHEMATICS: FindingKind.OTHER,
     ActionKind.REVIEW_SCIENCE: FindingKind.REVIEW,
     ActionKind.REFEREE_MANUSCRIPT: FindingKind.REVIEW,
     ActionKind.AUDIT_CITATIONS: FindingKind.REVIEW,
@@ -520,6 +692,15 @@ def _record_finding(
         return None
 
     data = dict(result.get("data") or {})
+    # The handler's own bounded quotation of what it found, if it authored one.
+    #
+    # Lifted rather than derived. Nothing here inspects the artifact, opens a
+    # file, or decides which part of a result is the interesting part: the
+    # handler that built the structure chose, and a finding with no excerpt
+    # falls back to exactly the behaviour that existed before excerpts did --
+    # summary plus artifact reference, which is still citable and still
+    # auditable, just thinner.
+    excerpt = str(data.get(EXCERPT_KEY) or "")
     artifacts = tuple(
         str(ref["artifact_id"]) for ref in result.get("artifacts", ()) if ref
     )
@@ -535,6 +716,7 @@ def _record_finding(
                 project_id=str(state["project_id"]),
                 kind=kind,
                 summary=summary,
+                excerpt=excerpt,
                 source_run_id=str(state["run_id"]),
                 source_cycle=int(state["cycle_index"]),
                 source_action=str(action),

@@ -28,10 +28,15 @@ import logging
 from collections.abc import Mapping
 from typing import Any
 
-from research_os.runtime.actions.base import ActionOutcome
+from research_os.runtime.actions.base import (
+    EXCERPT_KEY,
+    ActionOutcome,
+    bounded_excerpt,
+)
 from research_os.runtime.budgets import BudgetExhaustedError
 from research_os.runtime.context import CycleContext
 from research_os.runtime.failures import FailureClass
+from research_os.runtime.findings import MAX_EXCERPT_CHARS
 from research_os.runtime.interfaces import ModelRequest
 from research_os.runtime.prompts import FRONTIER, SCIENTIFIC_REVIEWER
 from research_os.runtime.routing import RoutingError
@@ -119,9 +124,38 @@ def review_science(
             "independence_note": response.independence_note,
             # Stated in the record, not only in the prompt.
             "approves_nothing": True,
+            # The verdict word is not the review. What a later proposal has to
+            # weigh is which alternatives the reviewer raised and what it said
+            # was overclaimed, and neither survives "verdict: REVISE".
+            EXCERPT_KEY: bounded_excerpt(
+                _review_lines(verdict), limit=MAX_EXCERPT_CHARS
+            ),
         },
         artifacts=(ref,),
     )
+
+
+def _review_lines(verdict: Mapping[str, Any]) -> list[str]:
+    """The reviewer's substantive findings, labelled by what kind each is.
+
+    Labelled because the four lists mean different things and a flat
+    concatenation of them reads as one undifferentiated complaint: an
+    alternative explanation is a rival account, an overclaim is a sentence that
+    outran its evidence, and a required change is neither.
+    """
+
+    lines: list[str] = []
+    for label, key in (
+        ("alternative", "alternative_explanations"),
+        ("evidence gap", "evidence_gaps"),
+        ("overclaiming", "overclaiming"),
+        ("required change", "required_changes"),
+    ):
+        for entry in verdict.get(key, ()) or ():
+            text = str(entry).strip()
+            if text:
+                lines.append(f"[{label}] {text}")
+    return lines
 
 
 def assess_frontier_ranked(

@@ -49,7 +49,11 @@ from research_os.runtime.actions.experiments import (
     run_local_experiment,
     submit_cluster_experiment,
 )
-from research_os.runtime.actions.explore import critique_hypotheses, propose_hypotheses
+from research_os.runtime.actions.explore import (
+    critique_hypotheses,
+    derive_mathematics,
+    propose_hypotheses,
+)
 from research_os.runtime.actions.insights import nominate_insight
 from research_os.runtime.actions.inspect import (
     inspect_repository,
@@ -163,6 +167,15 @@ ACTION_HANDLERS: dict[ActionKind, RegisteredAction] = {
         critique_hypotheses, replay_safe=True
     ),
     ActionKind.REVIEW_SCIENCE: RegisteredAction(review_science, replay_safe=True),
+    # Replay-safe for the same reason the critique is: it asks a model and
+    # writes an artifact whose address is its content hash. A replay that
+    # produced the same derivation writes nothing new; one that produced a
+    # different derivation records a different finding, which is the honest
+    # outcome -- two derivations that disagree are two observations, and
+    # collapsing them would hide the disagreement.
+    ActionKind.DERIVE_MATHEMATICS: RegisteredAction(
+        derive_mathematics, replay_safe=True
+    ),
     # --- experiments ------------------------------------------------------
     ActionKind.DESIGN_EXPERIMENT: RegisteredAction(design_experiment, replay_safe=True),
     # Replay-safe, and it is worth saying why, because this handler *does*

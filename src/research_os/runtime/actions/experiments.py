@@ -51,7 +51,11 @@ from pathlib import Path
 from typing import Any
 
 from research_os.errors import ResearchOSError
-from research_os.runtime.actions.base import ActionOutcome
+from research_os.runtime.actions.base import (
+    EXCERPT_KEY,
+    ActionOutcome,
+    bounded_excerpt,
+)
 from research_os.runtime.budgets import BudgetExhaustedError, Dimension
 from research_os.runtime.context import CycleContext
 from research_os.runtime.executors import (
@@ -63,6 +67,7 @@ from research_os.runtime.executors import (
     spec_digest,
 )
 from research_os.runtime.failures import FailureClass
+from research_os.runtime.findings import MAX_EXCERPT_CHARS
 from research_os.runtime.idempotency import idempotency_key
 from research_os.runtime.ids import new_external_job_id
 from research_os.runtime.interfaces import ExecutionSpec, ModelRequest
@@ -1189,6 +1194,38 @@ def interpret_results(
             # person performs.
             **criteria,
             "criteria_were_fixed_before_results": True,
+            # The criteria, quoted, beside whether the run that was measured
+            # against them was valid.
+            #
+            # This is the excerpt with the sharpest edge on it, so it is worth
+            # being explicit: it carries the *prespecified* endpoint and
+            # decision rule and the fact of how the job exited. It does not
+            # carry a verdict, because this handler does not reach one -- the
+            # reading of a result is the reviewer's and then a person's, and an
+            # excerpt that said "SUPPORTED" would be this layer deciding the
+            # science it exists to keep separate.
+            EXCERPT_KEY: bounded_excerpt(
+                [
+                    (
+                        f"job {job.job_id} finished {job.status} (exit "
+                        f"{job.exit_code}); ran_correctly={ran_correctly}"
+                    ),
+                    f"[primary endpoint] {criteria.get('primary_endpoint', '')}",
+                    *(
+                        f"[secondary endpoint] {item}"
+                        for item in criteria.get("secondary_endpoints", ()) or ()
+                    ),
+                    (
+                        "[success criteria, fixed beforehand] "
+                        f"{criteria.get('success_criteria', '')}"
+                    ),
+                    (
+                        "[failure criteria, fixed beforehand] "
+                        f"{criteria.get('failure_criteria', '')}"
+                    ),
+                ],
+                limit=MAX_EXCERPT_CHARS,
+            ),
         },
         artifacts=(ref,),
     )

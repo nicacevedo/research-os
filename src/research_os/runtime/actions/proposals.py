@@ -101,6 +101,7 @@ def _supplied(findings: tuple[RuntimeFinding, ...]) -> list[Any]:
             finding_id=item.finding_id,
             kind=str(item.kind),
             statement=item.summary,
+            excerpt=item.excerpt,
             rests_on=[
                 *item.artifact_ids,
                 *item.capsule_refs,

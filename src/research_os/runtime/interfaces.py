@@ -75,6 +75,21 @@ class ModelRole(StrEnum):
     REFEREE = "referee"
     EXTRACTOR = "extractor"
     FRONTIER = "frontier"
+    DERIVER = "deriver"
+    """Derives, or fails to derive, a mathematical proposition from stated
+    assumptions.
+
+    Its own role because the question it is asked has a different acceptance
+    condition from every other role's. An explorer is useful when it is
+    interesting and a reviewer is useful when it is sharp; a deriver is useful
+    only when each step follows, and "I could not derive this" is a complete
+    and valuable answer from it where it would be a failure from the others.
+
+    What it is never asked for is a measurement. The whole reason this role
+    exists is that ``design_experiment`` was being asked to settle propositions
+    no experiment can settle.
+    """
+
     NOMINATOR = "nominator"
     """Judges whether one project's finding is candidate knowledge for others.
 

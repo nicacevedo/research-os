@@ -184,6 +184,20 @@ class SuppliedFinding(BaseModel):
     statement: NonBlankStr
     """What was observed. Rendered as fenced, untrusted data, never as prose."""
 
+    excerpt: str = ""
+    """Bounded substance the producer selected, or "" when it authored none.
+
+    Optional, and every caller that omits it gets exactly the behaviour that
+    existed before this field: the statement, the identifier, the audit trail.
+    That fallback is not a courtesy to old callers -- it is the honest state for
+    a finding whose producer had no structured result to quote, and a required
+    field would have forced those producers to invent one.
+
+    Carries no more authority than :attr:`statement` does. It is fenced,
+    untrusted, noncanonical text, and a worker is told so in the block that
+    renders it.
+    """
+
     rests_on: list[str] = Field(default_factory=list)
     """Artifact ids, capsule object ids or literature keys, for the audit trail."""
 

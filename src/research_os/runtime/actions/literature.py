@@ -35,10 +35,15 @@ from collections.abc import Mapping
 from typing import Any
 
 from research_os.errors import ResearchOSError
-from research_os.runtime.actions.base import ActionOutcome
+from research_os.runtime.actions.base import (
+    EXCERPT_KEY,
+    ActionOutcome,
+    bounded_excerpt,
+)
 from research_os.runtime.budgets import BudgetExhaustedError, Dimension
 from research_os.runtime.context import CycleContext
 from research_os.runtime.failures import FailureClass
+from research_os.runtime.findings import MAX_EXCERPT_CHARS
 from research_os.runtime.idempotency import idempotency_key
 from research_os.runtime.interfaces import ModelRequest
 from research_os.runtime.locks import derived_index_lock
@@ -293,6 +298,22 @@ def search_literature(
         "network_calls": network_calls,
         "ingested": len(dict.fromkeys(work_keys)),
         "ranked": ranked,
+        # What was actually found, as a person would cite it.
+        #
+        # "12 work(s) ingested from 3 source(s); 8 ranked" is a description of
+        # a retrieval, not of a literature. A later cycle deciding whether the
+        # prior art has been covered needs the titles and the years, and a
+        # proposal claiming novelty needs to be answerable against them.
+        EXCERPT_KEY: bounded_excerpt(
+            [
+                f"{entry.get('key')} ({entry.get('year') or 'n.d.'}): "
+                f"{entry.get('title') or 'untitled'}"
+                + (f" doi:{entry['doi']}" if entry.get("doi") else "")
+                + (" [RETRACTED]" if entry.get("retracted") else "")
+                for entry in ranked
+            ],
+            limit=MAX_EXCERPT_CHARS,
+        ),
     }
     ref = context.artifacts.put_text(
         json.dumps(payload, indent=2, sort_keys=True),
@@ -468,7 +489,22 @@ def parse_literature(
         )
     return ActionOutcome.succeeded(
         f"extracted fields from {len(parsed)} document(s)",
-        data={"parsed": parsed, "queries": previous.get("queries", [])},
+        data={
+            "parsed": parsed,
+            "queries": previous.get("queries", []),
+            EXCERPT_KEY: bounded_excerpt(
+                [
+                    f"{entry.get('artifact_id', '')[:12]}: "
+                    + (
+                        str(entry["error"])
+                        if entry.get("error")
+                        else json.dumps(entry.get("fields", {}), sort_keys=True)
+                    )
+                    for entry in parsed
+                ],
+                limit=MAX_EXCERPT_CHARS,
+            ),
+        },
     )
 
 

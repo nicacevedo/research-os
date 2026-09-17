@@ -19,7 +19,7 @@ for manufacturing positive results, and this is where that would have to start.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Protocol
@@ -87,6 +87,70 @@ class ActionOutcome:
             artifacts=artifacts,
             failure_class=failure_class,
         )
+
+
+#: The key under which a handler puts its bounded excerpt in ``ActionOutcome.data``.
+#:
+#: ``data`` rather than a new field on :class:`ActionOutcome`, and that is the
+#: whole design. ``data`` is already the handler's structured result, already
+#: checkpointed, already carried through the idempotency ledger, and already the
+#: thing :func:`research_os.runtime.graphs.cycle._record_finding` reads to build
+#: a finding's references. An excerpt is one more piece of that same result. A
+#: parallel channel would have needed its own persistence, its own replay story
+#: and its own bound, to carry something the existing one carries for free.
+EXCERPT_KEY = "finding_excerpt"
+
+
+def bounded_excerpt(entries: Sequence[str], *, limit: int) -> str:
+    """Join a handler's chosen lines into one bounded, deterministic excerpt.
+
+    **Deterministic, given the same result.** No timestamps, no ids, no
+    iteration over anything unordered: the same structured result yields the
+    same string, so a replay that re-derives an excerpt from a ledger-preserved
+    result re-derives *that* excerpt. The ledger is what makes a replay reuse
+    the result at all; this is what makes the derivation from it stable.
+
+    **Truncation is visible.** A clipped excerpt ends with a marker naming what
+    was dropped, because an excerpt that silently stops mid-sentence reads like
+    the finding stopped mid-sentence -- and a reader who cannot tell the
+    difference will attribute the handler's completeness to the bound.
+
+    The caller chooses the lines. That is the point of producer authorship:
+    this function knows how to bound text and nothing about what matters in it.
+    """
+
+    lines = [" ".join(str(entry).split()) for entry in entries]
+    lines = [line for line in lines if line]
+
+    kept: list[str] = []
+    used = 0
+    for index, line in enumerate(lines):
+        remaining = len(lines) - index
+        marker = _omission_marker(remaining)
+        if len(marker) + 1 > limit:
+            # A limit too small to hold even the notice. Degenerate, and it
+            # still must not silently look complete.
+            marker = "[...]"
+        # Room for this line *and* for the marker that would be needed if it
+        # were the last one to fit. Reserving it up front is what keeps the
+        # marker from being the thing the final clip removes -- an excerpt that
+        # loses its own truncation notice reads as complete.
+        if used + len(line) + 1 + len(marker) + 1 > limit and kept:
+            kept.append(marker)
+            break
+        if used + len(line) + 1 > limit:
+            kept.append(line[: max(0, limit - used - 1)])
+            break
+        kept.append(line)
+        used += len(line) + 1
+    return "\n".join(kept)[:limit]
+
+
+def _omission_marker(count: int) -> str:
+    """What a clipped excerpt says about what it dropped."""
+
+    noun = "entry" if count == 1 else "entries"
+    return f"[... {count} further {noun} omitted to stay within the excerpt bound]"
 
 
 class ActionHandler(Protocol):

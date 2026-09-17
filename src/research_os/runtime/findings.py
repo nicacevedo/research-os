@@ -62,6 +62,38 @@ MAX_REFS_PER_KIND = 32
 #: that a bounded set of findings cannot become the largest thing in a prompt.
 MAX_SUMMARY_CHARS = 4_000
 
+#: The most characters of a finding's producer-authored excerpt that are stored.
+#:
+#: The gap it closes. A `critique_hypotheses` finding reached the proposal layer
+#: as ``"6 alternative explanation(s) for 5 target(s)"`` -- 44 characters -- while
+#: the six alternatives themselves, eleven kilobytes of them, sat in an immutable
+#: artifact the proposal worker had an id for and no way to read. The worker did
+#: the right thing and refused to ground anything in text it could not see; the
+#: proposal it wrote says so, in ``PR-002``:
+#:
+#:     Only that summary is available to this proposal; the text of the six
+#:     alternatives is not.
+#:
+#: Safe, and incomplete: the system had produced the evidence and then hidden it
+#: from itself.
+#:
+#: Two thousand characters, chosen against the two failure modes either side. Too
+#: small and the excerpt is a second summary, which is what already failed. Too
+#: large and twelve findings become the prompt -- so this is bounded such that a
+#: full :data:`MAX_PACKET_FINDINGS` packet stays a readable fraction of a
+#: proposal prompt, and the rendering layers clip further still.
+MAX_EXCERPT_CHARS = 2_000
+
+#: Characters of an excerpt that reach a prompt through :meth:`rendered`.
+#:
+#: Smaller than what is stored. The stored form is the record; a prompt is a
+#: working set, and a full packet of stored excerpts would be twenty-four
+#: thousand characters of one block. Clipped here rather than at the fence so
+#: the truncation is a property of what the block contains rather than of how
+#: it was serialised -- the same reason
+#: :func:`research_os.runtime.sciencecontext.finding_view` clips there.
+MAX_RENDERED_EXCERPT_CHARS = 1_500
+
 #: The most findings one proposal may be grounded in.
 #:
 #: Twelve, matching `proposal.planner.MAX_ITEMS`, for the same reason it gives:
@@ -127,6 +159,30 @@ class RuntimeFinding(BaseModel):
     kind: FindingKind
     summary: str
 
+    excerpt: str = ""
+    """Bounded scientific substance, selected by the handler that produced it.
+
+    **Producer-authored, deliberately.** The generic prompt layer does not read
+    artifacts. It cannot: an artifact is bytes with a media type, and a layer
+    that scraped them would have to guess which part of a ten-kilobyte review
+    document is the finding, on every schema any handler might ever write. The
+    handler already knows -- it built the structure a moment earlier -- so it
+    selects the excerpt and this field carries it.
+
+    **Noncanonical, like everything else here.** An excerpt is a model's output
+    quoted verbatim. It is rendered fenced and untrusted everywhere it reaches a
+    prompt, it is labelled as noncanonical in the same entry that carries it, and
+    it can no more become a Claim than the summary beside it can. What it changes
+    is only that a worker asked to ground a proposal in this finding can now read
+    what the finding *said*.
+
+    **Part of the digest, when present.** Two observations that said different
+    things are different observations. Absent from the digest material when
+    empty, so every finding recorded before this field existed keeps the digest
+    it was cited by -- an excerpt appearing later must not silently restate a
+    finding a proposal already rests on.
+    """
+
     source_run_id: str | None = None
     source_cycle: int | None = None
     source_work_id: str | None = None
@@ -152,6 +208,19 @@ class RuntimeFinding(BaseModel):
                 "for nothing, which is worse than no finding at all"
             )
         return collapsed[:MAX_SUMMARY_CHARS]
+
+    @field_validator("excerpt")
+    @classmethod
+    def _bounded_excerpt(cls, value: str) -> str:
+        """Clip to the stored bound. Blank is valid -- most findings have none.
+
+        Newlines survive, unlike in ``summary``: an excerpt is structured
+        material a person reads as a list, and collapsing it to one line would
+        make six alternative explanations into one paragraph. The prompt
+        serializer renders it inert either way.
+        """
+
+        return value.strip()[:MAX_EXCERPT_CHARS]
 
     @field_validator("artifact_ids", "capsule_refs", "literature_keys")
     @classmethod
@@ -194,6 +263,9 @@ class RuntimeFinding(BaseModel):
                 "project_id": self.project_id,
                 "kind": str(self.kind),
                 "summary": self.summary,
+                # Present only when non-empty, so a finding recorded before
+                # excerpts existed hashes to what it always hashed to.
+                **({"excerpt": self.excerpt} if self.excerpt else {}),
                 "source_action": self.source_action or "",
                 "artifact_ids": sorted(self.artifact_ids),
                 "capsule_refs": sorted(self.capsule_refs),
@@ -309,6 +381,8 @@ class FindingPacket(BaseModel):
                 "finding_id": item.finding_id,
                 "kind": str(item.kind),
                 "summary": item.summary,
+                "excerpt": _clip(item.excerpt, MAX_RENDERED_EXCERPT_CHARS),
+                "excerpt_is_noncanonical": True,
                 "rests_on_artifacts": list(item.artifact_ids),
                 "rests_on_capsule_objects": list(item.capsule_refs),
                 "rests_on_literature": list(item.literature_keys),
@@ -316,6 +390,14 @@ class FindingPacket(BaseModel):
             }
             for item in self.findings
         )
+
+
+def _clip(text: str, limit: int) -> str:
+    """Clip visibly, so a reader can tell short from shortened."""
+
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "..."
 
 
 def packet_from(findings: Sequence[RuntimeFinding]) -> FindingPacket:
