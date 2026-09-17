@@ -476,11 +476,41 @@ matters because promotion is the path this architecture exists to protect, and
 asserting it works on the strength of a different trigger would be the kind of
 claim this report is supposed to avoid.
 
-**Untouched by this pass.** Containment (this kernel refuses unprivileged user
-namespaces; `bwrap` fails on loopback, `systemd-run`'s user-scope sandboxing is
-silently ineffective, and neither podman nor docker is installed — so
-containment remains BLOCKED, not PASS). Slurm (`slurm.enabled: false`).
-Cross-provider review independence (one provider family installed).
+**Blocked on root, and it blocks the science harder than the gate does.**
+Containment. Diagnosed precisely rather than restated:
+
+```text
+kernel.apparmor_restrict_unprivileged_userns = 1      <- the whole cause
+/proc/sys/kernel/unprivileged_userns_clone   = 1      (permitted at this layer)
+/proc/sys/user/max_user_namespaces           = 46581  (ample)
+bwrap                                        = 0.9.0, installed, working
+
+$ unshare --user --map-root-user true
+unshare: write failed /proc/self/uid_map: Operation not permitted
+$ python -c "import research_os.sandbox as s; print(s.available_backend())"
+None
+```
+
+Ubuntu 24.04 restricts unprivileged user namespaces through AppArmor, no
+profile grants `bwrap` the `userns` permission, and neither podman nor docker
+is installed. `build_executors` does return a `local` executor for this
+project, but with `sandbox_mode=REQUIRED` — so the runtime will **design and
+preregister** an experiment and then refuse to execute it.
+
+That refusal is the correct behaviour and must not be routed around. But it
+means promoting `PR-006` does **not** by itself let the equivalence trace run:
+the containment prerequisite is the binding constraint, and it needs root.
+
+`deploy/apparmor-bwrap` is new, shipped and not installed: a targeted profile
+granting `userns` to `bwrap` alone, following the convention Ubuntu already
+uses on this machine for eight other binaries (`/etc/apparmor.d/thunderbird`,
+`crun`, `vpnns`, …). It parses under `apparmor_parser -Q -K`. It is offered as
+the alternative to `sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`,
+which would lift the restriction for every binary on the machine. Whether
+either is acceptable is the machine owner's call, and neither was applied.
+
+**Untouched by this pass.** Slurm (`slurm.enabled: false`). Cross-provider
+review independence (one provider family installed).
 
 **Not run.** The final adversarial science review and the final adversarial
 architecture review. Both were to attack work that does not exist yet.
