@@ -869,8 +869,22 @@ def test_a_capsule_less_research_run_reaches_ready_for_human(tmp_path: Path) -> 
     assert not (root / ".research").exists()
 
 
-def test_a_capsule_project_still_uses_the_scientific_pipeline(tmp_path: Path) -> None:
-    """The other half of the guarantee: nothing about capsule projects moved."""
+def test_a_capsule_project_still_uses_the_scientific_pipeline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other half of the guarantee: nothing about capsule projects moved.
+
+    `RESEARCH_OS_STATE_HOME` is relocated because this test reaches the
+    proposal store, and `proposals_root()` is `state_home() / "proposals"`.
+    Without it the autouse `isolate_xdg_env` fixture clears the override and
+    the store resolves to the researcher's real `~/.local/state/research-os`,
+    so every run of this test left a proposal there. It had left **61**, which
+    buried the six real ones this machine's `propose list` is supposed to show
+    -- including the human gate an autonomous run was waiting on.
+    """
+
+    monkeypatch.setenv("RESEARCH_OS_STATE_HOME", str(tmp_path / "state"))
 
     from tests.proposal_helpers import proposal_payload
     from tests.research_helpers import init_repo

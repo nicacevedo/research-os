@@ -139,6 +139,25 @@ no fingerprint. Closed under `SandboxMode.REQUIRED`; open otherwise; the fix is
 tamper-evidence over the whole proposal ledger and should be designed for
 promotions and declines together.
 
+### Fixed, found by driving the loop on this project's real research
+
+- **A refused action was planned again by the next cycle.** Each cycle opens a
+  new planner thread seeded only with project identity, so a successor had no
+  way to know what its predecessor had tried. Observed on a real objective: the
+  planner chose `run_local_experiment`, the action correctly refused with
+  `no preregistered design to run; design_experiment must come first`, and the
+  successor planned the identical action. The guard was right and the feedback
+  path was missing — §16's "seven cycles, one cycle's worth of information" in
+  a new form.
+
+  `graphs/cycle.py::_previous_attempt` now reads the parent run's last refused
+  `tool_invocation` and passes `"<action> was REFUSED: <detail>"` to the planner
+  as a new `previous_attempt` field; `prompts.py` gains the instruction
+  paragraph and the planner prompt goes to **version 3**. Verified on the same
+  objective under `planner@3`: it did not repeat the refused action, and
+  concluded `WAIT_HUMAN` — which is correct, because the design it needed was
+  the thing a human had to decide.
+
 ### Changed
 
 - `runtime doctor`'s check-profile row was a divergence warning, then briefly

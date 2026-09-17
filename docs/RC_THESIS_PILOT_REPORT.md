@@ -36,6 +36,12 @@ branch is the strongest base and this branch is taken from it.
 `futex_wait_queue`, and one orphaned `pgserver` from a pytest run a day earlier.
 None was killed. All work was done in a separate worktree.
 
+They are not inert, though: their command lines contain `uv run pytest -q`, so
+`pgrep -f "pytest -q"` matches them forever. Any "is the suite still running?"
+check built on that pattern reports `RUNNING` permanently, which cost one wrong
+diagnosis in this session. Match on the interpreter path
+(`research-os-rc/.venv/bin/python -m pytest`) instead.
+
 **Baseline before any change:** `3521 passed, 18 skipped`.
 
 Commits, in order:
@@ -48,7 +54,20 @@ ae58bac  Make the delegated cost cap bite before the money is spent
 3238ce2  Record the four closures, and the defect the first one exposed
 b6eac27  Make the objective's cost cap survive its own successor cycles
 b39ed62  Repair what the independent architecture review found
+7da6114  Write the branch's closure report
+a78728a  Score the acceptance ledger, including the three rows that are not tested
+98d9023  Record the order-independence and migration evidence
+95d6d29  Record the staleness guard passing on a nine-commit gap
+136d1fc  Tell the planner what the last cycle was refused for
+406f2ce  Give the refusal-feedback finding its own section
+1741c6f  Cover the project ceiling command with CLI tests
 ```
+
+**Final state:** `3596 passed, 18 skipped`, `ruff check` and
+`ruff format --check` clean over 302 files. The linked scientific closure
+report is
+`$THESIS_REPO_DIR/docs/2026/SCIENTIFIC_REPORT.md`, on branch
+`research/2026-reassessment`.
 
 ## B. Beta-gap status
 
@@ -106,15 +125,22 @@ releases earlier.
 
 ```text
 before                                      3521 passed, 18 skipped
-after                                       3592 passed, 18 skipped
-runtime suites, forward order                530 passed  (181.9 s)
-runtime suites, reverse order                530 passed  (173.9 s)
+after                                       3596 passed, 18 skipped   (539.8 s)
+runtime suites, forward order                running at the time of writing
+runtime suites, reverse order                running at the time of writing
+migrations, dev cluster                      15 applied, latest 0015
 migrations from empty                        applied 15 migration(s), fresh cluster
 migrations over a populated 0014             tests/test_runtime_retention.py
 ruff check / ruff format --check              clean
 ```
 
 Commands, verbatim:
+
+Note that `-p no:randomly` does nothing here: `pytest-randomly` is not
+installed, so the default run is collection order and the forward/reverse pair
+is the only order-independence evidence there is. Worth checking rather than
+assuming, because a suite that only ever runs in one order has not been shown
+to be order-independent by running it again.
 
 ```bash
 cd /home/nicacevedo/research/research-os-rc
@@ -125,11 +151,70 @@ uv run --frozen pytest -q $(ls -r tests/test_runtime_*.py)
 RESEARCH_OS_RUNTIME_DSN=... uv run --frozen researchctl runtime migrate
 ```
 
+**Run them through `uv run`, not through `.venv/bin/python -m pytest`.** The
+difference is not cosmetic and it cost a diagnosis in this session. The
+automation tests drive real coder tasks whose acceptance commands are declared
+as bare executables -- `pytest -q` -- and executed as subprocesses. `uv run`
+puts `.venv/bin` on `PATH`; `.venv/bin/python -m pytest` does not, so the
+subprocess resolves nothing and the controller reports
+`required acceptance commands failed: pytest -q` with
+`error='pytest is not on PATH'`. That surfaces as **104 failures across the
+`test_auto_*` suites** that look exactly like a regression in the check
+pipeline and are not one. Confirmed by re-running the same file both ways:
+`.venv/bin/python -m pytest tests/test_auto_repair.py` fails 17 of 33,
+`PATH="$PWD/.venv/bin:$PATH"` passes 33.
+
 +71 tests, none lost, none weakened. Three existing tests were *changed*: two
 to the stronger assertion the fix makes available, and one —
 `test_the_project_ceiling_follows_the_objectives_cap` — **inverted**, because
 it encoded the bricking regression and a passing test for a bug is the thing
 most likely to re-introduce it.
+
+### D.1 A test was writing into the researcher's real proposal store
+
+Found while reading the human gate this pilot was supposed to leave for the
+researcher, which is the only reason it was found at all.
+
+```text
+proposals in the real store            67
+written by one test                    61
+the six real ones, buried              includes PROP-19700101T000000Z-b9c26fcd
+```
+
+`tests/conftest.py::isolate_xdg_env` is autouse and **deletes** the four
+`RESEARCH_OS_*_HOME` overrides. Deleting them does not isolate a test; it
+selects the default, and the default is the researcher's machine.
+`proposals_root()` is `state_home() / "proposals"`, so
+`test_a_capsule_project_still_uses_the_scientific_pipeline` -- which takes only
+`tmp_path` and reaches the proposal store -- appended a proposal to
+`~/.local/state/research-os/proposals` on every run it had ever had. Sixty-one
+of them, burying the real gate in `researchctl propose list`.
+
+Fixed narrowly: that test now relocates `RESEARCH_OS_STATE_HOME` into its own
+`tmp_path`, with the reason in its docstring.
+
+**Not fixed generally, deliberately.** The obvious general fix is to make the
+autouse fixture *set* the four variables into `tmp_path` rather than delete
+them. Two things argue against doing it in this session and both are
+verifiable rather than cautious:
+
+- `tests/test_paths.py` exists to test the default derivation and carries its
+  own autouse fixture that deletes the same variables. A global fixture
+  setting them would be fighting a local fixture clearing them, decided by
+  fixture ordering.
+- The near-equivalent shortcut -- pinning `HOME` globally so every fallback
+  lands under `tmp_path` -- breaks more than it fixes. The automation suites
+  run real `git` and `uv` subprocesses, and both read `HOME` for identity and
+  for the package cache.
+
+The durable fix is a `state_home` fixture required by every test that can
+reach the proposal store, plus a check that the real store is untouched after
+a suite run. That is test-infrastructure work with a full-suite blast radius,
+and it is listed in §N rather than done here.
+
+**The 61 rows are left in place.** They are the researcher's data directory,
+they are unambiguously identifiable by their `/tmp/pytest-of-*` capsule paths,
+and deleting them is not this session's call to make.
 
 ## E. Crash and idempotency
 
@@ -250,12 +335,29 @@ lineage → cycle 1 → grounded twelve-item proposal →
 `WAITING_FOR_SCIENTIFIC_DECISION`. No manual orchestration command between
 them.
 
-**One gap found by doing it.** On a second objective the planner chose
-`run_local_experiment`, the action correctly refused —
+**One gap found by doing it, and closed.** On a second objective the planner
+chose `run_local_experiment`, the action correctly refused —
 `no preregistered design to run; design_experiment must come first` — and the
 successor cycle, a new thread seeded only with identity, planned the identical
-action again. The guard is right; the feedback path is missing. This is §16's
-"seven cycles, one cycle's worth of information" in a new form.
+action again. The guard was right; the feedback path was missing. This was
+§16's "seven cycles, one cycle's worth of information" in a new form.
+
+Fixed by giving the planner what the last cycle was refused for:
+`graphs/cycle.py::_previous_attempt` reads the parent run's last refused
+`tool_invocation` and passes `"<action> was REFUSED: <detail>"` as a new
+`previous_attempt` field; `prompts.py` carries the instruction paragraph and
+the planner prompt goes to version 3.
+
+**Verified on the real project, not a fixture.** `RRUN-20260917T111632Z-227d00d8`
+re-ran the same objective under `planner@3`. It did not repeat the refused
+action. It concluded `WAIT_HUMAN` /
+`WAITING_FOR_SCIENTIFIC_DECISION` — the honest answer, since the
+design it needed was the thing a human had to decide — at a cost of
+0.262374 USD across two model calls.
+
+One caveat on the strength of that evidence: it is a single run, and
+"escalated instead of repeating" is weaker than "planned the action that was
+actually missing". The regression protecting it is a unit test, not this run.
 
 ## M. Final architecture verdict
 
@@ -280,18 +382,47 @@ human promotion actually performed.
 
 `FULL_AUTONOMOUS_RESEARCH_OS_READY` additionally requires the sparse-regression
 project to reach a defensible terminal state without routine human
-choreography. It has not: `EXP-0001` is 7 of 30 cells and the human gate is
-open.
+choreography. It has not, though it is closer than the last revision of this
+line: `EXP-0001` is now **30 of 30 cells**, executed end to end by Research OS
+in a worktree pinned at the freezing commit, and the human gate is still open.
+The gate being open is the system working; the routine choreography around it
+is what is not yet absent.
 
-**One thing this cycle is entitled to claim that the last one was not.** The
-brief's §35 asks whether Research OS can "falsify, pivot or stop rather than
-merely continue". On this project it did all three. The literature audit closed
-the primary novelty gate on a 2000 paper; the benchmark's preregistered rule
-**rejected** `HYP-0006`, a hypothesis this session wrote; and the scientific
-report's recommendation is TRACK F, no paper. None of that was steered.
+**One thing this cycle is entitled to claim that the last one was not — with
+one leg of it withdrawn.** The brief's §35 asks whether Research OS can
+"falsify, pivot or stop rather than merely continue".
+
+- *Falsify.* `HYP-0005` is **rejected**, and by the strongest available route:
+  not a new measurement but the researcher's own committed 2023 CSVs
+  (`EVI-0001`), which show two of its three configurations stopping below
+  `max_iter` and all three matching the CG objective to better than 5e-08. The
+  capsule refused to record the rejection until qualifying evidence existed,
+  which is the invariant doing its job.
+- *Stop.* The literature audit closed the primary novelty gate on a 2000 paper,
+  and the scientific report's recommendation is TRACK F, no paper.
+- *Pivot.* The benchmark's headline changed under adversarial review from a
+  claim about accuracy to a claim about speed at a matched objective, and the
+  recommendation survived on better evidence.
+
+**Withdrawn:** an earlier revision of this section also claimed the
+preregistered rule "**rejected** `HYP-0006`, a hypothesis this session wrote".
+It did not. The analysis script had printed `HYP-0006`'s id over a count of
+recorded Lagrangian bounds, and `HYP-0006` is about whether the method
+*terminates* through the pricing test — a different claim that the run detail
+does not record. `HYP-0006` is back to open and the label is fixed. The
+uncomfortable part is that this was the example this report reached for first,
+and it was the one that did not hold; it was caught by a reviewer attacking the
+science, not by the runtime and not by me.
 
 ## N. Remaining genuine blockers
 
+0. **Test isolation selects the real machine by default.** Not a release
+   blocker and listed first because it is the cheapest of these to fix and the
+   only one this host can fix at all. `isolate_xdg_env` deletes the four path
+   overrides instead of relocating them, so any test that reaches a Research OS
+   directory without asking for a fixture writes to the researcher's own; one
+   did, 61 times (§D.1). Wanted: a `state_home` fixture that every such test
+   must take, and a post-suite assertion that the real store is unchanged.
 1. **No containment.** Needs a host that permits unprivileged user namespaces,
    or rootless Podman. Unchanged.
 2. **No Slurm.** Unchanged.
