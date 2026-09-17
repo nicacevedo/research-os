@@ -56,8 +56,8 @@ from research_os.runtime.models import InvocationStatus, ToolInvocation
 LOG = logging.getLogger("research_os.runtime.idempotency")
 
 INVOCATION_COLUMNS = (
-    "invocation_id, idempotency_key, run_id, work_id, kind, request, status, result, "
-    "error, attempts, owner, started_at, finished_at"
+    "invocation_id, idempotency_key, run_id, project_id, work_id, kind, request, "
+    "status, result, error, attempts, owner, started_at, finished_at"
 )
 
 
@@ -167,8 +167,12 @@ class InvocationLedger:
             row = conn.execute(
                 f"""
                 insert into tool_invocations
-                    (invocation_id, idempotency_key, run_id, work_id, kind, request, owner)
-                values (%(invocation_id)s, %(key)s, %(run_id)s, %(work_id)s, %(kind)s,
+                    (invocation_id, idempotency_key, run_id, project_id, work_id,
+                     kind, request, owner)
+                values (%(invocation_id)s, %(key)s, %(run_id)s,
+                        (select project_id from research_runs
+                          where run_id = %(run_id)s),
+                        %(work_id)s, %(kind)s,
                         %(request)s, %(owner)s)
                 on conflict (idempotency_key) do nothing
                 returning {INVOCATION_COLUMNS}

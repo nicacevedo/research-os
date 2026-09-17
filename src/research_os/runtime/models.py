@@ -272,6 +272,14 @@ class ToolInvocation(_Record):
     invocation_id: str
     idempotency_key: str
     run_id: str | None
+    #: Whose side effect this was, kept independently of the run.
+    #:
+    #: A run is a unit of work and can be pruned; the record that an externally
+    #: visible effect was claimed is provenance and must survive it. Before
+    #: 0015 the only route from this row to a project was the run, so pruning
+    #: the run made the effect unattributable. Derived at insert from the run,
+    #: so it cannot disagree with it.
+    project_id: str | None = None
     work_id: str | None
     kind: str
     request: dict[str, Any] = Field(default_factory=dict)
@@ -287,6 +295,9 @@ class ToolInvocation(_Record):
 class ModelCall(_Record):
     call_id: str
     run_id: str | None
+    #: Whose money this was. See :attr:`ToolInvocation.project_id`; the reason
+    #: is the same and the consequence here is cost attribution.
+    project_id: str | None = None
     work_id: str | None
     invocation_id: str | None
     provider: str

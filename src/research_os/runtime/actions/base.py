@@ -123,8 +123,11 @@ def latest_artifact(
     job and always returned "nothing to do" -- which meant the pipeline could
     write prose and never audit it.
 
-    The durable record is the answer. Artifacts are linked to their run when
-    produced, and runs belong to projects.
+    The durable record is the answer. Artifacts carry the project they were
+    produced for, on the link itself since ``0015``, with the run left-joined
+    for links written before that. The project has to be reachable without the
+    run, because a run is a unit of work that retention may prune and an
+    artifact is not.
     """
 
     with context.db.tx() as conn:
@@ -132,9 +135,9 @@ def latest_artifact(
             """
             select l.artifact_id
             from artifact_links l
-            join research_runs r on r.run_id = l.run_id
+            left join research_runs r on r.run_id = l.run_id
             join artifacts a on a.artifact_id = l.artifact_id
-            where r.project_id = %(project_id)s
+            where coalesce(l.project_id, r.project_id) = %(project_id)s
               and a.role like %(prefix)s
             order by l.created_at desc
             limit 1

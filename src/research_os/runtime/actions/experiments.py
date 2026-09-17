@@ -397,9 +397,19 @@ def _preregistration_rows(
     document, so the second question is the old bounded scan, and the caller
     still has to read each one to know what it froze.
 
-    Both are scoped to the project through the run link. A preregistration from
-    another project is not this project's commitment, and the earliest version
-    of this lookup did not say so.
+    Both are scoped to the project by ``artifact_links.project_id``, with a
+    left join to the run for links written before ``0015`` added that column. A
+    preregistration from another project is not this project's commitment, and
+    the earliest version of this lookup did not say so.
+
+    **The scoping used to go through the run, and that made pruning fatal.** It
+    was ``join research_runs r on r.run_id = l.run_id``, so deleting a run --
+    an ordinary retention action -- removed the only path from the artifact to
+    its project, and this returned nothing. The guard then refused the
+    experiment permanently, with the preregistration document sitting intact in
+    the content-addressed store. A final adversarial review of the previous
+    release executed that sequence; ``0015`` is the fix and this is the reader
+    that uses it.
     """
 
     with context.db.tx() as conn:
@@ -408,8 +418,9 @@ def _preregistration_rows(
             select distinct a.artifact_id, a.created_at
             from artifacts a
             join artifact_links l on l.artifact_id = a.artifact_id
-            join research_runs r on r.run_id = l.run_id
-            where a.role = %(role)s and r.project_id = %(project_id)s
+            left join research_runs r on r.run_id = l.run_id
+            where a.role = %(role)s
+              and coalesce(l.project_id, r.project_id) = %(project_id)s
             order by a.created_at desc
             """,
             {"role": preregistration_role(digest), "project_id": project_id},
@@ -419,8 +430,9 @@ def _preregistration_rows(
             select distinct a.artifact_id, a.created_at
             from artifacts a
             join artifact_links l on l.artifact_id = a.artifact_id
-            join research_runs r on r.run_id = l.run_id
-            where a.role = 'preregistration' and r.project_id = %(project_id)s
+            left join research_runs r on r.run_id = l.run_id
+            where a.role = 'preregistration'
+              and coalesce(l.project_id, r.project_id) = %(project_id)s
             order by a.created_at desc
             limit %(window)s
             """,
@@ -1079,10 +1091,11 @@ def interpret_results(
         return ActionOutcome.failed(
             f"no preregistration is reachable for {job.job_id} (spec "
             f"{job.spec_digest[:12]}), so there are no prespecified criteria to "
-            f"compare the result against. If research runs have been pruned "
-            f"from this database, the preregistration artifact may still exist "
-            f"with no link naming it: the lookup is scoped through "
-            f"artifact_links, whose rows are deleted with their run",
+            f"compare the result against. The lookup is scoped by "
+            f"artifact_links.project_id, which survives run pruning from "
+            f"schema 0015 on; a link written before that and whose run has "
+            f"since been deleted is unreachable, and that is the one case "
+            f"where the document may exist with nothing naming it",
             failure_class=FailureClass.ARTIFACT_MISSING,
             data={
                 "interpreted": False,

@@ -80,7 +80,8 @@ JOB_COLUMNS = (
     "run_dir, status, failure_class, exit_code, detail, submitted_at, last_polled_at, finished_at"
 )
 MODEL_CALL_COLUMNS = (
-    "call_id, run_id, work_id, invocation_id, provider, model, role, criticality, "
+    "call_id, run_id, project_id, work_id, invocation_id, provider, model, role, "
+    "criticality, "
     "independence_group, independence, independence_note, prompt_version, "
     "input_digest, output_artifact_id, tokens_in, tokens_out, cost_usd, latency_ms, "
     "status, error, created_at"
@@ -728,11 +729,15 @@ class RuntimeStore:
             row = conn.execute(
                 f"""
                 insert into model_calls
-                    (call_id, run_id, work_id, invocation_id, provider, model, role,
+                    (call_id, run_id, project_id, work_id, invocation_id, provider,
+                     model, role,
                      criticality, independence_group, independence, independence_note,
                      prompt_version, input_digest, output_artifact_id, tokens_in,
                      tokens_out, cost_usd, latency_ms, status, error)
-                values (%(call_id)s, %(run_id)s, %(work_id)s, %(invocation_id)s, %(provider)s,
+                values (%(call_id)s, %(run_id)s,
+                        (select project_id from research_runs
+                          where run_id = %(run_id)s),
+                        %(work_id)s, %(invocation_id)s, %(provider)s,
                         %(model)s, %(role)s, %(criticality)s, %(independence_group)s,
                         %(independence)s, %(independence_note)s,
                         %(prompt_version)s, %(input_digest)s, %(output_artifact_id)s,

@@ -305,9 +305,18 @@ class FilesystemArtifactStore:
             return
         with self._store.db.tx() as conn:  # type: ignore[attr-defined]
             conn.execute(
+                # `project_id` is derived from the run here rather than passed
+                # in, so it cannot disagree with it and no caller has to
+                # remember. It is what keeps this link findable after the run
+                # is pruned: the preregistration guard scopes by project, and
+                # before 0015 it could only reach the project through the run.
                 """
-                insert into artifact_links (artifact_id, run_id, work_id, role)
-                values (%(artifact_id)s, %(run_id)s, %(work_id)s, %(role)s)
+                insert into artifact_links
+                    (artifact_id, run_id, work_id, role, project_id)
+                values (
+                    %(artifact_id)s, %(run_id)s, %(work_id)s, %(role)s,
+                    (select project_id from research_runs where run_id = %(run_id)s)
+                )
                 on conflict do nothing
                 """,
                 {
