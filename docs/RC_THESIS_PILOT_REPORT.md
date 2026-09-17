@@ -107,9 +107,22 @@ releases earlier.
 ```text
 before                                      3521 passed, 18 skipped
 after                                       3592 passed, 18 skipped
-runtime suites, forward order                  see §D below
-runtime suites, reverse order                  see §D below
-ruff check / ruff format --check                clean
+runtime suites, forward order                530 passed  (181.9 s)
+runtime suites, reverse order                530 passed  (173.9 s)
+migrations from empty                        applied 15 migration(s), fresh cluster
+migrations over a populated 0014             tests/test_runtime_retention.py
+ruff check / ruff format --check              clean
+```
+
+Commands, verbatim:
+
+```bash
+cd /home/nicacevedo/research/research-os-rc
+uv run --frozen ruff check . && uv run --frozen ruff format --check .
+uv run --frozen pytest -q
+uv run --frozen pytest -q tests/test_runtime_*.py
+uv run --frozen pytest -q $(ls -r tests/test_runtime_*.py)
+RESEARCH_OS_RUNTIME_DSN=... uv run --frozen researchctl runtime migrate
 ```
 
 +71 tests, none lost, none weakened. Three existing tests were *changed*: two
