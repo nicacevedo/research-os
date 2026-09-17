@@ -262,6 +262,43 @@ The catalogue now carries each parameter's type, requiredness, bounds, choices
 and description, and `experimentalist@2` states the relative-in-tree-path rule
 outright, naming it as the mistake that has actually been made here.
 
+### D.4a Defect four, found by running the thing
+
+The daemon run in §E.5 exposed a second instance of the same defect class, and
+this one cost money. In ninety minutes:
+
+```text
+6 x cycle.design_experiment   ok=True
+    "preregistered a test of HYP-0002 using the declared command adjudicate-pricing"
+
+6 preregistration artifacts -> 6 DISTINCT spec digests
+    bf3ae182…  fa2628ad…  b24192d5…  bcc16b52…  19dc3073…  90dcfc0e…
+    every one of them tests_hypothesis: HYP-0002
+
+project spend 3.53 -> 7.57 USD
+```
+
+None of it wrong, none of it new. The mechanism is the science-context lag
+again: `design_experiment` is deliberately absent from `FINDING_FOR_ACTION` —
+"a specification is a plan, and its preregistration artifact is already durable
+and already looked up by digest" — but *looked up by digest* only helps a
+caller who has the digest, and a fresh planner does not. The frontier
+meanwhile goes on reporting `HYP-0002` as untested, which is correct, because a
+preregistration is not a capsule object and only a person can make it one. So
+the planner designed again. Deduplication by digest could not catch it because
+each design differed slightly.
+
+Preregistered designs are now the fourth category in the planner's
+noncanonical context, bounded at six, each labelled noncanonical and each
+carrying **the hypothesis it tests** — the field that actually stops the loop,
+because "a design for HYP-0002 already exists" is the sentence the planner
+needs and a digest does not say it. `planner@5` states the rule outright, and
+in the same breath that a preregistered hypothesis is still listed as untested
+in the frontier and that this is not a contradiction.
+
+Worth stating plainly: this defect was not found by reading the code. It was
+found by starting the daemon and watching what it spent.
+
 ### D.5 The lifecycle tests
 
 `tests/test_runtime_science_context.py`, 22 tests, covering the six properties
