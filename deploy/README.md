@@ -7,11 +7,19 @@ into a system location, enables a service, or reloads a service manager.
 |---|---|
 | `researchd.service` | a systemd **user** unit for the control plane. Its own header has the install steps. |
 | `researchd-db.service` | a systemd **user** unit for the disposable local PostgreSQL. Only for a development or single-workstation setup; a production runtime points at a PostgreSQL somebody backs up and does not install this. |
+| `apparmor-bwrap` | an AppArmor profile granting bubblewrap the `userns` permission, which is what this class of machine needs before Research OS can contain an experiment at all. Needs root. Its own header has the install steps and says what it does not do. |
 
-Installing both, plus `loginctl enable-linger`, is what makes a reboot not
-require the researcher to remember anything. Without linger the control plane
-stays stopped until the next login; without `researchd-db` it comes back and
-retries against a cluster nobody started. Neither is installed for you.
+Installing the two units, plus `loginctl enable-linger`, is what makes a
+reboot not require the researcher to remember anything. Without linger the
+control plane stays stopped until the next login; without `researchd-db` it
+comes back and retries against a cluster nobody started.
+
+`apparmor-bwrap` is a different kind of prerequisite: without it this machine
+has no working containment backend, so the runtime refuses to *execute* a
+model-written experiment at all -- it will design and preregister one and then
+stop. That refusal is correct and is not a bug to route around.
+
+None of the three is installed for you.
 
 Two boundaries worth restating, both from `AGENTS.md` and `SECURITY.md`:
 

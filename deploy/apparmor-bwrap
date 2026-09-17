@@ -1,0 +1,58 @@
+# AppArmor profile granting bubblewrap the `userns` permission.
+#
+# This file is shipped, not installed. Nothing in this repository copies it
+# into /etc or reloads AppArmor: it needs root, and granting a binary the right
+# to create user namespaces is the machine owner's decision.
+#
+# Why it is needed. Research OS refuses to run a model-written experiment
+# without OS containment (`SandboxMode.REQUIRED`), and on this class of machine
+# containment is unavailable for one specific reason:
+#
+#   $ sysctl kernel.apparmor_restrict_unprivileged_userns
+#   kernel.apparmor_restrict_unprivileged_userns = 1
+#   $ unshare --user --map-root-user true
+#   unshare: write failed /proc/self/uid_map: Operation not permitted
+#
+# Ubuntu 24.04 restricts unprivileged user namespaces through AppArmor. bwrap
+# 0.9.0 is installed and working; it simply may not create a namespace. The
+# blunt fix is
+#
+#   sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+#
+# which turns the restriction off for every binary on the machine. This profile
+# is the targeted alternative: it grants the permission to bwrap alone and
+# leaves the restriction in place for everything else.
+#
+# It follows the convention Ubuntu itself uses for this on this machine -- see
+# /etc/apparmor.d/thunderbird, /etc/apparmor.d/crun and six others, all of
+# which are `flags=(unconfined)` profiles whose only purpose is to name the
+# binary and grant `userns`.
+#
+# To install it, deliberately:
+#
+#   sudo install -m 644 deploy/apparmor-bwrap /etc/apparmor.d/bwrap
+#   sudo apparmor_parser -r /etc/apparmor.d/bwrap
+#   unshare --user --map-root-user true && echo "user namespaces now permitted"
+#   uv run --frozen researchctl runtime doctor      # should stop reporting uncontained
+#
+# To undo it:
+#
+#   sudo rm /etc/apparmor.d/bwrap
+#   sudo systemctl reload apparmor
+#
+# What this does NOT do. `flags=(unconfined)` means this profile confines
+# nothing; it exists to lift the userns restriction for one binary. The
+# containment Research OS then gets is bubblewrap's, not AppArmor's, and
+# SECURITY.md states that boundary in full. It is a real OS boundary -- mount,
+# PID, network and user namespaces -- and it is not a substitute for not
+# running code you have reason to distrust.
+
+abi <abi/4.0>,
+include <tunables/global>
+
+profile bwrap /usr/bin/bwrap flags=(unconfined) {
+  userns,
+
+  # Site-specific additions and overrides. See local/README for details.
+  include if exists <local/bwrap>
+}
