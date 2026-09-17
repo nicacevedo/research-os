@@ -2,6 +2,103 @@
 
 All notable changes to Research OS. Dates are release dates.
 
+## [Unreleased] — rc/thesis-pilot
+
+**Not released.** Branched from `integration/autonomous-runtime-vnext` at
+`b6109c1`. This entry closes the four correctness gaps
+`docs/RELEASE_CANDIDATE_REPORT.md` §J left open, and records one defect that
+closing the first of them exposed.
+
+### Fixed
+
+- **One project, one acceptance profile, on every path.** v1.1 gave a project
+  `projects.<id>.check_profiles` and one caller honoured it: `researchctl
+  research run` resolved a task's named checks against them, while anything
+  reaching `AutomationController` without a plan — which is every autonomous
+  coding cycle — ran acceptance commands the automation planner had written.
+  Closed in `_accept_plan`, the one place a plan becomes work orders however it
+  arrived. A project that *explicitly* declares check profiles has them as the
+  gate; a plan whose commands are already a subset of the declared argv stands,
+  which preserves the research layer's deliberate narrowing. Discovery is
+  unchanged: it is a guess at an unconfigured project and has no business
+  overruling a planner that narrowed a command to the change it made. The
+  project id is read from the capsule by path (`resolve_project_from_path`),
+  because a path is the only thing every caller has.
+
+- **The runtime's coding action could never succeed.**
+  `canonical_fingerprint` hashed `git show-ref` into one opaque `<git-refs>`
+  entry and compared it before and after the pipeline — and worktree isolation
+  creates a branch in the canonical repository, because that is what worktree
+  isolation *is*. So every honest coding run ended with a ref the guard had not
+  seen and was failed as `POLICY_REFUSED`, with the branch, the diff and a
+  passing review all on disk. It survived four adversarial reviews because the
+  only test of that handler substituted a controller that creates no worktree.
+  The fingerprint is now one entry per ref, which is strictly stronger — a
+  refusal names the ref that moved — and makes the narrow exemption
+  expressible: refs under `refs/heads/automation/<reserved run id>/`, a
+  namespace named before the pipeline starts and recomputable by the attempt
+  that adopts a crashed predecessor's branch. A new branch outside it, a moved
+  ref, a deleted one and a capsule write all still fail.
+  `tests/test_runtime_coding_pipeline.py` is the coverage whose absence was the
+  defect.
+
+- **A researcher can decline a proposal.** `ProposalStore` recorded promotions
+  and nothing else, so "I read this and I do not want it" was the same state as
+  "nobody has opened this yet" — and that is the question the cross-cycle
+  deduplication asks. A declined proposal stayed pending forever, so the
+  runtime kept offering it as the answer to every cycle with the same grounding
+  and never proposed about those findings again. `DeclineRecord`,
+  `declines.jsonl`, `decided_item_ids()`, and `researchctl propose decline`,
+  which refuses a non-interactive terminal exactly as `promote` does and
+  requires a reason. `test_no_runtime_module_declines_a_proposal` asserts
+  structurally that nothing under `research_os.runtime` can reach the writer:
+  a runtime able to close its own unanswered proposals could report an empty
+  queue it produced by refusing itself.
+
+- **Pruning a run no longer destroys the record of what it caused**
+  (schema 0015). `artifact_links`, `tool_invocations` and `model_calls` all
+  cascaded from `research_runs`. The consequential one was `artifact_links`:
+  the preregistration guard reached the project *through the run*, so deleting
+  a run removed the only link naming its preregistration and the guard then
+  refused that experiment permanently, with the document intact in the
+  content-addressed store. Each of the three now carries its own `project_id`,
+  backfilled from the run and derived inside each insert so no call site has to
+  remember it, with a cascading foreign key so deleting a *project* still
+  erases everything. `run_id` keeps its value rather than becoming null:
+  `artifact_links_identity_idx` is unique over a `coalesce(run_id, '')`, and
+  content addressing makes two runs storing identical bytes under one role
+  ordinary, so nulling it would collapse two rows onto one identity and
+  PostgreSQL would refuse the second delete. A prune that cannot run is worse
+  than a label that outlives its row.
+
+- **The delegated cost cap bites before the money is spent.**
+  `research_os.runtime.spend` wraps the provider adapters, which is the one
+  chokepoint both delegated controllers already pass through, so each call
+  reserves a MODEL_CALLS unit and a per-call MODEL_COST_USD ceiling *before*
+  the provider is asked and settles at the reported cost afterwards. A refused
+  reservation raises `BudgetExceededError` — an `AutomationError`, so both
+  controllers already fail the run on it terminally — before the call happens.
+  The previous release's `charge_all` recorded the spend afterwards, past the
+  limit when it must, which made the ledger true and was not a budget.
+  `charge_delegated_spend` keeps the provenance rows it alone can write and
+  becomes a reconciliation for calls the authority did not see, charging the
+  difference rather than the total. The residual is stated rather than hidden:
+  no provider quotes a price before it bills, so one call can exceed its
+  ceiling; the ceiling then ratchets to the largest observed cost, bounding the
+  excess by one call instead of repeating it.
+
+### Changed
+
+- `runtime doctor`'s check-profile row was a divergence warning and is now a
+  report of the resolved commands per project.
+- `RUNTIME_SCHEMA_VERSION` is `0015`.
+
+### Tests
+
+`3521 passed, 18 skipped` before; `3580 passed, 18 skipped` after, with the
+runtime suites green in both orders (519 each way). No existing test was
+weakened; two were updated to the stronger assertion the fix makes available.
+
 ## [Unreleased] — integration/autonomous-runtime-vnext
 
 **Not released.** Not merged, not tagged. The package version is deliberately

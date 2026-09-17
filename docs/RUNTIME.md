@@ -849,6 +849,75 @@ publish_externally              -> submit it yourself
 `tests/test_runtime_registry.py` asserts that no `A2` action has a handler. That
 is the property, stated as a test rather than as a promise.
 
+## 15a. The four gaps the beta left open, and what closing them found
+
+`docs/RELEASE_CANDIDATE_REPORT.md` §J listed five pieces of remaining
+substantive work and called the release `AUTONOMOUS_RUNTIME_BETA`. Four of
+them are closed on `rc/thesis-pilot`; the fifth (giving `design_experiment` an
+executor it can use) is an infrastructure question, not code.
+
+**One project, one acceptance profile.** `AutomationController._accept_plan`
+is the one place a plan becomes work orders, whoever wrote it, so it is the
+only place the substitution can be made once. A project that explicitly
+declares `check_profiles` gates every path on them. A plan whose commands are
+already a subset of the declared argv is left alone, which is what preserves
+the research layer's narrowing: a task that named `required_checks: [tests]`
+had it resolved from these same profiles, so its one command stands. The rule
+is about the *commands*, not about the caller, because a check on the caller
+is a check a future caller can fail to make.
+
+**And the defect that closing it exposed.** Driving `run_coding_task` against a
+real `AutomationController` — which no test had done — fails
+`POLICY_REFUSED`, every time. `canonical_fingerprint` hashed `git show-ref`
+into one `<git-refs>` entry, and worktree isolation creates a branch in the
+canonical repository, so every honest coding run looked like an escape. The
+runtime's only code-writing capability could not succeed, and the guard that
+detected it had survived four adversarial reviews because the one test of that
+handler used a controller that creates no worktree. **An escape detector that
+fires on every honest run is not a detector**, and the general lesson is the
+one this document keeps relearning: a double that removes the mechanism under
+test removes the test.
+
+The fingerprint is now one entry per ref. Strictly stronger — a refusal names
+what moved instead of the word "refs" — and it makes the exemption expressible:
+`refs/heads/automation/<reserved run id>/`, named from the reservation before
+the pipeline starts, so the attempt that adopts a crashed predecessor's branch
+computes the same namespace. Anything else still fails.
+
+**Decline.** A proposal lifecycle with only one half of a decision in it made
+"I read this and rejected it" indistinguishable from "nobody has looked", and
+the cross-cycle deduplication asks exactly that question — so a rejected
+proposal stayed pending forever and the runtime never proposed about those
+findings again. `researchctl propose decline` requires a TTY and a reason, and
+`test_no_runtime_module_declines_a_proposal` asserts structurally that nothing
+here can reach the writer. The authority is not the same as promotion's and it
+is not lesser: a decline writes nothing into a capsule, but it *closes* a
+question, and a runtime able to close its own unanswered proposals could report
+an empty queue it produced by refusing itself.
+
+**Retention.** 0015 gives `artifact_links`, `tool_invocations` and
+`model_calls` their own `project_id`, so pruning a run stops destroying the
+record of what the run caused. The consequential one was `artifact_links`: the
+preregistration guard reached the project through the run, so a prune made the
+guard refuse that experiment permanently while the document sat intact in the
+content-addressed store. `run_id` keeps its value rather than becoming null,
+because `artifact_links_identity_idx` is unique over `coalesce(run_id, '')` and
+nulling it can collapse two surviving rows onto one identity, which makes
+PostgreSQL refuse the delete. A prune that cannot run is worse than a label
+that outlives its row.
+
+**Delegated budget.** `research_os.runtime.spend` wraps the provider adapters.
+Both delegated controllers take a registry and call `invoke` once per model
+call, so the adapter is the chokepoint they already share, and wrapping it
+needs no change to either and covers any third controller written later. Each
+call reserves before the provider is asked; a refused reservation raises
+`BudgetExceededError` *before* the call, which is the whole difference between
+a budget and a report. `charge_delegated_spend` keeps the provenance rows it
+alone can write and becomes a reconciliation for calls the authority did not
+see. The residual is that no provider quotes a price before it bills, so one
+call can exceed its ceiling; the ceiling then ratchets to the largest observed
+cost, bounding the excess by one call rather than repeating it.
+
 ## 16. What two adversarial reviews and a real pilot changed
 
 Recorded here because the findings are more useful than the fixes, and because
