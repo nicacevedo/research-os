@@ -11,6 +11,62 @@ closing the first of them exposed.
 
 ### Fixed
 
+- **A finding could not carry what it found.** A `critique_hypotheses` cycle
+  wrote an eleven-kilobyte artifact holding six substantive alternative
+  explanations, recorded a finding, and linked the provenance — and the
+  finding's only text was the handler's own sentence, `6 alternative
+  explanation(s) for 5 target(s)`. Forty-four characters was all the proposal
+  layer could read. The proposal grounded in it says so in its own `PR-002`
+  ("Only that summary is available to this proposal; the text of the six
+  alternatives is not") and lists the finding's full text under
+  `required_inputs`. The worker refusing to reason from content it could not
+  see was correct; the architecture around it was not. Findings now carry a
+  bounded **producer-authored** excerpt: the handler that built the structure
+  chooses what to quote, because it is the only layer that knows which part of
+  its own result is the finding, and the generic prompt layer still reads no
+  artifacts. It travels in the existing structured result rather than in a
+  parallel evidence channel, is capped at `MAX_EXCERPT_CHARS`, is rendered
+  fenced and labelled noncanonical, and enters both the finding digest and the
+  grounding digest — but only when non-empty, so every finding recorded before
+  this keeps the digest it was already cited under. Schema `0016`.
+
+- **An unresolved hypothesis is not automatically an experiment.** The live
+  runtime designed six experiments for HYP-0002 — a biconditional about when an
+  infimum is finite — at about four dollars over ninety minutes. `planner@5`
+  could not stop it, because each design had a different spec digest and digest
+  deduplication saw six distinct pieces of work. They were six distinct pieces
+  of the *wrong* work: no measurement decides a biconditional.
+  `research_os.runtime.adjudication` classifies a target from the project's own
+  statement and falsification clause, weighting the falsifier twice because the
+  falsifier is where the researcher already wrote down what would settle the
+  thing. It is deterministic, never from a model, carries the literal words it
+  matched, and writes nothing — an adjudication kind is planning metadata about
+  a capsule object, not a claim about one. `planner@6` is shown it; and
+  `validate_plan` enforces it, refusing `design_experiment` when nothing a plan
+  addresses could be settled by measurement, and refusing `derive_mathematics`
+  for a target already derived — by proposition, not by digest, which is the
+  lesson `planner@5` had to learn. Refusals name the action that *would* answer
+  the question. `derive_mathematics` and `deriver@1` are the destination; its
+  outcome enum has no `SUPPORTED`, and its schema requires a suggested
+  numerical witness to state what it would *not* establish.
+
+- **A vulnerable sandbox could be reported as an available backend.**
+  `SandboxProbe.available` was the result of running the technology, which
+  cannot see a version-borne flaw: a bubblewrap affected by CVE-2026-87766 runs
+  perfectly and contains perfectly, right up until its setup path is pointed at
+  a symlink. The probe now reports four facts separately — executable present,
+  namespace capability, security eligibility, containment validated — and
+  `available_backend()` requires the middle two. `SECURITY_FLOORS` records the
+  floor per technology with its advisory, an undeterminable version is treated
+  as unsafe, and a binary claiming to be at bubblewrap's floor while still
+  setuid is refused as the contradiction it is. Containment validation is
+  recorded by the adversarial suite and keyed to the binary's content hash, so
+  an upgrade invalidates it; it is never inferred from a version.
+  `deploy/apparmor-bwrap` refuses to be installed against a vulnerable binary,
+  and its acceptance test no longer uses `unshare --user --map-root-user`,
+  which tests a different binary under a different profile and can pass while
+  bwrap still fails.
+
 - **One project, one acceptance profile, on every path.** v1.1 gave a project
   `projects.<id>.check_profiles` and one caller honoured it: `researchctl
   research run` resolved a task's named checks against them, while anything

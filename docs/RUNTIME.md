@@ -472,6 +472,26 @@ produced by this action, in this cycle, resting on these artifacts". It has no
 status a person could accept, no acceptance rule, never reaches `.research/`,
 and participates in no scientific digest.
 
+A finding also carries a bounded **producer-authored excerpt**, and that word
+is the design. A `critique_hypotheses` cycle wrote an eleven-kilobyte artifact
+holding six substantive alternatives and the finding said `6 alternative
+explanation(s) for 5 target(s)` -- forty-four characters, and all the proposal
+layer could read. The proposal grounded in it reported the hole itself, in its
+own `PR-002`: "Only that summary is available to this proposal; the text of the
+six alternatives is not." Refusing to reason from invisible content was right.
+Hiding the content was the defect.
+
+The excerpt is chosen by the handler that produced the result, not scraped by
+the prompt layer. An artifact is bytes with a media type; a generic layer
+reading them would have to guess which part of a ten-kilobyte document is the
+finding, for every schema any handler might ever write. The handler already
+knows -- it built the structure a moment earlier. It travels in the existing
+structured result under one reserved key, so it inherits the checkpointing and
+the idempotency ledger rather than needing its own. It is bounded, fenced,
+labelled noncanonical in the entry that carries it, and in both the finding
+digest and the grounding digest -- but only when non-empty, so every finding
+recorded before excerpts existed keeps the digest it was already cited under.
+
 What it buys is auditable grounding. The v1 proposal grounding allowlist has
 always had a `finding_ids` field and has always refused a citation to an id it
 was not given -- and nothing ever supplied one, so an autonomous result reached
@@ -1032,6 +1052,98 @@ different action, and say which.
 The parent's refusal only, and clipped. One cycle back stops the immediate
 repetition; a growing transcript of failures in a planning prompt is how a
 planner starts reasoning about its own failures instead of about the project.
+
+## 15d. An unresolved target is not automatically an experiment
+
+The second thing running the system on real work found, after §15c, and the
+more expensive one.
+
+```text
+HYP-0002   "the pricing subproblem has a finite infimum if and only if
+            ||X' psi||_inf <= lambda_1"
+planned    design_experiment, six times, six distinct spec digests
+cost       about four dollars, ninety minutes
+moved      nothing
+```
+
+No measurement decides a biconditional. `planner@5` could not stop it, and it
+is worth being precise about why: `planner@5` closed the *digest* loop -- it
+stopped a seventh preregistration of a design the project already had, by
+showing the planner which hypothesis each stored design tested rather than its
+digest. Every one of those six designs was different. Digest deduplication saw
+six distinct pieces of work, correctly, and they were six distinct pieces of
+the wrong work.
+
+```text
+unresolved hypothesis  !=  empirical experiment required
+```
+
+**Where the classification comes from.** `research_os/runtime/adjudication.py`
+reads the target's own `statement` and `falsification`, weighting the falsifier
+twice, because the falsifier is the sentence in which the researcher already
+wrote down what would settle the thing. A hypothesis saying "Prove that ... for
+every dual point the algorithm can reach" has *stated* that it is adjudicated
+by proof. Reading that is not inference.
+
+It is deterministic. The same object classifies the same way on every host and
+in every cycle, and the verdict carries the literal words it matched, so a
+person who disagrees can argue with the evidence rather than with an oracle.
+Against the thesis capsule as committed, all seven hypotheses classify
+correctly with no tuning.
+
+**What it must never do, and structurally cannot.** An `AdjudicationKind` is
+planning metadata about a capsule object. It is not stored in the capsule, it
+participates in no scientific digest, it has no status a person could accept,
+and it cannot retire, support or refute anything. It decides which *verb* the
+runtime reaches for. If it is wrong the cost is a cycle spent on the wrong kind
+of work -- a cost the system already pays -- and never a false scientific
+statement.
+
+Adding an `adjudication:` field to `Hypothesis` was the alternative, and it
+would have meant a canonical schema change, a migration of every capsule on
+disk, and a new way for an automated system to write a scientific-sounding
+label into files a person is supposed to own.
+
+**Two halves, and the prompt half is not the enforcement.** `planner@6` is
+shown the block so it routes correctly the first time. `validate_plan` refuses
+when it does not -- after every authority check, because this is the only
+refusal there that is about scientific *fit* rather than about permission, and
+conflating the two would send a planner hunting for a permission it already
+has.
+
+```text
+design_experiment     refused when NOTHING the plan addresses could be
+                      settled by measurement. A plan with a legitimate
+                      empirical half is not refused for its other half.
+derive_mathematics    refused for a target this project already holds a
+                      derivation finding for -- by proposition, not by
+                      digest, which is §15c's lesson one layer down.
+```
+
+Both refusals name the action that *would* answer the question, because §15c
+established that the refusal text is what the successor cycle reads.
+
+**Conservative in the direction that matters.** `UNDETERMINED` blocks nothing,
+`MIXED` blocks nothing on its own, and a plan addressing nothing classifiable
+is never refused. A target this build cannot classify behaves exactly as it did
+before this module existed.
+
+One asymmetry is deliberate and was a correction: repeat-work suppression is
+checked *before* the classification filter, not after. Whether a derivation has
+already been done is a fact about this project's findings, and it does not
+become unknown because the hypothesis is worded without any signal vocabulary.
+Checking it behind the `UNDETERMINED` filter left the loop reachable through
+the one door that was still open.
+
+**Somewhere to route to.** `derive_mathematics` is A0 and holds `READ_REPO`,
+like the critique: it reads the capsule, asks a model, writes an artifact and a
+noncanonical finding. `deriver@1`'s outcome enum is
+`DERIVED | REFUTED_BY_COUNTEREXAMPLE | NOT_DERIVABLE_AS_STATED | INCOMPLETE`.
+There is no `SUPPORTED`, because a deriver that could report a degree of
+support would be reporting an experiment it did not run, and the schema
+*requires* any suggested numerical witness to say what it would and would not
+establish. `DERIVED` is a model's report that a derivation went through. It
+reaches the capsule the way everything else does: a proposal, and a person.
 
 ## 16. What two adversarial reviews and a real pilot changed
 
