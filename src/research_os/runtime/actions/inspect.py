@@ -29,8 +29,119 @@ from research_os.errors import ResearchOSError
 from research_os.runtime.actions.base import ActionOutcome
 from research_os.runtime.context import CycleContext
 from research_os.runtime.failures import FailureClass
+from research_os.runtime.findings import MAX_REFS_PER_KIND
+from research_os.runtime.interfaces import ArtifactRef
 
 LOG = logging.getLogger("research_os.runtime.actions.inspect")
+
+
+#: Where a project keeps the documents that *are* its completed science.
+#:
+#: A convention rather than a search of the whole repository. Inspecting every
+#: file would register a project's source code and datasets as scientific work
+#: products, which is both wrong and unbounded; inspecting nothing is what the
+#: runtime did before, and it is how a finished literature audit became
+#: invisible to the cycle after it.
+DOCUMENT_ROOTS: tuple[str, ...] = ("docs", "reports")
+
+#: Extensions counted as a document. Prose and structured results, not code.
+DOCUMENT_SUFFIXES: frozenset[str] = frozenset({".md", ".rst", ".txt", ".json"})
+
+#: The most documents one inspection registers.
+#:
+#: Exactly :data:`research_os.runtime.findings.MAX_REFS_PER_KIND`, because the
+#: finding this inspection produces truncates its ``artifact_ids`` at that
+#: bound. A higher number here would copy documents into the artifact store and
+#: then drop them from the provenance of the only record that cites them, which
+#: is a worse outcome than not registering them: the bytes would be pinned and
+#: unreachable.
+MAX_DOCUMENTS = MAX_REFS_PER_KIND
+
+#: The largest document registered by content. A file above this is reported by
+#: path and size and not copied into the artifact store.
+MAX_DOCUMENT_BYTES = 1_048_576
+
+
+def _capsule_file_references(context: CycleContext) -> set[str]:
+    """Every repository path the capsule's own objects point at.
+
+    Read through the read-only kernel, from the fields that exist to hold a
+    file reference -- evidence locators, experiment artifacts and result
+    manifests -- plus anything a notes field names outright. Used only to
+    answer "does the capsule already know about this document", so a false
+    positive costs a document not being flagged and a false negative costs a
+    document being flagged that a person will recognise.
+    """
+
+    referenced: set[str] = set()
+    try:
+        objects = context.kernel.objects()
+    except ResearchOSError:
+        return referenced
+    for item in objects:
+        for field in ("locator", "result_manifest", "notes", "citation", "global_ref"):
+            value = getattr(item, field, None)
+            if isinstance(value, str) and value.strip():
+                referenced.add(value.strip())
+        artifacts = getattr(item, "artifacts", None)
+        if isinstance(artifacts, (list, tuple)):
+            referenced.update(str(one).strip() for one in artifacts if one)
+    return referenced
+
+
+def _scientific_documents(
+    repo: Path, context: CycleContext
+) -> tuple[list[dict[str, Any]], int, tuple[ArtifactRef, ...]]:
+    """Inventory the project's completed work products. Returns ``(shown, total)``.
+
+    Paths and content digests, never contents: this is the inventory a planner
+    needs in order to know what has already been produced, and a planner that
+    was handed the documents themselves would be reading the project's prose
+    instead of choosing an action.
+
+    Each document is registered in the content-addressed artifact store, so the
+    finding this inspection produces cites bytes that cannot change after being
+    cited. That is the whole difference between "a document exists somewhere in
+    the repository" and evidence a proposal can rest on.
+    """
+
+    referenced = _capsule_file_references(context)
+    found: list[dict[str, Any]] = []
+    refs: list[ArtifactRef] = []
+    for root_name in DOCUMENT_ROOTS:
+        root = repo / root_name
+        if not root.is_dir():
+            continue
+        for path in sorted(root.rglob("*")):
+            if not path.is_file() or path.is_symlink():
+                continue
+            if path.suffix.lower() not in DOCUMENT_SUFFIXES:
+                continue
+            relative = path.relative_to(repo).as_posix()
+            size = path.stat().st_size
+            entry: dict[str, Any] = {
+                "path": relative,
+                "bytes": size,
+                "referenced_by_capsule": any(
+                    relative in one or Path(one).name == path.name for one in referenced
+                ),
+                "artifact_id": "",
+            }
+            if size <= MAX_DOCUMENT_BYTES:
+                try:
+                    ref = context.artifacts.put_file(
+                        path, role="project_document", producer="inspect_repository"
+                    )
+                    entry["artifact_id"] = ref.artifact_id
+                    refs.append(ref)
+                except ResearchOSError as exc:
+                    # A document that cannot be stored is still worth reporting.
+                    LOG.warning("could not register %s: %s", relative, exc)
+            found.append(entry)
+    total = len(found)
+    shown = found[:MAX_DOCUMENTS]
+    shown_ids = {one["artifact_id"] for one in shown}
+    return shown, total, tuple(one for one in refs if one.artifact_id in shown_ids)
 
 
 def inspect_repository(
@@ -67,11 +178,42 @@ def inspect_repository(
             f"could not inspect {repo}: {exc}",
             failure_class=FailureClass.CODE_EXCEPTION,
         )
-    return ActionOutcome.succeeded(
-        f"HEAD {data['head'][:12]} on {data['branch']}"
-        + (" (dirty)" if data["dirty"] else ""),
-        data=data,
+    # What the repository *contains*, not only what Git thinks of it.
+    #
+    # This action reported `HEAD <sha> on <branch>` and nothing else, and its
+    # finding said exactly that. So a project holding a finished literature
+    # audit, a scientific report and a verdict document under `docs/` looked,
+    # to the next cycle, like a project holding a commit hash -- and the
+    # planner went on proposing the work that had already been done. The
+    # inventory is paths and digests, bounded; the documents themselves stay in
+    # the repository.
+    documents, document_total, document_refs = _scientific_documents(repo, context)
+    unreferenced = [
+        one["path"] for one in documents if not one["referenced_by_capsule"]
+    ]
+    data["documents"] = documents
+    data["document_total"] = document_total
+    data["documents_unreferenced_by_capsule"] = unreferenced
+
+    detail = f"HEAD {data['head'][:12]} on {data['branch']}" + (
+        " (dirty)" if data["dirty"] else ""
     )
+    if document_total:
+        detail += (
+            f"; {document_total} project document(s) under "
+            f"{'/, '.join(DOCUMENT_ROOTS)}/"
+        )
+        if unreferenced:
+            detail += (
+                f", {len(unreferenced)} not referenced by any capsule object: "
+                + ", ".join(unreferenced[:8])
+                + (
+                    f" (and {len(unreferenced) - 8} more)"
+                    if len(unreferenced) > 8
+                    else ""
+                )
+            )
+    return ActionOutcome.succeeded(detail, data=data, artifacts=document_refs)
 
 
 def validate_capsule(

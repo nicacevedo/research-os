@@ -115,6 +115,50 @@ def declared_commands(context: CycleContext, project_id: str) -> dict[str, Any]:
     return dict(project.commands) if project is not None else {}
 
 
+def _parameter_contract(parameter: Any) -> str:
+    """One declared parameter, with every constraint the validator enforces.
+
+    The catalogue used to list parameter *names* and nothing else, and the
+    experimentalist had no way to learn the rules its answer would be checked
+    against. On the thesis pilot it proposed an absolute path for
+    ``adjudicate-pricing``'s ``out``; ``spec._assert_relative`` rejected it,
+    ``design_experiment`` failed, and the next cycle proposed the same absolute
+    path and failed identically -- twice, because nothing in the prompt had
+    changed. A constraint the model is graded on and never shown is a loop.
+    """
+
+    parts = [f"type={parameter.type}"]
+    parts.append("required" if parameter.required else "optional")
+    if parameter.default is not None:
+        parts.append(f"default={parameter.default!r}")
+    if parameter.minimum is not None:
+        parts.append(f"minimum={parameter.minimum}")
+    if parameter.maximum is not None:
+        parts.append(f"maximum={parameter.maximum}")
+    if parameter.choices:
+        parts.append("choices=" + "|".join(str(one) for one in parameter.choices))
+    if str(parameter.type) == "path":
+        parts.append(
+            "MUST be a relative in-tree path: no leading '/' or '~', POSIX '/' "
+            "separators, no '.' or '..' segments"
+        )
+    detail = f" -- {parameter.description}" if parameter.description else ""
+    return f"    {parameter.name}: {', '.join(parts)}{detail}"
+
+
+def _command_lines(name: str, spec: Any) -> list[str]:
+    """One declared command as the experimentalist needs to see it."""
+
+    lines = [f"{name}: {spec.description or '(no description)'}"]
+    if not spec.parameters:
+        lines.append("    (no parameters)")
+    else:
+        lines.extend(_parameter_contract(one) for one in spec.parameters)
+    if spec.outputs:
+        lines.append("    declared outputs: " + ", ".join(spec.outputs))
+    return lines
+
+
 def design_experiment(
     state: Mapping[str, Any], context: CycleContext, plan: Mapping[str, Any]
 ) -> ActionOutcome:
@@ -159,9 +203,9 @@ def design_experiment(
         )
 
     catalogue = [
-        f"{name}: {spec.description or '(no description)'} "
-        f"[parameters: {', '.join(p.name for p in spec.parameters) or 'none'}]"
+        line
         for name, spec in sorted(available.items())
+        for line in _command_lines(name, spec)
     ]
     prompt = EXPERIMENTALIST.render(
         fields={

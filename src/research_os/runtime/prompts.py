@@ -307,7 +307,7 @@ _NOMINATOR_SCHEMA: Mapping[str, Any] = {
 
 PLANNER = PromptTemplate(
     name="planner",
-    version=3,
+    version=4,
     role=ModelRole.PLANNER,
     capability=Capability.PLANNING,
     criticality=Criticality.NORMAL,
@@ -329,10 +329,29 @@ PLANNER = PromptTemplate(
         "produced into a grounded, noncanonical proposal that a researcher reads "
         "and decides about. Nothing is written into the project by it.\n"
         "\n"
-        "So: if the findings count below is greater than zero and no permitted "
-        "action would tell you something new about this project, choose "
-        '"propose_capsule_change". That is the action that makes the next cycle '
-        "worth running.\n"
+        "THREE KINDS OF STATE, AND THEY ARE NOT INTERCHANGEABLE.\n"
+        "The FRONTIER block is canonical: it is derived from this project's "
+        "capsule files and it is what the project holds to be true. It changes "
+        "only when a person promotes something.\n"
+        "The COMPLETED FINDINGS block is NOT canonical. Each entry is work this "
+        "runtime has already finished -- a literature audit, an interpretation, a "
+        "review -- recorded with its artifacts. Nobody has accepted any of it. It "
+        "is not a claim, it has no status you can cite as settled, and it does "
+        "NOT resolve the frontier: a hypothesis still listed as untested is still "
+        "untested even if a finding below discusses it.\n"
+        "What the findings block IS for: knowing what has already been done, so "
+        "you do not spend a cycle redoing it, and so you do not describe as "
+        "missing something a finding below already produced. If a finding says "
+        "the literature was audited, the literature has been audited.\n"
+        "The OUTSTANDING PROPOSALS block lists decisions already in front of a "
+        "person. A finding marked as already cited by one of them has been asked "
+        "about; proposing it again asks the same question twice.\n"
+        "\n"
+        "So: if the census below shows completed findings and no permitted action "
+        "would tell you something new about this project, choose "
+        '"propose_capsule_change" -- unless every finding is already cited by an '
+        "outstanding proposal, in which case the useful state is WAIT_HUMAN and "
+        "you should say so in the rationale rather than proposing again.\n"
         "If there are no findings yet, choose the read-only action that would "
         "produce the most useful one -- inspecting the repository, searching the "
         "literature, critiquing a hypothesis, interpreting a finished experiment.\n"
@@ -352,9 +371,15 @@ PLANNER = PromptTemplate(
         "objective",
         "permitted_actions",
         "findings_available",
+        "noncanonical_census",
         "previous_attempt",
     ),
-    blocks=(("frontier", FRONTIER_FENCE), ("repository", REPOSITORY_FENCE)),
+    blocks=(
+        ("frontier", FRONTIER_FENCE),
+        ("completed_findings", RUNTIME_FINDING_FENCE),
+        ("outstanding_proposals", PROPOSAL_FENCE),
+        ("repository", REPOSITORY_FENCE),
+    ),
     output_schema=_PLAN_SCHEMA,
 )
 
@@ -430,7 +455,7 @@ SKEPTIC = PromptTemplate(
 
 EXPERIMENTALIST = PromptTemplate(
     name="experimentalist",
-    version=1,
+    version=2,
     role=ModelRole.EXPERIMENTALIST,
     capability=Capability.PLANNING,
     criticality=Criticality.NORMAL,
@@ -447,7 +472,19 @@ EXPERIMENTALIST = PromptTemplate(
         "are allowed and must be labelled secondary.\n"
         "Name the seeds, the dataset identity, and the resources required. If the "
         "hypothesis cannot be tested with the declared commands, say so instead of "
-        "choosing one that does not test it."
+        "choosing one that does not test it.\n"
+        "\n"
+        "THE PARAMETER CONTRACT IS NOT ADVISORY.\n"
+        "Each command in the quoted block lists its parameters with their type, "
+        "whether they are required, and every bound they are checked against. "
+        "Supply exactly the required ones and respect every bound; a value "
+        "outside the contract fails the whole design, and the failure looks "
+        "identical the next time unless you change the value.\n"
+        'A parameter of type "path" must be a RELATIVE in-tree path -- '
+        '"results/2026/pricing.json", never "/home/you/..." and never "~/...". '
+        "An absolute path is the mistake that has actually been made here: the "
+        "command runs inside a checkout whose location you are not told, and a "
+        "path you invent outside it is not somewhere this system will write."
     ),
     fields=("hypothesis", "data_description", "available_executors"),
     blocks=(("repository", REPOSITORY_FENCE),),

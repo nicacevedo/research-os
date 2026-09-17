@@ -1553,6 +1553,60 @@ class RuntimeStore:
         resolved = [self.get_finding(str(row["finding_id"])) for row in rows]
         return tuple(item for item in resolved if item is not None)
 
+    def created_proposals(
+        self, *, project_id: str, limit: int = 6
+    ) -> tuple[dict[str, object], ...]:
+        """Proposals this runtime has put in front of a person, newest first.
+
+        Only ``CREATED`` rows: a ``RESERVED`` row is an attempt in flight and a
+        ``FAILED`` one is an attempt that produced nothing, and neither is a
+        decision anybody is waiting on.
+
+        Deliberately says nothing about whether a proposal was *promoted*. That
+        is canonical scientific state, it lives in the capsule, and the capsule
+        is already where the frontier comes from. A runtime that tracked
+        promotion in its own tables would have a second answer to a question
+        the project has one answer to.
+        """
+
+        with self._db.tx() as conn:
+            rows = conn.execute(
+                """
+                select r.proposal_id, r.run_id, r.created_at,
+                       count(l.finding_id) filter (where l.cited) as cited_findings,
+                       count(l.finding_id) as offered_findings
+                from runtime_proposal_reservations r
+                left join runtime_proposal_links l
+                       on l.proposal_id = r.proposal_id
+                where r.project_id = %(project_id)s and r.status = 'CREATED'
+                group by r.proposal_id, r.run_id, r.created_at
+                order by r.created_at desc, r.proposal_id
+                limit %(limit)s
+                """,
+                {"project_id": project_id, "limit": limit},
+            ).fetchall()
+        return tuple(
+            {
+                "proposal_id": str(row["proposal_id"]),
+                "run_id": str(row["run_id"] or ""),
+                "created_at": row["created_at"].isoformat(),
+                "cited_findings": int(row["cited_findings"] or 0),
+                "offered_findings": int(row["offered_findings"] or 0),
+            }
+            for row in rows
+        )
+
+    def count_created_proposals(self, *, project_id: str) -> int:
+        """How many proposals exist for this project, however many are shown."""
+
+        with self._db.tx() as conn:
+            row = conn.execute(
+                "select count(*) as n from runtime_proposal_reservations "
+                "where project_id = %s and status = 'CREATED'",
+                (project_id,),
+            ).fetchone()
+        return int(row["n"]) if row else 0
+
     # --------------------------------------------- proposal reservations ----
     def reserve_proposal(
         self,

@@ -85,6 +85,7 @@ from research_os.runtime.policy import (
 from research_os.runtime.prompts import PLANNER, SCIENTIFIC_REVIEWER
 from research_os.runtime.registry import ACTION_HANDLERS, ActionOutcome
 from research_os.runtime.routing import IndependenceUnavailableError
+from research_os.runtime.sciencecontext import noncanonical_science
 
 LOG = logging.getLogger("research_os.runtime.graphs.cycle")
 
@@ -200,22 +201,40 @@ def plan_one_action(
             "notes": note(state, "frontier empty; planning an assessment only"),
         }
 
-    # How many findings this project already has. The planner needs it because
-    # `propose_capsule_change` is the only action that can change the frontier
-    # -- by asking a person to -- and it has nothing to propose from without
-    # them. Told as a count rather than as the findings themselves: the planner
-    # is choosing an action, not reasoning about evidence, and handing it the
-    # text would invite it to plan from a finding's content.
-    findings = context.store.list_findings(project_id=state["project_id"], limit=50)
+    # What this project has learned, alongside what it has accepted.
+    #
+    # This used to be a count and nothing else -- `findings_available: 1` --
+    # on the reasoning that a planner chooses an action rather than reasoning
+    # about evidence. The cost was that finished work disappeared: the frontier
+    # comes from capsule files, the capsule cannot move without a person, so a
+    # planner holding only the frontier sees a project where the literature
+    # audit it ran last cycle never happened. It plans it again, and the
+    # proposal it eventually writes calls the literature unavailable while the
+    # literature artifact sits in the repository. The thesis pilot did exactly
+    # that. `sciencecontext` gives it the findings and the outstanding
+    # proposals, bounded and labelled noncanonical; see that module for why the
+    # three categories are kept apart.
+    science = noncanonical_science(context.store, project_id=state["project_id"])
     prompt = PLANNER.render(
         fields={
             "objective": state["objective"],
             "permitted_actions": ", ".join(context.permitted_actions),
-            "findings_available": str(len(findings)),
+            # Kept for continuity with planner@3's wording, and it is the one
+            # number the instruction dispatches on.
+            "findings_available": str(science.findings_total),
+            "noncanonical_census": science.census(),
             "previous_attempt": _previous_attempt(context, state),
         },
         blocks={
             "frontier": [json.dumps(frontier, indent=2, sort_keys=True)],
+            "completed_findings": [
+                json.dumps(entry, indent=2, sort_keys=True)
+                for entry in science.findings
+            ],
+            "outstanding_proposals": [
+                json.dumps(entry, indent=2, sort_keys=True)
+                for entry in science.proposals
+            ],
             "repository": [state["repo_path"]],
         },
     )
