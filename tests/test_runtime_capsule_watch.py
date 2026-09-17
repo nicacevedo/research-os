@@ -282,13 +282,17 @@ def _park_a_run(
     *,
     terminal_state: TerminalState = TerminalState.WAITING_FOR_SCIENTIFIC_DECISION,
     frontier_digest: str | None = None,
+    objective: str = "whether the widget deforms",
 ) -> Any:
-    """A finished cycle whose objective is waiting for a person."""
+    """A finished cycle whose objective is waiting for a person.
+
+    ``objective`` is a parameter because ``parked_objectives`` is ``distinct on
+    (objective)``: two parked runs sharing an objective are one lineage and get
+    one successor between them, which is the point of that clause.
+    """
 
     store: RuntimeStore = plane["store"]
-    run = store.create_run(
-        project_id="alpha-project", objective="whether the widget deforms"
-    )
+    run = store.create_run(project_id="alpha-project", objective=objective)
     if frontier_digest is None:
         _capsule, frontier_digest = observed_digests(plane["repo"])
     store.set_frontier_digest(run.run_id, frontier_digest)
@@ -328,6 +332,53 @@ def test_a_parked_objective_gets_a_successor_when_the_frontier_moved(
     assert successor.thread_id != parked.thread_id
     # And the frontier it recorded is the new one.
     assert successor.frontier_digest != parked.frontier_digest
+
+
+def test_one_change_advances_every_parked_objective_exactly_once(
+    plane: dict[str, Any],
+) -> None:
+    """Two parked objectives, one promotion, two successors -- one each.
+
+    "Exactly one successor" is a property of an *objective*, not of a project.
+    A project can have several research threads parked on the same human
+    decision, and a promotion that unblocks the science unblocks all of them;
+    advancing only the first would leave the others waiting for a second change
+    that may never come.
+
+    Observed on the live thesis runtime, which is why this test exists: one
+    CAPSULE_CHANGED opened successors for two different parked runs, and the
+    per-parent count stayed at one for every parent. The fan-out is bounded by
+    how many objectives are parked, and `research_runs_one_successor_idx` is
+    what keeps each of them to one.
+    """
+
+    daemon: Daemon = plane["daemon"]
+    clock: FrozenClock = plane["clock"]
+    daemon.tick()
+    first = _park_a_run(plane, objective="whether the widget deforms")
+    second = _park_a_run(
+        plane,
+        objective="whether the housing cracks",
+        terminal_state=TerminalState.DONE_FOR_NOW,
+    )
+    assert first.objective != second.objective
+
+    _promote_a_hypothesis(plane["repo"])
+    clock.advance(60)
+    # Observe, ingest, then run the one advance work item, which walks every
+    # parked objective in a single pass.
+    daemon.tick()
+    daemon.tick()
+
+    store: RuntimeStore = plane["store"]
+    runs = store.list_runs(project_id="alpha-project")
+    # Exactly one CAPSULE_CHANGED, however many objectives it advanced.
+    assert len(_events(store, "CAPSULE_CHANGED")) == 1
+    for parked in (first, second):
+        successors = [run for run in runs if run.parent_run_id == parked.run_id]
+        assert len(successors) == 1, f"{parked.run_id} got {len(successors)}"
+        assert successors[0].objective == parked.objective
+        assert successors[0].cycle_index == parked.cycle_index + 1
 
 
 def test_a_capsule_change_that_leaves_the_frontier_identical_opens_no_cycle(
