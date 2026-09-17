@@ -233,10 +233,12 @@ def test_the_runtime_fixtures_isolate_every_xdg_directory(
 
     Before it existed, the experiment tests wrote job directories into the
     researcher's real data home and a chaos test came within one line of
-    deleting their literature database. ``isolate_xdg_env`` only unsets the
-    overrides, so an unredirected test silently falls back to the real
-    directories instead of failing -- which is the worst possible default for a
-    suite that deletes things.
+    deleting their literature database, because the autouse fixture of the day
+    only *unset* the overrides and the resolver then fell back to the real
+    directories -- the worst possible default for a suite that deletes things.
+    Isolation is now the autouse default and is checked after every test by
+    ``conftest.pytest_runtest_call``; this test still earns its place by
+    pinning the specific directories ``runtime_xdg`` is responsible for.
     """
 
     from research_os.paths import cache_home, config_home, data_home, state_home

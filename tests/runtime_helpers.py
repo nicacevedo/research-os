@@ -98,18 +98,21 @@ def pg_dsn(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
 def runtime_xdg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Redirect every Research OS directory into ``tmp_path``.
 
-    Autoused by :func:`runtime_db`, and not optional. The runtime reaches the
-    XDG homes in more places than is obvious -- the artifact store, experiment
-    run directories, the notification inbox, the literature index, the
-    disposable database's cluster -- and ``isolate_xdg_env`` only *unsets* the
-    overrides, which makes an unredirected test fall back to the researcher's
-    real directories rather than fail.
+    Requested by :func:`runtime_db`, and worth keeping even though
+    ``isolate_research_os_state`` now redirects every root for every test: the
+    runtime reaches the XDG homes in more places than is obvious -- the
+    artifact store, experiment run directories, the notification inbox, the
+    literature index, the disposable database's cluster -- and a runtime test
+    usually wants to *look* at one of those directories, which means knowing
+    which one it is.
 
-    That is not hypothetical. Before this fixture existed, the experiment tests
-    wrote seven job directories into the real data home, and the derived-index
-    chaos test was one line away from deleting the researcher's actual
-    literature database -- it was stopped by an unrelated schema check, which is
-    not a safety mechanism.
+    It used to be the only thing standing between those tests and the real
+    machine, because the autouse fixture of the day only *unset* the overrides
+    and the resolver fell back to ``Path.home()``. That was not hypothetical:
+    before this fixture existed the experiment tests wrote seven job
+    directories into the real data home, and the derived-index chaos test was
+    one line away from deleting the researcher's actual literature database --
+    stopped by an unrelated schema check, which is not a safety mechanism.
     """
 
     root = tmp_path / "xdg"

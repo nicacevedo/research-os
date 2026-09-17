@@ -875,13 +875,16 @@ def test_a_capsule_project_still_uses_the_scientific_pipeline(
 ) -> None:
     """The other half of the guarantee: nothing about capsule projects moved.
 
-    `RESEARCH_OS_STATE_HOME` is relocated because this test reaches the
-    proposal store, and `proposals_root()` is `state_home() / "proposals"`.
-    Without it the autouse `isolate_xdg_env` fixture clears the override and
-    the store resolves to the researcher's real `~/.local/state/research-os`,
-    so every run of this test left a proposal there. It had left **61**, which
-    buried the six real ones this machine's `propose list` is supposed to show
-    -- including the human gate an autonomous run was waiting on.
+    `RESEARCH_OS_STATE_HOME` is relocated here so the test can name the
+    directory it reaches; `proposals_root()` is `state_home() / "proposals"`.
+    It is no longer what keeps the test off the real machine -- the autouse
+    `isolate_research_os_state` fixture in `conftest.py` redirects all four
+    roots for every test -- but it was once the only thing that did, and only
+    for this test. While the autouse fixture merely *unset* the overrides, the
+    resolver fell back to `Path.home()`, so every unredirected test wrote to
+    the researcher's real `~/.local/state/research-os`: **61** proposals from
+    this file alone, burying the six real ones `propose list` is supposed to
+    show, including a human gate an autonomous run was waiting on.
     """
 
     monkeypatch.setenv("RESEARCH_OS_STATE_HOME", str(tmp_path / "state"))
