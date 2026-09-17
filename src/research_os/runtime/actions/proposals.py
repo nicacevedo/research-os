@@ -345,7 +345,9 @@ def _payload(outcome: Any, *, packet: FindingPacket) -> dict[str, Any]:
         "requires_human_promotion": True,
         "follow_up": (
             f"researchctl propose show {proposal.proposal_id}  # then "
-            f"`propose promote {proposal.proposal_id} --item PR-001` if you agree"
+            f"`propose promote {proposal.proposal_id} --item PR-001` if you agree, "
+            f"or `propose decline {proposal.proposal_id} --reason ...` if you do "
+            f"not. Both are decisions; only the second stops the runtime asking"
         ),
     }
 
@@ -378,13 +380,19 @@ def _equivalent_pending_proposal(
     promotion records name; an empty difference means the researcher has acted
     on all of it and a repeat would be arguing with a decision.
 
-    **There is no record of a decline.** `ProposalStore` writes promotions and
-    nothing else, so a researcher who reads a proposal and rejects it has no way
-    to say so, and this function will treat it as pending forever. An earlier
-    version of this docstring asserted that "one they declined is answered",
-    which described a state the system cannot represent. The gap is real and is
-    recorded in `docs/RELEASE_CANDIDATE_REPORT.md` §J rather than papered over
-    with a guess at what a decline would mean.
+    **A decline answers an item too**, and until this release it could not.
+    `ProposalStore` wrote promotions and nothing else, so "I read this and I do
+    not want it" had no representation: a rejected proposal stayed pending
+    forever, this function kept returning it as the answer to every cycle with
+    the same grounding, and the runtime never proposed about those findings
+    again. The predicate now asks `decided_item_ids`, which is promotions and
+    declines together, because the question here is whether a *person has acted*
+    and not which way they acted.
+
+    A decline is human-authored and this module cannot write one -- it reads the
+    store and `tests/test_runtime_authority.py` asserts structurally that no
+    runtime module can reach `record_decline`. Reading a decision is not making
+    one.
     """
 
     from research_os.errors import ProposalStoreError
@@ -429,7 +437,7 @@ def _equivalent_pending_proposal(
         basis = proposal.scientific_basis
         if basis is None or basis.finding_packet_digest != wanted:
             continue
-        decided = {record.item_id for record in store.promotions()}
+        decided = store.decided_item_ids()
         undecided = [
             item.item_id for item in proposal.items if item.item_id not in decided
         ]

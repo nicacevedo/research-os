@@ -152,6 +152,61 @@ def test_the_proposal_action_writes_no_capsule_file() -> None:
     )
 
 
+def test_no_runtime_module_declines_a_proposal() -> None:
+    """A decline is a scientific decision, and "no" is as much a decision as "yes".
+
+    The runtime *reads* declines -- `_equivalent_pending_proposal` asks whether
+    a person has acted on an item, and a decline is one of the two ways they
+    can have -- and it must not be able to write one. The consequence if it
+    could is specific and worse than it sounds: a runtime able to close its own
+    unanswered proposals could dismiss every item it had asked about and report
+    an empty queue it produced by refusing itself. The authority being defended
+    is the researcher's judgement about what is worth pursuing.
+
+    Structural rather than behavioural, for the same reason the promotion test
+    is: the guarantee has to hold for code nobody has written yet.
+    """
+
+    forbidden = {"record_decline"}
+    offenders: list[str] = []
+    for path in _runtime_sources():
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                name = getattr(node.func, "id", None) or getattr(
+                    node.func, "attr", None
+                )
+                if name in forbidden:
+                    offenders.append(f"{path.name}:{node.lineno}: calls {name}()")
+            if isinstance(node, ast.ImportFrom) and node.module in {
+                "research_os.proposal.commands"
+            }:
+                offenders.append(
+                    f"{path.name}:{node.lineno}: imports the human command module"
+                )
+    assert offenders == [], (
+        "the runtime must never record a proposal decline: " + "; ".join(offenders)
+    )
+
+
+def test_declining_refuses_a_non_interactive_terminal() -> None:
+    """The same guard `promote` has, because the same authority is at stake."""
+
+    import argparse
+
+    from research_os.errors import PromotionRefusedError
+    from research_os.proposal import commands as propose_commands
+
+    with pytest.raises(PromotionRefusedError, match="interactive terminal"):
+        propose_commands._decline(
+            argparse.Namespace(
+                proposal_id="PROP-20260101T000000Z-aaaaaaaa",
+                item="PR-001",
+                reason="not worth it",
+            )
+        )
+
+
 def test_no_runtime_module_reimplements_the_acceptance_rule() -> None:
     """There must be exactly one definition of what "accepted" means.
 

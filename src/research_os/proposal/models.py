@@ -610,6 +610,47 @@ class PromotionRecord(BaseModel):
     note: str = ""
 
 
+class DeclineRecord(BaseModel):
+    """The record that a human read a proposed item and does not want it.
+
+    The other half of a lifecycle that only had one. ``PromotionRecord`` says a
+    person turned an item into a draft; nothing said a person read one and
+    rejected it, so "I have decided about this" and "nobody has looked yet"
+    were the same state to everything downstream. The cross-cycle deduplication
+    in the runtime treats an item with no decision as still open, which is
+    correct -- and meant a rejected proposal stayed open forever, so the runtime
+    would keep offering it as the answer to any cycle with the same grounding
+    and never propose about those findings again.
+
+    A decline is a **scientific decision**, not an operational one. It is the
+    researcher saying this direction is not worth taking, and the reason is the
+    part worth keeping: six months later "we considered it and said no, because
+    X" is the useful record and "there is no proposal here" is not.
+
+    So it has the same authority as a promotion and is written the same way: by
+    the CLI, from an interactive terminal, and never by the runtime.
+    ``tests/test_runtime_authority.py`` asserts structurally that no module
+    under ``research_os.runtime`` can reach the writer.
+
+    Unlike a promotion this writes nothing into the capsule, which is exactly
+    why it is safe to record and exactly why it must still be human-authored: a
+    decline that automation could write would let a stuck runtime dismiss its
+    own unanswered proposals and report a clean queue.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    proposal_id: str
+    item_id: str
+    reason: NonBlankStr
+    """Why. Required, because a decline with no reason is indistinguishable
+    from neglect once the person who made it has forgotten."""
+
+    declined_at: str = Field(default_factory=utc_now)
+    declined_by: str = "human"
+    note: str = ""
+
+
 def _reject_unsupplied(
     item_id: str, label: str, cited: list[str], supplied: set[str]
 ) -> None:

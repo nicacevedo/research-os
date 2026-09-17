@@ -17,12 +17,18 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from research_os.errors import EXIT_ERROR, EXIT_OK, PromotionRefusedError
+from research_os.errors import (
+    EXIT_ERROR,
+    EXIT_OK,
+    PromotionRefusedError,
+    ProposalNotFoundError,
+)
 from research_os.proposal.basis import basis_status
-from research_os.proposal.models import ResearchProposal
+from research_os.proposal.models import DeclineRecord, ResearchProposal
 from research_os.proposal.promote import prepare_promotion, write_promotion
 from research_os.proposal.report import (
     blocking_summary,
+    render_decline_preview,
     render_promotion_preview,
     render_proposal,
     render_proposal_list,
@@ -93,6 +99,25 @@ def add_propose_parser(subparsers: argparse._SubParsersAction) -> None:
         ),
     )
 
+    decline = actions.add_parser(
+        "decline",
+        help=(
+            "Record that you read one proposed item and do not want it. "
+            "Writes nothing to the project. Requires an interactive terminal."
+        ),
+    )
+    decline.add_argument("proposal_id", metavar="PROPOSAL_ID")
+    decline.add_argument(
+        "--item",
+        metavar="PR-001",
+        help="Which proposed item. Omit to decline every undecided item.",
+    )
+    decline.add_argument(
+        "--reason",
+        required=True,
+        help="Why. Kept with the proposal; it is the part worth having later.",
+    )
+
     events = actions.add_parser("events", help="Print one proposal's event ledger.")
     events.add_argument("proposal_id", metavar="PROPOSAL_ID")
 
@@ -109,6 +134,7 @@ def dispatch(args: argparse.Namespace) -> int:
         "list": _list,
         "show": _show,
         "promote": _promote,
+        "decline": _decline,
         "events": _events,
     }
     return handlers[command](args)
@@ -164,6 +190,7 @@ def _show(args: argparse.Namespace) -> int:
             store.load(),
             assessment=store.load_assessment(),
             promotions=store.promotions(),
+            declines=store.declines(),
         ),
         end="",
     )
@@ -255,4 +282,81 @@ def _promote(args: argparse.Namespace) -> int:
             "\nA Claim becomes accepted only through a human Review:\n"
             f"     researchctl review {record.object_id} {record.project_path}"
         )
+    return EXIT_OK
+
+
+def _decline(args: argparse.Namespace) -> int:
+    """Record that a human read a proposed item and rejected it.
+
+    Guarded exactly like ``promote``, and the reason is not symmetry. A decline
+    writes nothing into the capsule, so it cannot corrupt a scientific record --
+    but it *closes* a question the runtime would otherwise keep asking, and an
+    automated process able to close its own unanswered proposals could report a
+    clean queue it produced by dismissing everything in it. The authority being
+    protected is the researcher's judgement about what is worth pursuing, and
+    "no" is as much a judgement as "yes".
+
+    Declining with no ``--item`` declines every item nobody has acted on. That
+    is the common case -- a researcher reads a nine-item proposal and wants none
+    of it -- and doing it one flag at a time would make the honest action the
+    tedious one.
+    """
+
+    from research_os.cli import _confirm, _is_interactive
+
+    if not _is_interactive():
+        raise PromotionRefusedError(
+            "researchctl propose decline requires an interactive terminal. "
+            "Declining a proposal is a scientific decision -- it records that a "
+            "person considered this direction and rejected it, and it stops the "
+            "runtime asking again -- so a non-human process must not make it. "
+            "Nothing has been written."
+        )
+
+    store = ProposalStore.open(args.proposal_id)
+    proposal = store.load()
+    decided = store.decided_item_ids()
+
+    if args.item:
+        known = {item.item_id for item in proposal.items}
+        if args.item not in known:
+            raise ProposalNotFoundError(
+                f"{proposal.proposal_id} has no item {args.item!r}; it has "
+                + ", ".join(sorted(known))
+            )
+        if args.item in decided:
+            print(f"{args.item} has already been decided; nothing was written")
+            return EXIT_ERROR
+        targets = [args.item]
+    else:
+        targets = [
+            item.item_id for item in proposal.items if item.item_id not in decided
+        ]
+        if not targets:
+            print(
+                f"every item of {proposal.proposal_id} has already been decided; "
+                "nothing was written"
+            )
+            return EXIT_ERROR
+
+    print(render_decline_preview(proposal, targets, reason=args.reason), end="")
+    if not _confirm(
+        f"Record {len(targets)} declined item(s) of {proposal.proposal_id}?"
+    ):
+        print("cancelled: nothing was written")
+        return EXIT_ERROR
+
+    for item_id in targets:
+        store.record_decline(
+            DeclineRecord(
+                proposal_id=proposal.proposal_id,
+                item_id=item_id,
+                reason=args.reason,
+            )
+        )
+    print(f"Declined {len(targets)} item(s) of {proposal.proposal_id}")
+    print(
+        "Nothing was written to your project. The runtime will stop treating "
+        "this proposal as an unanswered question about its findings."
+    )
     return EXIT_OK

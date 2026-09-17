@@ -16,6 +16,7 @@ Everything a worker wrote passes through the display sanitizer on the way out.
 from __future__ import annotations
 
 from research_os.proposal.models import (
+    DeclineRecord,
     EvidenceBasis,
     PromotionRecord,
     ProposalAssessment,
@@ -34,10 +35,17 @@ def render_proposal(
     *,
     assessment: ProposalAssessment | None = None,
     promotions: list[PromotionRecord] | None = None,
+    declines: list[DeclineRecord] | None = None,
 ) -> str:
-    """Render one complete proposal, its assessment, and what was promoted."""
+    """Render one complete proposal, its assessment, and what was decided.
+
+    Both decisions, because a reader who sees only promotions cannot tell an
+    item nobody has opened from one that was read and rejected -- and those are
+    the two states this view exists to distinguish.
+    """
 
     done = {item.item_id: item for item in promotions or []}
+    refused = {item.item_id: item for item in declines or []}
     lines = [
         "",
         RULE,
@@ -66,6 +74,8 @@ def render_proposal(
         if item.item_id in done:
             record = done[item.item_id]
             marker = f"   PROMOTED -> {record.object_id} ({record.object_status})"
+        elif item.item_id in refused:
+            marker = f"   DECLINED: {terminal_safe(refused[item.item_id].reason)}"
         lines.extend(
             [
                 "",
@@ -292,3 +302,51 @@ def blocking_summary(assessment: ProposalAssessment | None) -> str:
             "blocking or major finding(s) unresolved."
         )
     return ""
+
+
+def render_decline_preview(
+    proposal: ResearchProposal, item_ids: list[str], *, reason: str
+) -> str:
+    """Show exactly what is about to be closed, before it is closed.
+
+    A decline writes no file, so there is no document to preview -- which is
+    precisely why the items have to be named and quoted here. The thing being
+    decided is not visible anywhere else at the moment of deciding, and
+    "decline PROP-... --reason ..." on a nine-item proposal is otherwise a
+    command whose effect the person cannot see.
+    """
+
+    by_id = {item.item_id: item for item in proposal.items}
+    lines = [
+        "",
+        RULE,
+        f"Decline {len(item_ids)} item(s) of {proposal.proposal_id}",
+        RULE,
+        "",
+        f"project         {terminal_safe(proposal.project_path)}",
+        f"reason          {terminal_safe(reason)}",
+        "",
+        "These items would be recorded as decided and not pursued:",
+        "",
+    ]
+    for item_id in item_ids:
+        item = by_id.get(item_id)
+        if item is None:  # pragma: no cover - the caller validated the ids
+            continue
+        lines.append(f"  {item_id}  {terminal_safe(item.title)}")
+        lines.append(f"            {terminal_safe(item.statement)}")
+        lines.append("")
+    lines.extend(
+        [
+            THIN,
+            "This writes nothing into your project and changes no scientific",
+            "object. What it changes is that the runtime will stop treating",
+            "these items as questions nobody has answered, so it will not keep",
+            "re-proposing them from the same findings.",
+            "",
+            "It is still your decision and it is recorded as yours, with the",
+            "reason, in the proposal's ledger.",
+            "",
+        ]
+    )
+    return "\n".join(lines)

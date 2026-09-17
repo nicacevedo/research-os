@@ -27,6 +27,7 @@ from research_os.errors import ProposalNotFoundError, ProposalStoreError
 from research_os.paths import state_home
 from research_os.proposal.models import (
     PROPOSAL_ID_RE,
+    DeclineRecord,
     PromotionRecord,
     ProposalAssessment,
     ResearchProposal,
@@ -36,6 +37,7 @@ PROPOSALS_DIRNAME = "proposals"
 PROPOSAL_FILENAME = "proposal.json"
 ASSESSMENT_FILENAME = "assessment.json"
 PROMOTIONS_FILENAME = "promotions.jsonl"
+DECLINES_FILENAME = "declines.jsonl"
 EVENTS_FILENAME = "events.jsonl"
 
 
@@ -114,6 +116,10 @@ class ProposalStore:
     @property
     def promotions_file(self) -> Path:
         return self.directory / PROMOTIONS_FILENAME
+
+    @property
+    def declines_file(self) -> Path:
+        return self.directory / DECLINES_FILENAME
 
     @property
     def events_file(self) -> Path:
@@ -310,6 +316,64 @@ class ProposalStore:
             basis=str(record.basis),
         )
         return record
+
+    def record_decline(self, record: DeclineRecord) -> DeclineRecord:
+        """Append one decline. Append-only, exactly like a promotion.
+
+        Beside ``promotions.jsonl`` rather than inside it, because the two are
+        different facts and a reader that had to look at a ``kind`` field to
+        tell them apart is a reader that can get it wrong. Both are appended,
+        neither is ever rewritten, and a proposal that was declined and later
+        reconsidered gets a *promotion* appended after the decline -- which is
+        the honest history, not a mutation of it.
+        """
+
+        line = json.dumps(record.model_dump(mode="json"), sort_keys=True) + "\n"
+        try:
+            with self.declines_file.open("a", encoding="utf-8") as handle:
+                handle.write(line)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except OSError as exc:
+            raise ProposalStoreError(
+                f"cannot append to {self.declines_file}: {exc}"
+            ) from exc
+        self.append_event(
+            "item_declined",
+            item_id=record.item_id,
+            reason=record.reason,
+            declined_by=record.declined_by,
+        )
+        return record
+
+    def declines(self) -> list[DeclineRecord]:
+        if not self.declines_file.is_file():
+            return []
+        found: list[DeclineRecord] = []
+        for line in self._read(self.declines_file).splitlines():
+            if not line.strip():
+                continue
+            try:
+                found.append(DeclineRecord.model_validate_json(line))
+            except Exception as exc:
+                raise ProposalStoreError(
+                    f"corrupt decline record in {self.declines_file}: {exc}"
+                ) from exc
+        return found
+
+    def decided_item_ids(self) -> set[str]:
+        """Every item a human has acted on, promoted or declined.
+
+        The question the runtime's cross-cycle deduplication actually asks. It
+        used to ask only about promotions, so a proposal the researcher had
+        read and rejected looked identical to one nobody had opened, and the
+        runtime would neither re-propose about those findings nor let the
+        rejected one go.
+        """
+
+        return {record.item_id for record in self.promotions()} | {
+            record.item_id for record in self.declines()
+        }
 
     def promotions(self) -> list[PromotionRecord]:
         if not self.promotions_file.is_file():
