@@ -307,7 +307,7 @@ _NOMINATOR_SCHEMA: Mapping[str, Any] = {
 
 PLANNER = PromptTemplate(
     name="planner",
-    version=2,
+    version=3,
     role=ModelRole.PLANNER,
     capability=Capability.PLANNING,
     criticality=Criticality.NORMAL,
@@ -337,9 +337,23 @@ PLANNER = PromptTemplate(
         "produce the most useful one -- inspecting the repository, searching the "
         "literature, critiquing a hypothesis, interpreting a finished experiment.\n"
         'Choose "assess_frontier" only when neither applies, and say so in the '
-        "rationale."
+        "rationale.\n"
+        "\n"
+        "WHAT THE LAST CYCLE TRIED.\n"
+        "The previous cycle of this objective is summarised below. If it names a "
+        "refused action, that refusal is a fact about this project and not an "
+        "accident: repeating the same action with the same shape will be refused "
+        "again, and the refusal text usually says what is missing. Either satisfy "
+        "what it asks for or choose a different action, and say in your rationale "
+        "which you are doing.\n"
+        'If it says "nothing" then this is the first cycle of the objective.'
     ),
-    fields=("objective", "permitted_actions", "findings_available"),
+    fields=(
+        "objective",
+        "permitted_actions",
+        "findings_available",
+        "previous_attempt",
+    ),
     blocks=(("frontier", FRONTIER_FENCE), ("repository", REPOSITORY_FENCE)),
     output_schema=_PLAN_SCHEMA,
 )

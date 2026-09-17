@@ -1343,6 +1343,45 @@ class RuntimeStore:
             ).fetchall()
         return _finding_from(row, refs)
 
+    def last_refused_action(self, *, run_id: str) -> tuple[str, str] | None:
+        """The most recent action of ``run_id`` that refused, and why.
+
+        Exists because a successor cycle is a new LangGraph thread seeded only
+        with identity, so everything the previous cycle learned by *being
+        refused* was lost -- and the refusals in this system are the useful
+        kind. Observed twice on real work on 2026-09-17: a planner chose
+        ``run_local_experiment`` with no preregistered design, the action
+        refused with "design_experiment must come first", and the successor
+        planned the identical action; and an experimentalist supplied an
+        absolute path for a ``path`` parameter, the declared-parameter check
+        refused it naming the exact reason, and the successor supplied another
+        absolute path.
+
+        Read from `tool_invocations` rather than from graph state, because
+        graph state is the thing the successor does not have. The invocation
+        kind is ``cycle.<action>`` and the refusal is in its ``result``.
+        """
+
+        with self._db.tx() as conn:
+            row = conn.execute(
+                """
+                select kind, result from tool_invocations
+                where run_id = %(run_id)s
+                  and kind like 'cycle.%%'
+                  and status = 'COMPLETED'
+                  and result is not null
+                  and (result->>'ok') = 'false'
+                order by started_at desc
+                limit 1
+                """,
+                {"run_id": run_id},
+            ).fetchone()
+        if row is None:
+            return None
+        action = str(row["kind"]).removeprefix("cycle.")
+        detail = str((row["result"] or {}).get("detail") or "").strip()
+        return action, detail
+
     def list_findings(
         self,
         *,

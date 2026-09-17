@@ -8,6 +8,8 @@ merges to a canonical branch, or publishes.
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 from research_os.runtime.interfaces import ModelRole
@@ -185,3 +187,113 @@ def test_every_policy_rationale_is_written_for_a_person() -> None:
     for action, policy in ACTIONS.items():
         assert policy.rationale.strip(), f"{action} has no rationale"
         assert policy.rationale.strip()[0].isupper(), f"{action}: {policy.rationale}"
+
+
+def test_the_planner_is_told_what_the_previous_cycle_was_refused(
+    runtime_db: Any, tmp_path: Any
+) -> None:
+    """A successor cycle used to repeat the action its parent was refused for.
+
+    Observed twice on real work on 2026-09-17, on two different actions with
+    two different guards. `run_local_experiment` refused with
+    "design_experiment must come first" and the successor planned
+    `run_local_experiment`; `design_experiment` refused an absolute path for a
+    `path` parameter, naming the exact reason, and the successor supplied
+    another absolute path.
+
+    A successor is a new LangGraph thread seeded with identity alone, so the
+    refusal -- the single most informative thing that had happened -- was
+    invisible to the next planner. It is now a field in the planning prompt.
+    """
+
+    import json
+
+    from research_os.runtime.graphs.cycle import _previous_attempt
+    from research_os.runtime.store import RuntimeStore
+
+    store = RuntimeStore(runtime_db)
+    store.upsert_project(project_id="feedback", repo_path=str(tmp_path))
+    parent = store.create_run(project_id="feedback", objective="o")
+    child = store.create_run(
+        project_id="feedback", objective="o", parent_run_id=parent.run_id, cycle_index=1
+    )
+
+    class _Context:
+        pass
+
+    context = _Context()
+    context.store = store
+
+    # Nothing refused yet.
+    assert _previous_attempt(context, {"run_id": child.run_id}) == "nothing"
+    assert _previous_attempt(context, {"run_id": parent.run_id}) == "nothing"
+
+    with runtime_db.tx() as conn:
+        conn.execute(
+            """
+            insert into tool_invocations
+                (invocation_id, idempotency_key, run_id, kind, status, result)
+            values (%s, %s, %s, %s, 'COMPLETED', %s)
+            """,
+            (
+                "INV-refused",
+                "k:refused",
+                parent.run_id,
+                "cycle.run_local_experiment",
+                json.dumps(
+                    {
+                        "ok": False,
+                        "detail": (
+                            "no preregistered design to run; design_experiment "
+                            "must come first"
+                        ),
+                    }
+                ),
+            ),
+        )
+
+    told = _previous_attempt(context, {"run_id": child.run_id})
+    assert "run_local_experiment was REFUSED" in told
+    assert "design_experiment must come first" in told
+    # And the parent is told nothing about itself.
+    assert _previous_attempt(context, {"run_id": parent.run_id}) == "nothing"
+
+
+def test_a_successful_previous_action_is_not_reported_as_a_refusal(
+    runtime_db: Any, tmp_path: Any
+) -> None:
+    """Only refusals. A transcript of everything would crowd out the frontier."""
+
+    import json
+
+    from research_os.runtime.graphs.cycle import _previous_attempt
+    from research_os.runtime.store import RuntimeStore
+
+    store = RuntimeStore(runtime_db)
+    store.upsert_project(project_id="fine", repo_path=str(tmp_path))
+    parent = store.create_run(project_id="fine", objective="o")
+    child = store.create_run(
+        project_id="fine", objective="o", parent_run_id=parent.run_id, cycle_index=1
+    )
+    with runtime_db.tx() as conn:
+        conn.execute(
+            """
+            insert into tool_invocations
+                (invocation_id, idempotency_key, run_id, kind, status, result)
+            values (%s, %s, %s, %s, 'COMPLETED', %s)
+            """,
+            (
+                "INV-fine",
+                "k:fine",
+                parent.run_id,
+                "cycle.inspect_repository",
+                json.dumps({"ok": True, "detail": "read the repository"}),
+            ),
+        )
+
+    class _Context:
+        pass
+
+    context = _Context()
+    context.store = store
+    assert _previous_attempt(context, {"run_id": child.run_id}) == "nothing"

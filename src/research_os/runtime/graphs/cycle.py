@@ -127,6 +127,39 @@ def hydrate_project_state(
     }
 
 
+def _previous_attempt(context: CycleContext, state: CycleState) -> str:
+    """What the parent cycle tried and was refused, in one line, or "nothing".
+
+    A successor cycle is a new thread seeded with identity alone, so a refusal
+    the previous cycle earned -- which is the most informative thing that can
+    happen to it -- was invisible to the next planner. Two real runs on
+    2026-09-17 repeated a refused action verbatim, each time with the remedy
+    sitting in the refusal text.
+
+    Deliberately the *parent's* refusal and not a history: one cycle back is
+    what stops the immediate repetition, and a growing transcript of failures
+    in a planning prompt is how a planner starts reasoning about its own
+    failures instead of about the project.
+
+    The detail is rendered through the untrusted-data path by the template's
+    field escaping, and is clipped: a refusal is a sentence, and anything
+    longer is a stack trace that would crowd out the frontier.
+    """
+
+    run_id = str(state.get("run_id") or "")
+    if not run_id:
+        return "nothing"
+    run = context.store.get_run(run_id)
+    parent = getattr(run, "parent_run_id", None) if run else None
+    if not parent:
+        return "nothing"
+    refused = context.store.last_refused_action(run_id=parent)
+    if refused is None:
+        return "nothing"
+    action, detail = refused
+    return f"{action} was REFUSED: {detail[:600]}"
+
+
 def plan_one_action(
     state: CycleState, runtime: Runtime[CycleContext]
 ) -> dict[str, Any]:
@@ -179,6 +212,7 @@ def plan_one_action(
             "objective": state["objective"],
             "permitted_actions": ", ".join(context.permitted_actions),
             "findings_available": str(len(findings)),
+            "previous_attempt": _previous_attempt(context, state),
         },
         blocks={
             "frontier": [json.dumps(frontier, indent=2, sort_keys=True)],
