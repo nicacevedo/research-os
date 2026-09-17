@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 import subprocess
 from collections.abc import Callable, Mapping, Sequence
@@ -232,32 +233,294 @@ class SandboxSpec:
         )
 
 
+#: The version at or above which a technology is not known to be exploitable.
+#:
+#: One entry per technology, each naming the advisory it comes from, because a
+#: floor with no citation is a number nobody can re-check when it moves.
+#:
+#: **bubblewrap 0.12.0** -- CVE-2026-87766 / GHSA-pxhw-h44j-8pfx. During sandbox
+#: setup, creating files or directories under the new root can follow a parent
+#: symlink onto the host via ``/oldroot``, writing attacker-chosen paths outside
+#: the sandbox as the launching user. Every version below 0.12.0 is affected and
+#: upstream fixed it in 0.12.0.
+#:
+#: That threat model is exactly this system's: the coding pipeline runs
+#: acceptance commands over a worktree a model has just written to, so "attacker
+#: controlled filesystem content" is the ordinary case rather than the exotic
+#: one. A sandbox that can be made to write outside itself during *setup* is not
+#: a weaker boundary here, it is the absence of one.
+SECURITY_FLOORS: Mapping[str, tuple[tuple[int, ...], str]] = {
+    "bubblewrap": ((0, 12, 0), "CVE-2026-87766 / GHSA-pxhw-h44j-8pfx"),
+}
+
+
+def parse_version(text: str) -> tuple[int, ...] | None:
+    """The leading dotted-numeric version in ``text``, or ``None``.
+
+    Tolerant of what a real ``--version`` prints: a program name in front, a
+    distribution suffix behind. ``bubblewrap 0.9.0`` and ``0.12.0-1ubuntu1``
+    both parse; a string with no numeric version yields ``None``, which every
+    caller must treat as "unknown", never as "old enough".
+    """
+
+    match = re.search(r"(\d+(?:\.\d+)*)", text)
+    if match is None:
+        return None
+    return tuple(int(part) for part in match.group(1).split("."))
+
+
 @dataclass(frozen=True, slots=True)
 class SandboxProbe:
-    """Whether one containment technology can actually be used on this host.
+    """What one containment technology can do here, in four separate answers.
 
-    ``available`` is the result of *running* the technology, not of finding its
-    binary. A present ``bwrap`` on a host whose kernel refuses unprivileged user
-    namespaces is a binary that cannot contain anything, and reporting it as
-    available is how a deployment ends up believing it is sandboxed.
+    They were one boolean, and collapsing them is the specific mistake this
+    class now cannot make. A present ``bwrap``, a working user namespace, a
+    version that is not known-exploitable, and a containment boundary that has
+    actually been attacked and held are four different facts, and a deployment
+    that has the first three has *not* been shown to be contained.
+
+    .. code-block:: text
+
+        executable              the binary is on PATH
+        namespaces_ok           it ran, and got a real namespace with a uid map
+        security_eligible       its version is at or above the known floor
+        containment_validated   the adversarial suite ran against it, and held
+
+    :attr:`available` is the conjunction of the middle two, and is what
+    :func:`available_backend` selects on. A vulnerable binary that creates
+    perfectly good namespaces is ``namespaces_ok=True, security_eligible=False``
+    -- present, and not an acceptable production backend. It is reported that
+    way rather than as absent, because "we do not have bubblewrap" and "we have
+    a bubblewrap we decline to trust" call for different actions from whoever
+    reads the report.
     """
 
     technology: str
     executable: str | None
-    available: bool
+    namespaces_ok: bool
     detail: str
     remedy: str = ""
 
+    version: str | None = None
+    """What ``--version`` reported, verbatim. ``None`` when it was not asked."""
+
+    setuid: bool | None = None
+    """Whether the binary is setuid. ``None`` when it could not be stat'd.
+
+    Recorded because the two ways to get a user namespace on a restricted host
+    have opposite security properties, and a report that did not distinguish
+    them would let a setuid sandbox pass as the non-setuid one. bubblewrap
+    removed setuid support in 0.12.0, so on this technology a binary that is
+    both setuid and at the floor is a contradiction worth seeing.
+    """
+
+    security_eligible: bool = False
+    security_detail: str = ""
+    """Why the version is or is not acceptable, naming the advisory."""
+
+    containment_validated: bool = False
+    validation_detail: str = ""
+    """Whether this exact binary has been attacked by the adversarial suite.
+
+    Never inferred from the version. A backend can be at the security floor and
+    still be misconfigured by the caller, and the only thing that establishes a
+    boundary holds is trying to cross it.
+    """
+
+    @property
+    def available(self) -> bool:
+        """Whether this is an acceptable production containment backend.
+
+        Deliberately excludes :attr:`containment_validated`. Validation is a
+        property of a *deployment* having been tested, and gating ordinary
+        operation on it would mean a fresh host could never run the suite that
+        would validate it. What it must never exclude is
+        :attr:`security_eligible`.
+        """
+
+        return self.namespaces_ok and self.security_eligible
+
+
+def security_verdict(technology: str, version: str | None) -> tuple[bool, str]:
+    """Whether a version clears this technology's known-security floor.
+
+    Three answers, and the middle one is the one that matters. A version at or
+    above the floor is eligible. A version below it is **not** eligible and is
+    named with its advisory. A version that could not be determined is *also*
+    not eligible, because "we could not tell" and "it is fine" are different
+    facts and only one of them is a reason to run model-written code in it.
+
+    A technology with no floor recorded is eligible: the floors table is a list
+    of things known to be broken, not a list of things known to be good, and
+    refusing everything unlisted would refuse podman for never having had a
+    CVE entered here.
+    """
+
+    floor = SECURITY_FLOORS.get(technology)
+    if floor is None:
+        return True, "no known-security floor recorded for this technology"
+    minimum, advisory = floor
+    parsed = parse_version(version or "")
+    if parsed is None:
+        return False, (
+            f"could not determine the version, so it cannot be shown to be at "
+            f"or above {'.'.join(str(part) for part in minimum)} ({advisory}). "
+            f"An undetermined version is treated as unsafe"
+        )
+    if parsed < minimum:
+        return False, (
+            f"{version} is below {'.'.join(str(part) for part in minimum)} and "
+            f"is affected by {advisory}: during sandbox setup a parent symlink "
+            f"can be followed out of the sandbox, writing attacker-chosen paths "
+            f"on the host as the launching user. This runs acceptance commands "
+            f"over a worktree a model has just written, so that is this "
+            f"system's ordinary case. PRESENT_BUT_UNACCEPTABLE"
+        )
+    return True, (
+        f"{version} is at or above "
+        f"{'.'.join(str(part) for part in minimum)} ({advisory} fixed)"
+    )
+
+
+def _bwrap_version(executable: str) -> str | None:
+    """What ``bwrap --version`` prints, or ``None`` if it cannot be asked."""
+
+    try:
+        completed = subprocess.run(
+            [executable, "--version"],
+            check=False,
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        LOG.debug("bwrap --version failed: %s", exc)
+        return None
+    text = (completed.stdout or completed.stderr or "").strip()
+    return text or None
+
+
+def _is_setuid(executable: str) -> bool | None:
+    """Whether the binary carries the setuid bit, or ``None`` if unknowable."""
+
+    try:
+        import stat
+
+        return bool(os.stat(executable).st_mode & stat.S_ISUID)
+    except OSError as exc:  # pragma: no cover - a binary that vanished
+        LOG.debug("could not stat %s: %s", executable, exc)
+        return None
+
+
+def containment_root() -> Path:
+    """Where records of passed adversarial containment runs live.
+
+    A public root function, named the way every other writable family in this
+    product names one, because ``tests/conftest.py`` inventories exactly those
+    and redirects them under pytest's temporary root. A private helper here
+    would have been a writable path the isolation guard did not know about --
+    which is what the guard caught on the first run of this code, exactly as
+    intended.
+    """
+
+    from research_os.paths import state_home
+
+    return state_home() / "containment"
+
+
+def _validation_stamp_path() -> Path:
+    """The one file under :func:`containment_root` that holds the records."""
+
+    return containment_root() / "validated.json"
+
+
+def _binary_identity(executable: str, version: str | None) -> str:
+    """What a validation record is keyed by.
+
+    The binary's *content*, not its path. A validation earned by one
+    ``/usr/bin/bwrap`` must not be inherited by a different binary that has
+    since been installed at the same path -- which is exactly what an upgrade
+    does, and exactly when a stale "validated" would be most misleading.
+    """
+
+    import hashlib
+
+    digest = hashlib.sha256()
+    try:
+        with Path(executable).open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1 << 20), b""):
+                digest.update(chunk)
+    except OSError:
+        return f"unreadable:{executable}:{version or 'unknown'}"
+    return f"{digest.hexdigest()}:{version or 'unknown'}"
+
+
+def record_containment_validation(
+    executable: str, version: str | None, *, detail: str
+) -> None:
+    """Record that the adversarial suite ran against this binary and it held.
+
+    Called by the adversarial containment suite, never by a probe. The
+    separation is the point: a probe reports what it measured, and no amount of
+    measuring a binary's version establishes that a boundary was attacked.
+    """
+
+    import json
+
+    path = _validation_stamp_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        existing = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        existing = {}
+    existing[_binary_identity(executable, version)] = detail
+    path.write_text(json.dumps(existing, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def containment_validation(executable: str, version: str | None) -> tuple[bool, str]:
+    """Whether this exact binary has a passing adversarial-suite record."""
+
+    import json
+
+    path = _validation_stamp_path()
+    try:
+        records = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False, (
+            "the adversarial containment suite has not been run against this "
+            "binary on this host, so containment is measured but not proven"
+        )
+    detail = records.get(_binary_identity(executable, version))
+    if not detail:
+        return False, (
+            "no adversarial containment record for this exact binary. A record "
+            "is keyed by the binary's content hash, so an upgrade correctly "
+            "invalidates the previous one"
+        )
+    return True, str(detail)
+
 
 def probe_bubblewrap() -> SandboxProbe:
-    """Probe bubblewrap by asking it to contain ``true``.
+    """Probe bubblewrap on four axes, and report them separately.
 
-    Actually invoked, because the failure this catches is invisible to anything
-    short of invocation. On Ubuntu 24.04 and later,
+    **Namespaces are measured by running it**, because the failure is invisible
+    to anything short of invocation. On Ubuntu 24.04 and later
     ``kernel.apparmor_restrict_unprivileged_userns`` is 1 by default, so a
     non-setuid ``bwrap`` gets an unprivileged user namespace it has no
     capabilities in and ``setting up uid map`` fails. The binary is present, its
     ``--version`` works, and it cannot isolate a single path.
+
+    **Security eligibility is measured by version**, because that failure is
+    invisible to invocation -- the vulnerable binary runs perfectly and contains
+    perfectly, right up until the setup path is pointed at a symlink. A probe
+    that only ran the thing would report it working, which is exactly what the
+    advisory says it will do.
+
+    Both are reported even when the first fails. A host whose kernel refuses
+    namespaces *and* whose bwrap is vulnerable needs to know both, because
+    fixing only the kernel would turn a binary that cannot escape into one that
+    can.
     """
 
     executable = shutil.which("bwrap")
@@ -265,10 +528,35 @@ def probe_bubblewrap() -> SandboxProbe:
         return SandboxProbe(
             technology="bubblewrap",
             executable=None,
-            available=False,
+            namespaces_ok=False,
             detail="bwrap is not on PATH",
             remedy="install bubblewrap (apt install bubblewrap)",
         )
+
+    version = _bwrap_version(executable)
+    setuid = _is_setuid(executable)
+    eligible, security_detail = security_verdict("bubblewrap", version)
+    if eligible and setuid:
+        # bubblewrap removed setuid support in 0.12.0. A binary claiming to be
+        # at the floor while still setuid is not the binary the floor describes,
+        # and the conservative reading of a contradiction is to decline.
+        eligible = False
+        security_detail = (
+            f"{version} reports itself at or above the security floor, yet the "
+            f"binary is setuid -- support for which upstream removed in 0.12.0. "
+            f"The two cannot both be true, so this is not accepted"
+        )
+
+    common = {
+        "technology": "bubblewrap",
+        "executable": executable,
+        "version": version,
+        "setuid": setuid,
+        "security_eligible": eligible,
+        "security_detail": security_detail,
+    }
+    validated, validation_detail = containment_validation(executable, version)
+
     argv = [
         executable,
         "--unshare-user",
@@ -292,18 +580,39 @@ def probe_bubblewrap() -> SandboxProbe:
         )
     except (OSError, subprocess.SubprocessError) as exc:
         return SandboxProbe(
-            technology="bubblewrap",
-            executable=executable,
-            available=False,
+            **common,
+            namespaces_ok=False,
             detail=f"bwrap could not be run: {exc}",
+            containment_validated=validated,
+            validation_detail=validation_detail,
         )
+
     if completed.returncode == 0:
+        detail = "an unprivileged user namespace with a uid map"
+        remedy = ""
+        if not eligible:
+            # The dangerous state, and the one the report has to be loudest
+            # about: everything works, and it must not be used.
+            detail = (
+                f"namespaces work, but this build is NOT security-eligible: "
+                f"{security_detail}"
+            )
+            remedy = (
+                "install a bubblewrap at or above the security floor, or a "
+                "vendor package carrying the backport, before enabling "
+                "containment. Do not install an AppArmor userns profile for a "
+                "vulnerable binary: that grants it the namespace it needs and "
+                "leaves the escape intact"
+            )
         return SandboxProbe(
-            technology="bubblewrap",
-            executable=executable,
-            available=True,
-            detail="verified: an unprivileged user namespace with a uid map",
+            **common,
+            namespaces_ok=True,
+            detail=detail,
+            remedy=remedy,
+            containment_validated=validated,
+            validation_detail=validation_detail,
         )
+
     reason = (completed.stderr or completed.stdout or "").strip().splitlines()
     first = reason[0] if reason else f"exit {completed.returncode}"
     remedy = ""
@@ -315,12 +624,22 @@ def probe_bubblewrap() -> SandboxProbe:
             "administrator can permit it, install an AppArmor profile granting "
             "bwrap the `userns` permission, or install rootless Podman."
         )
+        if not eligible:
+            remedy = (
+                "two separate things are wrong here and the order matters. "
+                f"First, {security_detail}. Second, this kernel refuses "
+                f"unprivileged user namespaces. Granting the namespace before "
+                f"replacing the binary would produce a working sandbox with a "
+                f"known escape, which is worse than the present state -- so "
+                f"replace the binary first"
+            )
     return SandboxProbe(
-        technology="bubblewrap",
-        executable=executable,
-        available=False,
+        **common,
+        namespaces_ok=False,
         detail=first,
         remedy=remedy,
+        containment_validated=validated,
+        validation_detail=validation_detail,
     )
 
 
@@ -344,13 +663,13 @@ def probe_ineffective_systemd_run() -> SandboxProbe:
         return SandboxProbe(
             technology="systemd-run",
             executable=None,
-            available=False,
+            namespaces_ok=False,
             detail="systemd-run is not on PATH",
         )
     return SandboxProbe(
         technology="systemd-run",
         executable=executable,
-        available=False,
+        namespaces_ok=False,
         detail=(
             "present, and its user-scope sandboxing directives are silently "
             "ineffective without unprivileged user namespaces: the unit starts "
@@ -378,7 +697,7 @@ def probe_container_runtimes() -> tuple[SandboxProbe, ...]:
             SandboxProbe(
                 technology=name,
                 executable=executable,
-                available=False,
+                namespaces_ok=False,
                 detail=(
                     f"{name} is present but no backend is implemented for it"
                     if executable
@@ -435,11 +754,22 @@ def available_backend(*, refresh: bool = False) -> SandboxProbe | None:
 
 
 def unavailable_reason() -> str:
-    """One line a person can act on, assembled from every probe."""
+    """One line a person can act on, assembled from every probe.
+
+    A technology that runs but is not security-eligible says so explicitly
+    rather than joining the "not available" list, because the two call for
+    opposite actions: one wants the thing installed, the other wants the
+    installed thing replaced.
+    """
 
     parts = []
     for candidate in probe():
         line = f"{candidate.technology}: {candidate.detail}"
+        if candidate.namespaces_ok and not candidate.security_eligible:
+            line = (
+                f"{candidate.technology}: PRESENT_BUT_UNACCEPTABLE -- "
+                f"{candidate.security_detail}"
+            )
         if candidate.remedy:
             line += f" -- {candidate.remedy}"
         parts.append(line)

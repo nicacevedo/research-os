@@ -55,6 +55,37 @@ Neither is used on such a host. `researchctl runtime doctor` reports what was
 probed, what happened, and the remedy. Where nothing works, high-autonomy
 execution is refused and the fingerprint check below is all that remains.
 
+**A sandbox that runs is not thereby a sandbox that may be used.** The probe
+reports four facts and keeps them apart, because collapsing them is how a
+deployment ends up running model-written code inside a known-escapable
+boundary:
+
+```text
+executable present       the binary is on PATH
+namespace capability     it ran, and got a namespace with a uid map
+security-eligible        its version is at or above the known-security floor
+containment validated    the adversarial suite ran against it, and held
+```
+
+`available_backend()` returns a technology only when the middle two both hold,
+so a binary below its floor is never a production backend however well it runs.
+`SECURITY_FLOORS` records one entry per technology with the advisory it comes
+from; today that is bubblewrap 0.12.0 for CVE-2026-87766 / GHSA-pxhw-h44j-8pfx,
+a setup-time symlink traversal that can write outside the sandbox. A version
+that cannot be determined is treated as unsafe, because "we could not tell" and
+"it is fine" are different facts.
+
+The fourth is reported separately and never inferred: no amount of measuring a
+version establishes that a boundary was attacked and held. It is recorded by
+the adversarial suite, keyed to the binary's *content hash*, so replacing the
+binary correctly invalidates it. Until then the doctor says `NOT PROVEN`.
+
+The order this implies matters. Granting `userns` to a binary below its floor
+converts a sandbox that contains nothing into one that contains things and can
+be walked out of — strictly worse than the refusal. Replace the binary first;
+`docs/CONTAINMENT_OPTIONS.md` has the audited ways to do that, and
+`deploy/apparmor-bwrap` refuses the other order in its own header.
+
 **Project code executes with your Unix permissions.** Two paths run code this
 repository did not write:
 

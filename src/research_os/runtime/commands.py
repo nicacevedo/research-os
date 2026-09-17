@@ -758,12 +758,25 @@ def _sandbox_lines() -> list[str]:
         configured = SandboxMode.PREFERRED
 
     if backend is not None:
-        return [
+        lines = [
             (
                 f"  OK    sandbox       {backend.technology}: {backend.detail}; "
                 f"configured mode {configured}\n"
             )
         ]
+        # An eligible backend is not a proven one. The row says which, because
+        # a deployment that reads "OK sandbox" and stops has learned that a
+        # mechanism exists, not that anything was attacked and held.
+        if backend.containment_validated:
+            lines.append(
+                f"  OK    containment   adversarial suite has held against this "
+                f"binary: {backend.validation_detail}\n"
+            )
+        else:
+            lines.append(
+                f"  WARN  containment   NOT PROVEN -- {backend.validation_detail}\n"
+            )
+        return lines
     lines = [
         (
             "  WARN  sandbox       no containment technology works here, so "
@@ -777,6 +790,20 @@ def _sandbox_lines() -> list[str]:
         detail = candidate.detail
         if candidate.remedy:
             detail += f" -- {candidate.remedy}"
+        if candidate.namespaces_ok and not candidate.security_eligible:
+            # FAIL, not WARN, and it is the one sandbox row that is. Every
+            # other line here reports a capability this host does not have,
+            # which is a limitation. This one reports a capability it *does*
+            # have and must not use -- and a deployment that installs an
+            # AppArmor userns profile to "fix" a WARN would be granting a
+            # known-escapable binary exactly the namespace it needs.
+            lines.append(
+                f"  FAIL  sandbox       {candidate.technology}: "
+                f"PRESENT_BUT_UNACCEPTABLE -- {candidate.security_detail}"
+                + (f" -- {candidate.remedy}" if candidate.remedy else "")
+                + "\n"
+            )
+            continue
         lines.append(f"  WARN  sandbox       {candidate.technology}: {detail}\n")
     return lines
 

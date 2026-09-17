@@ -50,19 +50,24 @@ def test_every_technology_is_probed_and_reports_a_reason() -> None:
         assert item.detail, f"{item.technology} reported no reason"
 
 
-def test_bubblewrap_is_probed_by_running_it_not_by_finding_it() -> None:
+def test_bubblewrap_namespaces_are_probed_by_running_it_not_by_finding_it() -> None:
     """The failure this catches is invisible to ``which``.
 
     A present ``bwrap`` on a host whose kernel refuses unprivileged user
     namespaces is a binary that cannot isolate a single path -- which is the
     configuration Ubuntu 24.04 ships. Reporting it as available because the
     file exists is how a deployment ends up believing it is sandboxed.
+
+    Asserts ``namespaces_ok`` rather than ``available``: since the security
+    floor exists, ``available`` also depends on the version, and a probe that
+    ran perfectly is no longer by itself a probe that may be used.
     """
 
     found = next(item for item in probe() if item.technology == "bubblewrap")
     import shutil
 
     if shutil.which("bwrap") is None:
+        assert found.namespaces_ok is False
         assert found.available is False
         return
     # The binary is here. Whether it works is a fact about the kernel, and the
@@ -74,7 +79,7 @@ def test_bubblewrap_is_probed_by_running_it_not_by_finding_it() -> None:
         stdin=subprocess.DEVNULL,
         timeout=20,
     )
-    assert found.available is (completed.returncode == 0)
+    assert found.namespaces_ok is (completed.returncode == 0)
 
 
 def test_systemd_run_is_never_selected_even_when_present() -> None:
@@ -479,7 +484,8 @@ def _flags(argv: list[str], spec: SandboxSpec) -> list[str]:
 
     backend = SandboxProbe(
         technology="bubblewrap",
-        available=True,
+        namespaces_ok=True,
+        security_eligible=True,
         executable="/usr/bin/bwrap",
         detail="assumed for a construction test",
     )

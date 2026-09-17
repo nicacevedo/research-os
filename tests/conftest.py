@@ -74,6 +74,7 @@ _PATH_ENTRY_POINTS = (
     "research_os.runtime.config:config_path",
     "research_os.runtime.config:artifacts_root",
     "research_os.runtime.config:dev_db_root",
+    "research_os.sandbox:containment_root",
 )
 
 

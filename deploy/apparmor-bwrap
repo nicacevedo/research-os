@@ -4,17 +4,45 @@
 # into /etc or reloads AppArmor: it needs root, and granting a binary the right
 # to create user namespaces is the machine owner's decision.
 #
-# Why it is needed. Research OS refuses to run a model-written experiment
-# without OS containment (`SandboxMode.REQUIRED`), and on this class of machine
-# containment is unavailable for one specific reason:
+# ============================================================================
+# DO NOT INSTALL THIS AGAINST bubblewrap < 0.12.0.
+# ============================================================================
+#
+# Read this before running anything below. Installing this profile on a machine
+# whose bwrap is older than 0.12.0 makes the security posture WORSE, not better.
+#
+# CVE-2026-87766 / GHSA-pxhw-h44j-8pfx affects every bubblewrap below 0.12.0.
+# During sandbox *setup*, creating a file or directory under the new root can
+# follow a parent symlink out through /oldroot and write an attacker-chosen
+# path on the host, as the user who launched it. Upstream fixed it in 0.12.0.
+#
+# Research OS runs project acceptance commands over a worktree a model has just
+# written to. "Attacker-controlled filesystem content" is therefore this
+# system's ordinary case rather than an exotic one.
+#
+# This profile grants bwrap the user namespace it needs. On a vulnerable bwrap,
+# that converts a binary which *cannot* contain anything into one that contains
+# things and can be walked out of. The current state -- containment refused --
+# is strictly safer than that, which is why `researchctl runtime doctor`
+# reports a vulnerable-but-working bwrap as PRESENT_BUT_UNACCEPTABLE and
+# `available_backend()` declines to return it.
+#
+# Check first, and do not proceed unless the version is 0.12.0 or greater:
+#
+#   bwrap --version
+#   uv run --frozen --extra runtime researchctl runtime doctor | grep -i sandbox
+#
+# The order is: replace the binary, then install this profile. Never the
+# reverse. See docs/CONTAINMENT_OPTIONS.md for how to get a patched build.
+#
+# Why it is needed, once the binary is safe. Research OS refuses to run a
+# model-written experiment without OS containment (`SandboxMode.REQUIRED`), and
+# on this class of machine the namespace itself is refused:
 #
 #   $ sysctl kernel.apparmor_restrict_unprivileged_userns
 #   kernel.apparmor_restrict_unprivileged_userns = 1
-#   $ unshare --user --map-root-user true
-#   unshare: write failed /proc/self/uid_map: Operation not permitted
 #
-# Ubuntu 24.04 restricts unprivileged user namespaces through AppArmor. bwrap
-# 0.9.0 is installed and working; it simply may not create a namespace. The
+# Ubuntu 24.04 restricts unprivileged user namespaces through AppArmor. The
 # blunt fix is
 #
 #   sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
@@ -28,12 +56,29 @@
 # which are `flags=(unconfined)` profiles whose only purpose is to name the
 # binary and grant `userns`.
 #
-# To install it, deliberately:
+# The `profile` line below names /usr/bin/bwrap. If the patched binary lives
+# somewhere else -- /usr/local/bin/bwrap, say -- change that path to match
+# exactly, because an AppArmor profile binds to a path and a profile naming a
+# binary that is not the one being run grants nothing. Do not point it at a
+# user-writable directory: anything that can write that path would inherit the
+# userns grant.
+#
+# To install it, deliberately, AFTER confirming bwrap >= 0.12.0:
 #
 #   sudo install -m 644 deploy/apparmor-bwrap /etc/apparmor.d/bwrap
 #   sudo apparmor_parser -r /etc/apparmor.d/bwrap
-#   unshare --user --map-root-user true && echo "user namespaces now permitted"
-#   uv run --frozen researchctl runtime doctor      # should stop reporting uncontained
+#
+# To verify it, through the sandbox Research OS actually uses -- NOT through
+# `unshare --user --map-root-user true`, which tests a different binary under a
+# different profile and can pass while bwrap still fails:
+#
+#   uv run --frozen --extra runtime researchctl runtime doctor | grep -i sandbox
+#   uv run --frozen --extra runtime pytest tests/test_sandbox.py -q
+#
+# The doctor line must report the backend as OK, and the sandbox suite's
+# adversarial tests must stop skipping and must pass. Until those adversarial
+# tests have actually run and held, `containment_validated` stays false and the
+# doctor says NOT PROVEN -- a namespace is not a boundary.
 #
 # To undo it:
 #
