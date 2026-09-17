@@ -188,6 +188,22 @@ sparse-regression project produced a twelve-item proposal and concluded
 `WAITING_FOR_SCIENTIFIC_DECISION`. Nothing in this session promoted or declined
 it. §N has the commands.
 
+**And the staleness guard was exercised for real, not constructed.** The
+proposal was written at `9d5474e`, and the project has since taken nine more
+commits — new modules, new tests, a rewritten README, a closure report. Checked
+afterwards:
+
+```text
+stale      False
+reason     the basis is unchanged
+unchecked  the runtime findings it cites were not re-checked
+```
+
+Which is exactly right, and is the distinction the previous cycle built it for:
+the basis snapshots *the objects the proposal cites*, not the repository HEAD,
+so nine unrelated commits do not invalidate it — and the one thing it cannot
+verify without the operational database is reported rather than assumed.
+
 **One open hole, recorded.** A decline can be forged by appending a line to
 `declines.jsonl`, which lives outside every repository and no fingerprint
 covers. Closed under `SandboxMode.REQUIRED`; open otherwise.
