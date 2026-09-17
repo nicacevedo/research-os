@@ -1002,7 +1002,9 @@ def test_a_coding_run_that_reaches_the_canonical_checkout_is_caught(
             return 0.0
 
     monkeypatch.setattr(
-        coding, "_controller", lambda _context, autonomy: EscapingController()
+        coding,
+        "_controller",
+        lambda _context, autonomy, authority=None: EscapingController(),
     )
 
     from tests.runtime_graph_helpers import make_context

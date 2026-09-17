@@ -153,25 +153,34 @@ def charge_delegated_spend(
     invocations: Any,
     *,
     action: str,
+    authority: Any = None,
 ) -> None:
-    """Record, after the fact, what a delegated v1 controller spent.
+    """Write the provenance for a delegated controller's calls, and reconcile.
 
-    The runtime's router reserves ``MODEL_CALLS`` and ``MODEL_COST_USD`` before
-    every call it makes itself. It makes none of the calls in here: this handler
-    delegates to a v1 controller which owns its own providers, bounds itself
-    with its own per-action ceiling, and has never touched the runtime's ledger.
+    Two jobs, and they became different jobs when
+    :mod:`research_os.runtime.spend` arrived.
 
-    So a cycle that made four model calls reported one, and a run started with
-    ``--max-cost-usd 6`` reported a tenth of what it had spent. The budget was
-    not wrong about what it had *reserved*; it was silent about what the run had
-    *cost*, which is the number a researcher reads. Found by reading a real
-    pilot's run report next to its provider invocations, not by a test --
-    nothing asserted that the two agreed.
+    **The provenance rows are this function's, always.** One ``model_calls``
+    row per invocation, with the provider, the model, the tokens, the latency
+    and the cost. The budget authority cannot write them: it sees an
+    ``InvocationResult`` and not the ``ModelInvocation`` the controller builds
+    from it, and the richer record is the one worth keeping.
 
-    This cannot refuse, because the calls already happened. What it does is make
-    the ledger and the run report true, so the *next* reservation sees the
-    spend: the cap bites on the following call rather than on the one that
-    overran. `BudgetLedger.charge_all` says the same thing at more length.
+    **The budget charge is now a reconciliation, not the mechanism.** Before
+    the authority existed this was the whole of delegated accounting: record
+    the spend afterwards, past the limit when it must. That made the ledger
+    true and it was not a budget -- a cap that bites on the call *after* the
+    overrun is a cap that authorised the overrun. Each delegated call now
+    reserves before it happens and settles after, so by the time this runs the
+    money is usually already accounted.
+
+    What is left for it is the difference: calls the authority never saw. That
+    is not a hypothetical residue -- a controller that invokes a provider it
+    did not get from the wrapped registry, or a path that raises before
+    ``settle``, produces exactly it -- and charging the difference rather than
+    the total is what stops the two mechanisms double-counting. With no
+    ``authority`` the difference is the total, which is the old behaviour and
+    the right one for a caller that has no runtime budget.
 
     A provider that reports no cost is charged for the call and not for the
     money, and the model-call row records ``None`` rather than zero -- a spend
@@ -217,17 +226,27 @@ def charge_delegated_spend(
             # Recording the spend is not worth failing the action over; the
             # budget charge below is the part that must happen.
             LOG.warning("could not record a delegated model call: %s", exc)
-    context.budgets.charge_all(
-        dimension=Dimension.MODEL_CALLS,
-        amount=len(records),
-        run_id=run_id,
-        project_id=project_id,
-        work_id=work_id,
-    )
-    if cost > 0:
+    # Only what the authority did not already reserve and settle. `max(0, ...)`
+    # rather than an assertion: an authority that settled *more* than the run
+    # records -- a call whose invocation the controller failed to persist -- is
+    # a reporting gap, and turning it into a negative charge would hand the run
+    # back capacity it really spent.
+    settled_calls = int(getattr(authority, "settled_calls", 0) or 0)
+    settled_usd = Decimal(str(getattr(authority, "settled_usd", 0) or 0))
+    uncharged_calls = max(0, len(records) - settled_calls)
+    uncharged_cost = max(Decimal(0), cost - settled_usd)
+    if uncharged_calls:
+        context.budgets.charge_all(
+            dimension=Dimension.MODEL_CALLS,
+            amount=uncharged_calls,
+            run_id=run_id,
+            project_id=project_id,
+            work_id=work_id,
+        )
+    if uncharged_cost > 0:
         context.budgets.charge_all(
             dimension=Dimension.MODEL_COST_USD,
-            amount=cost,
+            amount=uncharged_cost,
             run_id=run_id,
             project_id=project_id,
             work_id=work_id,

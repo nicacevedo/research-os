@@ -56,6 +56,7 @@ from pathlib import Path
 from typing import Any
 
 from research_os.errors import (
+    BudgetExceededError,
     ProposalBudgetError,
     ProposalError,
     ProposalGroundingError,
@@ -69,6 +70,7 @@ from research_os.runtime.context import CycleContext
 from research_os.runtime.failures import FailureClass
 from research_os.runtime.findings import FindingPacket, RuntimeFinding, packet_from
 from research_os.runtime.idempotency import idempotency_key
+from research_os.runtime.spend import DelegatedSpendAuthority
 
 LOG = logging.getLogger("research_os.runtime.actions.proposals")
 
@@ -254,14 +256,28 @@ def reconcile_reserved_proposal(
     }
 
 
-def _controller(context: CycleContext) -> Any:
+def _controller(context: CycleContext, *, authority: Any = None) -> Any:
+    """A v1 proposal controller whose providers answer to the runtime's budget.
+
+    ``authority`` wraps every adapter, so each call this controller makes
+    reserves runtime capacity *before* it happens and settles afterwards. The
+    controller is unchanged and unaware: it was given a registry and it calls
+    ``invoke`` on it, which is precisely why the registry is where the budget
+    belongs. Without one -- a caller with no runtime ledger -- the adapters are
+    the plain ones.
+    """
+
     from research_os.automation.commands import provider_registry
     from research_os.automation.config import load_config
     from research_os.literature.config import load_config as load_literature_config
     from research_os.proposal.controller import ProposalController
 
+    del context
+    providers = provider_registry()
+    if authority is not None:
+        providers = authority.wrap(providers)
     return ProposalController(
-        providers=provider_registry(),
+        providers=providers,
         config=load_config(),
         literature_config=load_literature_config(),
     )
@@ -542,7 +558,16 @@ def propose_capsule_change(
     # would have been created under.
     proposal_id = stored_id
 
-    controller = _controller(context)
+    # One authority for this action's whole delegation, so the reconciliation
+    # below can subtract exactly what it settled.
+    authority = DelegatedSpendAuthority(
+        budgets=context.budgets,
+        run_id=str(state["run_id"]),
+        project_id=project_id,
+        work_id=state.get("work_id"),
+        action="propose_capsule_change",
+    )
+    controller = _controller(context, authority=authority)
     key = idempotency_key(
         "proposal.create", state["run_id"], state["cycle_index"], reservation_key
     )
@@ -561,12 +586,15 @@ def propose_capsule_change(
             findings=_supplied(packet.findings),
             proposal_id=proposal_id,
         )
-        # What the delegated worker spent, into the runtime's own ledger. It
-        # makes these calls through v1's providers, which never touch that
-        # ledger, so `runtime run` reported one model call for a cycle that made
-        # four. See `charge_delegated_spend`.
+        # The provenance rows for what the delegated worker did, and a
+        # reconciliation of anything the authority did not already reserve and
+        # settle. The money itself was accounted before each call was made.
         charge_delegated_spend(
-            state, context, outcome.invocations, action="propose_capsule_change"
+            state,
+            context,
+            outcome.invocations,
+            action="propose_capsule_change",
+            authority=authority,
         )
         # Written before the result is returned, so the links exist whenever the
         # proposal does. A proposal a person can read whose grounding this
@@ -630,7 +658,7 @@ def propose_capsule_change(
                 state, context, plan
             ),
         )
-    except (ProposalError, ProviderInvocationError) as exc:
+    except (ProposalError, ProviderInvocationError, BudgetExceededError) as exc:
         # **Look before failing, for every exception raised after the store.**
         #
         # `ProposalController` creates the proposal directory and *then* runs
@@ -656,6 +684,7 @@ def propose_capsule_change(
             context,
             getattr(exc, "model_invocations", ()),
             action="propose_capsule_change",
+            authority=authority,
         )
         recovered = reconcile_reserved_proposal(state, context, plan)
         if recovered is not None:
@@ -699,7 +728,12 @@ def propose_capsule_change(
                 # how a grounding gate stops meaning anything.
                 failure_class=FailureClass.MODEL_OUTPUT_INVALID_REPEATED,
             )
-        if isinstance(exc, ProposalBudgetError):
+        if isinstance(exc, ProposalBudgetError | BudgetExceededError):
+            # Two budgets, one terminal answer. `ProposalBudgetError` is the v1
+            # controller's own per-action call ceiling; `BudgetExceededError`
+            # here is the *runtime* budget refusing a call before it was made,
+            # raised by the wrapped provider. Neither is repaired: a budget
+            # that retries is not a budget.
             return ActionOutcome.failed(
                 str(exc), failure_class=FailureClass.BUDGET_EXHAUSTED
             )

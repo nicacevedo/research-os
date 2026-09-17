@@ -72,12 +72,13 @@ from typing import Any
 
 from research_os.automation import gitutil
 from research_os.automation.models import Budget, RunState
-from research_os.errors import ResearchOSError
+from research_os.errors import BudgetExceededError, ResearchOSError
 from research_os.runtime.actions.base import ActionOutcome, charge_delegated_spend
 from research_os.runtime.context import CycleContext
 from research_os.runtime.failures import FailureClass
 from research_os.runtime.idempotency import idempotency_key
 from research_os.runtime.locks import RepositoryBusyError, repository_lock
+from research_os.runtime.spend import DelegatedSpendAuthority
 from research_os.sandbox import SandboxError, SandboxMode
 
 LOG = logging.getLogger("research_os.runtime.actions.coding")
@@ -170,8 +171,15 @@ def _describe_drift(before: dict[str, str], after: dict[str, str]) -> str:
     return ", ".join(changed[:12]) + ("..." if len(changed) > 12 else "")
 
 
-def _controller(context: CycleContext, *, autonomy: str) -> Any:
+def _controller(context: CycleContext, *, autonomy: str, authority: Any = None) -> Any:
     """Build a v1 automation controller with this machine's providers.
+
+    ``authority`` wraps every adapter so each model call this pipeline makes
+    reserves runtime budget before it happens and settles after. The controller
+    is unchanged and unaware: it was handed a registry and calls ``invoke`` on
+    it, which is exactly why the registry is where the budget belongs. A
+    reservation the ledger refuses raises ``BudgetExceededError``, which this
+    controller already treats as a terminal run failure.
 
     The one thing the runtime overrides is containment. At high autonomy
     nobody is watching, and the pipeline runs a project's acceptance commands
@@ -191,8 +199,11 @@ def _controller(context: CycleContext, *, autonomy: str) -> Any:
     from research_os.automation.controller import AutomationController
 
     del context
+    providers = provider_registry()
+    if authority is not None:
+        providers = authority.wrap(providers)
     return AutomationController(
-        providers=provider_registry(),
+        providers=providers,
         config=load_config(),
         sandbox_mode=SandboxMode.REQUIRED if autonomy == "high" else None,
     )
@@ -408,7 +419,18 @@ def run_coding_task(
     # autonomy setting must not be the thing that quietly stops containment
     # being required, and every production path seeds it -- `cycles._execute`
     # puts the run's own setting into the initial state.
-    controller = _controller(context, autonomy=str(state.get("autonomy") or "high"))
+    authority = DelegatedSpendAuthority(
+        budgets=context.budgets,
+        run_id=str(state["run_id"]),
+        project_id=str(state["project_id"]),
+        work_id=state.get("work_id"),
+        action="edit_in_worktree",
+    )
+    controller = _controller(
+        context,
+        autonomy=str(state.get("autonomy") or "high"),
+        authority=authority,
+    )
     budget = Budget(
         max_model_calls=int(plan.get("parameters", {}).get("max_model_calls", 8)),
         max_write_work_orders=1,
@@ -488,6 +510,7 @@ def run_coding_task(
                 context,
                 getattr(_loaded_run(store), "invocations", ()),
                 action="edit_in_worktree",
+                authority=authority,
             )
 
         after = canonical_fingerprint(repo, owned_ref_prefixes=owned)
@@ -539,6 +562,14 @@ def run_coding_task(
         # would let the run proceed.
         return ActionOutcome.failed(
             str(exc), failure_class=FailureClass.CAPABILITY_DENIED
+        )
+    except BudgetExceededError as exc:
+        # The runtime budget refused a call before the provider was asked, or
+        # the v1 controller's own ceiling stopped the pipeline. Terminal either
+        # way: retrying spends the attempt budget on a question whose answer
+        # cannot have changed.
+        return ActionOutcome.failed(
+            str(exc), failure_class=FailureClass.BUDGET_EXHAUSTED
         )
     except RepositoryBusyError as exc:
         # Not a failure: another cycle is mutating this repository. The work item

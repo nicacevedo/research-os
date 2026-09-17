@@ -477,10 +477,13 @@ def _run_runtime_coding(env: dict[str, Any]) -> Any:
 
     built: list[AutomationController] = []
 
-    def _controller(_context: Any, *, autonomy: str) -> AutomationController:
-        controller = AutomationController(
-            providers={"fake": scripted()}, config=profiled_config()
-        )
+    def _controller(
+        _context: Any, *, autonomy: str, authority: Any = None
+    ) -> AutomationController:
+        providers: dict[str, Any] = {"fake": scripted()}
+        if authority is not None:
+            providers = authority.wrap(providers)
+        controller = AutomationController(providers=providers, config=profiled_config())
         built.append(controller)
         return controller
 

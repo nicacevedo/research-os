@@ -123,7 +123,9 @@ def _install_controller(
         },
     )
     controller = make_controller({"claude": provider})
-    env["monkeypatch"].setattr(proposal_action, "_controller", lambda _ctx: controller)
+    env["monkeypatch"].setattr(
+        proposal_action, "_controller", lambda _ctx, authority=None: controller
+    )
     env["provider"] = provider
     return controller
 
@@ -243,7 +245,9 @@ def test_a_proposal_citing_an_unsupplied_finding_is_refused(
         },
     )
     controller = make_controller({"claude": provider})
-    env["monkeypatch"].setattr(proposal_action, "_controller", lambda _ctx: controller)
+    env["monkeypatch"].setattr(
+        proposal_action, "_controller", lambda _ctx, authority=None: controller
+    )
 
     outcome = propose_capsule_change(env["state"], _context(env), {})
     assert not outcome.ok
@@ -387,7 +391,9 @@ def test_a_worker_that_cites_the_id_a_finding_invented_is_still_refused(
         },
     )
     controller = make_controller({"claude": provider})
-    env["monkeypatch"].setattr(proposal_action, "_controller", lambda _ctx: controller)
+    env["monkeypatch"].setattr(
+        proposal_action, "_controller", lambda _ctx, authority=None: controller
+    )
 
     outcome = propose_capsule_change(env["state"], _context(env), {})
     assert not outcome.ok
@@ -772,7 +778,9 @@ def test_an_assessor_failure_keeps_the_proposal_and_says_it_is_unassessed(
         },
     )
     controller = make_controller({"claude": provider})
-    env["monkeypatch"].setattr(proposal_action, "_controller", lambda _ctx: controller)
+    env["monkeypatch"].setattr(
+        proposal_action, "_controller", lambda _ctx, authority=None: controller
+    )
 
     outcome = propose_capsule_change(env["state"], _context(env), {})
     assert outcome.ok, outcome.detail

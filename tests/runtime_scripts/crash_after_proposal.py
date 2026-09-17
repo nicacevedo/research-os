@@ -51,7 +51,9 @@ provider = FakeProvider(
     },
 )
 controller = make_controller({"claude": provider})
-proposal_action._controller = lambda _ctx: controller  # type: ignore[assignment]
+proposal_action._controller = (  # type: ignore[assignment]
+    lambda _ctx, authority=None: controller
+)
 
 with Database(dsn) as db:
     context = make_context(

@@ -87,13 +87,15 @@ def drive(env: dict[str, Any], monkeypatch: pytest.MonkeyPatch, **plan: Any) -> 
     from tests.automation_helpers import fake_config
     from tests.runtime_graph_helpers import make_context, make_router
 
-    monkeypatch.setattr(
-        coding,
-        "_controller",
-        lambda _context, autonomy: AutomationController(
-            providers={"fake": scripted()}, config=fake_config()
-        ),
-    )
+    def build(_context: Any, *, autonomy: str, authority: Any = None) -> Any:
+        # The authority is threaded through exactly as production does, so
+        # these runs really reserve and settle against the runtime ledger.
+        providers: dict[str, Any] = {"fake": scripted()}
+        if authority is not None:
+            providers = authority.wrap(providers)
+        return AutomationController(providers=providers, config=fake_config())
+
+    monkeypatch.setattr(coding, "_controller", build)
     context = make_context(
         db=env["db"],
         repo=env["repo"],

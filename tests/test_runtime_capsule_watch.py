@@ -574,7 +574,9 @@ def test_the_closed_loop_from_finding_to_successor_cycle(
     from tests.proposal_helpers import make_controller
 
     controller = make_controller({"claude": provider})
-    monkeypatch.setattr(proposal_action, "_controller", lambda _ctx: controller)
+    monkeypatch.setattr(
+        proposal_action, "_controller", lambda _ctx, authority=None: controller
+    )
 
     # The cycle's planner picks the proposal action.
     plane["router"].answers["planner"] = plan_answer(
