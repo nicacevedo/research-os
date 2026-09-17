@@ -214,7 +214,9 @@ def plan_one_action(
     # that. `sciencecontext` gives it the findings and the outstanding
     # proposals, bounded and labelled noncanonical; see that module for why the
     # three categories are kept apart.
-    science = noncanonical_science(context.store, project_id=state["project_id"])
+    science = noncanonical_science(
+        context.store, project_id=state["project_id"], artifacts=context.artifacts
+    )
     prompt = PLANNER.render(
         fields={
             "objective": state["objective"],
@@ -234,6 +236,10 @@ def plan_one_action(
             "outstanding_proposals": [
                 json.dumps(entry, indent=2, sort_keys=True)
                 for entry in science.proposals
+            ],
+            "preregistered_designs": [
+                json.dumps(entry, indent=2, sort_keys=True)
+                for entry in science.preregistrations
             ],
             "repository": [state["repo_path"]],
         },

@@ -307,7 +307,7 @@ _NOMINATOR_SCHEMA: Mapping[str, Any] = {
 
 PLANNER = PromptTemplate(
     name="planner",
-    version=4,
+    version=5,
     role=ModelRole.PLANNER,
     capability=Capability.PLANNING,
     criticality=Criticality.NORMAL,
@@ -346,6 +346,18 @@ PLANNER = PromptTemplate(
         "The OUTSTANDING PROPOSALS block lists decisions already in front of a "
         "person. A finding marked as already cited by one of them has been asked "
         "about; proposing it again asks the same question twice.\n"
+        "The PREREGISTERED DESIGNS block lists experiment specifications this "
+        "project has already frozen. They are NOT canonical either -- a "
+        "preregistration becomes a capsule experiment only when a person "
+        "promotes it -- so a hypothesis named there is still listed as untested "
+        "in the frontier, and that is not a contradiction.\n"
+        'DO NOT plan "design_experiment" for a hypothesis that already appears '
+        "in that block. A second design for the same hypothesis is not progress: "
+        "it freezes a slightly different specification, costs a model call, and "
+        "leaves the frontier exactly where it was, because what the hypothesis "
+        "is waiting for is a person or an execution rather than another design. "
+        "If every untested hypothesis already has a design, say so and choose "
+        'either "run_local_experiment" or "propose_capsule_change".\n'
         "\n"
         "So: if the census below shows completed findings and no permitted action "
         "would tell you something new about this project, choose "
@@ -378,6 +390,7 @@ PLANNER = PromptTemplate(
         ("frontier", FRONTIER_FENCE),
         ("completed_findings", RUNTIME_FINDING_FENCE),
         ("outstanding_proposals", PROPOSAL_FENCE),
+        ("preregistered_designs", RESULT_FENCE),
         ("repository", REPOSITORY_FENCE),
     ),
     output_schema=_PLAN_SCHEMA,

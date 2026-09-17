@@ -31,6 +31,7 @@ from typing import Any
 
 import pytest
 
+from research_os.runtime.artifacts import FilesystemArtifactStore
 from research_os.runtime.checkpoints import ensure_tables
 from research_os.runtime.cycles import start_cycle
 from research_os.runtime.db import Database
@@ -63,13 +64,17 @@ def env(runtime_db: Database, pg_dsn: str, tmp_path: Path) -> dict[str, Any]:
     repo = make_capsule(tmp_path / "project")
     artifacts = tmp_path / "artifacts"
     RuntimeStore(runtime_db).upsert_project(project_id=PROJECT, repo_path=str(repo))
+    store = RuntimeStore(runtime_db)
     return {
         "db": runtime_db,
         "dsn": pg_dsn,
         "repo": repo,
         "artifacts": artifacts,
         "config": make_config(pg_dsn, artifacts),
-        "store": RuntimeStore(runtime_db),
+        "store": store,
+        # A real content-addressed store, because the preregistration tests
+        # read a document back out of it.
+        "artifacts_store": FilesystemArtifactStore(artifacts, store=store),
     }
 
 
@@ -369,10 +374,14 @@ def test_the_planner_template_declares_the_new_context(env: dict[str, Any]) -> N
     """A version bump, because a prompt is code and its identity is provenance."""
 
     del env
-    assert PLANNER.identity == "planner@4"
+    assert PLANNER.identity == "planner@5"
     assert "noncanonical_census" in PLANNER.fields
     declared = {name for name, _fence in PLANNER.blocks}
-    assert {"completed_findings", "outstanding_proposals"} <= declared
+    assert {
+        "completed_findings",
+        "outstanding_proposals",
+        "preregistered_designs",
+    } <= declared
 
 
 def test_outstanding_proposals_are_bounded_too() -> None:
@@ -572,3 +581,78 @@ def test_the_document_inventory_is_bounded(env: dict[str, Any]) -> None:
     # The true total is reported; the listing is not.
     assert f"{MAX_DOCUMENTS + 7} project document(s)" in finding.summary
     assert len(finding.artifact_ids) <= MAX_DOCUMENTS
+
+
+# --- preregistered designs: the loop that cost four dollars -----------------
+def test_a_preregistered_design_is_visible_to_the_next_planner(
+    env: dict[str, Any],
+) -> None:
+    """The defect this category exists for, reproduced from the live runtime.
+
+    `design_experiment` is deliberately not in `FINDING_FOR_ACTION`, and its
+    preregistration is "already looked up by digest" -- but by digest only
+    helps a caller who has one, and a fresh planner does not. Meanwhile the
+    frontier keeps reporting the hypothesis as untested, correctly, because a
+    preregistration is not a capsule object. So the planner designed again.
+
+    On the live thesis runtime that happened six times in ninety minutes, six
+    distinct spec digests, about four dollars of model spend, none of it wrong
+    and none of it new.
+    """
+
+    from research_os.runtime.actions.experiments import preregistration_role
+    from research_os.runtime.interfaces import ArtifactRef
+
+    role = preregistration_role("d" * 64)
+    ref = env["artifacts_store"].put_text(
+        json.dumps({"hypothesis": "HYP-0002", "command": "adjudicate-pricing"}),
+        role=role,
+    )
+    # Linked through a run, because that is how the real path records it:
+    # `link` derives project_id from the run so it cannot disagree with it.
+    run = env["store"].create_run(project_id=PROJECT, objective="test HYP-0002")
+    env["artifacts_store"].link(
+        ArtifactRef(artifact_id=ref.artifact_id, media_type="application/json"),
+        role=role,
+        run_id=run.run_id,
+    )
+
+    science = noncanonical_science(
+        env["store"], project_id=PROJECT, artifacts=env["artifacts_store"]
+    )
+    assert science.preregistrations_total == 1
+    entry = science.preregistrations[0]
+    assert entry["noncanonical"] is True
+    assert entry["tests_hypothesis"] == "HYP-0002"
+    assert "1 experiment design(s) already preregistered" in science.census()
+
+
+def test_the_planner_is_told_not_to_design_the_same_test_twice(
+    env: dict[str, Any],
+) -> None:
+    """The instruction has to say it; a block nobody is told to read is decoration."""
+
+    del env
+    assert 'DO NOT plan "design_experiment"' in PLANNER.instruction
+    assert "A second design for the same hypothesis is not progress" in (
+        PLANNER.instruction
+    )
+    # And it must not be mistaken for canonical state.
+    assert "NOT canonical either" in PLANNER.instruction
+    assert "still listed as untested" in PLANNER.instruction
+
+
+def test_an_unreadable_preregistration_does_not_fail_a_cycle(
+    env: dict[str, Any],
+) -> None:
+    """Planning context. Losing one field of it must not break a research run."""
+
+    from research_os.runtime.sciencecontext import _hypothesis_of
+
+    assert _hypothesis_of(None, "whatever") == ""
+
+    class Broken:
+        def get_text(self, artifact_id: str) -> str:
+            raise OSError("gone")
+
+    assert _hypothesis_of(Broken(), "whatever") == ""

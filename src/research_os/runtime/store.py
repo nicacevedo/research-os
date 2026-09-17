@@ -1596,6 +1596,64 @@ class RuntimeStore:
             for row in rows
         )
 
+    def stored_preregistrations(
+        self, *, project_id: str, limit: int = 6
+    ) -> tuple[dict[str, object], ...]:
+        """Preregistered experiment designs this project already holds.
+
+        Newest first, bounded. Scoped through ``artifact_links.project_id``
+        coalesced with the run's, which is the scoping
+        ``actions.experiments._preregistration_rows`` documents and the reason
+        it does not go through the run alone: pruning a run used to sever the
+        only path from the artifact to its project.
+
+        Only the ``preregistration:<digest>`` roles written from ``0012`` on.
+        The legacy bare ``preregistration`` role is deliberately absent: this
+        feeds a planning prompt, where a design whose digest cannot be read off
+        the row is not worth a document read, and the execution guard still
+        finds both.
+        """
+
+        with self._db.tx() as conn:
+            rows = conn.execute(
+                """
+                select distinct a.artifact_id, a.role, a.created_at
+                from artifacts a
+                join artifact_links l on l.artifact_id = a.artifact_id
+                left join research_runs r on r.run_id = l.run_id
+                where a.role like 'preregistration:%%'
+                  and coalesce(l.project_id, r.project_id) = %(project_id)s
+                order by a.created_at desc
+                limit %(limit)s
+                """,
+                {"project_id": project_id, "limit": limit},
+            ).fetchall()
+        return tuple(
+            {
+                "artifact_id": str(row["artifact_id"]),
+                "spec_digest": str(row["role"]).partition(":")[2],
+                "created_at": row["created_at"].isoformat(),
+            }
+            for row in rows
+        )
+
+    def count_stored_preregistrations(self, *, project_id: str) -> int:
+        """How many designs this project holds, however many are shown."""
+
+        with self._db.tx() as conn:
+            row = conn.execute(
+                """
+                select count(distinct a.artifact_id) as n
+                from artifacts a
+                join artifact_links l on l.artifact_id = a.artifact_id
+                left join research_runs r on r.run_id = l.run_id
+                where a.role like 'preregistration:%%'
+                  and coalesce(l.project_id, r.project_id) = %(project_id)s
+                """,
+                {"project_id": project_id},
+            ).fetchone()
+        return int(row["n"]) if row else 0
+
     def count_created_proposals(self, *, project_id: str) -> int:
         """How many proposals exist for this project, however many are shown."""
 

@@ -39,6 +39,7 @@ that could write a capsule.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -64,6 +65,24 @@ MAX_PLANNER_SUMMARY_CHARS = 600
 #: The most outstanding proposals the planner is shown.
 MAX_PLANNER_PROPOSALS = 6
 
+#: The most preregistered designs the planner is shown.
+#:
+#: The reason this category exists at all: `design_experiment` is deliberately
+#: not in `FINDING_FOR_ACTION` -- "a specification is a plan, and its
+#: preregistration artifact is already durable and already looked up by digest"
+#: -- but *looked up by digest* only helps a caller who has the digest, and a
+#: fresh planner does not. So a preregistered design was invisible to the next
+#: cycle, while the frontier went on reporting the hypothesis as untested,
+#: because a preregistration is not a capsule object and only a person can make
+#: it one.
+#:
+#: The live thesis runtime did exactly that six times in ninety minutes: six
+#: `design_experiment` calls, six *distinct* spec digests -- variations on one
+#: test of HYP-0002 -- and about four dollars of model spend, none of it wrong
+#: and none of it new. Deduplication by digest could not stop it because each
+#: design differed.
+MAX_PLANNER_PREREGISTRATIONS = 6
+
 
 @dataclass(frozen=True, slots=True)
 class NoncanonicalScience:
@@ -77,12 +96,14 @@ class NoncanonicalScience:
 
     findings: tuple[Mapping[str, object], ...]
     proposals: tuple[Mapping[str, object], ...]
+    preregistrations: tuple[Mapping[str, object], ...]
     findings_total: int
     proposals_total: int
+    preregistrations_total: int
 
     @property
     def empty(self) -> bool:
-        return not self.findings and not self.proposals
+        return not self.findings and not self.proposals and not self.preregistrations
 
     def census(self) -> str:
         """One line of counts, for a plain prompt field outside every fence.
@@ -101,6 +122,11 @@ class NoncanonicalScience:
             )
         else:
             parts.append("no proposal has been put to a human yet")
+        if self.preregistrations_total:
+            parts.append(
+                f"{self.preregistrations_total} experiment design(s) already "
+                f"preregistered, {len(self.preregistrations)} shown"
+            )
         return "; ".join(parts)
 
 
@@ -135,7 +161,28 @@ def finding_view(
     }
 
 
-def noncanonical_science(store: Any, *, project_id: str) -> NoncanonicalScience:
+def preregistration_view(
+    row: Mapping[str, object], *, hypothesis: str = ""
+) -> dict[str, object]:
+    """One preregistered design as plain data for a fenced block.
+
+    ``hypothesis`` is what actually stops the loop -- "a design for HYP-0002
+    already exists" is the sentence a planner needs, and the digest alone does
+    not say it.
+    """
+
+    return {
+        "spec_digest": str(row["spec_digest"])[:16],
+        "noncanonical": True,
+        "preregistered_at": row["created_at"],
+        "tests_hypothesis": hypothesis,
+        "artifact_id": row["artifact_id"],
+    }
+
+
+def noncanonical_science(
+    store: Any, *, project_id: str, artifacts: Any = None
+) -> NoncanonicalScience:
     """Assemble what this project has learned but not yet had accepted.
 
     Two reads and no writes. The findings are newest-first and bounded; each
@@ -151,6 +198,21 @@ def noncanonical_science(store: Any, *, project_id: str) -> NoncanonicalScience:
         project_id=project_id, limit=MAX_PLANNER_PROPOSALS
     )
     proposals_total = store.count_created_proposals(project_id=project_id)
+
+    # Designs already frozen, and the hypothesis each one tests. The document
+    # is read for the bounded set only, and a document that cannot be read
+    # yields an empty hypothesis rather than an error: this is planning
+    # context, and losing one field of it must not fail a cycle.
+    prereg_rows = store.stored_preregistrations(
+        project_id=project_id, limit=MAX_PLANNER_PREREGISTRATIONS
+    )
+    preregistrations = tuple(
+        preregistration_view(
+            row, hypothesis=_hypothesis_of(artifacts, str(row["artifact_id"]))
+        )
+        for row in prereg_rows
+    )
+    preregistrations_total = store.count_stored_preregistrations(project_id=project_id)
 
     # Which proposals cite which finding. Built from the proposals actually
     # shown, so the edge a planner reads is one it can also see the other end
@@ -168,6 +230,21 @@ def noncanonical_science(store: Any, *, project_id: str) -> NoncanonicalScience:
             for item in shown
         ),
         proposals=proposals,
+        preregistrations=preregistrations,
         findings_total=total,
         proposals_total=proposals_total,
+        preregistrations_total=preregistrations_total,
     )
+
+
+def _hypothesis_of(artifacts: Any, artifact_id: str) -> str:
+    """The hypothesis a stored preregistration names, or "" if unreadable."""
+
+    if artifacts is None:
+        return ""
+    try:
+        document = json.loads(artifacts.get_text(artifact_id))
+    except Exception:  # noqa: BLE001 - planning context, never a cycle failure
+        return ""
+    value = document.get("hypothesis") if isinstance(document, dict) else None
+    return str(value)[:64] if value else ""
