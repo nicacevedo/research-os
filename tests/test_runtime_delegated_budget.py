@@ -507,3 +507,192 @@ def test_a_call_the_authority_never_saw_is_still_charged(
         authority=auth,
     )
     assert Decimal(budget(budgeted, Dimension.MODEL_COST_USD).spent) == Decimal("0.30")
+
+
+# -- the objective's cap, across the cycles of one objective -------------------
+
+
+def test_a_successor_cycle_inherits_the_objectives_explicit_cap(
+    runtime_db: Database, tmp_path: Any
+) -> None:
+    """Measured on a real objective before it was a test.
+
+    `researchctl runtime start --max-cost-usd 6` set a run-scope limit on the
+    run it created. A successor cycle is a different run, and
+    `apply_default_budgets` overwrote its limits with the configuration
+    defaults unconditionally -- so cycle 0 held 6 and cycle 1 held 25. Over
+    `max_cycles_per_objective = 12` that is an exposure of
+    `6 + 11 x 25 = 281 USD` against a number the researcher typed as 6.
+
+    Observed on 2026-09-17 on `cg-sparse-regression`:
+    `run:RRUN-...-6e916d0b model_cost_usd available 5.80` and
+    `run:RRUN-...-42c57607 model_cost_usd available 24.39`.
+    """
+
+    from research_os.runtime.cycles import apply_default_budgets
+    from tests.runtime_graph_helpers import make_config
+
+    config = make_config(dsn="", artifacts_root=tmp_path / "artifacts")
+    ledger = BudgetLedger(runtime_db)
+    store = RuntimeStore(runtime_db)
+    store.upsert_project(project_id="capped-objective", repo_path=str(tmp_path))
+    parent = store.create_run(project_id="capped-objective", objective="o")
+
+    # What the CLI does: the explicit cap, then the defaults which must not
+    # raise it.
+    ledger.set_limit(
+        scope=BudgetScope.RUN,
+        scope_id=parent.run_id,
+        dimension=Dimension.MODEL_COST_USD,
+        limit_value=Decimal(6),
+    )
+    apply_default_budgets(
+        ledger,
+        config=config,
+        run_id=parent.run_id,
+        project_id="capped-objective",
+        inherit_from_run_id=parent.run_id,
+    )
+    parent_limit = ledger.get(
+        scope=BudgetScope.RUN,
+        scope_id=parent.run_id,
+        dimension=Dimension.MODEL_COST_USD,
+    )
+    assert parent_limit is not None
+    assert Decimal(parent_limit.limit_value) == Decimal(6), (
+        "the defaults overwrote the researcher's explicit cap"
+    )
+
+    # And the successor.
+    child = store.create_run(
+        project_id="capped-objective",
+        objective="o",
+        parent_run_id=parent.run_id,
+        cycle_index=1,
+    )
+    apply_default_budgets(
+        ledger,
+        config=config,
+        run_id=child.run_id,
+        project_id="capped-objective",
+        inherit_from_run_id=parent.run_id,
+    )
+    child_limit = ledger.get(
+        scope=BudgetScope.RUN,
+        scope_id=child.run_id,
+        dimension=Dimension.MODEL_COST_USD,
+    )
+    assert child_limit is not None
+    assert Decimal(child_limit.limit_value) == Decimal(6), (
+        f"the successor got {child_limit.limit_value} rather than the objective's 6"
+    )
+
+
+def test_the_project_ceiling_follows_the_objectives_cap(
+    runtime_db: Database, tmp_path: Any
+) -> None:
+    """A 6 USD objective must not buy a 300 USD project ceiling.
+
+    The ceiling exists to bound an objective, and deriving it from the
+    configuration default rather than from the researcher's number made it
+    bound the wrong thing.
+    """
+
+    from research_os.runtime.cycles import apply_default_budgets
+    from tests.runtime_graph_helpers import make_config
+
+    config = make_config(dsn="", artifacts_root=tmp_path / "artifacts")
+    ledger = BudgetLedger(runtime_db)
+    store = RuntimeStore(runtime_db)
+    store.upsert_project(project_id="ceiling-project", repo_path=str(tmp_path))
+    run = store.create_run(project_id="ceiling-project", objective="o")
+
+    ledger.set_limit(
+        scope=BudgetScope.RUN,
+        scope_id=run.run_id,
+        dimension=Dimension.MODEL_COST_USD,
+        limit_value=Decimal(6),
+    )
+    apply_default_budgets(
+        ledger,
+        config=config,
+        run_id=run.run_id,
+        project_id="ceiling-project",
+        inherit_from_run_id=run.run_id,
+    )
+    ceiling = ledger.get(
+        scope=BudgetScope.PROJECT,
+        scope_id="ceiling-project",
+        dimension=Dimension.MODEL_COST_USD,
+    )
+    assert ceiling is not None
+    expected = Decimal(6) * Decimal(config.settings.max_cycles_per_objective)
+    assert Decimal(ceiling.limit_value) == expected
+    assert Decimal(ceiling.limit_value) < Decimal(300)
+
+
+def test_applying_the_defaults_twice_does_not_reset_a_cap(
+    runtime_db: Database, tmp_path: Any
+) -> None:
+    """`set_limit` is an upsert, so a second call would silently widen a run.
+
+    Reachable on any path that opens a run and then re-applies budgets -- a
+    resume, a reconciler, a future caller. The check that prevents it is not
+    decoration.
+    """
+
+    from research_os.runtime.cycles import apply_default_budgets
+    from tests.runtime_graph_helpers import make_config
+
+    config = make_config(dsn="", artifacts_root=tmp_path / "artifacts")
+    ledger = BudgetLedger(runtime_db)
+    store = RuntimeStore(runtime_db)
+    store.upsert_project(project_id="twice-project", repo_path=str(tmp_path))
+    run = store.create_run(project_id="twice-project", objective="o")
+
+    ledger.set_limit(
+        scope=BudgetScope.RUN,
+        scope_id=run.run_id,
+        dimension=Dimension.MODEL_COST_USD,
+        limit_value=Decimal(2),
+    )
+    for _ in range(3):
+        apply_default_budgets(
+            ledger, config=config, run_id=run.run_id, project_id="twice-project"
+        )
+    limit = ledger.get(
+        scope=BudgetScope.RUN,
+        scope_id=run.run_id,
+        dimension=Dimension.MODEL_COST_USD,
+    )
+    assert limit is not None
+    assert Decimal(limit.limit_value) == Decimal(2)
+
+
+def test_an_unconstrained_objective_still_gets_the_defaults(
+    runtime_db: Database, tmp_path: Any
+) -> None:
+    """The fix must not turn "no cap given" into "no budget"."""
+
+    from research_os.runtime.cycles import apply_default_budgets
+    from tests.runtime_graph_helpers import make_config
+
+    config = make_config(dsn="", artifacts_root=tmp_path / "artifacts")
+    ledger = BudgetLedger(runtime_db)
+    store = RuntimeStore(runtime_db)
+    store.upsert_project(project_id="default-project", repo_path=str(tmp_path))
+    run = store.create_run(project_id="default-project", objective="o")
+    apply_default_budgets(
+        ledger,
+        config=config,
+        run_id=run.run_id,
+        project_id="default-project",
+        inherit_from_run_id=run.run_id,
+    )
+    limit = ledger.get(
+        scope=BudgetScope.RUN,
+        scope_id=run.run_id,
+        dimension=Dimension.MODEL_COST_USD,
+    )
+    assert limit is not None
+    assert Decimal(limit.limit_value) == Decimal(str(config.budget.max_model_cost_usd))

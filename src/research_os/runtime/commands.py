@@ -72,8 +72,23 @@ def add_runtime_parser(subparsers: argparse._SubParsersAction) -> None:
         action="store_true",
         help="Run one cycle inline instead of leaving it to researchd.",
     )
-    start.add_argument("--max-model-calls", type=int, default=None)
-    start.add_argument("--max-cost-usd", type=float, default=None)
+    start.add_argument(
+        "--max-model-calls",
+        type=int,
+        default=None,
+        help="Model calls one cycle of this objective may make.",
+    )
+    start.add_argument(
+        "--max-cost-usd",
+        type=float,
+        default=None,
+        help=(
+            "Provider spend one CYCLE of this objective may authorise. An "
+            "objective may run several cycles, so its exposure is this times "
+            "the configured max_cycles_per_objective; `runtime run` prints "
+            "both. The value is inherited by every successor cycle."
+        ),
+    )
 
     status = actions.add_parser("status", help="What is running, waiting, and failed.")
     status.add_argument("--project", default=None)
@@ -262,7 +277,11 @@ def _start(args: argparse.Namespace) -> int:
             autonomy=Autonomy(config.autonomy),
         )
         ledger = BudgetLedger(db)
-        apply_default_budgets(ledger, config=config, run_id=run.run_id)
+        # The explicit caps are applied *before* the defaults, and the defaults
+        # then refuse to raise a tighter limit. Applied the other way round,
+        # `apply_default_budgets` would create the project ceiling from the
+        # configuration's per-cycle cost rather than from the researcher's --
+        # so `--max-cost-usd 6` would still buy a 300 USD objective ceiling.
         if args.max_model_calls is not None:
             ledger.set_limit(
                 scope=BudgetScope.RUN,
@@ -277,6 +296,17 @@ def _start(args: argparse.Namespace) -> int:
                 dimension=Dimension.MODEL_COST_USD,
                 limit_value=args.max_cost_usd,
             )
+        # `project_id` was not passed here, so an objective started from the CLI
+        # got no project ceiling at all until its *first successor* created one
+        # -- which is to say, the ceiling that exists to bound an objective did
+        # not exist for the first cycle of any objective.
+        apply_default_budgets(
+            ledger,
+            config=config,
+            run_id=run.run_id,
+            project_id=project_id,
+            inherit_from_run_id=run.run_id,
+        )
         store.record_event(
             kind="RESEARCH_RUN_REQUESTED",
             project_id=project_id,

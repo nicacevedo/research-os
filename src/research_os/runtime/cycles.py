@@ -27,6 +27,7 @@ import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -156,29 +157,88 @@ def build_context(
     )
 
 
+#: Every dimension a run budget covers, in one place, so `apply_default_budgets`
+#: and the inheritance it performs cannot drift apart.
+_BUDGET_DIMENSIONS: tuple[Dimension, ...] = (
+    Dimension.MODEL_CALLS,
+    Dimension.MODEL_COST_USD,
+    Dimension.WALL_CLOCK_SECONDS,
+    Dimension.EXTERNAL_JOBS,
+    Dimension.WORK_ITEMS,
+)
+
+
 def apply_default_budgets(
     ledger: BudgetLedger,
     *,
     config: RuntimeConfig,
     run_id: str,
     project_id: str | None = None,
+    inherit_from_run_id: str | None = None,
 ) -> None:
-    """Give a new cycle its own budget, and its project a standing ceiling.
+    """Give a new cycle its budget, and its project a standing ceiling.
 
     The per-run budget is never widened afterwards: a cycle that is already
     going has the budget it started with, so editing the configuration cannot
     retroactively authorise more spending on work in flight.
 
+    **``inherit_from_run_id`` is what makes ``--max-cost-usd`` mean anything
+    past the first cycle**, and its absence was a real and measured defect.
+
+    ``researchctl runtime start --max-cost-usd 6`` sets a run-scope limit on the
+    run it creates. A successor cycle is a *different* run, and this function
+    used to overwrite its limits with the configuration defaults
+    unconditionally. So an objective a researcher capped at 6 USD ran its first
+    cycle at 6 and every cycle after it at the default 25 -- exposure of
+    ``6 + 11 x 25 = 281 USD`` against a number the researcher had typed as 6,
+    with nothing reporting the discrepancy. Observed on a real objective on
+    2026-09-17: cycle 0 held ``model_cost_usd`` limit 6 and cycle 1 held 25.
+
+    A successor continues the same objective under the same authorisation, so
+    it inherits the root run's limits rather than the defaults. Where the
+    parent has no limit for a dimension -- it cannot, today, but a future
+    dimension could be added -- the default fills in.
+
+    **``set_limit`` overwrites**, which is why the existing-limit check below is
+    not decoration: without it, calling this twice on one run (a resume, a
+    reconciler) would silently reset a researcher's explicit cap to the
+    default. Only *raising* a limit is refused; the configuration may still
+    lower one.
+
     The per-*project* cost ceiling exists because the run budget alone does not
     bound an objective. ``should_continue`` deliberately ignores run scope when
     deciding to continue -- the successor gets a fresh run budget -- so without
     this, one objective's exposure was ``max_cycles_per_objective`` times the
-    per-run cost, which at the defaults is 300 USD with nothing warning. An
-    independent review pointed that out. It is set only if absent, so a
-    researcher who has chosen their own ceiling keeps it.
+    per-run cost. It is now derived from the *effective* per-cycle cost limit
+    rather than from the default, so a 6 USD objective gets a 72 USD project
+    ceiling instead of 300, and it is set only if absent, so a researcher who
+    has chosen their own ceiling keeps it.
+
+    **What is still true and is not hidden:** ``--max-cost-usd X`` bounds one
+    cycle, and an objective may run up to ``max_cycles_per_objective`` of them.
+    The exposure is ``X * max_cycles_per_objective``, and both numbers are
+    printed by ``researchctl runtime run``. Making the cap bound the whole
+    objective means one budget shared by every cycle in the chain, which is a
+    larger change to the reservation path and is recorded as remaining work
+    rather than smuggled in here.
     """
 
     defaults = config.budget
+    inherited: dict[Dimension, Decimal] = {}
+    if inherit_from_run_id:
+        for dimension in _BUDGET_DIMENSIONS:
+            record = ledger.get(
+                scope=BudgetScope.RUN,
+                scope_id=inherit_from_run_id,
+                dimension=dimension,
+            )
+            if record is not None:
+                inherited[dimension] = Decimal(record.limit_value)
+
+    def limit_for(dimension: Dimension, fallback: float) -> Decimal:
+        return inherited.get(dimension, Decimal(str(fallback)))
+
+    effective_cost = limit_for(Dimension.MODEL_COST_USD, defaults.max_model_cost_usd)
     if project_id is not None:
         existing = ledger.get(
             scope=BudgetScope.PROJECT,
@@ -190,21 +250,29 @@ def apply_default_budgets(
                 scope=BudgetScope.PROJECT,
                 scope_id=project_id,
                 dimension=Dimension.MODEL_COST_USD,
-                limit_value=defaults.max_model_cost_usd
-                * config.settings.max_cycles_per_objective,
+                limit_value=effective_cost
+                * Decimal(config.settings.max_cycles_per_objective),
             )
-    for dimension, limit in (
+    for dimension, fallback in (
         (Dimension.MODEL_CALLS, defaults.max_model_calls),
         (Dimension.MODEL_COST_USD, defaults.max_model_cost_usd),
         (Dimension.WALL_CLOCK_SECONDS, defaults.max_wall_clock_seconds),
         (Dimension.EXTERNAL_JOBS, defaults.max_external_jobs),
         (Dimension.WORK_ITEMS, defaults.max_work_items),
     ):
+        wanted = limit_for(dimension, fallback)
+        current = ledger.get(
+            scope=BudgetScope.RUN, scope_id=run_id, dimension=dimension
+        )
+        if current is not None and Decimal(current.limit_value) < wanted:
+            # A tighter limit already exists on this run. Raising it here would
+            # be retroactive authorisation, which the first paragraph forbids.
+            continue
         ledger.set_limit(
             scope=BudgetScope.RUN,
             scope_id=run_id,
             dimension=dimension,
-            limit_value=limit,
+            limit_value=wanted,
         )
 
 
@@ -238,7 +306,15 @@ def open_cycle(
         cycle_index=cycle_index,
     )
     apply_default_budgets(
-        BudgetLedger(db), config=config, run_id=run.run_id, project_id=project_id
+        BudgetLedger(db),
+        config=config,
+        run_id=run.run_id,
+        project_id=project_id,
+        # A successor continues the same objective under the same
+        # authorisation, so it inherits the parent's limits rather than the
+        # configuration defaults. Without this a `--max-cost-usd 6` objective
+        # ran cycle 0 at 6 and every cycle after it at 25.
+        inherit_from_run_id=parent_run_id,
     )
     store.record_event(
         kind="RESEARCH_RUN_REQUESTED",
