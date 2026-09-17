@@ -616,3 +616,92 @@ def test_a_dsn_with_no_secret_is_left_readable() -> None:
         redact_dsn("postgresql:///db?host=/run/pg") == "postgresql:///db?host=/run/pg"
     )
     assert redact_dsn("") == ""
+
+
+# ------------------------------------------------------- the project ceiling --
+def test_the_project_ceiling_can_be_read_and_raised(
+    cli: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`runtime budget` exists because the ceiling had no way to change.
+
+    It is created once per project, `spent` accumulates for the project's whole
+    lifetime and nothing resets it, so a project that reached its ceiling was
+    permanently unable to do autonomous work with no recourse. An adversarial
+    review found that, and found that an earlier version of this branch made it
+    reachable by typing a small `--max-cost-usd` on the first objective.
+    """
+
+    from decimal import Decimal
+
+    from research_os.runtime.budgets import BudgetLedger, Dimension
+    from research_os.runtime.models import BudgetScope
+
+    ledger = BudgetLedger(cli["db"])  # type: ignore[arg-type]
+    ledger.set_limit(
+        scope=BudgetScope.PROJECT,
+        scope_id="alpha-project",
+        dimension=Dimension.MODEL_COST_USD,
+        limit_value=Decimal(10),
+    )
+    assert run_cli(monkeypatch, "runtime", "budget", "alpha-project") == 0
+    assert "10.000000 USD" in capsys.readouterr().out
+
+    assert (
+        run_cli(
+            monkeypatch, "runtime", "budget", "alpha-project", "--max-cost-usd", "50"
+        )
+        == 0
+    )
+    assert "50.000000 USD" in capsys.readouterr().out
+
+
+def test_lowering_the_ceiling_below_what_is_spent_is_refused(
+    cli: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Setting it there stops all further work at once, so it asks first."""
+
+    from decimal import Decimal
+
+    from research_os.runtime.budgets import BudgetLedger, Dimension
+    from research_os.runtime.models import BudgetScope
+
+    ledger = BudgetLedger(cli["db"])  # type: ignore[arg-type]
+    ledger.set_limit(
+        scope=BudgetScope.PROJECT,
+        scope_id="alpha-project",
+        dimension=Dimension.MODEL_COST_USD,
+        limit_value=Decimal(10),
+    )
+    ledger.charge_all(
+        dimension=Dimension.MODEL_COST_USD,
+        amount=Decimal(4),
+        run_id="RRUN-none",
+        project_id="alpha-project",
+    )
+    assert (
+        run_cli(
+            monkeypatch, "runtime", "budget", "alpha-project", "--max-cost-usd", "3"
+        )
+        != 0
+    )
+    assert "refusing" in capsys.readouterr().out
+
+    assert (
+        run_cli(
+            monkeypatch,
+            "runtime",
+            "budget",
+            "alpha-project",
+            "--max-cost-usd",
+            "3",
+            "--force",
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "3.000000 USD" in out
+    assert "at its ceiling" in out
