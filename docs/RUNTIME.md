@@ -993,15 +993,45 @@ because a finding nobody wrote down is a finding that gets re-found.
   call -- the provenance loss it prevents is real and was demonstrated -- but
   the migration's framing of pruning as "an ordinary retention action" is
   stronger than the codebase supports.
-- **`run_local_experiment` refuses correctly and the refusal is not fed back.**
-  Observed on a real objective: the planner chose `run_local_experiment`, the
-  action refused with `policy_refused` and the exact remedy in its detail
-  ("no preregistered design to run; design_experiment must come first"), and
-  the successor cycle -- a new LangGraph thread seeded only with identity --
-  planned the identical action again. The guard is right; the feedback path is
-  missing. This is the "seven cycles, one cycle's worth of information" failure
-  of §16 in a new form, and the fix is to carry the previous cycle's failed
-  action and its detail into the successor's planning prompt.
+*(The refusal-feedback gap that was listed here is now fixed; see below.)*
+
+## 15c. Being refused taught the objective nothing, twice
+
+Worth its own section because it was found by running the system on real work
+rather than by reading it, because it happened twice with two different guards,
+and because both guards were correct.
+
+```text
+run_local_experiment   refused: "no preregistered design to run;
+                        design_experiment must come first"
+                        -> the successor cycle planned run_local_experiment
+
+design_experiment      refused: "parameter 'out' must be relative, not
+                        '/home/nicacevedo/.local/share/research-os/...'"
+                        -> the successor cycle supplied another absolute path
+```
+
+Neither refusal is a defect. The preregistration guard is the mechanism that
+makes "the criteria were fixed before the result" true, and the declared-
+parameter type check is what `docs/EXPERIMENTS.md` means by "a value that does
+not fit is refused, never escaped". Both messages name exactly what is wrong.
+
+The defect is that a successor cycle is a new LangGraph thread seeded with
+identity alone, so the refusal -- the single most informative thing that had
+happened to the objective -- was invisible to the next planner. This is §16's
+"seven cycles, one cycle's worth of information" in a second form: there the
+frontier could not move, here the reason it could not move was recorded and
+thrown away.
+
+`RuntimeStore.last_refused_action` reads it from `tool_invocations`, not from
+graph state, because graph state is precisely what the successor does not have.
+`plan_one_action` renders it as one field and the planner prompt (version 3)
+says what to do with it: satisfy what the refusal asks for, or choose a
+different action, and say which.
+
+The parent's refusal only, and clipped. One cycle back stops the immediate
+repetition; a growing transcript of failures in a planning prompt is how a
+planner starts reasoning about its own failures instead of about the project.
 
 ## 16. What two adversarial reviews and a real pilot changed
 
