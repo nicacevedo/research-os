@@ -126,8 +126,8 @@ releases earlier.
 ```text
 before                                      3521 passed, 18 skipped
 after                                       3596 passed, 18 skipped   (539.8 s)
-runtime suites, forward order                running at the time of writing
-runtime suites, reverse order                running at the time of writing
+runtime suites, forward order                 534 passed  (231.3 s)
+runtime suites, reverse order                 534 passed  (209.0 s)
 migrations, dev cluster                      15 applied, latest 0015
 migrations from empty                        applied 15 migration(s), fresh cluster
 migrations over a populated 0014             tests/test_runtime_retention.py
