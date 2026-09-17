@@ -549,6 +549,29 @@ either is acceptable is the machine owner's call, and neither was applied.
 **Untouched by this pass.** Slurm (`slurm.enabled: false`). Cross-provider
 review independence (one provider family installed).
 
+**Identified, evidenced, and not fixed: a finding's substance does not reach
+the proposal layer.** The runtime found this about itself, which is the part
+worth noting.
+
+`critique_hypotheses` produced `FIND-20260917T183904Z-9b053d6e`, whose *summary*
+is the single line "6 alternative explanation(s) for 5 target(s)" and whose
+substance — six alternative explanations with mechanisms, falsifiers and
+novelty verdicts — is in the artifact it cites. `actions/proposals.py` builds
+`SuppliedFinding(statement=item.summary)`, so the proposal worker received the
+one-liner and the artifact *id*, never the artifact's content.
+
+The autonomously written proposal `PROP-19700101T000000Z-33ec307e` says so in
+its own PR-002: "only its summary line reached this prompt, so no item here is
+grounded in the content of its six alternatives, and a human must read the
+payload before promoting any of them." A system that fences what it could not
+read is working correctly. It is still reading less than it has.
+
+The fix is not "put the artifact in the prompt" — that is the context dump
+`sciencecontext` exists to avoid. It is that a finding whose substance is an
+artifact should carry a bounded excerpt of it, chosen by the handler that wrote
+the artifact rather than by the prompt builder. That is the next change this
+lifecycle wants, and it is not in this pass.
+
 **Not run.** The final adversarial science review and the final adversarial
 architecture review. Both were to attack work that does not exist yet.
 
