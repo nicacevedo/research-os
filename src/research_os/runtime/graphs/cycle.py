@@ -1210,6 +1210,43 @@ def conclude(state: CycleState, runtime: Runtime[CycleContext]) -> dict[str, Any
                 state, "concluded: checks failed; a repair cycle is warranted"
             ),
         }
+    # **The frontier's own WAIT_HUMAN, honoured.** Found by running the thing
+    # rather than reading it: a real cycle asked the frontier role whether
+    # another cycle was warranted, was told `WAIT_HUMAN` with the reason that
+    # two proposals already ask the same researcher the same questions, wrote
+    # that into a finding -- and then concluded `START_NEXT_CYCLE`, because
+    # this function only ever reached `WAIT_HUMAN` through
+    # `requires_human_promotion`, which is set by `propose_capsule_change` and
+    # `nominate_insight` and by nothing else. The daemon read the
+    # recommendation off the event and opened a successor against a frontier
+    # whose own assessment said to stop.
+    #
+    # So the one recommendation whose entire purpose is to end the loop was
+    # advisory. A researcher running `researchd` would have got cycles instead
+    # of a system waiting for them, each one costing model calls to be told
+    # again that the answer is a decision only they can make.
+    #
+    # Scoped to the action that is *asked* this question. A `recommendation`
+    # key in some other handler's data means something else, and reading it
+    # here would be the same defect in the other direction.
+    planned_action = str((state.get("plan") or {}).get("action", ""))
+    recommended = str(data.get("recommendation") or "")
+    if planned_action == str(ActionKind.ASSESS_FRONTIER) and recommended in {
+        "WAIT_HUMAN",
+        "BLOCKED",
+    }:
+        reason = str(data.get("recommendation_rationale") or "").strip()
+        return {
+            "frontier_digest": digest,
+            "terminal_state": str(TerminalState.WAITING_FOR_SCIENTIFIC_DECISION),
+            "next_recommendation": recommended,
+            "notes": note(
+                state,
+                f"concluded: the frontier assessment recommends {recommended} -- "
+                + (reason or "see `researchctl propose list`"),
+            ),
+        }
+
     if frontier.empty:
         return {
             "frontier_digest": digest,

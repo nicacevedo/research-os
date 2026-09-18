@@ -37,6 +37,7 @@ from research_os.runtime.checkpoints import ensure_tables
 from research_os.runtime.cycles import start_cycle
 from research_os.runtime.db import Database
 from research_os.runtime.kernel import ScientificKernelAdapter
+from research_os.runtime.models import TerminalState
 from research_os.runtime.policy import ActionKind
 from research_os.runtime.sciencecontext import noncanonical_science
 from research_os.runtime.store import RuntimeStore
@@ -351,3 +352,121 @@ def test_an_artifact_is_addressed_by_its_content(env: dict[str, Any]) -> None:
     run(env, ActionKind.CRITIQUE_HYPOTHESES, skeptic=CRITIQUE_ANSWER)
     again = findings_for(env, ActionKind.CRITIQUE_HYPOTHESES)[0]
     assert again.artifact_ids == finding.artifact_ids
+
+
+# --- the frontier's own WAIT_HUMAN, honoured -------------------------------
+def test_a_frontier_that_recommends_waiting_opens_no_successor(
+    runtime_db: Database, pg_dsn: str, tmp_path: Path
+) -> None:
+    """Found by running a real cycle, not by reading the code.
+
+    The frontier role was asked whether another cycle was warranted, answered
+    ``WAIT_HUMAN`` with the reason that two proposals already ask the same
+    researcher the same questions, and that answer was written into a finding.
+    The cycle then concluded ``START_NEXT_CYCLE``, because this branch was only
+    ever reached through ``requires_human_promotion`` -- which
+    ``propose_capsule_change`` and ``nominate_insight`` set and nothing else
+    does. The daemon read the recommendation off the event and opened a
+    successor against a frontier whose own assessment said to stop.
+
+    The recommendation whose entire purpose is to end the loop was advisory.
+    """
+
+    ensure_tables(pg_dsn)
+    repo = make_capsule(tmp_path / "project")
+    store = RuntimeStore(runtime_db)
+    store.upsert_project(project_id=PROJECT, repo_path=str(repo))
+    router = ScriptedRouter(
+        answers={
+            "planner": plan_answer(str(ActionKind.ASSESS_FRONTIER)),
+            "frontier": {
+                "recommendation": "WAIT_HUMAN",
+                "recommendation_rationale": (
+                    "Two proposals already put these questions to the researcher."
+                ),
+                "ranked_actions": [
+                    {
+                        "action": "propose_capsule_change",
+                        "addresses": ["Q-0001"],
+                        "importance": "low",
+                        "information_gain": "low",
+                        "feasibility": "high",
+                        "cost": "medium",
+                        "rationale": "an unaudited third ask would restate a question.",
+                    }
+                ],
+            },
+            "scientific_reviewer": review_answer(),
+        }
+    )
+    result = start_cycle(
+        config=make_config(pg_dsn, tmp_path / "artifacts"),
+        db=runtime_db,
+        project_id=PROJECT,
+        repo_path=repo,
+        objective="decide whether another cycle is warranted",
+        models=router,
+    )
+
+    # The recommendation the daemon reads, and the honest terminal word.
+    assert result.recommendation == "WAIT_HUMAN"
+    assert result.terminal_state is TerminalState.WAITING_FOR_SCIENTIFIC_DECISION
+    assert any("recommends WAIT_HUMAN" in note for note in result.notes), result.notes
+    assert any("already put these questions" in note for note in result.notes), (
+        result.notes
+    )
+
+    # And the reason survives into the finding a later proposal would cite,
+    # rather than only into the note a person has to go looking for.
+    findings = store.list_findings(project_id=PROJECT, limit=5)
+    assert findings
+    assert "WAIT_HUMAN" in findings[0].excerpt
+
+    # The run is still parked, so a human decision can still wake it: honouring
+    # the recommendation must stop the loop, not close the objective.
+    parked = store.parked_objectives(project_id=PROJECT)
+    assert [run.run_id for run in parked] == [result.run.run_id]
+
+
+def test_a_frontier_that_recommends_continuing_still_does(
+    runtime_db: Database, pg_dsn: str, tmp_path: Path
+) -> None:
+    """The control. A branch that stopped every cycle would also pass the test
+    above, and would be a runtime that never does anything."""
+
+    ensure_tables(pg_dsn)
+    repo = make_capsule(tmp_path / "project")
+    store = RuntimeStore(runtime_db)
+    store.upsert_project(project_id=PROJECT, repo_path=str(repo))
+    router = ScriptedRouter(
+        answers={
+            "planner": plan_answer(str(ActionKind.ASSESS_FRONTIER)),
+            "frontier": {
+                "recommendation": "START_NEXT_CYCLE",
+                "recommendation_rationale": "there is executable work outstanding.",
+                "ranked_actions": [
+                    {
+                        "action": "inspect_repository",
+                        "addresses": ["Q-0001"],
+                        "importance": "high",
+                        "information_gain": "high",
+                        "feasibility": "high",
+                        "cost": "low",
+                        "rationale": "the repository has not been read this run.",
+                    }
+                ],
+            },
+            "scientific_reviewer": review_answer(),
+        }
+    )
+    result = start_cycle(
+        config=make_config(pg_dsn, tmp_path / "artifacts"),
+        db=runtime_db,
+        project_id=PROJECT,
+        repo_path=repo,
+        objective="rank what is next",
+        models=router,
+    )
+
+    assert result.recommendation == "START_NEXT_CYCLE"
+    assert result.terminal_state is TerminalState.DONE_FOR_NOW

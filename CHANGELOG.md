@@ -240,6 +240,29 @@ release's own fix.
   `tests/test_sandbox_adversarial.py` now attacks a real canonical repository,
   and `record()` refuses to write a validation from a run that attacked none.
 
+- **The runtime asked whether to wait for a human, was told yes, and carried
+  on.** The same acceptance run found this one, and it is the more serious of
+  the two. `assess_frontier_ranked` recommended `WAIT_HUMAN`, with the reason
+  that two proposals already ask the same researcher the same questions and
+  that an unaudited third ask was the *least* useful action available. The cycle
+  concluded `START_NEXT_CYCLE`.
+
+  `conclude` only ever reached `WAIT_HUMAN` through
+  `requires_human_promotion`, which `propose_capsule_change` and
+  `nominate_insight` set and nothing else does. A frontier assessment's own
+  recommendation was never read. So the daemon took the recommendation off the
+  event, opened a successor, and would have gone on opening them -- against a
+  frontier whose own assessment said to stop, spending model calls to be told
+  again that the answer is a decision only the researcher can make. Observed:
+  one daemon tick started exactly that successor.
+
+  The recommendation whose entire purpose is to end the loop was advisory.
+  `conclude` now honours `WAIT_HUMAN` and `BLOCKED` from the action that is
+  actually asked the question, records the reason in the run's notes, and
+  concludes `WAITING_FOR_SCIENTIFIC_DECISION` -- which is still parked, so a
+  human decision still wakes the objective. Honouring the recommendation has to
+  stop the loop without closing the work, and a test pins both halves.
+
 - **The frontier ranking recorded a count and threw away its reasons.** Found
   by exercising the repaired science-context pipeline for real rather than by
   reading it. One bounded cycle on the thesis project produced exactly one
