@@ -240,6 +240,28 @@ release's own fix.
   `tests/test_sandbox_adversarial.py` now attacks a real canonical repository,
   and `record()` refuses to write a validation from a run that attacked none.
 
+- **The frontier ranking recorded a count and threw away its reasons.** Found
+  by exercising the repaired science-context pipeline for real rather than by
+  reading it. One bounded cycle on the thesis project produced exactly one
+  finding:
+
+  ```text
+  7 ranked candidate(s); recommends WAIT_HUMAN
+  ```
+
+  with an empty excerpt. Not which seven, not why, and not why waiting was the
+  answer -- while the ranking itself, sitting in the artifact beside it, argued
+  in detail that authoring a third proposal was the *least* useful thing
+  available because two already ask the same researcher the same questions.
+
+  Excerpts were added so a later proposal could weigh what a finding said
+  instead of its one-line summary. The handlers for literature, exploration,
+  critique and experiments got them; `assess_frontier_ranked` -- the handler
+  that decides what happens next, and whose content bears most directly on the
+  next decision -- was the one left out. It now records the recommendation, the
+  reason for it, and each candidate with what it addresses and why it ranked
+  where it did.
+
 ### Added
 
 - **`researchctl runtime containment-audit`, because the record it writes had no

@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from research_os.runtime.actions.base import (
@@ -277,6 +277,54 @@ def assess_frontier_ranked(
             "ranked_actions": actions,
             "cycles_used": depth + 1,
             "cycles_remaining": max(0, ceiling - depth - 1),
+            # **The gap an acceptance run found.** Excerpts were added so that a
+            # later proposal could weigh what a finding actually said rather
+            # than its one-line summary -- and this handler, the one that ranks
+            # what to do next, was left out. A real cycle produced
+            # `7 ranked candidate(s); recommends WAIT_HUMAN` and nothing else:
+            # not which seven, not why, not why waiting was the answer. That is
+            # the same blindness the release set out to remove, in the finding
+            # whose content bears most directly on the next decision.
+            EXCERPT_KEY: bounded_excerpt(
+                _ranking_lines(recommendation, ranking, actions),
+                limit=MAX_EXCERPT_CHARS,
+            ),
         },
         artifacts=(ref, ranked_ref),
     )
+
+
+def _ranking_lines(
+    recommendation: str,
+    ranking: Mapping[str, Any],
+    actions: Sequence[Mapping[str, Any]],
+) -> list[str]:
+    """The ranking's substance, labelled by what each line is.
+
+    Producer-authored: this handler knows that the recommendation and its
+    reason come first, and that a candidate is only useful to a later reader
+    with the action it names and the reason it was ranked where it was.
+    """
+
+    lines = [f"recommendation: {recommendation}"]
+    rationale = str(ranking.get("recommendation_rationale") or "").strip()
+    if rationale:
+        lines.append(f"why: {rationale}")
+    for position, candidate in enumerate(actions, start=1):
+        if not isinstance(candidate, Mapping):
+            continue
+        action = str(candidate.get("action") or "").strip() or "unnamed"
+        addresses = ", ".join(
+            str(item) for item in candidate.get("addresses", ()) if item
+        )
+        importance = str(candidate.get("importance") or "").strip()
+        reason = str(candidate.get("rationale") or "").strip()
+        parts = [f"candidate {position}: {action}"]
+        if addresses:
+            parts.append(f"addresses {addresses}")
+        if importance:
+            parts.append(f"importance {importance}")
+        if reason:
+            parts.append(reason)
+        lines.append(" -- ".join(parts))
+    return lines

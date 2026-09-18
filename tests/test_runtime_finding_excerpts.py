@@ -492,3 +492,108 @@ def test_the_excerpt_key_is_not_mistaken_for_a_reference() -> None:
     """The lifted key must not leak into provenance as an identifier."""
 
     assert EXCERPT_KEY not in {"ranked", "job_id", "spec_digest"}
+
+
+# --- 9. the handler an acceptance run found missing -------------------------
+def run_frontier(env: dict[str, Any], *, objective: str = "rank what is next") -> Any:
+    """Drive a cycle whose action is the frontier ranking."""
+
+    router = ScriptedRouter(
+        answers={
+            "planner": plan_answer(str(ActionKind.ASSESS_FRONTIER)),
+            "frontier": (
+                {
+                    "recommendation": "WAIT_HUMAN",
+                    "recommendation_rationale": (
+                        "Two proposals already put these questions to the "
+                        "researcher; nothing read-only would move the frontier."
+                    ),
+                    "ranked_actions": [
+                        {
+                            "action": "propose_capsule_change",
+                            "addresses": ["HYP-0002", "Q-0001"],
+                            "importance": "high",
+                            "information_gain": "medium",
+                            "feasibility": "high",
+                            "cost": "low",
+                            "rationale": (
+                                "HYP-0002 is a mathematical proposition and needs "
+                                "a derivation, not another experiment."
+                            ),
+                        },
+                        {
+                            "action": "search_literature",
+                            "addresses": ["Q-0003"],
+                            "importance": "medium",
+                            "information_gain": "low",
+                            "feasibility": "high",
+                            "cost": "low",
+                            "rationale": "the working-set priority question is a "
+                            "literature determination.",
+                        },
+                    ],
+                }
+            ),
+            "scientific_reviewer": review_answer(),
+        }
+    )
+    result = start_cycle(
+        config=env["config"],
+        db=env["db"],
+        project_id=PROJECT,
+        repo_path=env["repo"],
+        objective=objective,
+        models=router,
+    )
+    return result, router
+
+
+def only_frontier_finding(env: dict[str, Any]) -> RuntimeFinding:
+    findings = env["store"].list_findings(project_id=PROJECT, limit=10)
+    ranked = [f for f in findings if f.kind is FindingKind.FRONTIER]
+    assert ranked, f"no frontier finding was recorded; got {findings}"
+    assert len(ranked) == 1
+    return ranked[0]
+
+
+def test_the_frontier_ranking_carries_its_candidates_not_only_their_count(
+    env: dict[str, Any],
+) -> None:
+    """The gap a real acceptance run exposed.
+
+    Exercising the repaired pipeline on the thesis project produced exactly one
+    finding -- ``7 ranked candidate(s); recommends WAIT_HUMAN`` -- with an empty
+    excerpt. Not which seven, not why, and not why waiting was the answer. The
+    handler that decides what happens next was the one left out when excerpts
+    were added, which is the same blindness the excerpt work set out to remove,
+    in the finding whose content bears most directly on the next decision.
+    """
+
+    run_frontier(env)
+    finding = only_frontier_finding(env)
+
+    assert "ranked candidate(s); recommends WAIT_HUMAN" in finding.summary
+    assert finding.excerpt, "the frontier ranking recorded no substance"
+    # The recommendation and its reason.
+    assert "recommendation: WAIT_HUMAN" in finding.excerpt
+    assert "already put these questions" in finding.excerpt
+    # And each candidate, with what it addresses and why it ranked there.
+    assert "propose_capsule_change" in finding.excerpt
+    assert "HYP-0002" in finding.excerpt
+    assert "needs a derivation, not another experiment" in finding.excerpt
+    assert "search_literature" in finding.excerpt
+    assert "importance high" in finding.excerpt
+
+
+def test_the_frontier_excerpt_reaches_a_later_proposal(env: dict[str, Any]) -> None:
+    """An excerpt nothing reads is a longer summary."""
+
+    run_frontier(env)
+    finding = only_frontier_finding(env)
+
+    from research_os.runtime.actions.proposals import _supplied
+
+    supplied = _supplied((finding,))
+    assert supplied, "the finding did not convert for the proposal layer"
+    assert "WAIT_HUMAN" in supplied[0].excerpt
+    assert "HYP-0002" in supplied[0].excerpt
