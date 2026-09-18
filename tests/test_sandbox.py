@@ -16,7 +16,10 @@ itself the release-blocking evidence, not a gap in coverage. A test that
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
+import tempfile
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -238,6 +241,9 @@ def test_writable_binds_come_after_the_read_only_operating_system(
     explain.
     """
 
+    # It has to exist: a bind mount needs a source, and the sandbox refuses to
+    # create one rather than making host directories of its own.
+    (tmp_path / "out").mkdir()
     prepared = contain(
         ["/bin/true"],
         spec=SandboxSpec(workdir=tmp_path, writable=(tmp_path / "out",)),
@@ -252,6 +258,32 @@ def test_writable_binds_come_after_the_read_only_operating_system(
 
 
 # ------------------------------------------------------------- adversarial --
+@pytest.fixture
+def outside_tmp() -> Iterator[Path]:
+    """A fixture directory the sandbox does **not** shadow.
+
+    `_bubblewrap` mounts `--tmpfs /tmp`, so anything pytest's `tmp_path` builds
+    is invisible inside the sandbox for a reason that has nothing to do with
+    policy. An adversarial audit of these tests found three of them passing on
+    exactly that: the attack could not be *attempted*, the command printed
+    "denied", and the assertion was satisfied. They would have passed against a
+    sandbox with no filesystem policy at all.
+
+    `/var/tmp` is not in `_OS_PATHS` and not shadowed, so a path under it is
+    denied by policy rather than hidden by a mount -- which is the property
+    these tests are named for.
+    """
+
+    base = Path("/var/tmp")
+    if not base.is_dir() or not os.access(base, os.W_OK):  # pragma: no cover
+        pytest.skip("this host has no writable /var/tmp to build fixtures in")
+    made = Path(tempfile.mkdtemp(prefix="research-os-sandbox-", dir=base))
+    try:
+        yield made
+    finally:
+        shutil.rmtree(made, ignore_errors=True)
+
+
 def _run_contained(script: str, *, workdir: Path, network: bool = False) -> str:
     """Run a shell snippet inside the sandbox and return its combined output."""
 
@@ -273,43 +305,73 @@ def _run_contained(script: str, *, workdir: Path, network: bool = False) -> str:
 
 
 @needs_sandbox
-def test_the_canonical_capsule_cannot_be_written(tmp_path: Path) -> None:
+def test_the_canonical_capsule_cannot_be_written(outside_tmp: Path) -> None:
     """The escape ``docs/RUNTIME.md`` §16 describes, attempted for real."""
 
-    canonical = tmp_path / "canonical"
+    canonical = outside_tmp / "canonical"
     (canonical / ".research").mkdir(parents=True)
-    (canonical / ".research" / "CLAIM-0001.yaml").write_text("status: draft\n", "utf-8")
-    worktree = tmp_path / "worktree"
+    claim = canonical / ".research" / "CLAIM-0001.yaml"
+    claim.write_text("status: draft\n", "utf-8")
+    worktree = outside_tmp / "worktree"
     worktree.mkdir()
 
     output = _run_contained(
-        f"echo accepted > {canonical / '.research' / 'CLAIM-0001.yaml'} "
-        f"&& echo WROTE || echo denied",
+        f"echo accepted > {claim} && echo WROTE || echo denied",
         workdir=worktree,
     )
     assert "WROTE" not in output
-    assert (canonical / ".research" / "CLAIM-0001.yaml").read_text("utf-8") == (
-        "status: draft\n"
-    )
+    # The half that carries the property: the *host* file, read afterwards.
+    assert claim.read_text("utf-8") == "status: draft\n"
 
 
 @needs_sandbox
-def test_git_refs_cannot_be_updated(tmp_path: Path) -> None:
-    """A push or a branch write is as much of an escape as a commit."""
+def test_git_refs_cannot_be_updated(outside_tmp: Path) -> None:
+    """A push or a branch write is as much of an escape as a commit.
 
-    repo = tmp_path / "repo"
+    An audit found the earlier version of this test vacuous twice over: the
+    repository lived under `tmp_path`, which the sandbox's own tmpfs hides, so
+    `cd` failed and the `&&` chain never reached `update-ref`; and the test then
+    asserted only on the command's output, never re-reading the host's refs.
+    Both halves are fixed -- the repository is somewhere the sandbox can see,
+    and the refs are compared before and after.
+    """
+
+    repo = outside_tmp / "repo"
+    for args in (
+        ["init", "-q", "--initial-branch=main", str(repo)],
+        ["-C", str(repo), "config", "user.email", "t@example.invalid"],
+        ["-C", str(repo), "config", "user.name", "T"],
+    ):
+        subprocess.run(["git", *args], check=True, capture_output=True)
+    (repo / "f.txt").write_text("one\n", encoding="utf-8")
     subprocess.run(
-        ["git", "init", "-q", "--initial-branch=main", str(repo)],
+        ["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-qm", "init"],
         check=True,
         capture_output=True,
     )
-    worktree = tmp_path / "worktree"
+
+    def refs() -> str:
+        return subprocess.run(
+            ["git", "-C", str(repo), "show-ref"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+
+    before = refs()
+    assert before.strip(), "the fixture has no refs, so the test would prove nothing"
+    worktree = outside_tmp / "worktree"
     worktree.mkdir()
     output = _run_contained(
-        f"cd {repo} && git update-ref refs/heads/escaped HEAD && echo WROTE || echo denied",
+        f"cd {repo} && git update-ref refs/heads/escaped HEAD && echo WROTE "
+        "|| echo denied",
         workdir=worktree,
     )
     assert "WROTE" not in output
+    assert refs() == before
 
 
 @needs_sandbox
@@ -348,22 +410,33 @@ def test_a_path_outside_the_worktree_cannot_be_written(tmp_path: Path) -> None:
 
 
 @needs_sandbox
-def test_a_symlink_out_of_the_worktree_does_not_escape(tmp_path: Path) -> None:
+def test_a_symlink_out_of_the_worktree_does_not_escape(outside_tmp: Path) -> None:
     """Containment has to survive the worktree's own contents.
 
     Scope enforcement refuses outbound symlinks, and a sandbox that relied on
     that would be relying on a check that runs at a different time.
+
+    The fixture is outside `/tmp` deliberately. With it under `tmp_path` the
+    link dangled inside the sandbox's own tmpfs, so `cat` failed for a reason
+    unrelated to containment and the test passed without exercising the
+    property it is named for. An audit found it.
     """
 
-    outside = tmp_path / "outside"
+    outside = outside_tmp / "outside"
     outside.mkdir()
     (outside / "secret.txt").write_text("SECRET\n", encoding="utf-8")
-    worktree = tmp_path / "worktree"
+    worktree = outside_tmp / "worktree"
     worktree.mkdir()
     (worktree / "link").symlink_to(outside)
+    # The link really does resolve on the host; only the sandbox may refuse it.
+    assert (worktree / "link" / "secret.txt").read_text("utf-8") == "SECRET\n"
 
     output = _run_contained("cat link/secret.txt || echo denied", workdir=worktree)
     assert "SECRET" not in output
+    # And writing through it changes nothing on the host.
+    planted = outside / "planted.txt"
+    _run_contained("echo x > link/planted.txt || echo denied", workdir=worktree)
+    assert not planted.exists()
 
 
 @needs_sandbox
@@ -567,9 +640,6 @@ def test_a_system_program_adds_no_binding(tmp_path: Path) -> None:
     workdir = tmp_path / "project"
     workdir.mkdir()
     flags = _flags(["/bin/sh", "-c", "true"], SandboxSpec(workdir=workdir))
-    assert flags.count("--ro-bind") == len(
-        [token for token in flags if token == "--ro-bind"]
-    )
     assert "/bin/sh" not in [
         flags[index + 1]
         for index, token in enumerate(flags)
@@ -582,17 +652,23 @@ def test_a_system_program_adds_no_binding(tmp_path: Path) -> None:
 def test_uv_reads_its_interpreters_and_writes_nothing_on_the_host(
     monkeypatch, tmp_path
 ) -> None:
-    """The uv directories are read-only, and the cache is not bound at all.
+    """The uv data directory is read-only, and the cache is not in *this* list.
 
-    An earlier version of this put both in `writable`, which was a host
-    code-execution escape: the managed interpreter's stdlib directory is
-    writable by this user and is what nine venvs on this machine execute, so
-    contained model-written code could drop a `sitecustomize.py` there and the
-    next `uv run` anywhere on the host would execute it outside the sandbox.
+    An earlier version put both in `writable`, which was a host code-execution
+    escape: the managed interpreter's stdlib directory is writable by this user
+    and is what nine venvs on this machine execute, so contained model-written
+    code could drop a `sitecustomize.py` there and the next `uv run` anywhere
+    on the host would execute it outside the sandbox.
 
-    The cache is excluded rather than made read-only because a read-only cache
-    does not work -- measured: `Failed to initialize cache ... Permission
-    denied`. uv gets the sandbox's own tmpfs HOME instead.
+    **The cache is not absent from the sandbox**, and an audit was right that
+    the previous wording here implied it was. A read-only cache does not work --
+    measured: `Failed to initialize cache ... Permission denied` -- so it is
+    handled by `uv_discarded_paths` instead, which exposes it as a throwaway
+    overlay: readable wholesale, writable in appearance, every write destroyed
+    with the sandbox. That is a real read exposure of the researcher's package
+    cache and it is stated in `SECURITY.md`. What this test pins is narrower
+    and still worth pinning: the cache never reaches the *read-only bind* list,
+    where it would break uv, nor the writable one, where it was an escape.
     """
 
     from research_os.automation.checks import uv_readonly_paths
@@ -608,7 +684,16 @@ def test_uv_reads_its_interpreters_and_writes_nothing_on_the_host(
     paths = uv_readonly_paths(["uv", "run", "--frozen", "pytest"])
 
     assert paths == (home / ".local" / "share" / "uv",)
-    assert home / ".cache" / "uv" not in paths, "the package cache must not be bound"
+    assert home / ".cache" / "uv" not in paths, (
+        "the package cache must not be in the read-only bind list -- uv cannot "
+        "initialise a read-only cache. It is exposed as an overlay instead."
+    )
+    from research_os.automation.checks import uv_discarded_paths
+
+    assert uv_discarded_paths(["uv", "run", "--frozen", "pytest"]) == (
+        home / ".cache" / "uv",
+    )
+    assert uv_discarded_paths(["pytest"]) == ()
     # Only for uv. Every other program's needs are the caller's to declare.
     assert uv_readonly_paths(["pytest"]) == ()
     assert uv_readonly_paths([]) == ()

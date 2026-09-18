@@ -11,6 +11,278 @@ closing the first of them exposed.
 
 ### Fixed
 
+- **Containment made every real command vanish, and the message named the wrong
+  file.** The moment the sandbox actually executed things, 112 tests failed at
+  once with
+
+  ```text
+  bwrap: execvp pytest: No such file or directory
+  ```
+
+  for a `pytest` that existed, was bound read-only, and was on the sandbox
+  PATH. `<venv>/bin/pytest` begins `#!<venv>/bin/python3`, and the kernel
+  reports a missing *interpreter* by naming the *script*. The binding layer
+  exposed the executable file and nothing else -- correct for an ELF binary
+  whose libraries live under `/usr`, wrong for everything else.
+
+  The unit is not the file, it is the **execution dependency closure**: every
+  host path the kernel and the program's own runtime must find between `execvp`
+  and the first instruction. `program_binding` now walks it -- every name in a
+  symbolic-link chain, the `#!` interpreter, `/usr/bin/env` resolved against the
+  sandbox's own PATH rather than the host's, and the ELF loader out of
+  `PT_INTERP` so a missing one is *named* instead of being reported as a missing
+  binary.
+
+  It still refuses to bind a directory because a program lives in it. `uv` lives
+  in `~/.local/bin` under a `~/.local` holding this system's own database. The
+  only directory ever bound is a *runtime root* -- one carrying a marker the
+  runtime itself wrote, `pyvenv.cfg` or `lib/python3.*/os.py` -- and then only
+  the root. A virtual environment is exposed; the project around it is not.
+
+  And a `#!` line is file content a model wrote one step earlier, so an
+  interpreter it names is honoured only inside the operating system, inside
+  what the caller declared, or inside the program's own runtime. Writing the
+  test matrix found a hole in the first version of that rule: the check applied
+  to the path requested and not to where its symbolic links *landed*, so
+  replacing a virtual environment's `bin/python3` with a link to `~/.ssh/id_rsa`
+  bound that file inside. Every name in a chain is checked now, and a hop may
+  leave the trusted set only by landing in a runtime root.
+
+  Malformed input fails closed with the reason: an empty `#!`, a relative
+  interpreter, a line longer than the 256 bytes the kernel reads, `env -S`,
+  `env FOO=bar`, a symbolic-link cycle, a missing interpreter. The new
+  `SandboxPreparationError` separates "this command could not be set up" from
+  "this host cannot contain anything" -- the second is a refusal no repair can
+  change, the first is a fact about one command and is reported against it.
+
+- **Two more defects the same hour of real execution exposed.** The report that
+  opened this work said the 112 failures shared one root cause. They shared
+  three.
+
+  *A linked Git worktree could not reach its own repository.* Every acceptance
+  command runs inside a `git worktree add` checkout, where `.git` is a pointer
+  file naming a directory outside the worktree. The sandbox denied it, so every
+  project whose checks include a `git` command failed with `fatal: not a git
+  repository` -- naming a repository that was fine. `linked_worktree_paths`
+  exposes the repository's common directory, read-only, which was measured to be
+  enough for `git status`, `git diff --check`, `git rev-parse` and `git
+  show-ref`. `git update-ref` against a canonical branch is attacked in the
+  adversarial suite and denied.
+
+  *A declared writable path that did not exist yet.* `uv` materialises its
+  project environment at a path the controller chooses and uv creates, which is
+  nothing at all until the first `uv run` -- and under containment that is a
+  bind mount with no source: `bwrap: Can't find source path`. The owner of the
+  directory creates it now. The sandbox does not, and says why: a sandbox that
+  manufactures host directories in order to contain something has a write of
+  its own.
+
+- **A contained `uv run` could not install anything, and the previous release
+  had measured that it could.** `uv_readonly_paths` recorded that the package
+  cache was deliberately dropped and that uv would use the sandbox's tmpfs
+  `HOME` instead -- "verified to work from empty with `UV_OFFLINE=1`", at a cost
+  of "a cold cache per contained run. That is the correct price." The
+  verification had not covered a project with a dependency. A cold cache and no
+  network cannot install `pytest`, so the price was not a slower run, it was
+  every `uv run` check failing with a DNS error attributed to the project.
+
+  The cache is now a `--tmp-overlay`: readable, writable as far as uv can tell,
+  and the whole upper layer destroyed with the sandbox. Measured: five packages
+  installed with the network denied, and nothing new in the host cache
+  afterwards. Not the read-write bind an earlier review found to be a host
+  code-execution escape -- no write survives the run for anything to execute.
+  uv is also told the network is denied, so it resolves from the cache instead
+  of retrying an index it cannot reach for fifteen seconds. A host whose kernel
+  has no unprivileged overlay drops the exposure, warns, and runs cold.
+
+### Fixed, after two independent adversarial reviews of this work
+
+Both reviews were given the changed files and the invariants they were supposed
+to hold. Between them they found one critical defect, one high, and seven places
+where a test or a check could not fail. The critical one was introduced by this
+release's own fix.
+
+- **CRITICAL: a `pyvenv.cfg` a model could write mounted the host root.**
+  `_declared_base` read the `home =` line of a virtual environment's config and
+  put the directory it named straight into the bind set. `pathlib` does not
+  normalise `..`, so `Path("/etc/..")` has `.parent == /etc` and `.name == ".."`
+  and passed every textual guard -- the home check, the exposure filter, the
+  root check -- while the kernel resolved it to `/`. A worktree is writable by
+  design, so `home = /etc/../bin` is a line the contained code of the *previous*
+  step could write.
+
+  Measured, not inferred: `--ro-bind /etc/.. /etc/..` mounts the whole host
+  filesystem read-only inside the sandbox, and `~/.ssh/id_ed25519` was readable
+  there. In production the flag ordering makes bubblewrap abort instead -- the
+  `--dir /tmp/sandbox-home` that follows fails on a now-read-only root -- so the
+  reachable effect today is that every contained command dies. That is an
+  accident of ordering and not a policy, and it was one reordered line away from
+  being the other thing.
+
+  `_absolute` now normalises what it returns, `_declared_base` refuses a `..`
+  segment outright, and the declared base must clear the same runtime-root test
+  the `#!` interpreter and the ELF loader already had to clear. Three guards,
+  because the review found the two that existed both failing on the same input.
+
+- **HIGH: a worktree's `.git` pointer could name any repository on the host.**
+  In a linked worktree `.git` is a file, and `linked_worktree_paths` accepted
+  whatever it said as long as the path ended in `.git`. A contained acceptance
+  command writing `gitdir: /home/you/private-client-repo/.git` had that
+  repository's object store, branches and config bound read-only into the next
+  run. Git records the reverse link when it creates a worktree, so the pointer
+  must now be agreed at both ends -- forging one is easy, forging both needs
+  write access to the repository being aimed at. And `run_acceptance_command`
+  now sets `protected=(.git, .research)`, which `LocalExecutor` has done since
+  the hook escape and which this path should always have done.
+
+- **HIGH: the suite that declared containment validated never touched the
+  policy this release added.** Every attack ran `/bin/sh -c`, and `/bin/sh` is
+  inside `_OS_PATHS`, so `program_binding` emitted no binds and the entire
+  executable closure went unexercised. Both findings above were invisible to a
+  fully green run. The suite now attacks the closure directly -- a `#!` naming a
+  path outside policy, a symlink out of an exposed environment, a hostile
+  `pyvenv.cfg`, a forged worktree pointer -- with a control that a legitimate
+  console script still runs, so "everything is refused" cannot read as
+  "everything held". The policy digest the record is keyed to now covers
+  `automation/checks.py` and `runtime/executors.py` as well, because that is
+  where the spec is built and where this project's worst historical defect
+  lived.
+
+- **Seven checks and tests that could not fail.** Found by audit, each confirmed
+  by making it capable and watching what happened:
+
+  - `loopback_denied` used `/dev/tcp`, which is a bash feature; `/bin/sh` here
+    is dash, so the redirection failed identically with the network granted and
+    denied. The denial "held" because the instrument could not connect under any
+    circumstances. Its new control caught it on the first run.
+  - `network_is_a_real_capability` accepted either of the only two strings its
+    own script could print.
+  - `no_survivors_after_cancellation` put its sentinel in `sleep`'s argv --
+    `sleep 300 <sentinel>` is an invalid time interval, so every child exited
+    at once and nothing was ever cancelled. It now waits for the children to
+    exist and reports how many there were.
+  - `inherited_file_descriptors` passed `close_fds=True` and then checked the
+    descriptor was absent, which Python guarantees before bubblewrap is reached.
+    It now leaks one deliberately first, as a control.
+  - `symlink_to_home` looked for `.ssh` in the output of `ls`, which does not
+    list dotfiles.
+  - `path_traversal` wrote `../../../etc/...` from a worktree several levels
+    deep, so it aimed at `<somewhere>/etc/...` and then asked whether `/etc`
+    had gained a file nothing had tried to create.
+  - `test_the_canonical_capsule_cannot_be_written`,
+    `test_git_refs_cannot_be_updated` and
+    `test_a_symlink_out_of_the_worktree_does_not_escape` built their fixtures
+    under `tmp_path`, which the sandbox's own `--tmpfs /tmp` hides -- so the
+    attacks could not be *attempted*, the command printed "denied", and the
+    assertions were satisfied. `test_git_refs_cannot_be_updated` also never
+    re-read the host's refs. All three now build outside `/tmp` and compare host
+    state before and after; `audit()` refuses a `/tmp` root outright.
+
+- **A second review of the fixes found the git one incomplete.** The reverse
+  link proves the Git directory agrees it owns this worktree -- and a worker
+  writes *both* ends. Copy a plausible per-worktree directory into the worktree,
+  make `gitdir` name the pointer, and `commondir` may then be any repository on
+  the host: no symlink, no `..`, nothing `git status` reports, and git keeps
+  working. Confirmed by execution.
+
+  Two more conditions close it, and both are git's own invariants rather than
+  new policy. A worktree's Git directory is never inside the worktree. And the
+  shared directory always contains the per-worktree one -- `<common>/worktrees/
+  <name>` -- a relation this code was already computing, but only to decide how
+  many paths to return. Making it a requirement kills every variant.
+
+  The same review found the ELF loader's symlink chain bound hop by hop with
+  only its first name checked against the trusted set, so a loader inside a
+  trusted directory could point anywhere; it now recurses through the identical
+  per-hop treatment the interpreter's chain gets. And it found one of the new
+  closure checks vacuous: its symlink pointed at `~/.ssh/id_ed25519`, which is
+  not executable, so the refusal came from the executability guard and the
+  check would have passed with the policy it tests deleted. `_refuses` now
+  requires the refusal to name the reason.
+
+- **Two more places where the record could overstate what was measured.**
+  `record()` accepted any existing directory as a canonical repository, so
+  `--repo /var/tmp/anything` earned a validation; a directory with neither
+  `.research` nor `.git` now reports `SKIP` and blocks it. And the policy digest
+  gained `paths.py` and `automation/config.py`, which decide where this system's
+  own state lives and supply `extra_readable` and `network` -- change either and
+  the mount surface moves.
+
+- **One repair was implemented and then reverted**, which is worth recording
+  because the reasoning is the point. `.research` is left writable in projects
+  that have no capsule yet. Mounting an empty read-only tmpfs at the path fixes
+  that and bubblewrap *creates the destination* -- inside the read-write
+  worktree -- so every contained check in every capsule-less project would have
+  left an empty directory behind on the host. A sandbox that writes to the host
+  is a worse defect than the one being closed. The residual is documented at the
+  code and pinned by a test, rather than fixed at that price.
+
+- **Smaller, from the same reviews.** A CRLF `#!` line resolved `/bin/sh` here
+  while the kernel exec'd `/bin/sh\r` -- the same misdiagnosis this release set
+  out to remove -- and now fails closed naming the cause. A `PATH` in
+  `SandboxSpec.environment` used to win inside the sandbox while the binding
+  layer resolved `env` against the default, so the file bound and the file run
+  could differ; the sandbox's `PATH` is now final. An ELF binary naming a loader
+  that does not exist is refused by name rather than by `bwrap: Can't find
+  source path`. `_runtime_root` refuses this system's own state, config and
+  cache directories explicitly, instead of relying on the accident that no
+  `~/.local/pyvenv.cfg` exists on this machine. And an `assert` that `python -O`
+  would strip is now a refusal.
+
+- **Evidence that is now re-runnable.** The coding-pipeline and containment
+  acceptance results were transcripts of one-off scripts that were not in the
+  repository -- unable to be re-run after the next change, unable to be
+  inspected for the defects above, and unable to fail.
+  `tests/test_coding_pipeline_contained.py` builds a real uv project, a real
+  linked worktree and a real virtual environment, runs the discovered check
+  profile at `SandboxMode.REQUIRED`, and asserts `contained is True` on every
+  one -- which no test in the suite previously did on that path.
+  `tests/test_sandbox_adversarial.py` now attacks a real canonical repository,
+  and `record()` refuses to write a validation from a run that attacked none.
+
+### Added
+
+- **`researchctl runtime containment-audit`, because the record it writes had no
+  producer.** `runtime doctor` reported "containment validated" from a file under
+  the state home, and `available_backend()` gated unattended execution of
+  model-written code on the same file. Nothing in this repository had ever
+  written it. The one on the development machine had been created by hand after
+  a session of manual attacks: a claim that a boundary held, load-bearing for
+  the most consequential decision this system makes, existing as a sentence
+  somebody typed.
+
+  `src/research_os/sandbox_audit.py` holds the attacks and runs them through the
+  production `contain()` adapter. `tests/test_sandbox_adversarial.py` runs the
+  same function, so the release gate and the command a researcher re-runs by
+  hand cannot drift apart. The record is written only when every check both ran
+  and held -- a `SKIP` blocks it, because a suite that half executed is not
+  evidence -- and it is keyed to the bubblewrap binary's content hash **and** to
+  a digest of this system's own containment policy. This release proved why the
+  second half was needed: rewriting the binding policy changed what the sandbox
+  binds, and the old record went on reporting 27/27 against a filesystem surface
+  that no longer existed.
+
+  Writing the checks found two of them measuring the wrong thing. One failed
+  because the contained command printed `WROTE` -- and the command was right:
+  inside the sandbox `/tmp` is a fresh tmpfs, so the write succeeded against a
+  filesystem the host never sees. Another asked `[ -w /etc ]` from inside, which
+  is bubblewrap's own tmpfs root and writable by construction. Both now read the
+  *host* afterwards, which is what the boundary actually promises. The suite
+  also carries two controls that are supposed to succeed -- the worktree is
+  writable, and granting the network grants it -- so "nothing worked" cannot
+  read as "everything held".
+
+- **Nested user namespaces are disabled inside contained commands.** A previous
+  adversarial record noted that a contained process could still run `unshare
+  --user --map-root-user` and be root inside the result, which is where
+  published namespace escapes begin. No workload here needs one: acceptance
+  commands are `uv`, `pytest` and `ruff`, and a declared experiment is a script.
+  `--disable-userns` requests it and `--assert-userns-disabled` fails the
+  command if it did not take, so the denial is a property of the host rather
+  than a comment in this file. The namespace probe sets both flags too, for the
+  same reason `_OS_PATHS` is shared with it: a probe that builds a different
+  sandbox from production can pass where production fails.
+
 - **The namespace probe reported a kernel denial for its own filesystem
   mistake.** After an AppArmor profile correctly granted `/usr/bin/bwrap` the
   `userns` permission, `runtime doctor` went on saying the kernel refused

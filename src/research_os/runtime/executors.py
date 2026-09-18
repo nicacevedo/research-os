@@ -61,6 +61,7 @@ from research_os.runtime.store import RuntimeStore
 from research_os.sandbox import (
     SandboxError,
     SandboxMode,
+    SandboxPreparationError,
     SandboxSpec,
     contain,
     process_limit_preexec,
@@ -232,6 +233,21 @@ class LocalExecutor:
                 environment=dict(spec.env),
             )
             prepared = contain(spec.argv, spec=sandbox_spec, mode=self.sandbox_mode)
+        except SandboxPreparationError as exc:
+            # Containment exists and *this* command could not be set up in it.
+            # Not `ContainmentUnavailableError`, which means the host cannot
+            # contain anything and no repair can change that: this names a
+            # missing interpreter or a `#!` line pointing outside policy, which
+            # is a fact about the declared command and belongs on the handle
+            # beside "not on PATH".
+            return ExecutionHandle(
+                executor=self.name,
+                run_dir=str(run_dir),
+                spec_digest=digest,
+                finished=True,
+                exit_code=None,
+                detail=f"the sandbox could not be prepared for {spec.name}: {exc}",
+            )
         except SandboxError as exc:
             # A refusal, not an executor malfunction. `EXECUTOR_FAILED` is
             # `REPAIR`, so classifying it that way put the work item back on the

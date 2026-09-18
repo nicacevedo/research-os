@@ -114,6 +114,22 @@ class SandboxError(ResearchOSError):
     """Raised when containment was required and could not be provided."""
 
 
+class SandboxPreparationError(SandboxError):
+    """Raised when containment is available but *this command* cannot be set up.
+
+    A different failure from its parent, and the distinction is the one that
+    cost this release a day. :class:`SandboxError` means "this host cannot
+    contain anything" -- nothing a repair worker does can change it, so the
+    runtime classifies it as a refusal rather than a fault. This means "the
+    host can contain, and the execution closure for this particular argv could
+    not be built" -- a missing interpreter, a `#!` line naming a path policy
+    will not expose, a symbolic-link cycle. That is a property of one command,
+    it is reported against that command, and it names the exact file that was
+    missing instead of letting the kernel report `No such file or directory`
+    against a binary that is present.
+    """
+
+
 class SandboxMode(StrEnum):
     """How much the researcher insists on containment.
 
@@ -170,6 +186,33 @@ class SandboxSpec:
     #: Rendered as `--ro-bind` *after* the writable binds, because later binds
     #: win. That ordering is the mechanism.
     protected: tuple[Path, ...] = ()
+    #: Paths a command may write, whose writes are **thrown away**.
+    #:
+    #: Rendered as bubblewrap's ``--overlay-src`` plus ``--tmp-overlay``: the
+    #: host directory is the lower layer, a tmpfs is the upper one, and the
+    #: upper one vanishes with the sandbox. Reads see the host's content;
+    #: writes appear to succeed and reach nothing.
+    #:
+    #: It exists for exactly one shape of problem, and `uv`'s package cache is
+    #: it. A contained command is denied the network, so `uv run` can only
+    #: install from a cache -- and a *read-only* cache does not work, measured:
+    #: uv exits with ``Failed to initialize cache ... Permission denied``
+    #: before running anything. The previous release removed the cache from the
+    #: read-only set for that reason and recorded that uv would use the
+    #: sandbox's own tmpfs ``HOME`` instead, "verified to work from empty with
+    #: ``UV_OFFLINE=1``". That claim is false for any project with a
+    #: dependency, and this release measured it: a cold cache with no network
+    #: cannot install ``pytest``, so every ``uv run`` check failed. A lock file
+    #: exists so that dependency resolution does not need the network; it does
+    #: not conjure the wheels.
+    #:
+    #: The overlay gives uv a cache it can initialise, populated, and discarded
+    #: -- verified: five packages installed offline with the network denied,
+    #: and nothing new in the host cache afterwards. It is strictly safer than
+    #: the read-write bind an earlier release shipped, which was a host
+    #: code-execution escape, because no write survives the run to be executed
+    #: by anything.
+    discarded: tuple[Path, ...] = ()
     #: Network access, as a capability rather than a default.
     network: bool = False
     #: Wall-clock ceiling, enforced by the caller's own timeout as well.
@@ -231,6 +274,166 @@ class SandboxSpec:
         return tuple(
             dict.fromkeys(item.resolve() for item in self.protected if item.exists())
         )
+
+    def resolved_discarded(self) -> tuple[Path, ...]:
+        """Overlay sources. Only ones that exist: there is nothing to layer over
+        a directory that is not there, and an absent cache is a cold cache
+        rather than an error."""
+
+        return tuple(
+            dict.fromkeys(item.resolve() for item in self.discarded if item.exists())
+        )
+
+
+def linked_worktree_paths(workdir: Path) -> tuple[Path, ...]:
+    """The repository directory a **linked Git worktree** cannot run without.
+
+    The second defect this release found, and it is the same shape as the
+    first. ``_program_binding`` was binding a program without the runtime its
+    ``#!`` line needs; this is a *worktree* bound without the repository its
+    ``.git`` names. The coding pipeline runs every acceptance command inside a
+    ``git worktree add`` checkout, where ``.git`` is not a directory but a file
+    holding one line:
+
+    ```text
+    gitdir: /home/you/project/.git/worktrees/task-0007
+    ```
+
+    That path is outside the worktree, so the sandbox denied it and every
+    project whose checks include a ``git`` command failed with
+
+    ```text
+    fatal: not a git repository: /home/you/project/.git/worktrees/task-0007
+    ```
+
+    which reads like the project's own repository being broken. It is the same
+    misdiagnosis as ``execvp pytest: No such file or directory`` for a pytest
+    that exists: the file the message names is present, and the dependency it
+    needs is the thing that is absent.
+
+    **Read-only, and measured to be enough.** Git records where the shared
+    object store lives in ``commondir``, and the per-worktree directory sits
+    inside it, so one read-only path covers both. ``git status``, ``git diff
+    --check HEAD``, ``git rev-parse`` and ``git show-ref`` were all run against
+    a read-only bind and all succeeded -- git refreshes its index when it can
+    and does without when it cannot. Nothing here is writable, so the
+    adversarial property that ``git update-ref`` cannot move a canonical branch
+    is unchanged, and ``.git/hooks`` stays as unwritable as
+    :attr:`SandboxSpec.protected` makes it in the experiment path.
+
+    **What this does expose**, stated plainly rather than left implicit: a
+    contained acceptance command can *read* the repository the worktree came
+    from -- its history, its other branches, and ``.git/config``. A remote URL
+    with a token embedded in it would be readable, which is a reason not to
+    keep one there and is now written down in `SECURITY.md`. It cannot write
+    any of it.
+
+    Returns nothing for an ordinary checkout, whose ``.git`` is a directory
+    inside the workdir and needs no help, and nothing for a worktree whose
+    pointer does not resolve -- the caller's own Git error is a better
+    diagnosis than a bind of whatever the file happened to say.
+    """
+
+    pointer = workdir / ".git"
+    try:
+        if not pointer.is_file():
+            return ()
+        declared = pointer.read_text("utf-8", errors="replace").strip()
+    except OSError:
+        return ()
+    prefix = "gitdir:"
+    if not declared.startswith(prefix):
+        return ()
+    target = Path(declared[len(prefix) :].strip())
+    if ".." in target.parts:
+        return ()
+    if not target.is_absolute():
+        target = workdir / target
+    try:
+        gitdir = target.resolve()
+        if not gitdir.is_dir():
+            return ()
+        # **The pointer file is inside a directory a model has just written to,
+        # so it is attacker input, and `name == ".git"` was the entire policy.**
+        # An adversarial review pointed at any other repository on the host --
+        # `gitdir: /home/you/private-client-repo/.git` -- and got its whole
+        # object store, its branches and its config bound read-only into the
+        # sandbox. Every private repository on the machine, from a file the
+        # contained command could write itself.
+        #
+        # Git records the reverse link when it creates a worktree: `gitdir`
+        # inside the per-worktree directory holds the absolute path of the
+        # `.git` file that points at it. Forging the pointer is easy; forging
+        # *both ends* needs write access to the repository being aimed at,
+        # which is the access this is trying to deny in the first place.
+        back = gitdir / "gitdir"
+        if not back.is_file():
+            return ()
+        claimed = Path(back.read_text("utf-8", errors="replace").strip())
+        if claimed.resolve() != pointer.resolve():
+            LOG.warning(
+                "%s names %s as its Git directory, but %s points back at %s. "
+                "Refusing to expose it: a worktree pointer is file content, and "
+                "a repository that does not agree it owns this worktree is not "
+                "this worktree's repository.",
+                pointer,
+                gitdir,
+                back,
+                claimed,
+            )
+            return ()
+        # **The per-worktree directory must not live inside the worktree.**
+        # A second review showed why the reverse link alone is not enough: a
+        # worker can copy a plausible gitdir *into* the worktree, write both
+        # ends of the link so they agree, and then point `commondir` at any
+        # repository on the host. Everything the first fix checked was
+        # satisfied, because the attacker wrote everything the first fix
+        # checked. Git never puts a worktree's gitdir inside the worktree.
+        resolved_workdir = workdir.resolve()
+        if gitdir == resolved_workdir or resolved_workdir in gitdir.parents:
+            LOG.warning(
+                "%s names %s as its Git directory, which is inside the worktree "
+                "itself. Git does not do that, and a worktree is writable by "
+                "the thing being contained. Refusing to expose it.",
+                pointer,
+                gitdir,
+            )
+            return ()
+        link = gitdir / "commondir"
+        common = gitdir
+        if link.is_file():
+            named = Path(link.read_text("utf-8", errors="replace").strip())
+            if ".." in named.parts and named.is_absolute():
+                return ()
+            common = (named if named.is_absolute() else gitdir / named).resolve()
+        if not common.is_dir():
+            common = gitdir
+        # **And the shared directory must contain the per-worktree one.** Git's
+        # layout is `<common>/worktrees/<name>`, always. This relation was
+        # already computed a line below, but only to decide how many paths to
+        # return -- making it a *requirement* is what stops `commondir` naming
+        # an unrelated repository, which is the whole attack.
+        if not (gitdir == common or common in gitdir.parents):
+            LOG.warning(
+                "%s names %s as the shared Git directory, which does not "
+                "contain %s. Git's layout is <common>/worktrees/<name>; "
+                "refusing to expose a repository that does not own this "
+                "worktree.",
+                link,
+                common,
+                gitdir,
+            )
+            return ()
+    except OSError:
+        return ()
+    found = (
+        [common] if gitdir == common or common in gitdir.parents else [common, gitdir]
+    )
+    # Never the home directory, never the filesystem root, and never anything
+    # this system keeps its own state in.
+    return tuple(
+        item for item in found if item.name == ".git" and not _refused_as_root(item)
+    )
 
 
 #: The version at or above which a technology is not known to be exploitable.
@@ -895,6 +1098,69 @@ def _validation_stamp_path() -> Path:
     return containment_root() / "validated.json"
 
 
+#: The modules whose source constitutes the containment policy.
+#:
+#: Relative to this package. `sandbox.py` builds the invocation; the other two
+#: decide which paths go into the spec it is built from, and a record that
+#: survived a change to either would be a claim about a sandbox nobody builds
+#: any more.
+_POLICY_SOURCES: tuple[str, ...] = (
+    "sandbox.py",
+    "automation/checks.py",
+    "runtime/executors.py",
+    # `paths.py` decides where this system's own state lives, and
+    # `_forbidden_roots` reads it to keep those directories out of the bind
+    # set. `config.py` carries `extra_readable` and `network`, which go into
+    # the spec directly. A review found both missing: change either and the
+    # mount surface moves with every existing record still standing.
+    "paths.py",
+    "automation/config.py",
+)
+
+
+def _policy_identity() -> str:
+    """A digest of *this system's own* containment policy.
+
+    The second half of what a validation record is about, and it was missing.
+    A record keyed only by the bubblewrap binary says "these 27 escapes were
+    attempted against this bwrap and failed" -- and then survives a change to
+    the mount policy it was actually measuring. This release proved the point:
+    :func:`program_binding` was rewritten to bind virtual environments and
+    interpreter prefixes read-only, which is a change to the sandbox's
+    filesystem surface, and the previous record went on reporting 27/27 against
+    a surface that no longer existed. An adversarial result is about a boundary,
+    not about a binary.
+
+    The digest is over the source of the modules that *constitute* the policy.
+    That is a proxy and it is deliberately the conservative one: a rewritten
+    comment invalidates a record that was still true, which costs one test run,
+    and no reachable change to the policy can leave a record standing. A digest
+    of the rendered flags was considered and rejected for failing in the other
+    direction -- it would not have noticed this release's change at all, because
+    the flags are identical and the *paths they name* are what moved.
+
+    **It is more than this module**, and an adversarial review is why. Half the
+    mount policy is decided by the callers: `automation/checks.py` chooses what
+    goes into ``readable``, ``writable``, ``discarded`` and ``protected``, and
+    `runtime/executors.py` chooses the experiment path's. The worst defect this
+    project has shipped -- uv's data directory in ``writable``, a host
+    code-execution escape -- lived in the first of those. A digest that covered
+    only this file would have let that exact regression return with every
+    existing "containment validated" record still standing.
+    """
+
+    import hashlib
+
+    digest = hashlib.sha256()
+    for name in _POLICY_SOURCES:
+        try:
+            digest.update(name.encode())
+            digest.update((Path(__file__).parent / name).read_bytes())
+        except OSError:  # pragma: no cover - these ship with the package
+            return "unreadable-policy"
+    return digest.hexdigest()[:16]
+
+
 def _binary_identity(executable: str, version: str | None) -> str:
     """What a validation record is keyed by.
 
@@ -902,6 +1168,11 @@ def _binary_identity(executable: str, version: str | None) -> str:
     ``/usr/bin/bwrap`` must not be inherited by a different binary that has
     since been installed at the same path -- which is exactly what an upgrade
     does, and exactly when a stale "validated" would be most misleading.
+
+    And the containment *policy* alongside it. See :func:`_policy_identity`:
+    the binary is half of what the suite attacked, and a record that outlived
+    the other half is a claim about a sandbox that is no longer the one being
+    built.
     """
 
     import hashlib
@@ -912,8 +1183,8 @@ def _binary_identity(executable: str, version: str | None) -> str:
             for chunk in iter(lambda: handle.read(1 << 20), b""):
                 digest.update(chunk)
     except OSError:
-        return f"unreadable:{executable}:{version or 'unknown'}"
-    return f"{digest.hexdigest()}:{version or 'unknown'}"
+        return f"unreadable:{executable}:{version or 'unknown'}:{_policy_identity()}"
+    return f"{digest.hexdigest()}:{version or 'unknown'}:{_policy_identity()}"
 
 
 def record_containment_validation(
@@ -954,9 +1225,11 @@ def containment_validation(executable: str, version: str | None) -> tuple[bool, 
     detail = records.get(_binary_identity(executable, version))
     if not detail:
         return False, (
-            "no adversarial containment record for this exact binary. A record "
-            "is keyed by the binary's content hash, so an upgrade correctly "
-            "invalidates the previous one"
+            "no adversarial containment record for this exact binary and this "
+            "exact containment policy. A record is keyed by the binary's "
+            "content hash and by a digest of the policy that was attacked, so "
+            "both an upgrade of the binary and a change to what this system "
+            "binds correctly invalidate the previous one"
         )
     return True, str(detail)
 
@@ -1129,6 +1402,12 @@ def _namespace_probe_argv(executable: str) -> list[str]:
         "--unshare-user",
         "--unshare-net",
         "--unshare-pid",
+        # Production sets both, so the probe must too. A probe that omitted
+        # them would report a host as able to contain while every real command
+        # failed on `--assert-userns-disabled` -- the exact shape of defect the
+        # `_OS_PATHS` paragraph above exists to prevent, in a different field.
+        "--disable-userns",
+        "--assert-userns-disabled",
         "--proc",
         "/proc",
     ]
@@ -1264,6 +1543,59 @@ def available_backend(*, refresh: bool = False) -> SandboxProbe | None:
                 break
         _BACKEND = found
     return _BACKEND if not isinstance(_BACKEND, _Unset) else None
+
+
+_OVERLAY_SUPPORT: bool | _Unset = _Unset()
+
+
+def overlay_available(executable: str, *, refresh: bool = False) -> bool:
+    """Whether this host can give a contained command a throwaway overlay.
+
+    ``--tmp-overlay`` needs unprivileged overlayfs inside a user namespace,
+    which Linux has had since 5.11 and which a hardened kernel may still
+    refuse. Measured once by running it, for the same reason the namespace
+    probe runs bubblewrap rather than looking for it: the failure is invisible
+    to anything short of invocation.
+
+    A host without it is not an error. The caller's overlay paths are dropped,
+    the command runs against an empty one, and the warning says so -- which for
+    ``uv`` means a project that must resolve dependencies needs
+    ``sandbox.network: true``. Failing every check instead would be a refusal
+    made on behalf of a researcher whose only remaining option is one this file
+    cannot take for them.
+    """
+
+    global _OVERLAY_SUPPORT
+    if refresh or isinstance(_OVERLAY_SUPPORT, _Unset):
+        # Built on the namespace probe's own invocation, so the sentinel has
+        # the operating system it needs to run. Overlaying `/usr` *in place*
+        # with nothing else bound removes the sentinel from the sandbox, and
+        # the first version of this function did exactly that and concluded the
+        # host had no overlay support -- measuring its own missing mount for
+        # the second time in this file's history. The overlay therefore lands
+        # somewhere that changes nothing about whether the sentinel runs.
+        flags = _namespace_probe_argv(executable)
+        source = "/usr" if Path("/usr").is_dir() else "/"
+        at = flags.index("--")
+        flags[at:at] = ["--overlay-src", source, "--tmp-overlay", "/overlay-probe"]
+        try:
+            completed = subprocess.run(
+                flags,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            _OVERLAY_SUPPORT = completed.returncode == 0
+            if not _OVERLAY_SUPPORT:
+                LOG.info(
+                    "this host cannot provide a throwaway overlay: %s",
+                    (completed.stderr or "").strip() or "no reason given",
+                )
+        except (OSError, subprocess.SubprocessError) as exc:
+            LOG.info("could not measure overlay support: %s", exc)
+            _OVERLAY_SUPPORT = False
+    return bool(_OVERLAY_SUPPORT)
 
 
 def unavailable_reason() -> str:
@@ -1484,6 +1816,18 @@ def contain(
     )
 
 
+def _sandbox_path_value(extra_path: str | None) -> str:
+    """The sandbox's ``PATH``, in one place.
+
+    Both :func:`_sandbox_environment` and :func:`_search_path` derive from
+    this. They used to build it separately, which is how a binding layer and
+    the sandbox it prepares come to disagree about which file a command
+    resolves to.
+    """
+
+    return f"{extra_path}:{_SANDBOX_PATH}" if extra_path else _SANDBOX_PATH
+
+
 def _sandbox_environment(
     spec: SandboxSpec,
     inherited: Mapping[str, str],
@@ -1504,7 +1848,7 @@ def _sandbox_environment(
     """
 
     built = {
-        "PATH": f"{extra_path}:{_SANDBOX_PATH}" if extra_path else _SANDBOX_PATH,
+        "PATH": _sandbox_path_value(extra_path),
         "HOME": "/tmp/sandbox-home",
         "TMPDIR": "/tmp",
         "USER": "sandbox",
@@ -1515,38 +1859,668 @@ def _sandbox_environment(
         if value:
             built[name] = value
     built.update(dict(spec.environment))
+    # `PATH` is the sandbox's to set, and a caller does not get to overrule it.
+    # It used to: `spec.environment` was applied last and won. That made the
+    # PATH a command resolves `env python3` against inside the sandbox differ
+    # from the one `_search_path` resolved it against out here -- so the file
+    # that got bound and the file that would run could be two different files.
+    # An adversarial review found it latent; no caller sets `PATH` today.
+    built["PATH"] = _sandbox_path_value(extra_path)
     return built
 
 
-def _program_binding(
-    argv: Sequence[str], *, spec: SandboxSpec
-) -> tuple[tuple[str, ...], str | None]:
-    """Read-only binds and a PATH prefix so ``argv[0]`` exists inside.
+# ------------------------------------------------- the execution closure --
+#: How many bytes of a ``#!`` line the kernel reads. Linux 5.1 and later use
+#: ``BINPRM_BUF_SIZE == 256`` and silently *truncate* anything longer, so a
+#: line at the limit is refused rather than guessed at: the interpreter this
+#: file would bind and the one the kernel would run could differ.
+_SHEBANG_LIMIT = 256
 
-    An adversarial review ran the arithmetic that this function exists to fix.
-    :data:`_SANDBOX_PATH` is the four standard system directories, and the
-    read-only binds are :data:`_OS_PATHS`; ``uv`` -- the program every
-    acceptance command in this repository starts with -- installs to
-    ``~/.local/bin``, which is in neither. So containment did not deny the
-    command, it made it *vanish*: ``exit 127``, "uv: not found", recorded as an
-    acceptance failure of the code the worker had just written. Turning
-    containment on would have failed every check in the repository and the
-    failures would have looked like the project's.
+#: How many interpreter hops to follow. A script whose interpreter is a script
+#: is legal; eight of them is a loop somebody built on purpose.
+_INTERPRETER_DEPTH = 8
 
-    The binding is the resolved file, at its own path, and nothing else. Not the
-    directory: ``~/.local/bin`` holds whatever else the researcher installed,
-    and one program being reachable is the requirement. The returned prefix is
-    that file's directory, prepended to PATH so a relative ``argv[0]`` resolves
-    the same way it did outside.
+#: How many symbolic links to follow, matching the kernel's own ``ELOOP``.
+_LINK_DEPTH = 40
 
-    Nothing is bound when the program already resolves inside the sandbox --
-    under :data:`_OS_PATHS` or under a path the caller made readable or
-    writable -- so the common case adds no flags.
+#: ``PT_INTERP`` -- the program header that names an ELF binary's loader.
+_PT_INTERP = 3
+
+#: Filenames that make a directory a self-describing *runtime root*.
+#:
+#: The distinction this list exists for is the whole security argument of
+#: :func:`program_binding`. A program's parent directory is **not** its runtime:
+#: ``uv`` lives in ``~/.local/bin`` beside forty other console scripts, and
+#: ``~/.local`` holds ``share/`` and ``state/`` -- this system's own database
+#: among them. Binding a parent because a program lives inside it is how a
+#: sandbox grows to contain the thing it was protecting.
+#:
+#: A runtime root is instead a directory that *says* it is one, in a file the
+#: runtime itself put there. ``pyvenv.cfg`` is written by every virtual
+#: environment builder; ``lib/python3.*/os.py`` is the marker of an
+#: installation prefix. Both are positive evidence, and a directory with
+#: neither gets nothing bound but the executable file itself.
+#:
+#: Data rather than code so a second runtime can be added by adding a marker,
+#: and so the list is readable as policy.
+_RUNTIME_MARKERS: tuple[str, ...] = (
+    # A Python virtual environment, written by `venv`, `virtualenv` and `uv`.
+    "pyvenv.cfg",
+    # A Python installation prefix. The glob is the version directory.
+    "lib/python3.*/os.py",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ProgramBinding:
+    """What ``argv[0]`` needs in order to exist and to run inside the sandbox.
+
+    :attr:`paths` are bound read-only at their own names, so a path resolves
+    inside exactly as it does outside. :attr:`path_prefix` is prepended to the
+    sandbox ``PATH`` when the program lives somewhere the sandbox does not
+    already expose.
     """
 
-    program = argv[0] if argv else ""
+    paths: tuple[Path, ...] = ()
+    path_prefix: str | None = None
+    detail: str = ""
+
+
+def _exposed_paths(spec: SandboxSpec) -> tuple[Path, ...]:
+    """Every host path this sandbox already shows at its own name."""
+
+    found = [Path(item) for item in _OS_PATHS]
+    found.extend(spec.resolved_readable())
+    found.extend(spec.resolved_writable())
+    found.append(spec.workdir.resolve())
+    return tuple(found)
+
+
+def _within(path: Path, roots: Sequence[Path]) -> bool:
+    return any(path == root or root in path.parents for root in roots)
+
+
+def _home() -> Path | None:
+    try:
+        return Path.home()
+    except (RuntimeError, OSError):  # pragma: no cover - HOME is always set here
+        return None
+
+
+def _forbidden_roots() -> tuple[Path, ...]:
+    """Directories that are never a runtime root, whatever markers they carry.
+
+    The marker test is positive evidence and it is not enough on its own. A
+    review pointed out that the *only* thing keeping `~/.local` out of the bind
+    set was the accident that no `~/.local/pyvenv.cfg` happens to exist on this
+    machine -- and `~/.local` is where this system keeps its own database and
+    its own containment record. An invariant held by a coincidence of host
+    layout is not an invariant.
+
+    So the places this system itself writes are named, along with the obvious
+    credential directories, and refused explicitly. Ancestors of them too: a
+    root that *contains* the state directory exposes it just as completely as
+    the state directory itself.
+    """
+
+    found: list[Path] = [Path("/")]
+    home = _home()
+    if home is not None:
+        found.append(home)
+        found.extend(
+            home / name
+            for name in (".local", ".config", ".cache", ".ssh", ".aws", ".gnupg")
+        )
+    try:
+        from research_os import paths
+
+        for accessor in (
+            paths.state_home,
+            paths.data_home,
+            paths.config_home,
+            paths.cache_home,
+        ):
+            try:
+                found.append(Path(accessor()))
+            except (OSError, AttributeError):  # pragma: no cover - defensive
+                continue
+    except ImportError:  # pragma: no cover - paths is part of this package
+        pass
+    return tuple(dict.fromkeys(found))
+
+
+def _refused_as_root(candidate: Path) -> bool:
+    """True when ``candidate`` is, or contains, somewhere that must never bind."""
+
+    for forbidden in _forbidden_roots():
+        if candidate == forbidden or candidate in forbidden.parents:
+            return True
+    return False
+
+
+def _absolute(path: Path) -> Path:
+    """Absolute, with the *directory* components resolved and the name kept.
+
+    ``Path.resolve()`` would follow the final symlink too, which loses the name
+    the program is actually invoked by -- and a console script that re-execs
+    ``sys.executable`` needs that name to exist inside.
+    """
+
+    candidate = Path(path)
+    if not candidate.is_absolute():
+        candidate = Path.cwd() / candidate
+    resolved = candidate.parent.resolve() / candidate.name
+    # `pathlib` does not normalise `..`, and an adversarial review turned that
+    # into the whole host filesystem: `Path("/etc/..")` has `.parent == /etc`
+    # and `.name == ".."`, so it survived every textual guard below while the
+    # kernel resolved it to `/`. Measured, `--ro-bind /etc/.. /etc/..` mounts
+    # the host root read-only inside the sandbox and `~/.ssh/id_ed25519` is
+    # readable. The final component is normalised here, once, so no caller can
+    # forget: `/etc/..` becomes `/`, which the root guards already refuse.
+    return Path(os.path.normpath(resolved))
+
+
+def _link_chain(path: Path) -> tuple[Path, ...]:
+    """Every name traversed from ``path`` to the file it finally denotes.
+
+    Bubblewrap resolves the *source* of a ``--ro-bind`` on the host, so binding
+    a symlink puts its target at the link's own name. Binding every name in the
+    chain therefore makes the file reachable under each of them -- which is what
+    ``<venv>/bin/python3 -> python -> <uv>/bin/python3.12`` needs, because a
+    virtual environment's interpreter is found by its *link* name and Python
+    then looks beside it for ``pyvenv.cfg``.
+
+    Refuses on a cycle and refuses past the kernel's own ``ELOOP`` ceiling
+    rather than binding whatever it happened to reach.
+    """
+
+    seen: list[Path] = []
+    current = _absolute(path)
+    for _ in range(_LINK_DEPTH):
+        if current in seen:
+            raise SandboxPreparationError(
+                f"{path} resolves through a symbolic-link cycle at {current}; "
+                "refusing to build an execution closure for it"
+            )
+        seen.append(current)
+        try:
+            target = os.readlink(current)
+        except OSError:
+            # Not a symlink, or gone. Either way this is the end of the chain.
+            return tuple(seen)
+        current = _absolute(
+            Path(target) if Path(target).is_absolute() else current.parent / target
+        )
+    raise SandboxPreparationError(
+        f"{path} resolves through more than {_LINK_DEPTH} symbolic links; "
+        "refusing to build an execution closure for it"
+    )
+
+
+def _runtime_root(path: Path) -> Path | None:
+    """The self-describing runtime an executable at ``path`` belongs to.
+
+    ``<root>/bin/<name>`` where ``<root>`` carries one of
+    :data:`_RUNTIME_MARKERS`. Everything else returns ``None``, and ``None``
+    means "bind the file, nothing else" -- never "bind the parent".
+
+    ``$HOME`` and the filesystem root are refused outright even if a marker
+    were somehow present, because no correct answer here is ever one of those
+    and a wrong one is the whole sandbox.
+    """
+
+    parent = path.parent
+    if parent.name != "bin":
+        return None
+    root = parent.parent
+    return root if _is_runtime_root(root) else None
+
+
+def _is_runtime_root(root: Path) -> bool:
+    """Does ``root`` declare itself a runtime, and is it allowed to be one?
+
+    Split out from :func:`_runtime_root` because the same question is asked of
+    a directory that was reached by *name* rather than by layout -- the ``home``
+    line of a ``pyvenv.cfg`` -- and asking it two different ways is how the two
+    answers come to differ.
+    """
+
+    if root == root.parent or _refused_as_root(root):
+        return False
+    for marker in _RUNTIME_MARKERS:
+        try:
+            if "*" in marker:
+                head, _, tail = marker.partition("/")
+                if any((root / head).glob(tail)):
+                    return True
+            elif (root / marker).is_file():
+                return True
+        except OSError:  # pragma: no cover - unreadable directory
+            continue
+    return False
+
+
+def _declared_base(root: Path) -> Path | None:
+    """The base installation a virtual environment names in ``pyvenv.cfg``.
+
+    A virtual environment built with ``--copies`` has no symbolic link to
+    follow, so the interpreter's own stdlib is reachable only through what the
+    environment *declares*. That declaration is attacker-writable whenever the
+    environment is, so the answer is accepted only if the directory it names is
+    itself a runtime root: a ``home =`` pointing at ``~/.ssh`` names a
+    directory with no ``lib/python3.*/os.py`` in it and is refused.
+    """
+
+    config = root / "pyvenv.cfg"
+    try:
+        text = config.read_text("utf-8", errors="replace")
+    except OSError:
+        return None
+    for line in text.splitlines():
+        key, sep, value = line.partition("=")
+        if not sep or key.strip() != "home":
+            continue
+        base = Path(value.strip())
+        if not base.is_absolute():
+            return None
+        # `pyvenv.cfg` is a file in a directory a model may have written to, so
+        # its text is attacker input. A `..` segment in it is how a review got
+        # `--ro-bind /etc/.. /etc/..` -- the host root -- out of this function.
+        # Refused here as well as normalised in `_absolute`, because the two
+        # guards fail differently and this one names the reason.
+        if ".." in base.parts:
+            return None
+        if base.name == "bin":
+            base = base.parent
+        base = _absolute(base)
+        return base if _is_runtime_root(base) else None
+    return None
+
+
+def _script_interpreter(path: Path) -> tuple[str, ...] | None:
+    """The ``#!`` line of ``path`` split as the kernel splits it.
+
+    ``None`` when the file has no ``#!``, which is not an error: ``execvp``
+    falls back to ``/bin/sh`` for a file it cannot recognise, and ``/bin`` is
+    already bound.
+
+    Everything that *is* a ``#!`` and cannot be read as one raises. A malformed
+    interpreter line is the case where guessing is worst: the guess decides
+    which host file gets bound into a sandbox.
+    """
+
+    try:
+        with path.open("rb") as handle:
+            head = handle.read(_SHEBANG_LIMIT)
+    except OSError as exc:
+        raise SandboxPreparationError(
+            f"{path} is executable but could not be read to determine how it "
+            f"runs: {exc}"
+        ) from None
+    if not head.startswith(b"#!"):
+        return None
+    if b"\n" not in head and len(head) == _SHEBANG_LIMIT:
+        raise SandboxPreparationError(
+            f"the `#!` line of {path} is longer than the {_SHEBANG_LIMIT} bytes "
+            "the kernel reads, so the interpreter it names and the one that "
+            "would run are not the same thing; refusing to bind either"
+        )
+    line = head[2:].split(b"\n", 1)[0]
+    if b"\0" in line:
+        raise SandboxPreparationError(
+            f"the `#!` line of {path} contains a NUL byte and does not name an "
+            "interpreter"
+        )
+    try:
+        text = line.decode("utf-8")
+    except UnicodeDecodeError:
+        raise SandboxPreparationError(
+            f"the `#!` line of {path} is not valid UTF-8 and does not name an "
+            "interpreter this can resolve"
+        ) from None
+    # The kernel skips *spaces and tabs* after `#!`, takes one token as the
+    # interpreter, and passes the rest of the line as a single argument. It does
+    # not treat a carriage return as whitespace. `str.split(None, 1)` does, so a
+    # CRLF file made this function resolve and bind `/bin/sh` while the kernel
+    # exec'd `/bin/sh\r` and returned ENOENT naming the script -- reintroducing
+    # the exact misdiagnosis `SandboxPreparationError` exists to remove. An
+    # adversarial review found it.
+    text = text.strip(" \t")
+    parts = [item for item in re.split(r"[ \t]+", text, maxsplit=1) if item]
+    if parts and any(character.isspace() for character in parts[0]):
+        raise SandboxPreparationError(
+            f"the `#!` line of {path} names an interpreter containing "
+            f"whitespace the kernel does not strip ({parts[0]!r}); the file "
+            "is most likely saved with CRLF line endings"
+        )
+    if not parts:
+        raise SandboxPreparationError(
+            f"{path} begins with `#!` and names no interpreter"
+        )
+    return tuple(parts)
+
+
+def _elf_loader(path: Path) -> Path | None:
+    """The dynamic loader an ELF binary names in ``PT_INTERP``.
+
+    ``None`` for a static binary, and ``None`` for anything that is not an ELF
+    this understands -- a diagnosis, not a guess.
+
+    This exists because of a specific afternoon. ``/usr/bin/true`` needs
+    ``/lib64/ld-linux-x86-64.so.2``; ``/lib64`` is a usrmerge symlink; the
+    namespace probe bound neither and ``exec`` returned ``ENOENT``, which was
+    read as "this kernel refuses user namespaces" for hours. Reading the loader
+    out of the header turns that class of failure into a sentence that names
+    the missing file.
+    """
+
+    try:
+        with path.open("rb") as handle:
+            header = handle.read(64)
+            if len(header) < 20 or header[:4] != b"\x7fELF":
+                return None
+            wide = header[4] == 2
+            byteorder: str = "little" if header[5] == 1 else "big"
+            if wide:
+                if len(header) < 64:
+                    return None
+                offsets, entry_size, count = 0x20, 0x36, 0x38
+                size = 8
+            else:
+                offsets, entry_size, count = 0x1C, 0x2A, 0x2C
+                size = 4
+
+            def read(at: int, width: int) -> int:
+                return int.from_bytes(header[at : at + width], byteorder)  # type: ignore[arg-type]
+
+            table = read(offsets, size)
+            stride = read(entry_size, 2)
+            headers = read(count, 2)
+            if not table or not stride or not headers or headers > 512:
+                return None
+            handle.seek(table)
+            blob = handle.read(stride * headers)
+            for index in range(headers):
+                entry = blob[index * stride : (index + 1) * stride]
+                if len(entry) < stride:
+                    break
+                kind = int.from_bytes(entry[0:4], byteorder)  # type: ignore[arg-type]
+                if kind != _PT_INTERP:
+                    continue
+                if wide:
+                    start = int.from_bytes(entry[0x08:0x10], byteorder)  # type: ignore[arg-type]
+                    length = int.from_bytes(entry[0x20:0x28], byteorder)  # type: ignore[arg-type]
+                else:
+                    start = int.from_bytes(entry[0x04:0x08], byteorder)  # type: ignore[arg-type]
+                    length = int.from_bytes(entry[0x10:0x14], byteorder)  # type: ignore[arg-type]
+                if not length or length > 4096:
+                    return None
+                handle.seek(start)
+                raw = handle.read(length).split(b"\0", 1)[0]
+                if not raw:
+                    return None
+                return _absolute(Path(raw.decode("utf-8", "replace")))
+    except OSError:
+        return None
+    return None
+
+
+def _search_path(prefix: str | None) -> tuple[Path, ...]:
+    """The directories ``/usr/bin/env`` will search **inside** the sandbox.
+
+    Derived from the same string :func:`_sandbox_environment` sets, so what
+    this function resolves and what the sandbox resolves cannot drift apart.
+
+    It is deliberately *not* the host's ``PATH``, and deliberately not
+    :attr:`SandboxSpec.environment`'s either. A caller may set ``PATH`` in the
+    spec and that value wins inside the sandbox -- but it must not decide which
+    host file gets bound, because then a variable would choose what the sandbox
+    exposes. A spec ``PATH`` can therefore make a command fail to find its
+    interpreter, which is visible, and cannot make it find a different one,
+    which would not be.
+    """
+
+    return tuple(Path(item) for item in _sandbox_path_value(prefix).split(":") if item)
+
+
+def _resolve_env_shebang(
+    tokens: tuple[str, ...], *, script: Path, search: Sequence[Path]
+) -> Path:
+    """Resolve ``#!/usr/bin/env python3`` without a shell and without the host.
+
+    ``env`` is the one shebang form whose interpreter is chosen at run time, so
+    it is the one that must be pinned down here. The rules are narrow on
+    purpose: exactly one operand, a bare program name, no options, no variable
+    assignments. ``env -S`` re-splits the line, ``env -i`` clears the
+    environment, and ``env FOO=bar python3`` sets one -- each of those changes
+    what runs, and none of them can be honoured by a function whose job is to
+    say in advance which file that is.
+    """
+
+    if len(tokens) != 2:
+        raise SandboxPreparationError(
+            f"the `#!` line of {script} runs `env` with no interpreter to find"
+        )
+    wanted = tokens[1].strip()
+    if wanted.startswith("-"):
+        raise SandboxPreparationError(
+            f"the `#!` line of {script} passes the option {wanted!r} to `env`. "
+            "Options change which interpreter runs, and this resolves the "
+            "interpreter before anything runs; use an explicit path instead."
+        )
+    if "=" in wanted:
+        raise SandboxPreparationError(
+            f"the `#!` line of {script} sets {wanted!r} through `env`. A "
+            "contained command's environment is an allowlist built by the "
+            "sandbox, not by the file being run."
+        )
+    if not wanted or os.sep in wanted:
+        raise SandboxPreparationError(
+            f"the `#!` line of {script} gives `env` {wanted!r}, which is not a "
+            "bare program name"
+        )
+    for directory in search:
+        candidate = directory / wanted
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return _absolute(candidate)
+    raise SandboxPreparationError(
+        f"the `#!` line of {script} runs `env {wanted}`, and {wanted} is on "
+        "none of the directories the sandbox's own PATH searches "
+        f"({':'.join(str(item) for item in search)}). The host's PATH is "
+        "deliberately not consulted: an inherited PATH entry would let the "
+        "environment choose which host file gets bound into the sandbox."
+    )
+
+
+def _close_over(
+    path: Path,
+    *,
+    needed: list[Path],
+    trusted: list[Path],
+    search: Sequence[Path],
+    depth: int,
+) -> None:
+    """Accumulate everything ``path`` needs in order to ``exec`` successfully."""
+
+    if depth > _INTERPRETER_DEPTH:
+        raise SandboxPreparationError(
+            f"resolving how to run {path} passed through more than "
+            f"{_INTERPRETER_DEPTH} interpreters; refusing to continue"
+        )
+    chain = _link_chain(path)
+    for index, member in enumerate(chain):
+        # **Every name in the chain is checked, not only the one that was
+        # asked for.** The first version of this checked the requested path and
+        # then bound wherever its links landed, and the test matrix executed
+        # what that granted: a virtual environment is a trusted runtime root,
+        # so replacing its `bin/python3` with a link to `~/.ssh/id_rsa` bound
+        # that file, read-only, at its own name, inside the sandbox. A worktree
+        # a model has just written to can contain a `pyvenv.cfg`, so the
+        # environment being trusted is not a reason to trust where its links go.
+        #
+        # A hop may leave the trusted set only by landing in a *runtime root* --
+        # a directory carrying one of `_RUNTIME_MARKERS`, written there by the
+        # runtime itself. That is what `<venv>/bin/python3 -> <install>/bin/
+        # python3.12` does and what a link to a private key cannot.
+        if index and not _within(member, trusted) and _runtime_root(member) is None:
+            raise SandboxPreparationError(
+                f"{chain[0]} resolves through {member}, which is outside the "
+                "operating system, outside what the caller declared, and is "
+                "not itself part of a runtime. A symbolic link inside an "
+                "exposed environment does not get to choose which other part "
+                "of this host is bound into a sandbox."
+            )
+        needed.append(member)
+        root = _runtime_root(member)
+        if root is None or root in trusted:
+            continue
+        trusted.append(root)
+        needed.append(root)
+        base = _declared_base(root)
+        # Subject it to the same test the `#!` interpreter and the ELF loader
+        # get. A review found this was the one edge that went straight into the
+        # bind set on the strength of a file's contents alone, and turned that
+        # into `--ro-bind /etc/.. /etc/..`.
+        if base is not None and base not in trusted and _is_runtime_root(base):
+            trusted.append(base)
+            needed.append(base)
+    real = chain[-1]
+    shebang = _script_interpreter(real)
+    if shebang is None:
+        loader = _elf_loader(real)
+        if loader is None:
+            return
+        if not _within(loader, trusted):
+            raise SandboxPreparationError(
+                f"{real} is an ELF binary whose dynamic loader is {loader}, "
+                "which is outside every path this sandbox exposes. Running it "
+                "would fail with a bare `No such file or directory` naming the "
+                "binary rather than the loader."
+            )
+        if not loader.is_file():
+            # Binding a source that is not there produces `bwrap: Can't find
+            # source path`, which is the class of message this whole function
+            # exists to replace with the name of the missing file.
+            raise SandboxPreparationError(
+                f"{real} names the dynamic loader {loader}, and no such file "
+                "exists on this host. The binary is present; the loader it "
+                "needs is not."
+            )
+        # Recurse rather than `needed.extend(_link_chain(loader))`. A review
+        # found that only the loader's *first* name was checked against the
+        # trusted set while `_link_chain` then followed up to forty symbolic
+        # links and appended every hop -- so a loader inside a trusted
+        # directory could point anywhere. Recursing gives the loader's own
+        # chain the identical per-hop treatment the interpreter's gets.
+        _close_over(
+            loader, needed=needed, trusted=trusted, search=search, depth=depth + 1
+        )
+        return
+    named = shebang[0]
+    if not named.startswith("/"):
+        raise SandboxPreparationError(
+            f"the `#!` line of {real} names the interpreter {named!r}, which is "
+            "not an absolute path. The kernel does not search PATH for it, so "
+            "there is nothing here to resolve."
+        )
+    interpreter = _absolute(Path(named))
+    if interpreter.name == "env" and _within(
+        interpreter, [Path(item) for item in _OS_PATHS]
+    ):
+        interpreter = _resolve_env_shebang(shebang, script=real, search=search)
+    if not interpreter.is_file():
+        raise SandboxPreparationError(
+            f"{real} needs the interpreter {interpreter} named on its `#!` "
+            "line, and no such file exists on this host. The command would "
+            f"otherwise fail with `No such file or directory` naming {real}, "
+            "which exists, and the missing file would never be named."
+        )
+    if not os.access(interpreter, os.X_OK):
+        raise SandboxPreparationError(
+            f"{real} names {interpreter} on its `#!` line, and that file is "
+            "not executable. Binding it would put a file this system cannot "
+            "even run inside the sandbox."
+        )
+    if not _within(interpreter, trusted):
+        raise SandboxPreparationError(
+            f"{real} names the interpreter {interpreter}, which lies outside "
+            "the operating system, outside what the caller declared, and "
+            f"outside {real.name}'s own runtime. A `#!` line is file content, "
+            "and file content does not get to choose which part of this host "
+            "is bound into a sandbox."
+        )
+    _close_over(
+        interpreter, needed=needed, trusted=trusted, search=search, depth=depth + 1
+    )
+
+
+def _minimal(paths: Sequence[Path]) -> tuple[Path, ...]:
+    """Drop any path already covered by another in the set, order preserved."""
+
+    ordered = list(dict.fromkeys(paths))
+    return tuple(
+        item
+        for item in ordered
+        if not any(other != item and other in item.parents for other in ordered)
+    )
+
+
+def program_binding(argv: Sequence[str], *, spec: SandboxSpec) -> ProgramBinding:
+    """The smallest read-only closure that lets ``argv[0]`` actually run.
+
+    **The defect this replaced.** An earlier version bound the resolved
+    executable *file* and nothing else, which is right for an ELF binary whose
+    libraries live under ``/usr`` and wrong for everything else. Containment
+    began really executing commands and 112 tests failed at once with
+
+    ```text
+    bwrap: execvp pytest: No such file or directory
+    ```
+
+    for a ``pytest`` that existed, was bound, and was reachable -- because
+    ``<venv>/bin/pytest`` starts ``#!<venv>/bin/python3``, and the kernel's
+    ``ENOENT`` for a missing *interpreter* names the script. The file was
+    present and the thing that runs it was not.
+
+    So the unit is not the file, it is the **execution dependency closure**:
+    every host path the kernel and the program's own runtime must find between
+    ``execvp`` and the program's first instruction. Four kinds of edge, and
+    they compose:
+
+    ```text
+    symbolic links   every name in the chain, because a venv interpreter is
+                     found by its link name and looks beside *that* for
+                     `pyvenv.cfg`
+    `#!` line        the interpreter, resolved and then closed over in turn
+    `env`            the interpreter the *sandbox's own* PATH would find
+    PT_INTERP        the ELF loader, so a missing one is named rather than
+                     reported as a missing binary
+    ```
+
+    **What it will not do.** It never binds a directory because a program lives
+    in it. ``uv`` lives in ``~/.local/bin`` beside forty console scripts, under
+    a ``~/.local`` that holds this system's own state; ``<venv>/bin/pytest``
+    lives inside a project checkout. The only directory that ever gets bound is
+    a *runtime root* -- one carrying a :data:`_RUNTIME_MARKERS` file that the
+    runtime itself wrote -- and then only the root, never its parent. A venv is
+    exposed; the project around it is not.
+
+    **And a `#!` line is untrusted input.** It is content in a file a model
+    wrote one step earlier. An interpreter it names is honoured only inside the
+    operating system allowlist, inside what the caller declared readable or
+    writable, or inside the runtime root of the program being run. A script in
+    the worktree naming ``/home/you/.ssh/bin/python`` is refused, and so is one
+    naming an unrelated virtual environment.
+
+    Everything is read-only. A caller that genuinely needs one of these paths
+    writable -- ``uv`` materialising a project environment -- declares it in
+    :attr:`SandboxSpec.writable`, and wins, because these binds are emitted
+    before the caller's.
+    """
+
+    program = str(argv[0]) if argv else ""
     if not program:
-        return (), None
+        return ProgramBinding(detail="no program to bind")
     # No `..` segment, ever. `Path("/work") / "../../etc/shadow"` resolves out
     # of the workdir, and `.resolve()` follows symlinks with no root check, so a
     # final adversarial review got `--ro-bind /etc/shadow` and `--ro-bind /` out
@@ -1554,14 +2528,14 @@ def _program_binding(
     # command policy's literal allowlist closed it; the local experiment
     # executor has no such policy.
     if ".." in Path(program).parts:
-        return (), None
-    if os.sep in str(program):
+        return ProgramBinding(detail=f"{program} contains a `..` segment")
+    if os.sep in program:
         # A path, which a relative one resolves against the *sandbox's* working
         # directory and not this process's. `./run.sh` means the same thing
         # inside as it does to the caller writing the spec, and resolving it
         # here against `os.getcwd()` would bind whatever happens to sit beside
         # the daemon.
-        real = (spec.workdir / program).resolve()
+        candidate = _absolute(spec.workdir / program)
     else:
         located = shutil.which(program)
         if not located:
@@ -1569,22 +2543,59 @@ def _program_binding(
             # against the host, which is the accurate diagnosis; inventing a
             # bind for a path that does not exist would turn it into a bwrap
             # error.
-            return (), None
-        real = Path(located).resolve()
+            return ProgramBinding(detail=f"{program} is not on this host's PATH")
+        candidate = _absolute(Path(located))
     # A regular, executable file. Not a directory (`argv[0] = "/"` bound the
     # whole filesystem read-only), not a device, not a dangling symlink.
     # Binding something this process cannot even execute buys nothing and is
     # exactly how an arbitrary path gets inside.
-    if not real.is_file() or not os.access(real, os.X_OK):
-        return (), None
-    already = [Path(item) for item in _OS_PATHS]
-    already.extend(spec.resolved_readable())
-    already.extend(spec.resolved_writable())
-    already.append(spec.workdir.resolve())
-    for root in already:
-        if real == root or root in real.parents:
-            return (), None
-    return ("--ro-bind", str(real), str(real)), str(real.parent)
+    if not candidate.is_file() or not os.access(candidate, os.X_OK):
+        return ProgramBinding(detail=f"{candidate} is not an executable file")
+
+    exposed = _exposed_paths(spec)
+    inside_already = _within(candidate, exposed)
+    prefix = None if inside_already else str(candidate.parent)
+    search = _search_path(prefix)
+    trusted = list(exposed)
+    if prefix is not None:
+        # The sandbox prepends this directory to PATH, so by construction it is
+        # where this program's own neighbours resolve from. Saying so here is
+        # what keeps the binding and the run in agreement.
+        trusted.append(Path(prefix))
+    needed: list[Path] = []
+    _close_over(candidate, needed=needed, trusted=trusted, search=search, depth=0)
+
+    binds = _minimal([item for item in needed if not _within(item, exposed)])
+    for item in binds:
+        if _refused_as_root(item):
+            raise SandboxPreparationError(
+                f"building the execution closure for {program} produced "
+                f"{item}, which is the filesystem root, the researcher's home, "
+                "or somewhere this system keeps its own state. Refusing: no "
+                "correct answer here is ever one of those, and a wrong one is "
+                "the entire sandbox."
+            )
+    return ProgramBinding(
+        paths=binds,
+        path_prefix=prefix,
+        detail=(
+            f"{len(binds)} read-only path(s) for {program}"
+            if binds
+            else f"{program} already resolves inside the sandbox"
+        ),
+    )
+
+
+def _program_binding(
+    argv: Sequence[str], *, spec: SandboxSpec
+) -> tuple[tuple[str, ...], str | None]:
+    """:func:`program_binding` rendered as bubblewrap flags."""
+
+    binding = program_binding(argv, spec=spec)
+    flags: list[str] = []
+    for path in binding.paths:
+        flags.extend(["--ro-bind", str(path), str(path)])
+    return tuple(flags), binding.path_prefix
 
 
 def _bubblewrap(
@@ -1602,7 +2613,30 @@ def _bubblewrap(
     by the read-only bind of ``/usr``.
     """
 
-    assert backend.executable is not None
+    if backend.executable is None:  # pragma: no cover - probes always set it
+        # Not `assert`: `python -O` strips it, and what follows would then put
+        # `None` at argv[0] and raise `TypeError` where a refusal belongs.
+        raise SandboxError(
+            "the selected containment backend reported no executable to run"
+        )
+    # Bubblewrap binds a *source* that exists; there is no create-on-demand and
+    # there must not be, because a sandbox that manufactures host directories
+    # in order to contain something has a write side effect of its own. So the
+    # missing path is named here, before anything runs.
+    #
+    # The third defect this release found. `uv` materialises its project
+    # environment at a path the controller chooses and uv creates, which is
+    # nothing at all until the first `uv run` -- and under containment that is
+    # a `--bind` of a source that is not there. Every `uv run` check failed
+    # with `bwrap: Can't find source path ...`, attributed to the project.
+    missing = [path for path in spec.resolved_writable() if not path.exists()]
+    if missing:
+        raise SandboxPreparationError(
+            "these paths were declared writable and do not exist: "
+            + ", ".join(str(path) for path in missing)
+            + ". A bind mount needs a source, and this does not create one: "
+            "whoever owns the directory creates it before the command runs."
+        )
     flags: list[str] = [
         backend.executable,
         # One flag, six namespaces, and `--unshare-all` includes the network.
@@ -1620,6 +2654,20 @@ def _bubblewrap(
         # A new session, so the contained process has no controlling terminal
         # and cannot push characters into the researcher's shell with TIOCSTI.
         "--new-session",
+        # No *further* user namespaces inside. An adversarial review recorded
+        # that a contained process could still run `unshare --user
+        # --map-root-user`, which is a nested namespace in which it is root --
+        # the position from which every namespace escape published to date
+        # starts. Nothing this system contains needs one: acceptance commands
+        # are `uv`, `pytest` and `ruff`, and a declared experiment is a script.
+        # bubblewrap implements it by writing 0 to `max_user_namespaces` in the
+        # new namespace, so a nested `unshare` fails with ENOSPC.
+        "--disable-userns",
+        # And fail if that did not take. `--disable-userns` alone is a request;
+        # this is the check. Without it a kernel that silently ignored the
+        # write would run every command in a sandbox whose nested-namespace
+        # denial was a comment in this file rather than a property of the host.
+        "--assert-userns-disabled",
         "--clearenv",
     ]
     if spec.network:
@@ -1650,7 +2698,27 @@ def _bubblewrap(
     # caller's binds, so a caller who made its directory writable still wins.
     flags.extend(program_bind)
 
-    for path in spec.resolved_readable():
+    # Only the read-only inputs that exist, exactly as `resolved_protected`
+    # already does. An input that is absent exposes nothing, and the command's
+    # own "no such file" is a better diagnosis of it than bubblewrap's.
+    readable = [path for path in spec.resolved_readable() if path.exists()]
+
+    # After the read-only operating system so it is not shadowed by it, and
+    # before the caller's writable binds so a caller who declared one of these
+    # genuinely writable still wins.
+    requested = spec.resolved_discarded()
+    overlays = requested if requested and overlay_available(backend.executable) else ()
+    if requested and not overlays:
+        LOG.warning(
+            "this host cannot provide a throwaway overlay, so %s is not exposed "
+            "and the command runs against an empty one. A `uv` command that "
+            "must resolve dependencies will need `sandbox.network: true`.",
+            ", ".join(str(path) for path in requested),
+        )
+    for path in overlays:
+        flags.extend(["--overlay-src", str(path), "--tmp-overlay", str(path)])
+
+    for path in readable:
         flags.extend(["--ro-bind", str(path), str(path)])
     for path in spec.resolved_writable():
         flags.extend(["--bind", str(path), str(path)])
@@ -1659,7 +2727,22 @@ def _bubblewrap(
     # nothing earlier can express that.
     for path in spec.resolved_protected():
         flags.extend(["--ro-bind", str(path), str(path)])
-
+    # **A protected path that does not exist is not covered, and that is a
+    # deliberate trade rather than an oversight.** A review pointed out that
+    # `.research` is left writable in exactly the projects that have no capsule
+    # yet. The obvious repair -- mounting an empty read-only tmpfs at the path
+    # -- was implemented and then reverted, because bubblewrap *creates* the
+    # destination, and the destination is inside the read-write worktree, so
+    # every contained acceptance command in every capsule-less project would
+    # leave an empty `.research` directory behind on the host. A sandbox with a
+    # write of its own is the thing this file refuses to be, and the risk being
+    # closed is smaller than the one being introduced.
+    #
+    # The residual, stated so it is not rediscovered: a contained command can
+    # create a capsule in a worktree that had none, and the diff archived for
+    # the human is taken before the checks run, so it would not show it. The
+    # worktree is disposable and its merge is a human decision; the *canonical*
+    # capsule is covered by `canonical_fingerprint` either way.
     flags.extend(["--dir", "/tmp/sandbox-home"])
     flags.extend(["--chdir", str(spec.workdir.resolve())])
     flags.append("--")
@@ -1673,8 +2756,11 @@ def _bubblewrap(
         technology=backend.technology,
         detail=(
             f"bubblewrap: {len(spec.resolved_writable())} writable, "
-            f"{len(spec.resolved_readable())} read-only, "
-            f"{len(spec.resolved_protected())} protected, network "
-            f"{'granted' if spec.network else 'denied'}"
+            f"{len(readable)} read-only, "
+            f"{len(spec.resolved_protected())} protected, "
+            f"{len(program_bind) // 3} program, "
+            f"{len(overlays)} discarded, network "
+            f"{'granted' if spec.network else 'denied'}, nested user "
+            "namespaces disabled"
         ),
     )

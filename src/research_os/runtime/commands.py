@@ -36,6 +36,7 @@ if TYPE_CHECKING:
 
 import argparse
 import json
+import os
 import socket
 import sys
 from decimal import Decimal
@@ -195,6 +196,22 @@ def add_runtime_parser(subparsers: argparse._SubParsersAction) -> None:
     cancel.add_argument("run_id", metavar="RUN_ID")
 
     actions.add_parser("doctor", help="Report whether the runtime can run here.")
+    audit = actions.add_parser(
+        "containment-audit",
+        help="Attack the sandbox and record whether its boundaries held.",
+    )
+    audit.add_argument(
+        "--repo",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help=(
+            "A canonical repository to attack in place. Attempts to write its "
+            "capsule, its hooks and its refs, then verifies it is byte-identical. "
+            "Repeatable."
+        ),
+    )
+    audit.add_argument("--json", action="store_true", help="Emit the checks as JSON.")
     actions.add_parser("migrate", help="Apply pending operational schema migrations.")
 
     daemon = actions.add_parser(
@@ -231,6 +248,7 @@ def dispatch(args: argparse.Namespace) -> int:
         "events": _events,
         "cancel": _cancel,
         "doctor": _doctor,
+        "containment-audit": _containment_audit,
         "migrate": _migrate,
         "daemon": _daemon,
         "dev-db": _dev_db,
@@ -614,6 +632,101 @@ def _cancel(args: argparse.Namespace) -> int:
             return EXIT_OK
     print(f"{run.run_id} cancelled; {cancelled_work} queued or leased item(s) stopped.")
     return EXIT_OK
+
+
+def _containment_audit(args: argparse.Namespace) -> int:
+    """Run the adversarial suite against the production adapter and record it.
+
+    **This exists because the record it writes previously had no producer.**
+    ``runtime doctor`` reports "containment validated" from a file under the
+    state home, and nothing in this repository ever wrote it. The one on this
+    machine had been created by hand after a session of manual attacks.
+
+    The record is *reported*, not enforced: ``SandboxProbe.available`` excludes
+    it on purpose, so that a fresh host can run the suite that would validate
+    it. An earlier version of this docstring claimed it gated high-autonomy
+    execution. It does not, and the claim is corrected rather than deleted.
+
+    Now the record is the output of a command anyone can re-run, it is keyed to
+    the bubblewrap binary's content *and* to a digest of this system's own
+    containment policy, and it is written only when every check both ran and
+    held. A check that could not run is reported as ``SKIP`` and blocks the
+    record, because a suite that half executed is not evidence -- and a run that
+    attacked no canonical repository (no ``--repo``) does not qualify either.
+    """
+
+    import shutil
+    import tempfile
+
+    from research_os.sandbox_audit import run_and_record, summarise
+
+    # Not under `/tmp`: the sandbox replaces `/tmp` with a tmpfs of its own, so
+    # fixtures placed there are invisible inside for a reason that has nothing
+    # to do with policy, and the checks would pass without measuring anything.
+    root = Path(tempfile.mkdtemp(prefix="audit-", dir=_prepared_audit_root()))
+    if not args.repo:
+        lines_note = (
+            "note: no --repo was given, so no canonical repository was attacked "
+            "and no record will be written.\n"
+        )
+    else:
+        lines_note = ""
+    try:
+        checks, recorded = run_and_record(
+            root, [Path(item).expanduser().resolve() for item in args.repo]
+        )
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+    lines = ["containment audit\n", lines_note]
+    for check in checks:
+        lines.append(f"  {check.status:5} {check.name:32} {check.description}\n")
+        lines.append(f"        {check.evidence}\n")
+    lines.append(f"\n{summarise(checks)}\n")
+    lines.append(
+        "recorded: containment is now validated for this binary and policy\n"
+        if recorded
+        else "NOT recorded: a record requires every check to run and hold\n"
+    )
+    payload = [
+        {
+            "name": check.name,
+            "description": check.description,
+            "status": check.status,
+            "evidence": check.evidence,
+        }
+        for check in checks
+    ]
+    _emit(
+        {"checks": payload, "recorded": recorded, "summary": summarise(checks)},
+        "".join(lines),
+        as_json=bool(args.json),
+    )
+    return EXIT_OK if recorded else EXIT_ERROR
+
+
+def _prepared_audit_root() -> Path:
+    """Where the audit builds its fixtures: outside ``/tmp``, and not in state.
+
+    Outside ``/tmp`` because the sandbox replaces ``/tmp`` with a tmpfs of its
+    own. A fixture placed there is invisible inside for a reason that has
+    nothing to do with policy, so the checks would pass while measuring the
+    sandbox's own scratch filesystem rather than its boundaries. `audit()`
+    refuses such a root outright.
+
+    Not under the state home either. An earlier version used the containment
+    directory, which holds the validation record -- a review pointed out that
+    an audit interrupted halfway then leaves scratch fixtures beside the thing
+    they are evidence for, and the test-isolation guard reports any new entry
+    under those roots as contamination, correctly.
+    """
+
+    for candidate in (Path("/var/tmp"), Path.home()):
+        if candidate.is_dir() and os.access(candidate, os.W_OK):
+            return candidate
+    raise ResearchOSError(  # pragma: no cover - one of the two always works
+        "no writable directory outside /tmp to build the audit's fixtures in"
+    )
 
 
 def _doctor(args: argparse.Namespace) -> int:

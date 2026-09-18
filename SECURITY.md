@@ -101,8 +101,36 @@ somebody adds it, having read its changelog.
 
 The fourth is reported separately and never inferred: no amount of measuring a
 version establishes that a boundary was attacked and held. It is recorded by
-the adversarial suite, keyed to the binary's *content hash*, so replacing the
-binary correctly invalidates it. Until then the doctor says `NOT PROVEN`.
+the adversarial suite, keyed to the binary's *content hash* **and to a digest of
+this system's own containment policy**, so replacing the binary invalidates it
+and so does changing what this system binds. Until then the doctor says
+`NOT PROVEN`.
+
+Run it with:
+
+```sh
+researchctl runtime containment-audit --repo /path/to/your/repository
+```
+
+It attacks the boundaries below through the same `contain()` adapter the coding
+pipeline uses, prints one line per attack, and writes the record only if every
+check both **ran** and **held**. A check that could not run on this host is
+reported `SKIP` and blocks the record, because a suite that half executed is
+not evidence that anything held. `tests/test_sandbox_adversarial.py` runs the
+same function, so the release gate and the command a researcher can re-run by
+hand are one suite.
+
+**This is a repair of a real gap.** Until this release nothing in this
+repository ever wrote that record; the one on the development machine had been
+produced by hand.
+
+Be precise about its force: the record is **reported, not enforced**.
+`SandboxProbe.available` is `namespaces_ok and security_eligible` and
+deliberately excludes validation, so that a fresh host can run the suite that
+would validate it. An earlier draft of this section said the record gated
+unattended execution. It did not. The sentence is corrected rather than removed,
+because a security document that overstates what enforces a property is the same
+defect as a sandbox that overstates what it contains.
 
 The order this implies matters. Granting `userns` to a binary below its floor
 converts a sandbox that contains nothing into one that contains things and can
@@ -145,6 +173,63 @@ instructions:
   cannot forge a fence delimiter or alter controller-authored instructions.
 - Every command is an argv list. There is no `shell=True`, no `os.system`, no
   `eval`, and no `exec` anywhere in the source.
+
+**What a contained command is deliberately given.** Containment is a boundary,
+not a vacuum: a command that cannot run is not contained, it is broken, and a
+sandbox that made every check fail would be turned off within a day. Four
+things are exposed on purpose, each read-only or discarded, and each is here
+because leaving it out was measured to break the pipeline rather than because
+it was convenient.
+
+- **The program's execution dependency closure.** Whatever the kernel and the
+  program's own runtime must find between `execvp` and its first instruction:
+  the executable, every name in its symbolic-link chain, its `#!` interpreter,
+  that interpreter's *runtime root*, and its ELF loader. A runtime root is a
+  directory carrying a marker the runtime itself wrote — `pyvenv.cfg`, or
+  `lib/python3.*/os.py`. Never a parent directory merely because a program sits
+  inside one: `uv` lives in `~/.local/bin` under a `~/.local` that holds this
+  system's own database. So a virtual environment is exposed and the project
+  around it is not. All read-only; a `#!` line is file content a model wrote one
+  step earlier, and an interpreter it names is honoured only inside the
+  operating system, inside what the caller declared, or inside the program's own
+  runtime.
+- **The repository a linked Git worktree belongs to**, read-only. Every
+  acceptance command runs inside a `git worktree add` checkout whose `.git` is a
+  pointer file, so without this a project whose checks include a `git` command
+  fails with "not a git repository" against a repository that is fine. A
+  contained command can therefore *read* that repository — its history, its
+  other branches, and `.git/config`. **Do not keep a credential in a remote URL
+  in `.git/config`**; it is readable from inside, and it should not be there for
+  the reasons everyone already knows. Nothing there is writable: `git
+  update-ref` against a canonical branch is attacked in the suite and denied.
+- **uv's package cache**, as a throwaway overlay. Readable, writable as far as
+  the command can tell, and the entire upper layer is destroyed with the
+  sandbox. A contained command has no network, so `uv run` can only install from
+  a cache; a *read-only* cache does not work, measured, and a cold one cannot
+  install `pytest`. This is not the read-write bind an earlier release shipped —
+  that one was a host code-execution escape, and the difference is that no write
+  here survives the run for anything to execute.
+- **uv's managed interpreters**, read-only, for the same reason and with the
+  same rule.
+
+One consequence worth stating plainly: because an interpreter under
+`~/.local/share/uv` is exposed, the *empty ancestor directories* of that path
+exist inside the sandbox, and one of them is your home directory. Your home
+directory's **contents** are not there — `.ssh`, `.aws`, `.netrc`,
+`.git-credentials`, `.config/gh` and `.claude` are all attacked in the suite and
+all absent — but `$HOME` is not simply missing, and a claim that it is would be
+false.
+
+**Nested user namespaces are disabled** inside every contained command, with
+`--disable-userns` and `--assert-userns-disabled`, so the assertion fails closed
+rather than the flag being a hope. Nothing this system runs needs one, and a
+nested namespace is where published namespace escapes begin.
+
+**Process limiting is host-relative, not a per-sandbox quota.** `RLIMIT_NPROC`
+is counted per `(user namespace, uid)` and is set before the namespace exists,
+so it must first clear the researcher's own task count. It bounds a fork storm —
+attacked in the suite, and the shell reports `Cannot fork` — and it partitions
+nothing. Calling it a quota would claim a property nothing here provides.
 
 **What is not claimed.** No containment against a hostile project, no protection
 against a compromised provider CLI, no multi-user isolation, and no defence

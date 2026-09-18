@@ -35,8 +35,10 @@ from research_os.automation.models import AcceptanceCommand, CommandResult, utc_
 from research_os.automation.uvlock import UV_FROZEN
 from research_os.sandbox import (
     SandboxMode,
+    SandboxPreparationError,
     SandboxSpec,
     contain,
+    linked_worktree_paths,
     process_limit_preexec,
 )
 
@@ -47,6 +49,12 @@ UV_PROGRAM = "uv"
 
 #: The uv setting that names where a project environment is materialised.
 UV_PROJECT_ENVIRONMENT = "UV_PROJECT_ENVIRONMENT"
+
+#: The uv setting that names where its package cache lives.
+UV_CACHE_DIR = "UV_CACHE_DIR"
+
+#: The uv setting that says there is no network, so use the cache or fail.
+UV_OFFLINE = "UV_OFFLINE"
 
 
 def check_environment(
@@ -89,6 +97,7 @@ def check_overrides(
     *,
     uv_project_environment: Path | None,
     uv_frozen: bool = False,
+    network: bool = True,
 ) -> dict[str, str]:
     """Return only the variables the *controller decided*, not the environment.
 
@@ -110,6 +119,26 @@ def check_overrides(
     overrides = {UV_PROJECT_ENVIRONMENT: str(uv_project_environment)}
     if uv_frozen:
         overrides[UV_FROZEN] = "1"
+    if not network:
+        # The sandbox denies the network, so say so rather than letting uv
+        # discover it. Told, uv resolves from its cache; not told, it attempts
+        # the index, retries three times and fails the check with
+        #
+        #   error: Request failed after 3 retries ... dns error
+        #
+        # which is a network diagnosis of a containment decision, attributed to
+        # the project. It is also what the sandbox already promised: "a command
+        # that silently fetches something is a command whose result is not
+        # reproducible" -- and a command that *cannot* fetch should not spend
+        # fifteen seconds trying.
+        overrides[UV_OFFLINE] = "1"
+    cache = uv_cache_dir()
+    if cache is not None:
+        # Point uv at the cache this command is given as a throwaway overlay --
+        # see `uv_discarded_paths`. Without this uv uses the sandbox's own
+        # tmpfs HOME, which is empty, and an empty cache with no network cannot
+        # install anything.
+        overrides[UV_CACHE_DIR] = str(cache)
     return overrides
 
 
@@ -133,13 +162,20 @@ def uv_readonly_paths(argv: Sequence[str]) -> tuple[Path, ...]:
     ``canonical_fingerprint`` sees none of it, nothing has to be checked out for
     it to fire, and it reaches every project on the machine.
 
-    The cache is gone from this list entirely rather than made read-only,
-    because a read-only cache does not work: measured, uv exits with
-    ``Failed to initialize cache ... Permission denied`` before running
-    anything. What it gets instead is the sandbox's own ``HOME``, a tmpfs, where
-    its default cache location is writable, isolated and disposable -- verified
-    to work from empty with ``UV_OFFLINE=1``. The cost is a cold cache per
-    contained run. That is the correct price.
+    The cache is not in this list, because a read-only cache does not work:
+    measured, uv exits with ``Failed to initialize cache ... Permission
+    denied`` before running anything. It is handled by `uv_discarded_paths`
+    instead, which layers a throwaway tmpfs over it.
+
+    **An earlier version of this paragraph said the cache was simply dropped**,
+    and that uv would use the sandbox's tmpfs ``HOME`` -- "verified to work from
+    empty with ``UV_OFFLINE=1``", at a cost of "a cold cache per contained run.
+    That is the correct price." The verification did not cover a project with a
+    dependency. A cold cache and no network cannot install one, so the price
+    was not a slower run, it was every ``uv run`` check failing with a DNS
+    error attributed to the project. Left here rather than deleted: the
+    measurement was real and the conclusion drawn from it was too broad, which
+    is a failure worth being able to recognise again.
     """
 
     if not argv or argv[0] != UV_PROGRAM:
@@ -149,6 +185,63 @@ def uv_readonly_paths(argv: Sequence[str]) -> tuple[Path, ...]:
     xdg_data = os.environ.get("XDG_DATA_HOME")
     data_dir = (Path(xdg_data) if xdg_data else Path.home() / ".local" / "share") / "uv"
     return (data_dir,) if data_dir.exists() else ()
+
+
+def uv_cache_dir() -> Path | None:
+    """Where uv keeps downloaded packages on this host, if it exists.
+
+    ``XDG_CACHE_HOME`` when set, ``~/.cache/uv`` otherwise, which is uv's own
+    rule. ``None`` when there is nothing there to expose.
+    """
+
+    xdg_cache = os.environ.get("XDG_CACHE_HOME")
+    found = (Path(xdg_cache) if xdg_cache else Path.home() / ".cache") / "uv"
+    return found if found.is_dir() else None
+
+
+def uv_discarded_paths(argv: Sequence[str]) -> tuple[Path, ...]:
+    """uv's package cache, to be exposed with every write thrown away.
+
+    **This is what makes a contained ``uv run`` possible at all.** A contained
+    command has no network, so uv can only install from a cache; and it will
+    not use a read-only one -- measured, it exits with ``Failed to initialize
+    cache ... Permission denied`` before running anything. The previous release
+    concluded from that measurement that the cache should not be exposed, and
+    recorded that uv would use the sandbox's tmpfs ``HOME`` instead, "verified
+    to work from empty with ``UV_OFFLINE=1``".
+
+    That verification did not cover a project with a dependency, and this
+    release measured what happens when it does:
+
+    ```text
+    error: Unable to ... Failed to fetch `https://pypi.org/simple/pytest/`
+           ... failed to lookup address information
+    ```
+
+    Every ``uv run`` acceptance check failed that way, attributed to the
+    project. A lock file means dependency resolution does not need the network;
+    it does not put the wheels on disk.
+
+    So the cache goes in :attr:`SandboxSpec.discarded`: bubblewrap layers a
+    tmpfs over it, uv can initialise and populate what it sees, and the whole
+    upper layer is destroyed with the sandbox. Verified: five packages
+    installed with the network denied, and nothing new in the host cache
+    afterwards. It is not the read-write bind an earlier review found to be a
+    host code-execution escape -- no write survives the run for anything to
+    execute.
+
+    What it does expose is *read* access to the researcher's package cache:
+    wheels, source distributions and their unpacked contents. That is package
+    data rather than secrets, and it is strictly less than the managed
+    interpreters `uv_readonly_paths` already exposes.
+    """
+
+    if not argv or argv[0] != UV_PROGRAM:
+        return ()
+    if shutil.which(UV_PROGRAM) is None:
+        return ()
+    cache = uv_cache_dir()
+    return (cache,) if cache is not None else ()
 
 
 def run_acceptance_command(
@@ -220,6 +313,12 @@ def run_acceptance_command(
     )
     writable = [cwd]
     if uv_project_environment is not None:
+        # The controller owns this directory and uv creates it on first use --
+        # which under containment is too late, because a bind mount needs a
+        # source that already exists. Created here rather than in the sandbox:
+        # a sandbox that makes host directories in order to contain something
+        # is a sandbox with a write of its own.
+        uv_project_environment.mkdir(parents=True, exist_ok=True)
         # uv materialises the project environment here, so it has to be
         # writable. It is outside every worktree on purpose -- see this module's
         # docstring -- which means the sandbox would deny it by default and
@@ -229,9 +328,29 @@ def run_acceptance_command(
     spec = SandboxSpec(
         workdir=cwd,
         writable=tuple(writable),
-        # uv's managed interpreters, read-only. Never writable: see
-        # `uv_readonly_paths`.
-        readable=(*sandbox_readable, *uv_readonly_paths(argv)),
+        # uv's managed interpreters and the repository a linked worktree
+        # belongs to, both read-only. Never writable: see `uv_readonly_paths`
+        # and `linked_worktree_paths`. Every acceptance command in this
+        # pipeline runs inside a `git worktree add` checkout, so a project
+        # whose checks include `git diff --check` needs the second one or the
+        # check fails with "not a git repository" against a repository that is
+        # fine.
+        readable=(
+            *sandbox_readable,
+            *uv_readonly_paths(argv),
+            *linked_worktree_paths(cwd),
+        ),
+        # uv's package cache, readable and writable-in-appearance, with every
+        # write discarded when the sandbox exits. See `uv_discarded_paths`.
+        discarded=uv_discarded_paths(argv),
+        # The two things inside the worktree an acceptance command must not be
+        # able to write, whatever else it may. `LocalExecutor` has protected
+        # these since an adversarial review planted a `post-checkout` hook from
+        # inside "containment"; this path did not, and the asymmetry was the
+        # enabler for a second review's finding: `.git` in a linked worktree is
+        # a *pointer file*, so a contained command could rewrite it to name any
+        # other repository on the host and have it exposed on the next run.
+        protected=(cwd / ".git", cwd / ".research"),
         network=sandbox_network,
         wall_seconds=timeout_seconds,
         # The controller's *decisions*, not the researcher's environment.
@@ -244,9 +363,33 @@ def run_acceptance_command(
             argv,
             uv_project_environment=uv_project_environment,
             uv_frozen=uv_frozen,
+            network=sandbox_network,
         ),
     )
-    prepared = contain(argv, spec=spec, mode=sandbox_mode)
+    try:
+        prepared = contain(argv, spec=spec, mode=sandbox_mode)
+    except SandboxPreparationError as exc:
+        # Containment is available; *this command* could not be set up inside
+        # it -- a `#!` line naming an interpreter that does not exist, or one
+        # naming a path policy will not expose. Reported against the command,
+        # with the reason, rather than raised out of the function: a host that
+        # cannot contain at all is a different fact and keeps raising.
+        #
+        # The distinction is the whole point of the message. Without it the
+        # command runs and the kernel says `No such file or directory` naming
+        # the script, which exists, and the missing interpreter is never named.
+        return CommandResult(
+            argv=argv,
+            cwd=str(cwd),
+            required=command.required,
+            exit_code=None,
+            timed_out=False,
+            timeout_seconds=timeout_seconds,
+            started_at=started,
+            ended_at=utc_now(),
+            duration_ms=int((time.monotonic() - monotonic) * 1000),
+            error=f"the sandbox could not be prepared for this command: {exc}",
+        )
 
     try:
         completed = subprocess.run(
