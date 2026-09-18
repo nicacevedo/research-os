@@ -249,6 +249,88 @@ class SandboxSpec:
 #: controlled filesystem content" is the ordinary case rather than the exotic
 #: one. A sandbox that can be made to write outside itself during *setup* is not
 #: a weaker boundary here, it is the absence of one.
+class NamespaceState(StrEnum):
+    """What the namespace probe actually found, in three answers not two.
+
+    The distinction this exists for cost an afternoon. The probe ran
+
+        bwrap --unshare-user --unshare-net --ro-bind /usr /usr \
+              --proc /proc -- /bin/true
+
+    and reported any non-zero exit as "this kernel refuses unprivileged user
+    namespaces". After an AppArmor profile correctly granted the namespace, it
+    kept reporting a refusal -- because the real failure had become
+
+        bwrap: execvp /bin/true: No such file or directory
+
+    The namespace was created. The *sandbox* had no ``/bin`` and no
+    ``/lib64``: this host is usrmerged, ``/bin`` and ``/lib64`` are symlinks
+    into ``/usr``, and binding only ``/usr`` leaves neither present. ``execvp``
+    then returns ENOENT for a missing **ELF interpreter** exactly as it does for
+    a missing binary, so a filesystem mistake in the probe read as a kernel
+    denial and sent an operator to look at AppArmor, which was working.
+
+    Both non-success states still mean "not usable": what changes is which of
+    them a person is told to go and fix.
+    """
+
+    AVAILABLE = "available"
+    BLOCKED = "blocked"
+    """The kernel or a security module refused the namespace. EPERM territory."""
+
+    PROBE_ERROR = "probe_error"
+    """The namespace was obtained and the probe itself failed afterwards.
+
+    A bug here, or a host whose layout the probe's filesystem does not suit.
+    Never evidence about the kernel's policy.
+    """
+
+
+#: stderr fragments that mean the kernel or an LSM refused the namespace.
+#:
+#: Checked *after* the exec markers below, because a message can carry both and
+#: "the namespace was created, then exec failed" is the more specific reading.
+_NAMESPACE_DENIED_MARKERS: tuple[str, ...] = (
+    "setting up uid map",
+    "uid map",
+    "gid map",
+    "no permissions to create new namespace",
+    "clone failed",
+    "unshare failed",
+    "user namespace",
+    "userns",
+    "operation not permitted",
+    "rtm_newaddr",
+)
+
+#: stderr fragments that mean the sandbox was built and the sentinel did not run.
+#:
+#: ``execvp`` is the decisive one: bubblewrap only reaches it after every
+#: namespace and every mount has succeeded, so its presence is positive
+#: evidence that the namespace was obtained.
+_PROBE_ERROR_MARKERS: tuple[str, ...] = (
+    "execvp",
+    "can't find",
+    "can't create",
+    "can't mkdir",
+    "can't make",
+    "no such file or directory",
+)
+
+
+def classify_namespace_failure(message: str) -> NamespaceState:
+    """Read one bubblewrap error line as a denial or as a probe defect."""
+
+    lowered = message.lower()
+    if any(marker in lowered for marker in _PROBE_ERROR_MARKERS):
+        return NamespaceState.PROBE_ERROR
+    if any(marker in lowered for marker in _NAMESPACE_DENIED_MARKERS):
+        return NamespaceState.BLOCKED
+    # Unrecognised. Not "blocked", because claiming a kernel policy we did not
+    # observe is what this classifier exists to stop; and not available either.
+    return NamespaceState.PROBE_ERROR
+
+
 @dataclass(frozen=True, slots=True)
 class SecurityFloor:
     """The upstream version that fixes an advisory, and how to name it."""
@@ -590,9 +672,20 @@ class SandboxProbe:
 
     technology: str
     executable: str | None
-    namespaces_ok: bool
+    namespace_state: NamespaceState
     detail: str
     remedy: str = ""
+
+    @property
+    def namespaces_ok(self) -> bool:
+        """Whether a real namespace with a uid map was obtained.
+
+        A property rather than the stored field it used to be, so that the two
+        non-success states cannot drift apart from it: BLOCKED and PROBE_ERROR
+        are both "not usable", and only the advice differs.
+        """
+
+        return self.namespace_state is NamespaceState.AVAILABLE
 
     version: str | None = None
     """What ``--version`` reported, verbatim. ``None`` when it was not asked."""
@@ -895,7 +988,7 @@ def probe_bubblewrap() -> SandboxProbe:
         return SandboxProbe(
             technology="bubblewrap",
             executable=None,
-            namespaces_ok=False,
+            namespace_state=NamespaceState.PROBE_ERROR,
             detail="bwrap is not on PATH",
             remedy="install bubblewrap (apt install bubblewrap)",
         )
@@ -926,18 +1019,7 @@ def probe_bubblewrap() -> SandboxProbe:
     }
     validated, validation_detail = containment_validation(executable, version)
 
-    argv = [
-        executable,
-        "--unshare-user",
-        "--unshare-net",
-        "--ro-bind",
-        "/usr",
-        "/usr",
-        "--proc",
-        "/proc",
-        "--",
-        "/bin/true",
-    ]
+    argv = _namespace_probe_argv(executable)
     try:
         completed = subprocess.run(
             argv,
@@ -950,7 +1032,7 @@ def probe_bubblewrap() -> SandboxProbe:
     except (OSError, subprocess.SubprocessError) as exc:
         return SandboxProbe(
             **common,
-            namespaces_ok=False,
+            namespace_state=NamespaceState.PROBE_ERROR,
             detail=f"bwrap could not be run: {exc}",
             containment_validated=validated,
             validation_detail=validation_detail,
@@ -975,7 +1057,7 @@ def probe_bubblewrap() -> SandboxProbe:
             )
         return SandboxProbe(
             **common,
-            namespaces_ok=True,
+            namespace_state=NamespaceState.AVAILABLE,
             detail=detail,
             remedy=remedy,
             containment_validated=validated,
@@ -984,8 +1066,16 @@ def probe_bubblewrap() -> SandboxProbe:
 
     reason = (completed.stderr or completed.stdout or "").strip().splitlines()
     first = reason[0] if reason else f"exit {completed.returncode}"
-    remedy = ""
-    if "uid map" in first or "RTM_NEWADDR" in first or "userns" in first.lower():
+    state = classify_namespace_failure(first)
+
+    if state is NamespaceState.PROBE_ERROR:
+        remedy = (
+            "this is a defect in the probe or an unusual host layout, NOT a "
+            "kernel policy: bubblewrap only reaches this point after every "
+            "namespace and every mount has succeeded. Do not change AppArmor "
+            "or sysctl in response to it. Reproduce with: " + " ".join(argv)
+        )
+    else:
         remedy = (
             "this kernel refuses unprivileged user namespaces. Check "
             "`sysctl kernel.apparmor_restrict_unprivileged_userns` and "
@@ -1005,12 +1095,65 @@ def probe_bubblewrap() -> SandboxProbe:
             )
     return SandboxProbe(
         **common,
-        namespaces_ok=False,
+        namespace_state=state,
         detail=first,
         remedy=remedy,
         containment_validated=validated,
         validation_detail=validation_detail,
     )
+
+
+def _namespace_probe_argv(executable: str) -> list[str]:
+    """The smallest sandbox that can run a sentinel and still test what matters.
+
+    **It reuses :data:`_OS_PATHS`**, which is what :func:`_bubblewrap` binds for
+    a real contained command. That is the point: a probe that builds a
+    *different* filesystem from production can pass while production fails, or
+    -- as it did here -- fail while production would have worked. Binding the
+    same set means the probe exercises the same mounts, and a host where one of
+    them is missing is a host where the probe says so.
+
+    ``--ro-bind / /`` would also have run the sentinel, and was rejected: it
+    hides exactly the class of defect that caused this, because every path
+    exists under it whether or not the production bind list is right.
+
+    ``--unshare-user`` is the strict form, never ``--unshare-user-try``, so a
+    host that cannot give a user namespace fails here rather than quietly
+    running the sentinel outside one. ``--unshare-net`` is included because a
+    contained command is denied the network by default and that denial is a
+    namespace this must prove it can create.
+    """
+
+    flags = [
+        executable,
+        "--unshare-user",
+        "--unshare-net",
+        "--unshare-pid",
+        "--proc",
+        "/proc",
+    ]
+    for path in _OS_PATHS:
+        if Path(path).exists():
+            flags.extend(["--ro-bind", path, path])
+    flags.extend(["--", _probe_sentinel()])
+    return flags
+
+
+def _probe_sentinel() -> str:
+    """A tiny executable the probe can run inside the sandbox.
+
+    Resolved against the *host*, because the bind list above reproduces the
+    host's layout inside the sandbox. ``/bin/true`` is listed first and is a
+    symlink into ``/usr`` on a usrmerged host -- which is fine, because
+    ``/bin`` is in :data:`_OS_PATHS` and bubblewrap resolves the source.
+
+    The fallback matters on a host where ``true`` lives in only one of them.
+    """
+
+    for candidate in ("/bin/true", "/usr/bin/true"):
+        if Path(candidate).exists():
+            return candidate
+    return "/bin/true"
 
 
 def probe_ineffective_systemd_run() -> SandboxProbe:
@@ -1033,13 +1176,13 @@ def probe_ineffective_systemd_run() -> SandboxProbe:
         return SandboxProbe(
             technology="systemd-run",
             executable=None,
-            namespaces_ok=False,
+            namespace_state=NamespaceState.PROBE_ERROR,
             detail="systemd-run is not on PATH",
         )
     return SandboxProbe(
         technology="systemd-run",
         executable=executable,
-        namespaces_ok=False,
+        namespace_state=NamespaceState.BLOCKED,
         detail=(
             "present, and its user-scope sandboxing directives are silently "
             "ineffective without unprivileged user namespaces: the unit starts "
@@ -1067,7 +1210,7 @@ def probe_container_runtimes() -> tuple[SandboxProbe, ...]:
             SandboxProbe(
                 technology=name,
                 executable=executable,
-                namespaces_ok=False,
+                namespace_state=NamespaceState.PROBE_ERROR,
                 detail=(
                     f"{name} is present but no backend is implemented for it"
                     if executable
@@ -1180,6 +1323,35 @@ def process_limit_preexec(
     Within a sandbox the limit is still blunt -- it stops a fork bomb and would
     also stop a legitimate build that spawns more, hence the generous default --
     and it bounds runaway process creation rather than partitioning anything.
+
+    **And the limit must first clear the host's own task count.** This is the
+    third time this repository has made a version of the mistake above, and the
+    first two notes were still not enough, because they got the *timing* wrong.
+    A ``preexec_fn`` runs in the child between ``fork`` and ``exec`` -- which is
+    before ``bwrap`` runs at all, and therefore before the user namespace that
+    makes the count "start near zero" exists. At the moment bubblewrap calls
+    ``clone(CLONE_NEWUSER)`` the limit is still being checked against the
+    researcher's session.
+
+    ``RLIMIT_NPROC`` also counts *tasks*, not processes. On the machine this was
+    found on that was 1163 threads against 254 processes, so a 512 ceiling made
+    namespace creation itself fail:
+
+    ```text
+    bwrap: Creating new namespace failed: Resource temporarily unavailable
+    ```
+
+    Every contained command failed that way, and it was invisible for as long
+    as the host could not create namespaces at all -- the containment tests
+    skipped, so nothing executed this path. It surfaced the hour containment
+    started working.
+
+    So the ceiling is raised, in the parent, to clear the current task count
+    with headroom. Inside the sandbox the uid maps to a fresh ``user_struct``
+    whose count starts near zero, and the inherited limit becomes the real
+    per-sandbox ceiling it was always meant to be -- just a larger number than
+    the caller asked for, and :attr:`SandboxSpec.max_processes` is the floor of
+    it rather than the value.
     """
 
     if spec.max_processes is None or not contained:
@@ -1188,7 +1360,11 @@ def process_limit_preexec(
         import resource
     except ImportError:  # pragma: no cover - POSIX only
         return None
-    ceiling = int(spec.max_processes)
+
+    # Computed in the *parent*. A `preexec_fn` runs after `fork` in a process
+    # that may hold locks other threads were using, so it must do as close to
+    # nothing as possible -- certainly not walk /proc.
+    ceiling = max(int(spec.max_processes), _uid_task_count() + _NPROC_HEADROOM)
 
     def apply() -> None:  # pragma: no cover - runs in the forked child
         _soft, hard = resource.getrlimit(resource.RLIMIT_NPROC)
@@ -1196,6 +1372,45 @@ def process_limit_preexec(
         resource.setrlimit(resource.RLIMIT_NPROC, (wanted, hard))
 
     return apply
+
+
+#: Tasks of headroom above the host's current count, for the contained ceiling.
+#:
+#: The count is sampled once, before the command starts; the researcher's
+#: desktop keeps creating threads while it runs, and a ceiling sampled exactly
+#: at the current count would fail the moment a browser tab opened.
+_NPROC_HEADROOM = 1024
+
+
+def _uid_task_count() -> int:
+    """How many tasks this uid currently owns, as ``RLIMIT_NPROC`` counts them.
+
+    Tasks, not processes: the kernel checks the limit per ``clone``, so a
+    process with forty threads costs forty. Reading ``/proc`` directly rather
+    than shelling out to ``ps``, because this is on the path of every contained
+    command.
+
+    Returns 0 when it cannot be determined, which makes the ceiling exactly
+    what the caller asked for -- the previous behaviour, and the right fallback
+    for a platform whose ``/proc`` this does not understand.
+    """
+
+    try:
+        uid = os.getuid()
+        total = 0
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                if entry.stat().st_uid != uid:
+                    continue
+                total += len(list((entry / "task").iterdir()))
+            except OSError:
+                # The process exited while we were looking at it.
+                continue
+        return total
+    except OSError:  # pragma: no cover - /proc is present on Linux
+        return 0
 
 
 @dataclass(frozen=True, slots=True)

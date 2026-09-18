@@ -11,6 +11,44 @@ closing the first of them exposed.
 
 ### Fixed
 
+- **The namespace probe reported a kernel denial for its own filesystem
+  mistake.** After an AppArmor profile correctly granted `/usr/bin/bwrap` the
+  `userns` permission, `runtime doctor` went on saying the kernel refused
+  unprivileged user namespaces. It did not. The probe's error had changed from
+  `setting up uid map` to `execvp /bin/true: No such file or directory`, and
+  the probe classified any non-zero exit as a denial.
+
+  The namespace was being created. The probe's *sandbox* had no `/bin` and no
+  `/lib64`: it bound only `/usr`, this host is usrmerged, and `execvp` returns
+  ENOENT for a missing ELF interpreter exactly as it does for a missing binary.
+  So a one-line filesystem bug in the probe read as a kernel policy and sent an
+  operator to inspect a profile that was working.
+
+  The probe now builds its sandbox from `_OS_PATHS` -- the same set
+  `_bubblewrap` binds for a real contained command -- so it exercises the
+  filesystem production actually gets. `--ro-bind / /` would also have run the
+  sentinel and was rejected: every path exists under it, so it hides exactly
+  this class of defect. `NamespaceState` replaces the boolean with
+  `AVAILABLE | BLOCKED | PROBE_ERROR`; both failures still mean unusable, and
+  only a real denial is allowed to advise changing AppArmor or sysctl.
+
+- **Every contained command failed, for as long as containment worked.** The
+  hour the namespace became available, `run_acceptance_command` started
+  returning exit 1 with `bwrap: Creating new namespace failed: Resource
+  temporarily unavailable`. `process_limit_preexec` applies `RLIMIT_NPROC` in
+  the child between `fork` and `exec` -- which is *before* bubblewrap runs, and
+  therefore before the user namespace that makes the count "start near zero"
+  exists. At `clone(CLONE_NEWUSER)` the limit is still checked against the
+  researcher's whole session, and `RLIMIT_NPROC` counts tasks, not processes:
+  1163 threads here against a 512 ceiling.
+
+  This is the third time this repository has made a version of this mistake and
+  the first time the timing, rather than the scope, was what was wrong. The
+  ceiling is now raised in the parent to clear the current task count with
+  headroom, so `SandboxSpec.max_processes` is the floor of the in-sandbox
+  ceiling rather than its value. It was invisible while the host could not
+  create namespaces at all, because the containment tests skipped.
+
 - **A vendor security backport is now recognised, and a withdrawn one is not.**
   The eligibility gate compared only the program's own `--version` against the
   upstream floor, which produced a false *negative* on every distribution that

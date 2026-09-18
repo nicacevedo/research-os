@@ -1,18 +1,35 @@
 # Getting a containment backend this deployment may use
 
 ```text
-Status:   HUMAN_ROOT_ACTION_REQUIRED
-Audited:  2026-09-17, on the workstation running the thesis pilot
-          re-audited after the 0.9.0-1ubuntu0.3 upgrade
-Blocker:  bubblewrap 0.9.0-1ubuntu0.3 is PRESENT_BUT_UNACCEPTABLE
-          (Ubuntu shipped the fix in 0.2 and REVERTED it in 0.3)
+Status:   RESOLVED on this host, 2026-09-18
+          Option A was taken: Debian's 0.12.0-1 rebuilt for noble
+Backend:  bubblewrap 0.12.0 (pkg 0.12.0-1~deb13u1), /usr/bin/bwrap,
+          NOT setuid, sha256 1e2250f2605d7584...
+State:    security eligible  OK
+          namespace          OK   (targeted AppArmor profile installed)
+          containment        OK   (27/27 adversarial checks, one real task)
 ```
 
-This document exists because the honest answer to "can Research OS contain a
-model-written experiment on this machine" is currently **no**, for two separate
-reasons, and the order in which they are fixed matters.
+`kernel.apparmor_restrict_unprivileged_userns` is still **1**. It was not
+weakened; the targeted `deploy/apparmor-bwrap` profile grants `userns` to that
+one binary, which is the model this document recommended.
 
-## What is wrong, in order of precedence
+Two defects surfaced the moment containment started working, both in Research
+OS rather than on the host, and both are fixed:
+
+- the namespace probe bound only `/usr`, so on a usrmerged host no dynamically
+  linked sentinel could start, and it reported the resulting ENOENT as a kernel
+  denial;
+- `RLIMIT_NPROC` was applied before `exec(bwrap)`, so it was checked against the
+  researcher's session (1163 tasks) rather than the sandbox's, and every
+  contained command failed with `Creating new namespace failed`.
+
+The history below is kept because the version trap in it is still live for
+anyone on the stock Ubuntu package.
+
+---
+
+## The history: what was wrong, in order of precedence
 
 **1. The installed bubblewrap has a known sandbox escape, again.**
 

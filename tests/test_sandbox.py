@@ -23,6 +23,7 @@ import pytest
 
 from research_os.automation.models import AcceptanceCommand
 from research_os.sandbox import (
+    NamespaceState,
     SandboxError,
     SandboxMode,
     SandboxSpec,
@@ -66,14 +67,23 @@ def test_bubblewrap_namespaces_are_probed_by_running_it_not_by_finding_it() -> N
     found = next(item for item in probe() if item.technology == "bubblewrap")
     import shutil
 
+    from research_os.sandbox import _namespace_probe_argv
+
     if shutil.which("bwrap") is None:
         assert found.namespaces_ok is False
         assert found.available is False
         return
     # The binary is here. Whether it works is a fact about the kernel, and the
-    # probe's answer must match what actually happens when it is run.
+    # probe's answer must match what actually happens when *its own* invocation
+    # is run.
+    #
+    # This used to run a hand-written `--ro-bind /usr /usr -- /bin/true`, which
+    # on a usrmerged host has no `/lib64` inside the sandbox and so cannot
+    # start any dynamically linked program. It agreed with the probe only
+    # because the probe had the same defect; once the probe was fixed, the
+    # hand-written command was the one still failing.
     completed = subprocess.run(
-        ["bwrap", "--unshare-user", "--ro-bind", "/usr", "/usr", "--", "/bin/true"],
+        _namespace_probe_argv(shutil.which("bwrap") or "bwrap"),
         check=False,
         capture_output=True,
         stdin=subprocess.DEVNULL,
@@ -304,13 +314,37 @@ def test_git_refs_cannot_be_updated(tmp_path: Path) -> None:
 
 @needs_sandbox
 def test_a_path_outside_the_worktree_cannot_be_written(tmp_path: Path) -> None:
+    """The property is that the **host** is unchanged, not that write() fails.
+
+    This test used to assert only that the command printed "denied", and on
+    this host it started printing "WROTE" the moment containment began working
+    -- which looked like an escape and was not one. `tmp_path` lives under
+    `/tmp`, the sandbox mounts `--tmpfs /tmp`, and binding the worktree back in
+    creates its parent directories inside that tmpfs. So the write succeeded,
+    into an ephemeral filesystem that vanishes with the sandbox, and the host
+    file was never created.
+
+    Both halves are now asserted, and they are different claims: a path the
+    sandbox genuinely denies must be refused, and *no* path outside the
+    worktree may leave anything behind on the host.
+    """
+
     worktree = tmp_path / "worktree"
     worktree.mkdir()
+
+    # Under the sandbox's own tmpfs: the write may succeed, and must not reach
+    # the host.
+    shadowed = tmp_path / "escaped"
+    _run_contained(f"touch {shadowed} && echo WROTE || echo denied", workdir=worktree)
+    assert not shadowed.exists(), "a write under /tmp reached the host"
+
+    # Outside anything the sandbox provides: the write must be refused outright.
+    denied = Path.home() / ".research-os-escape-probe"
     output = _run_contained(
-        f"touch {tmp_path / 'escaped'} && echo WROTE || echo denied", workdir=worktree
+        f"touch {denied} && echo WROTE || echo denied", workdir=worktree
     )
-    assert "WROTE" not in output
-    assert not (tmp_path / "escaped").exists()
+    assert "WROTE" not in output, output
+    assert not denied.exists(), "a write under $HOME reached the host"
 
 
 @needs_sandbox
@@ -484,7 +518,7 @@ def _flags(argv: list[str], spec: SandboxSpec) -> list[str]:
 
     backend = SandboxProbe(
         technology="bubblewrap",
-        namespaces_ok=True,
+        namespace_state=NamespaceState.AVAILABLE,
         security_eligible=True,
         executable="/usr/bin/bwrap",
         detail="assumed for a construction test",

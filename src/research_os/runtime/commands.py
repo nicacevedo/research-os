@@ -763,25 +763,23 @@ def _sandbox_lines() -> list[str]:
         configured = SandboxMode.PREFERRED
 
     if backend is not None:
+        # The selected backend first, reported as the three separate facts it
+        # actually has, then the others for the record. An eligible backend is
+        # not a proven one, and a reader who sees "OK sandbox" and stops has
+        # learned that a mechanism exists -- not that anything was attacked and
+        # held. That is why the containment row is emitted either way.
         lines = [
             (
-                f"  OK    sandbox       {backend.technology}: {backend.detail}; "
+                f"  OK    sandbox       selected backend: {backend.technology}; "
                 f"configured mode {configured}\n"
             )
         ]
-        # An eligible backend is not a proven one. The row says which, because
-        # a deployment that reads "OK sandbox" and stops has learned that a
-        # mechanism exists, not that anything was attacked and held.
-        if backend.containment_validated:
-            lines.append(
-                f"  OK    containment   adversarial suite has held against this "
-                f"binary: {backend.validation_detail}\n"
-            )
-        else:
-            lines.append(
-                f"  WARN  containment   NOT PROVEN -- {backend.validation_detail}\n"
-            )
+        lines.extend(_backend_lines(backend))
+        for candidate in probe():
+            if candidate.technology != backend.technology:
+                lines.extend(_backend_lines(candidate))
         return lines
+
     lines = [
         (
             "  WARN  sandbox       no containment technology works here, so "
@@ -806,7 +804,7 @@ def _backend_lines(candidate: SandboxProbe) -> list[str]:
     host two of them are false at once, in an order that matters.
     """
 
-    from research_os.sandbox import security_basis
+    from research_os.sandbox import NamespaceState, security_basis
 
     name = candidate.technology
     lines: list[str] = []
@@ -859,10 +857,21 @@ def _backend_lines(candidate: SandboxProbe) -> list[str]:
         lines.append(f"        basis         {rendered}\n")
 
     # 2. namespace capability, which is a fact about the kernel.
-    if candidate.namespaces_ok:
-        lines.append(f"  OK    namespace     {name}: user namespace with a uid map\n")
-    else:
+    # 2. namespace capability, in three states rather than two.
+    #
+    # "blocked" and "the probe broke" both mean unusable and are fixed by
+    # completely different people: the first by a host administrator, the
+    # second by us. Reporting the second as the first sent an operator to
+    # inspect an AppArmor profile that was working correctly.
+    if candidate.namespace_state is NamespaceState.AVAILABLE:
+        lines.append(f"  OK    namespace     {name}: available\n")
+    elif candidate.namespace_state is NamespaceState.BLOCKED:
         lines.append(f"  WARN  namespace     {name}: blocked -- {candidate.detail}\n")
+    else:
+        lines.append(
+            f"  WARN  namespace     {name}: PROBE ERROR (not a kernel denial) "
+            f"-- {candidate.detail}\n"
+        )
 
     # 3. containment, which is a fact about having tried to break out.
     if candidate.containment_validated:

@@ -34,6 +34,7 @@ from research_os import sandbox
 from research_os.sandbox import (
     SECURITY_FLOORS,
     VENDOR_FIXED_RANGES,
+    NamespaceState,
     SandboxProbe,
     VendorPackage,
     available_backend,
@@ -61,10 +62,19 @@ def _restore_backend_cache() -> object:
 
 
 def make_probe(**overrides: object) -> SandboxProbe:
+    # `namespaces_ok` is a derived property now, but it is still the clearest
+    # thing to write in a test about availability, so it is accepted here and
+    # translated.
+    if "namespaces_ok" in overrides:
+        overrides["namespace_state"] = (
+            NamespaceState.AVAILABLE
+            if overrides.pop("namespaces_ok")
+            else NamespaceState.BLOCKED
+        )
     base: dict[str, object] = {
         "technology": "bubblewrap",
         "executable": "/usr/bin/bwrap",
-        "namespaces_ok": True,
+        "namespace_state": NamespaceState.AVAILABLE,
         "detail": "namespaces work",
         "security_eligible": True,
         "version": "bubblewrap 0.12.0",
@@ -309,7 +319,7 @@ def test_the_reason_distinguishes_unacceptable_from_absent(
         "probe",
         lambda: (
             make_probe(
-                namespaces_ok=True,
+                namespace_state=NamespaceState.AVAILABLE,
                 security_eligible=False,
                 security_detail="0.9.0 is below 0.12.0",
             ),
@@ -589,21 +599,151 @@ def test_the_basis_distinguishes_upstream_from_vendor_and_from_affected() -> Non
     assert state("bubblewrap 0.9.0", None) == "affected"
 
 
-def test_this_host_is_reported_as_affected() -> None:
-    """The live machine, as a regression.
+def test_the_live_hosts_verdict_matches_its_own_evidence() -> None:
+    """Whatever this machine has installed, the verdict must follow from it.
 
-    It carries 0.9.0-1ubuntu0.3, which is the reverting package. If this ever
-    starts passing without VENDOR_FIXED_RANGES being edited, something has
-    started trusting a version ordering again.
+    Written as a consistency check rather than as a pin to one version,
+    because the host has already moved twice under this suite:
+    0.9.0-1ubuntu0.1 (unfixed), 0.9.0-1ubuntu0.3 (the revert), and now a
+    rebuilt Debian 0.12.0-1~deb13u1. A test pinned to any one of those skips
+    itself into uselessness on the next upgrade.
     """
 
     found = next(item for item in sandbox.probe() if item.technology == "bubblewrap")
-    if found.vendor_package is None:
-        pytest.skip("bwrap here is not owned by a distribution package")
-    if found.vendor_package.version != "0.9.0-1ubuntu0.3":
-        pytest.skip(f"host has moved to {found.vendor_package.version}")
-    assert found.security_eligible is False
-    assert found.available is False
+    if found.executable is None:
+        pytest.skip("no bwrap on this host")
+
+    upstream = parse_version(found.version or "")
+    floor = SECURITY_FLOORS["bubblewrap"].minimum
+    upstream_ok = upstream is not None and upstream >= floor
+    vendor_ok = (
+        sandbox.vendor_backport_verdict(found.vendor_package, "CVE-2026-87766")[0]
+        if found.vendor_package is not None
+        else False
+    )
+    assert found.security_eligible is (upstream_ok or vendor_ok), found.security_detail
+    # And availability never outruns eligibility, whatever the kernel allows.
+    assert found.available is (found.security_eligible and found.namespaces_ok)
+
+
+# --- 9. what the namespace probe found, in three states ---------------------
+#
+# The distinction cost an afternoon. After an AppArmor profile correctly
+# granted bwrap the `userns` permission, the probe went on reporting a kernel
+# denial -- because its error had changed from "setting up uid map" to
+# "execvp /bin/true: No such file or directory", and it classified any non-zero
+# exit as a denial. The namespace was fine; the probe's own sandbox had no
+# /bin and no /lib64, this host being usrmerged, and execvp returns ENOENT for
+# a missing ELF interpreter exactly as it does for a missing binary.
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        # (a) AppArmor / userns denied.
+        ("bwrap: setting up uid map: Permission denied", NamespaceState.BLOCKED),
+        (
+            "bwrap: Creating new namespace failed: Operation not permitted",
+            NamespaceState.BLOCKED,
+        ),
+        (
+            "bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted",
+            NamespaceState.BLOCKED,
+        ),
+        ("bwrap: No permissions to create new namespace", NamespaceState.BLOCKED),
+        # (b) malformed sandbox root -> ENOENT, after the namespace succeeded.
+        (
+            "bwrap: execvp /bin/true: No such file or directory",
+            NamespaceState.PROBE_ERROR,
+        ),
+        ("bwrap: Can't find source path /nope", NamespaceState.PROBE_ERROR),
+        ("bwrap: Can't mkdir /oldroot/usr", NamespaceState.PROBE_ERROR),
+        # Unrecognised: not claimed as a kernel policy we did not observe.
+        ("bwrap: something nobody has seen before", NamespaceState.PROBE_ERROR),
+    ],
+)
+def test_a_namespace_failure_is_classified_by_what_it_says(
+    message: str, expected: NamespaceState
+) -> None:
+    assert sandbox.classify_namespace_failure(message) is expected
+
+
+def test_an_exec_failure_is_never_reported_as_a_kernel_denial() -> None:
+    """The specific misdirection: it sent an operator to look at AppArmor.
+
+    "Operation not permitted" appears in the denial vocabulary, so a message
+    carrying both markers must still resolve to the more specific reading --
+    bubblewrap only reaches execvp after every namespace and mount succeeded.
+    """
+
+    both = "bwrap: execvp /bin/true: Operation not permitted"
+    assert sandbox.classify_namespace_failure(both) is NamespaceState.PROBE_ERROR
+
+
+@pytest.mark.parametrize(
+    ("namespaces_work", "stderr", "expected"),
+    [
+        (
+            False,
+            "bwrap: setting up uid map: Permission denied",
+            NamespaceState.BLOCKED,
+        ),
+        (
+            False,
+            "bwrap: execvp /bin/true: No such file or directory",
+            NamespaceState.PROBE_ERROR,
+        ),
+        (True, "", NamespaceState.AVAILABLE),
+    ],
+    ids=["apparmor-denied", "malformed-root-enoent", "namespace-created"],
+)
+def test_the_probe_reports_the_three_states_end_to_end(
+    monkeypatch: pytest.MonkeyPatch,
+    namespaces_work: bool,
+    stderr: str,
+    expected: NamespaceState,
+) -> None:
+    _fake_bwrap(
+        monkeypatch,
+        version="bubblewrap 0.12.0",
+        namespaces_work=namespaces_work,
+        stderr=stderr,
+    )
+    found = sandbox.probe_bubblewrap()
+    assert found.namespace_state is expected
+    assert found.namespaces_ok is (expected is NamespaceState.AVAILABLE)
+    # Only a real denial may send someone to change AppArmor or sysctl. The
+    # probe-error remedy mentions both, to say explicitly *not* to touch them.
+    if expected is NamespaceState.PROBE_ERROR:
+        assert "not a kernel policy" in found.remedy.lower()
+        assert "do not change apparmor or sysctl" in found.remedy.lower()
+    elif expected is NamespaceState.BLOCKED:
+        assert "apparmor" in found.remedy.lower()
+        assert "do not change apparmor" not in found.remedy.lower()
+
+
+def test_the_probe_binds_what_production_binds() -> None:
+    """A probe that builds a different filesystem from production can pass
+    while production fails -- or, as here, fail while production would work.
+
+    Binding only `/usr` left no `/lib64` on a usrmerged host, so no dynamically
+    linked sentinel could start. Reusing `_OS_PATHS` is what makes the probe's
+    filesystem the same shape as a real contained command's.
+    """
+
+    argv = sandbox._namespace_probe_argv("/usr/bin/bwrap")
+    bound = {argv[i + 1] for i, token in enumerate(argv) if token == "--ro-bind"}
+    expected = {path for path in sandbox._OS_PATHS if Path(path).exists()}
+    assert bound == expected
+    # The strict form, never `--unshare-user-try`.
+    assert "--unshare-user" in argv
+    assert "--unshare-user-try" not in argv
+    # And the network namespace, because a contained command is denied network
+    # by default and that denial is a namespace this has to prove it can make.
+    assert "--unshare-net" in argv
+
+
+def test_the_probe_sentinel_exists_on_this_host() -> None:
+    sentinel = sandbox._probe_sentinel()
+    assert Path(sentinel).exists(), sentinel
 
 
 def test_the_three_facts_stay_distinct_after_a_backport(
