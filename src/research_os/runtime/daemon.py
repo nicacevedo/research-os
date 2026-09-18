@@ -959,7 +959,94 @@ class Daemon:
         run = self._store.require_run(run_id)
         repo = self._repo_for(run.project_id)
 
-        recommendation = str(item.payload.get("recommendation") or "")
+        # **What the run concluded, from the run.**
+        #
+        # This used to read `item.payload["recommendation"]`, which is a copy of
+        # the `RESEARCH_CYCLE_FINISHED` payload, which is a copy of what the
+        # graph returned. Two messages away from the row that concluded it, in a
+        # queue row that outlives the process, the build, and any later
+        # correction to how the conclusion is reached.
+        #
+        # The live thesis runtime showed what that costs.
+        # `RRUN-20260918T054218Z-cb4962f4` asked the frontier role whether
+        # another cycle was warranted, was told `WAIT_HUMAN`, and recorded that
+        # in a finding -- but the build of the day reached `WAIT_HUMAN` only
+        # through `requires_human_promotion`, so the cycle concluded
+        # `START_NEXT_CYCLE`. `conclude` now honours the frontier's own
+        # recommendation, and that fixed nothing for the work item already on
+        # the queue: it still said `START_NEXT_CYCLE`, and on the next restart
+        # it would still have been believed.
+        #
+        # So the payload is advisory and the row is authoritative. The fallback
+        # is for a run finished before the column existed, where null means "we
+        # do not know" rather than "nothing was recommended" -- and the result
+        # says which source was used, because a continuation decision made from
+        # a message rather than from a run is a thing an auditor should be able
+        # to see.
+        durable = run.next_recommendation
+        carried = str(item.payload.get("recommendation") or "")
+        recommendation = durable if durable is not None else carried
+        source = "run record" if durable is not None else "event payload"
+        overruled = durable is not None and carried and carried != durable
+        if overruled:
+            LOG.info(
+                "%s carried recommendation %r; %s concluded %r, which wins",
+                item.work_id,
+                carried,
+                run_id,
+                durable,
+            )
+
+        def outcome(**fields: Any) -> dict[str, Any]:
+            """This item's result, with what the decision was made on.
+
+            ``parent_recommendation`` rather than ``recommendation``, because
+            on the success path ``_cycle_result_payload`` already puts the
+            *successor's* recommendation under that key. Two different facts
+            under one name is how a reader ends up auditing the wrong cycle,
+            and the first version of this helper did exactly that: a refusal
+            reported the parent's conclusion and a success silently reported
+            the child's, with ``parent_recommendation_source`` describing the
+            parent in both.
+            """
+
+            record: dict[str, Any] = {
+                "parent_recommendation": recommendation,
+                "parent_recommendation_source": source,
+                **fields,
+            }
+            if overruled:
+                record["superseded_payload_recommendation"] = carried
+            return record
+
+        # At most one successor per parent, checked before the work rather than
+        # only at the insert.
+        #
+        # `_work_advance_objective` has had this since
+        # `sql/0014_one_successor_per_run.sql` and this handler did not, which
+        # made the two disagree about the same invariant. The live runtime found
+        # the gap: a researcher cancelled the successor this item had opened,
+        # the item's lease expired, and a restart would have reclaimed it,
+        # re-run it, and hit `research_runs_one_successor_idx` as an
+        # *exception* -- three failed attempts and a dead-lettered work item,
+        # for a system behaving exactly as intended.
+        #
+        # A cancelled successor counts. Cancelling a research cycle is a
+        # person's act, and a queue row is not entitled to undo it by being
+        # retried. The index makes this a pre-check rather than the guard: two
+        # concurrent passes can both read False, and the loser raises
+        # `SuccessorExistsError` at the insert below.
+        if self._store.has_successor(run_id):
+            return outcome(
+                continued=False,
+                reason=(
+                    f"{run_id} already has a successor. A parent run has at "
+                    "most one, and a successor that was cancelled stays "
+                    "cancelled: reopening it would be this queue row undoing a "
+                    "decision a person made."
+                ),
+            )
+
         previous = CycleResult(
             run=run,
             status=run.status,
@@ -973,30 +1060,36 @@ class Daemon:
             db=self._db, config=self._config, result=previous
         )
         if not proceed:
-            return {"continued": False, "reason": why}
+            return outcome(continued=False, reason=why)
 
-        successor = start_cycle(
-            config=self._config,
-            db=self._db,
-            project_id=run.project_id,
-            repo_path=repo,
-            objective=run.objective,
-            # A factory, not a provider: the router records provenance against a
-            # run id, and the successor's does not exist until `open_cycle` has
-            # created it.
-            models=lambda successor_id: self._models(
-                successor_id, run.project_id, item.work_id
-            ),
-            autonomy=Autonomy(str(run.autonomy)),
-            parent_run_id=run.run_id,
-            cycle_index=run.cycle_index + 1,
-        )
-        return {
-            "continued": True,
-            "reason": why,
-            "successor_run_id": successor.run.run_id,
+        try:
+            successor = start_cycle(
+                config=self._config,
+                db=self._db,
+                project_id=run.project_id,
+                repo_path=repo,
+                objective=run.objective,
+                # A factory, not a provider: the router records provenance
+                # against a run id, and the successor's does not exist until
+                # `open_cycle` has created it.
+                models=lambda successor_id: self._models(
+                    successor_id, run.project_id, item.work_id
+                ),
+                autonomy=Autonomy(str(run.autonomy)),
+                parent_run_id=run.run_id,
+                cycle_index=run.cycle_index + 1,
+            )
+        except SuccessorExistsError as exc:
+            # The race the pre-check cannot close, closed by the database.
+            # Losing it is not a failure of this work item: the successor
+            # exists, which is what this item was for.
+            return outcome(continued=False, reason=str(exc))
+        return outcome(
+            continued=True,
+            reason=why,
+            successor_run_id=successor.run.run_id,
             **self._cycle_result_payload(successor),
-        }
+        )
 
     def _work_advance_objective(self, item: WorkItem) -> dict[str, Any]:
         """Continue a parked objective after a person changed the science.
@@ -1123,6 +1216,19 @@ class Daemon:
                 {
                     "parent_run_id": run.run_id,
                     "successor_run_id": successor.run.run_id,
+                    # What this pass overrode, recorded.
+                    #
+                    # This handler supplies `START_NEXT_CYCLE` itself rather
+                    # than reading the parked run, which is correct and is the
+                    # one place the runtime overrules a previous cycle's
+                    # conclusion -- it is allowed to, because the thing that
+                    # conclusion was waiting for happened. An audit pointed out
+                    # that `continue_objective` now records which source its
+                    # decision came from and this one recorded nothing, so the
+                    # *deliberate* override was the invisible one. Every parked
+                    # run in production carries `WAIT_HUMAN` here.
+                    "parent_recommendation": run.next_recommendation or "",
+                    "parent_recommendation_source": ("overridden by a capsule change"),
                     **self._cycle_result_payload(successor),
                 }
             )

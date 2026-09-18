@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Sequence
 from enum import StrEnum
 
@@ -140,6 +141,15 @@ class FindingRefKind(StrEnum):
     LITERATURE_KEY = "literature_key"
 
 
+#: The shape a producer-stated identity must have.
+#:
+#: ``<producer>:v<version>:<sha256 hex>``. The version is there so a producer
+#: can change what it hashes without the new keys colliding with the old ones,
+#: and the digest is there because a key without one is almost certainly a
+#: constant -- which merges every finding of its kind onto one row.
+_SEMANTIC_KEY_RE = re.compile(r"[a-z_]+:v[0-9]+:[0-9a-f]{64}")
+
+
 class RuntimeFinding(BaseModel):
     """One thing the runtime observed, with enough provenance to audit it.
 
@@ -195,6 +205,46 @@ class RuntimeFinding(BaseModel):
     experiment_job_id: str | None = None
     spec_digest: str | None = None
 
+    semantic_key: str = ""
+    """What makes two of these the same observation, when content will not do.
+
+    **Why content is not always enough.** The digest below is over what the
+    finding says and what it rests on, which is right whenever the content *is*
+    the observation. It is wrong for a handler whose result contains a model's
+    prose. A frontier assessment reached over identical scientific state,
+    concluding the identical thing, produces a differently worded rationale and
+    a differently hashed artifact -- so it hashes differently, so it becomes a
+    second citable identifier for one observation. Twenty of them fill all
+    :data:`research_os.runtime.sciencecontext.MAX_PLANNER_FINDINGS` slots of
+    the planner's window -- that constant, not the one in this module, which
+    bounds a *proposal's* grounding packet -- and push the project's real
+    findings out of it, with nothing about the project having changed.
+
+    **So the producer may state the identity instead.** When this is set, the
+    digest is computed from it and from the finding's project, kind and
+    producing action, and from nothing else. The summary, the excerpt and the
+    references are still stored, still read and still cited -- they are simply
+    not what decides whether this is a new finding.
+
+    **The obligation that comes with setting it.** Two findings with equal keys
+    are permanently the same finding. A handler that sets one must put
+    everything material into it and nothing that varies without the observation
+    varying. See :data:`research_os.runtime.actions.base.SEMANTIC_KEY`, and
+    :func:`research_os.runtime.actions.review.assessment_identity` for the one
+    handler that does -- asserted structurally, because a second producer
+    setting a key badly would merge citable findings with nothing to notice.
+    The column is ``sql/0017_finding_semantic_identity.sql``; the shape is
+    enforced by the validator below, so a constant is refused rather than
+    silently collapsing everything of its kind.
+
+    **Repeats keep the first wording, deliberately.** ``record_finding``
+    returns the existing row, so the stored prose is the first occurrence's. A
+    finding is immutable and superseded rather than updated -- a citation is
+    worth nothing if the thing cited can change after being cited -- and if a
+    later assessment's substance differs, its key differs and it is a new
+    finding rather than a rewrite of this one.
+    """
+
     created_at: str | None = None
     """Set by the store. Not part of the digest, so a repeat is a repeat."""
 
@@ -221,6 +271,40 @@ class RuntimeFinding(BaseModel):
         """
 
         return value.strip()[:MAX_EXCERPT_CHARS]
+
+    @field_validator("semantic_key")
+    @classmethod
+    def _well_formed_semantic_key(cls, value: str) -> str:
+        """Refuse a key that would merge findings it should not.
+
+        The failure this prevents, and it is permanent when it happens: a
+        producer that sets a *constant* -- ``"assess_frontier"`` rather than a
+        digest of what it assessed -- collapses every finding of that
+        ``(project, kind, source_action)`` onto the first row, citably, with no
+        error and nothing to notice. Prose in
+        :data:`research_os.runtime.actions.base.SEMANTIC_KEY` states the
+        obligation; this enforces the part of it a schema can.
+
+        ``<producer>:v<n>:<64 hex>`` -- the shape the one producer emits. The
+        digest is what makes a key specific to what was assessed, so requiring
+        one makes "I hashed the inputs" the only accepted answer. Blank stays
+        valid and means the finding is identified by its content, which is
+        every other handler.
+        """
+
+        collapsed = value.strip()
+        if not collapsed:
+            return ""
+        if _SEMANTIC_KEY_RE.fullmatch(collapsed) is None:
+            raise ValueError(
+                f"{collapsed[:64]!r} is not a well-formed semantic key. A key "
+                "states what makes two findings the same observation, and two "
+                "findings with equal keys are the same finding permanently -- "
+                "so it must be <producer>:v<n>:<64 hex digest of the material "
+                "assessed>, not a constant. See "
+                "research_os.runtime.actions.base.SEMANTIC_KEY."
+            )
+        return collapsed
 
     @field_validator("artifact_ids", "capsule_refs", "literature_keys")
     @classmethod
@@ -256,6 +340,26 @@ class RuntimeFinding(BaseModel):
         excluded from the *digest* is only what decides whether two observations
         are the same observation.
         """
+
+        if self.semantic_key:
+            # Identity as the producer stated it. A separate material shape
+            # rather than one more key in the one below, because the point is
+            # that the content fields are *excluded*: including them would
+            # leave the digest moving with the prose, which is the whole
+            # defect. Versioned separately so a change to either shape cannot
+            # silently restate findings already cited under the other.
+            keyed = json.dumps(
+                {
+                    "v": "semantic-1",
+                    "project_id": self.project_id,
+                    "kind": str(self.kind),
+                    "source_action": self.source_action or "",
+                    "semantic_key": self.semantic_key,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            return hashlib.sha256(keyed.encode("utf-8")).hexdigest()
 
         material = json.dumps(
             {

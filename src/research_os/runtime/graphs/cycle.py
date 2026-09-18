@@ -55,7 +55,7 @@ from langgraph.runtime import Runtime
 from langgraph.types import interrupt
 
 from research_os.errors import ResearchOSError
-from research_os.runtime.actions.base import EXCERPT_KEY
+from research_os.runtime.actions.base import EXCERPT_KEY, SEMANTIC_KEY
 from research_os.runtime.adjudication import (
     AdjudicationKind,
     adjudication_view,
@@ -221,7 +221,14 @@ def plan_one_action(
     # proposals, bounded and labelled noncanonical; see that module for why the
     # three categories are kept apart.
     science = noncanonical_science(
-        context.store, project_id=state["project_id"], artifacts=context.artifacts
+        context.store,
+        project_id=state["project_id"],
+        artifacts=context.artifacts,
+        # The run's own repository, so each outstanding proposal can be
+        # reported current or stale. A proposal resting on objects that have
+        # since moved is not a live decision, and a planner that counted it as
+        # one would wait for a decision nobody can take.
+        repo_path=str(state.get("repo_path") or "") or None,
     )
     # What kind of work could settle each unresolved target.
     #
@@ -260,8 +267,14 @@ def plan_one_action(
                 json.dumps(entry, indent=2, sort_keys=True)
                 for entry in science.findings
             ],
+            # Compact, unlike every other block here, and the difference is
+            # deliberate. `indent=2` costs about 1 600 characters across a
+            # twelve-item proposal, which is what pushed the entry past the
+            # per-entry clip that lost nine of them. This block is a set of
+            # identifiers a reader intersects, not prose a reader reads, so the
+            # whitespace buys nothing and cost the property.
             "outstanding_proposals": [
-                json.dumps(entry, indent=2, sort_keys=True)
+                json.dumps(entry, sort_keys=True, separators=(",", ":"), default=str)
                 for entry in science.proposals
             ],
             "preregistered_designs": [
@@ -701,6 +714,18 @@ def _record_finding(
     # summary plus artifact reference, which is still citable and still
     # auditable, just thinner.
     excerpt = str(data.get(EXCERPT_KEY) or "")
+    # What the handler says makes this the same observation as a previous one,
+    # if it says anything. Lifted, exactly like the excerpt, and for the same
+    # reason: the handler built the structure and knows which of its fields
+    # carry substance and which carry wording. Nothing here decides identity
+    # for a handler that stayed silent -- those keep the content digest they
+    # have always had.
+    # Stripped, because the branch in `RuntimeFinding.digest` tests
+    # truthiness: a key of whitespace would take the keyed path and collapse
+    # every finding of this `(project, kind, source_action)` onto the first
+    # row, permanently and citably. The field validator refuses a malformed
+    # key outright; this stops a blank one reaching it as "set".
+    semantic_key = str(data.get(SEMANTIC_KEY) or "").strip()
     artifacts = tuple(
         str(ref["artifact_id"]) for ref in result.get("artifacts", ()) if ref
     )
@@ -725,6 +750,7 @@ def _record_finding(
                 literature_keys=literature[:MAX_REFS_PER_KIND],
                 experiment_job_id=str(data.get("job_id") or "") or None,
                 spec_digest=str(data.get("spec_digest") or "") or None,
+                semantic_key=semantic_key,
             )
         )
     except (ResearchOSError, ValueError) as exc:

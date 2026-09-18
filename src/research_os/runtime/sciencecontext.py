@@ -31,20 +31,30 @@ said*; it is not a claim, it has no status a person could accept, and the
 planner is told so in the same sentence it is handed them.
 
 **Why it cannot become an accepted claim by this route.** Nothing in this module
-writes. It reads two tables and returns dictionaries. The only path from a
-finding to canonical state still runs through ``propose_capsule_change`` and a
-human promotion, and :mod:`research_os.runtime.kernel` still holds no handle
-that could write a capsule.
+writes. It *reads* -- two operational tables, the proposal documents those
+tables name, and (for the basis check only) the project's own capsule -- and
+returns dictionaries. An earlier version of this paragraph said "two tables",
+which stopped being true when proposal items and basis freshness were added,
+and a security review was right to point at it: the honest statement is that
+the reads have grown and the writes are still none.
+
+The only path from a finding to canonical state still runs through
+``propose_capsule_change`` and a human promotion, and
+:mod:`research_os.runtime.kernel` still holds no handle that could write a
+capsule.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 from research_os.runtime.findings import RuntimeFinding
+
+LOG = logging.getLogger("research_os.runtime.sciencecontext")
 
 #: The most findings the planner is shown.
 #:
@@ -93,6 +103,52 @@ MAX_PLANNER_PROPOSALS = 6
 #: design differed.
 MAX_PLANNER_PREREGISTRATIONS = 6
 
+#: The most proposed items shown for one proposal.
+#:
+#: The gap this closes, found by running the thing. A real frontier assessment
+#: ranked "audit whether the existing proposals already cover the open
+#: questions" as its highest-value action and then reported that it could not
+#: perform it -- because a proposal reached the prompt as
+#: ``{proposal_id, run_id, created_at, cited_findings, offered_findings}`` and
+#: nothing else. Five fields, none of them scientific. "Does a proposal already
+#: ask about Q-0004" is not answerable from a count of findings, so the
+#: assessment either guessed or asked for file access it must not have.
+#:
+#: What makes it answerable is the one thing a proposed item carries that the
+#: reservation row does not: ``addresses``, the capsule object ids the item is
+#: about. With those, coverage is a set intersection the reader can do, and the
+#: two live thesis proposals -- twelve items and eleven -- become a map from
+#: open question to the item already asking about it.
+#:
+#: Twelve, matching ``proposal.planner.MAX_ITEMS``: a proposal cannot hold more
+#: than that, so a bound below it would silently hide items and make a covered
+#: question look uncovered. The *count* is reported separately either way.
+MAX_PROPOSAL_ITEMS = 12
+
+#: Characters of a proposed item's title shown.
+#:
+#: A title, not a statement. The reader is deciding whether a question is
+#: already in front of a person, and the item's ``addresses`` answers that; the
+#: title is there so the answer is legible rather than a list of identifiers.
+#: The statements are in the proposal, which is what the researcher reads.
+#:
+#: **Eighty, and the number is measured rather than chosen.** An independent
+#: security review found the first version of this block silently clipped: a
+#: proposal view is *one* block entry, ``prompt_safe_block`` clips each entry
+#: at ``DEFAULT_FIELD_CHARS`` (2 000), and twelve items at ``indent=2`` with a
+#: 160-character title serialise to 6 550 characters -- so **three** of the
+#: twelve reached the prompt, the JSON was cut mid-object, and nothing said so.
+#: Both live thesis proposals hold eleven and twelve items, so the coverage
+#: intersection this block exists for was being computed over a quarter of the
+#: data while ``census`` asserted all of it was there.
+#:
+#: Three changes together make it fit, and the test at the *rendered* layer is
+#: what keeps it fitting: this bound, compact serialisation at both render
+#: sites, and an explicit per-block limit on the template
+#: (:data:`research_os.runtime.prompts.PROPOSAL_BLOCK_CHARS`). Worst case now
+#: measured at 3 595 characters for twelve items.
+MAX_PROPOSAL_TITLE_CHARS = 80
+
 
 @dataclass(frozen=True, slots=True)
 class NoncanonicalScience:
@@ -115,6 +171,28 @@ class NoncanonicalScience:
     def empty(self) -> bool:
         return not self.findings and not self.proposals and not self.preregistrations
 
+    @property
+    def proposed_items_shown(self) -> int:
+        """How many proposed items the blocks actually carry."""
+
+        return sum(len(tuple(row.get("items") or ())) for row in self.proposals)
+
+    @property
+    def proposed_items_total(self) -> int:
+        """How many the readable proposals hold, shown or not."""
+
+        return sum(
+            int(row.get("items_total") or 0)
+            for row in self.proposals
+            if not row.get("items_unavailable")
+        )
+
+    @property
+    def proposals_unreadable(self) -> int:
+        """How many shown proposals could not be opened."""
+
+        return sum(1 for row in self.proposals if row.get("items_unavailable"))
+
     def census(self) -> str:
         """One line of counts, for a plain prompt field outside every fence.
 
@@ -126,10 +204,35 @@ class NoncanonicalScience:
             (f"{self.findings_total} completed finding(s), {len(self.findings)} shown")
         ]
         if self.proposals_total:
+            # "N shown" and not "N", because a bound that is silently hit is
+            # the defect a security review found one layer down: the reader was
+            # told every item was present while nine of twelve had been clipped
+            # out of the rendered block, and read the missing ones as absent
+            # rather than as unseen.
+            items = (
+                f"{self.proposed_items_shown} proposed item(s)"
+                if self.proposed_items_shown == self.proposed_items_total
+                else (
+                    f"{self.proposed_items_shown} of "
+                    f"{self.proposed_items_total} proposed item(s)"
+                )
+            )
             parts.append(
                 f"{self.proposals_total} proposal(s) already awaiting a human "
-                f"decision, {len(self.proposals)} shown"
+                f"decision, {len(self.proposals)} shown with {items} and the "
+                f"capsule objects each one addresses"
             )
+            # Said in the controller's own words, outside every fence, because
+            # a reader that cannot tell "nothing addresses this question" from
+            # "I could not read what addresses it" will read the second as the
+            # first -- which is how an assessment concludes a direction is
+            # uncovered when it is already in front of a person.
+            unreadable = self.proposals_unreadable
+            if unreadable:
+                parts.append(
+                    f"{unreadable} of those proposal(s) could not be read, so "
+                    "coverage cannot be established for them"
+                )
         else:
             parts.append("no proposal has been put to a human yet")
         if self.preregistrations_total:
@@ -181,6 +284,182 @@ def _clipped(text: str, limit: int) -> str:
     return stripped[:limit] + "..."
 
 
+def proposal_view(
+    row: Mapping[str, object],
+    *,
+    repo_path: str | None = None,
+    project_id: str | None = None,
+) -> dict[str, object]:
+    """One outstanding proposal as plain data, including what it proposes about.
+
+    **What the row alone could not say.** ``created_proposals`` returns the
+    reservation: an id, the run that made it, when, and how many findings it
+    cited. Every field is operational. A reader asked "is Q-0004 already in
+    front of the researcher" cannot answer it from any of them, and a real
+    frontier assessment ranked that exact audit first and then reported it had
+    no way to perform it.
+
+    So the items are read here, from the proposal store, by the id the
+    reservation gives. Each item contributes the two things that decide
+    coverage -- the capsule objects it ``addresses``, and whether a person has
+    already acted on it -- plus a title so the answer is legible to a person
+    reading the prompt rather than a list of identifiers.
+
+    **Read-only, and never fatal.** This is planning context. A proposal
+    directory that has been moved, a document this build cannot parse, a
+    permission error: each yields the row with ``items_unavailable`` set and
+    the reader told plainly that coverage could not be established, rather
+    than failing a cycle over a decision aid. Reporting the absence matters as
+    much as reporting the items: "no item addresses Q-0004" and "I could not
+    read the items" are different facts, and a reader that cannot tell them
+    apart will read the second as the first.
+
+    ``repo_path`` is supplied by a caller that knows where the project is --
+    the run's own repository, from the runtime's context, never the path
+    recorded inside the proposal document. With it, the basis check runs and
+    the reader learns whether the science the proposal rests on has moved
+    since it was written; without it, the basis is reported as unchecked.
+    """
+
+    from research_os.proposal.store import ProposalStore  # lazy: scientific layer
+
+    view = dict(row)
+    view["noncanonical"] = True
+    proposal_id = str(row.get("proposal_id") or "")
+    try:
+        store = ProposalStore.open(proposal_id)
+        proposal = store.load()
+        decided = store.decided_item_ids()
+    except Exception as exc:  # noqa: BLE001 - planning context, never a failure
+        return _unreadable(view, _why_unreadable(exc))
+
+    # The row was scoped by project; the *document* was not.
+    #
+    # `created_proposals` filters on `project_id`, but the document is then
+    # read out of a store shared by every project in one state home, and a
+    # reserved id is a 32-bit digest of the reservation key
+    # (`proposal.store.reserved_proposal_id`). A collision would put another
+    # project's items, titles and addresses into this project's coverage
+    # calculation. Unlikely, and free to exclude. Checked only when the
+    # document records an id, because proposals written before that field
+    # existed record none and refusing those would hide real ones.
+    document_project = getattr(proposal, "project_id", None)
+    if project_id and document_project and str(document_project) != project_id:
+        return _unreadable(
+            view,
+            f"this document belongs to a different project ({document_project})",
+        )
+
+    items = list(proposal.items)
+    shown = items[:MAX_PROPOSAL_ITEMS]
+    view["items_total"] = len(items)
+    #: How many of them this entry carries. Reported beside the total, so a
+    #: proposal with more items than the bound reads as *partially* shown
+    #: rather than as fully shown -- the same distinction ``items_unavailable``
+    #: keeps for a proposal that could not be read at all, and for the same
+    #: reason: a reader that cannot tell "nothing addresses this" from "I was
+    #: not shown everything" will treat the second as the first.
+    view["items_shown"] = len(shown)
+    view["items"] = [
+        # Four fields and a title, and the omissions are deliberate. This block
+        # exists so a reader can compute coverage; `importance`, `confidence`
+        # and each item's evidence `basis` are adjudication aids for the
+        # researcher reading the proposal itself, and carrying them here cost
+        # about 900 characters across twelve items -- which is what pushed the
+        # entry past the clip that lost nine of them.
+        {
+            "item_id": item.item_id,
+            "kind": str(item.kind),
+            "title": _clipped(item.title, MAX_PROPOSAL_TITLE_CHARS),
+            # The field coverage is computed from. Capsule object ids, sorted,
+            # so two renderings of one item are the same text.
+            "addresses": sorted(str(target) for target in item.addresses if target),
+            # "A person has already acted on this" -- promoted or declined. An
+            # item nobody has decided is the only kind still worth ranking.
+            "decided_by_human": item.item_id in decided,
+        }
+        for item in shown
+    ]
+    view["base_commit"] = proposal.base_commit or ""
+    view["basis"] = _basis_line(proposal, repo_path=repo_path)
+    return view
+
+
+def _unreadable(view: dict[str, object], reason: str) -> dict[str, object]:
+    """The view for a proposal whose items could not be established.
+
+    One shape for every cause, because the reader's response to all of them is
+    the same: coverage for this proposal is *unknown*. What must not happen is
+    an empty ``items`` list with no marker beside it, which reads identically
+    to "this proposal addresses nothing".
+    """
+
+    view["items_unavailable"] = reason
+    view["items"] = []
+    view["items_total"] = 0
+    view["items_shown"] = 0
+    view["basis"] = "unchecked: the proposal could not be read"
+    return view
+
+
+def _why_unreadable(exc: BaseException) -> str:
+    """Why a read failed, in a form that can safely enter a prompt.
+
+    **The exception class, and deliberately not its message.** An independent
+    audit of the first version found the boundary this module claims being
+    false on exactly this path. ``ProposalStore.open`` raises ``no proposal
+    <id> under <proposals_root()>``, an absolute path under the state home;
+    formatting ``str(exc)`` put it into ``items_unavailable``, which is
+    serialised into the prompt -- so a role told in the same prompt that it has
+    no filesystem was handed the researcher's home directory name, and a test
+    asserted that it arrived.
+
+    A class name is producer-controlled and path-free, and it is what the
+    reader needs: "the items could not be read" is the fact that changes its
+    reasoning, and *which* directory could not be read is not. The full
+    exception goes to the log, where a person debugging it is looking and a
+    model provider is not.
+    """
+
+    LOG.info("proposal context unavailable: %s", exc, exc_info=False)
+    return type(exc).__name__
+
+
+def _basis_line(proposal: object, *, repo_path: str | None) -> str:
+    """Whether the science this proposal rests on still holds, in one line.
+
+    Three answers and not two, because ``basis_status`` has three and
+    collapsing them is how "we never checked" gets read as "we checked and it
+    is fine". A proposal written before basis snapshots existed is
+    ``unchecked``; so is one this caller has no repository for.
+    """
+
+    if not repo_path:
+        return "unchecked: no repository path was supplied to this reader"
+    from pathlib import Path
+
+    from research_os.proposal.basis import basis_status  # lazy: scientific layer
+
+    try:
+        status = basis_status(proposal, project_path=Path(repo_path))  # type: ignore[arg-type]
+    except Exception as exc:  # noqa: BLE001 - planning context, never a failure
+        # Path-free by construction: `_why_unreadable` reports the class only.
+        # This branch is reachable with the *caller's* repository in the
+        # exception -- a capsule mid-checkout, a missing directory -- and that
+        # path must not enter a prompt either.
+        return f"unchecked: the basis check failed ({_why_unreadable(exc)})"
+    if not status.checkable:
+        return f"unchecked: {' '.join(status.reason.split())[:200]}"
+    if status.stale:
+        changed = ", ".join(status.changed_objects[:6]) or "see the proposal"
+        return (
+            "STALE: the scientific objects it rests on have changed since it "
+            f"was written ({changed}). Promoting it needs a regenerated "
+            "proposal, so it is not a live decision as it stands."
+        )
+    return "current: the scientific objects it rests on are unchanged"
+
+
 def preregistration_view(
     row: Mapping[str, object], *, hypothesis: str = ""
 ) -> dict[str, object]:
@@ -201,23 +480,58 @@ def preregistration_view(
 
 
 def noncanonical_science(
-    store: Any, *, project_id: str, artifacts: Any = None
+    store: Any,
+    *,
+    project_id: str,
+    artifacts: Any = None,
+    repo_path: str | None = None,
+    exclude_finding_actions: Sequence[str] = (),
 ) -> NoncanonicalScience:
     """Assemble what this project has learned but not yet had accepted.
 
-    Two reads and no writes. The findings are newest-first and bounded; each
+    Reads only, no writes. The findings are newest-first and bounded; each
     carries the proposals that already cite it, so a planner can tell "this was
     observed and nobody has been asked about it" from "this was observed and a
     person is already deciding about it" -- the distinction that decides whether
     another ``propose_capsule_change`` would be useful or duplicative.
+
+    ``exclude_finding_actions`` leaves out findings a particular *caller* must
+    not be shown. There is one such caller: the frontier assessment, which must
+    not be handed its own previous assessments in a block the instruction
+    describes as completed work. Its own prior recommendation and rationale
+    read as established findings, and the role whose answer decides whether
+    more money is spent and whether the system stops for a person is the last
+    one that should be anchored on what it said last time. The planner passes
+    nothing and sees everything.
+
+    ``repo_path`` is the run's own repository. It is used for one thing --
+    whether each proposal's scientific basis still holds -- and a caller that
+    does not have it gets proposals whose basis is reported ``unchecked``,
+    which is honest and still useful. The path comes from the runtime's
+    context, never from a proposal document: a reader that dereferenced a path
+    it read out of a stored document would be letting the document choose what
+    gets opened.
     """
 
-    shown = store.list_findings(project_id=project_id, limit=MAX_PLANNER_FINDINGS)
-    total = store.count_findings(project_id=project_id)
-    proposals = store.created_proposals(
+    shown = store.list_findings(
+        project_id=project_id,
+        limit=MAX_PLANNER_FINDINGS,
+        exclude_actions=exclude_finding_actions,
+    )
+    total = store.count_findings(
+        project_id=project_id, exclude_actions=exclude_finding_actions
+    )
+    proposal_rows = store.created_proposals(
         project_id=project_id, limit=MAX_PLANNER_PROPOSALS
     )
     proposals_total = store.count_created_proposals(project_id=project_id)
+    # The items, not just the reservation. See `proposal_view`: without them a
+    # reader cannot answer "is this question already in front of a person",
+    # which is the question the frontier assessment is for.
+    proposals = tuple(
+        proposal_view(row, repo_path=repo_path, project_id=project_id)
+        for row in proposal_rows
+    )
 
     # Designs already frozen, and the hypothesis each one tests. The document
     # is read for the bounded set only, and a document that cannot be read
@@ -239,7 +553,7 @@ def noncanonical_science(
     # of; a citation by a proposal too old to be listed would be an identifier
     # pointing at nothing.
     cited_by: dict[str, list[str]] = {}
-    for row in proposals:
+    for row in proposal_rows:
         proposal_id = str(row["proposal_id"])
         for finding in store.proposal_findings(proposal_id, cited_only=True):
             cited_by.setdefault(finding.finding_id, []).append(proposal_id)

@@ -100,6 +100,37 @@ class ActionOutcome:
 #: and its own bound, to carry something the existing one carries for free.
 EXCERPT_KEY = "finding_excerpt"
 
+#: The key under which a handler puts the *semantic identity* of its result in
+#: ``ActionOutcome.data``.
+#:
+#: Beside :data:`EXCERPT_KEY`, in ``data``, for the same reasons that field
+#: gives: already structured, already checkpointed, already carried through the
+#: idempotency ledger, already what
+#: :func:`research_os.runtime.graphs.cycle._record_finding` reads.
+#:
+#: **What it is for.** A finding is deduplicated by a digest over its content,
+#: and for most handlers that is exactly right: the content *is* the
+#: observation. For a handler whose result contains a model's prose, it is not.
+#: An assessment of the research frontier reached over identical scientific
+#: state, concluding the identical thing, mints a new citable finding on every
+#: cycle -- because the rationale is phrased differently, and because the
+#: artifact holding that rationale hashes differently. Twenty repetitions
+#: consume all twelve slots of the planner's bounded finding window, and
+#: operational repetition has become what looks like scientific progress.
+#:
+#: So a handler that knows which part of its result is the *observation* may
+#: say so, in one deterministic string, and identity is computed from that
+#: instead. Producer-authored for the same reason the excerpt is: only the
+#: handler knows which fields carry the substance and which carry the wording.
+#:
+#: **The obligation on a handler that sets it.** Two results with equal keys
+#: are the same finding, permanently and citably. So the key must contain
+#: everything a reader would consider material -- the state assessed, the
+#: conclusion reached, the targets named -- and nothing that varies without
+#: the observation varying: no timestamp, no run id, no cycle index, no work
+#: id, no artifact id, no free prose.
+SEMANTIC_KEY = "finding_semantic_key"
+
 
 def bounded_excerpt(entries: Sequence[str], *, limit: int) -> str:
     """Join a handler's chosen lines into one bounded, deterministic excerpt.

@@ -166,25 +166,57 @@ def test_an_upgrade_over_a_database_the_race_already_happened_in_says_what_to_do
                     "insert into schema_migrations (version, checksum) values (%s, %s)",
                     (migration.version, migration.checksum),
                 )
-        store = RuntimeStore(db)
-        store.upsert_project(project_id="raced", repo_path="/tmp/raced")
-        parent = store.create_run(project_id="raced", objective="advance me")
-        # Two successors, which only the *absent* index made possible. Written
-        # through the store, so this is the state the old code really produced.
-        for _ in range(2):
-            store.create_run(
-                project_id="raced",
-                objective="advance me",
-                parent_run_id=parent.run_id,
-                cycle_index=1,
+        # A parent and two successors, which only the *absent* index made
+        # possible.
+        #
+        # Inserted with explicit SQL rather than through ``RuntimeStore``, and
+        # naming only columns this schema has. The store's column list
+        # describes today's schema, so writing these rows through it makes
+        # every later additive migration fail here on a column that did not
+        # exist yet -- reporting an arrangement problem as a fault in ``0014``.
+        # Nothing about the property under test depends on which writer made
+        # the duplicates: what matters is that a real deployment could hold
+        # them, which the race in ``0014``'s own header establishes.
+        parent_run_id = "RRUN-19700101T000000Z-racedpar"
+        with db.tx() as conn:
+            conn.execute(
+                "insert into projects (project_id, repo_path) values (%s, %s)",
+                ("raced", "/tmp/raced"),
             )
+            conn.execute(
+                "insert into research_runs (run_id, project_id, objective, status, "
+                "thread_id) values (%s, %s, %s, %s, %s)",
+                (
+                    parent_run_id,
+                    "raced",
+                    "advance me",
+                    "SUCCEEDED",
+                    f"cycle:{parent_run_id}",
+                ),
+            )
+            for index in range(2):
+                child = f"RRUN-19700101T000000Z-racedch{index}"
+                conn.execute(
+                    "insert into research_runs (run_id, project_id, objective, "
+                    "status, thread_id, parent_run_id, cycle_index) "
+                    "values (%s, %s, %s, %s, %s, %s, %s)",
+                    (
+                        child,
+                        "raced",
+                        "advance me",
+                        "CREATED",
+                        f"cycle:{child}",
+                        parent_run_id,
+                        1,
+                    ),
+                )
 
         with pytest.raises(RuntimeDatabaseError) as raised:
             migrate(db)
 
     message = str(raised.value)
     assert "more than one successor" in message
-    assert parent.run_id in message, "the message must name the run to look at"
+    assert parent_run_id in message, "the message must name the run to look at"
     assert "delete the" in message
 
 
@@ -293,16 +325,46 @@ def test_the_new_migrations_apply_as_an_upgrade_over_the_previous_release(
                 )
 
         # Rows, because an empty table satisfies any constraint.
+        #
+        # Written with explicit SQL rather than through ``RuntimeStore``, and
+        # that is the point rather than an inconvenience. The store's column
+        # lists describe *today's* schema, so every additive migration after
+        # the cut point makes a store call here fail on a column the previous
+        # release did not have -- a failure in the arrangement, reported as a
+        # failure of the upgrade. ``0017`` is the first one to do it. These
+        # inserts name only columns the previous release actually had, so the
+        # rows are the rows that deployment would really be holding.
+        run_id = "RRUN-19700101T000000Z-upgrade0"
+        job_id = "JOB-19700101T000000Z-upgrade0"
+        with db.tx() as conn:
+            conn.execute(
+                "insert into projects (project_id, repo_path) values (%s, %s)",
+                ("upgraded", "/tmp/upgraded"),
+            )
+            conn.execute(
+                "insert into research_runs (run_id, project_id, objective, status, "
+                "thread_id) values (%s, %s, %s, %s, %s)",
+                (
+                    run_id,
+                    "upgraded",
+                    "before the upgrade",
+                    "CREATED",
+                    f"cycle:{run_id}",
+                ),
+            )
+            conn.execute(
+                "insert into external_jobs (job_id, project_id, executor, "
+                "spec_digest, run_dir, status) values (%s, %s, %s, %s, %s, %s)",
+                (
+                    job_id,
+                    "upgraded",
+                    "local",
+                    "a" * 64,
+                    "/tmp/upgraded/run",
+                    "SUBMITTING",
+                ),
+            )
         store = RuntimeStore(db)
-        store.upsert_project(project_id="upgraded", repo_path="/tmp/upgraded")
-        run = store.create_run(project_id="upgraded", objective="before the upgrade")
-        job = store.create_external_job(
-            project_id="upgraded",
-            run_id=run.run_id,
-            executor="local",
-            spec_digest="a" * 64,
-            run_dir="/tmp/upgraded/run",
-        )
 
         # Now the upgrade.
         applied = migrate(db)
@@ -315,35 +377,58 @@ def test_the_new_migrations_apply_as_an_upgrade_over_the_previous_release(
         # the whole point: a foreign key to `external_jobs` that the upgrade
         # path cannot satisfy would pass every other test in this file.
         interpretation, created = store.claim_interpretation(
-            job_id=job.job_id,
+            job_id=job_id,
             project_id="upgraded",
-            spec_digest=job.spec_digest,
+            spec_digest="a" * 64,
             interpreter_version="upgrade-probe@1",
-            run_id=run.run_id,
+            run_id=run_id,
         )
         assert created is True
-        assert interpretation.job_id == job.job_id
+        assert interpretation.job_id == job_id
 
         finding, created = store.record_finding(
             RuntimeFinding(
                 project_id="upgraded",
                 kind=FindingKind.FRONTIER,
                 summary="a finding recorded after the upgrade",
-                source_run_id=run.run_id,
-                experiment_job_id=job.job_id,
+                source_run_id=run_id,
+                experiment_job_id=job_id,
             )
         )
         assert created is True
+        # And the semantic identity `0017` adds works against a row the
+        # previous release wrote: the pre-existing finding above keeps its
+        # content digest, and a keyed one recorded now is a different finding
+        # rather than a conflict with it.
+        keyed, keyed_created = store.record_finding(
+            RuntimeFinding(
+                project_id="upgraded",
+                kind=FindingKind.FRONTIER,
+                summary="a finding whose identity its producer stated",
+                source_run_id=run_id,
+                # A well-formed key: the validator refuses a constant,
+                # because a producer that set one would merge every finding of
+                # its kind onto the first row. A test's keys are digests too.
+                semantic_key=f"assess_frontier:v2:{'a' * 64}",
+            )
+        )
+        assert keyed_created is True
+        assert keyed.finding_id != finding.finding_id
+        assert keyed.semantic_key == f"assess_frontier:v2:{'a' * 64}"
+        # The run row carries the column `0017` adds, and it is null for a run
+        # the previous release created -- which is what null is for here.
+        upgraded_run = store.require_run(run_id)
+        assert upgraded_run.next_recommendation is None
         store.link_proposal_findings(
             proposal_id="PROP-19700101T000000Z-aaaaaaaa",
             finding_ids=(finding.finding_id,),
-            run_id=run.run_id,
+            run_id=run_id,
         )
         store.link_nomination_findings(
             nomination_id="NOM-19700101T000000Z-aaaaaaaa",
             finding_ids=(finding.finding_id,),
             project_id="upgraded",
-            run_id=run.run_id,
+            run_id=run_id,
         )
         changed, _previous_capsule, _previous_frontier = store.observe_capsule(
             project_id="upgraded", capsule_digest="d" * 64, frontier_digest="e" * 64

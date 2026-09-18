@@ -297,7 +297,29 @@ def _park_a_run(
         _capsule, frontier_digest = observed_digests(plane["repo"])
     store.set_frontier_digest(run.run_id, frontier_digest)
     store.set_run_status(run.run_id, RunStatus.RUNNING)
-    store.set_run_status(run.run_id, RunStatus.SUCCEEDED, terminal_state=terminal_state)
+    store.set_run_status(
+        run.run_id,
+        RunStatus.SUCCEEDED,
+        terminal_state=terminal_state,
+        # What a parked run really carries.
+        #
+        # An audit pointed out that this helper left `next_recommendation`
+        # null, so every advance test ran against a state that no longer
+        # occurs: in production *every* parked run concluded WAIT_HUMAN and
+        # records it. `_work_advance_objective` deliberately overrules that --
+        # it supplies START_NEXT_CYCLE itself, because the thing the
+        # conclusion was waiting for has happened -- and the override was
+        # covered only where there was nothing to override.
+        next_recommendation=(
+            "WAIT_HUMAN"
+            if terminal_state
+            in {
+                TerminalState.WAITING_FOR_SCIENTIFIC_DECISION,
+                TerminalState.DONE_FOR_NOW,
+            }
+            else str(terminal_state)
+        ),
+    )
     return store.require_run(run.run_id)
 
 
@@ -332,6 +354,21 @@ def test_a_parked_objective_gets_a_successor_when_the_frontier_moved(
     assert successor.thread_id != parked.thread_id
     # And the frontier it recorded is the new one.
     assert successor.frontier_digest != parked.frontier_digest
+    # The parked run concluded WAIT_HUMAN and this pass overruled it, which is
+    # correct -- the thing it was waiting for happened -- and is recorded.
+    # It is the one place the runtime overrules a cycle's own conclusion, so a
+    # reader should be able to see that it did.
+    assert parked.next_recommendation == "WAIT_HUMAN"
+    with plane["db"].tx() as conn:
+        row = conn.execute(
+            "select result from work_items where kind = %s and project_id = %s "
+            "order by updated_at desc limit 1",
+            ("advance_objective", "alpha-project"),
+        ).fetchone()
+    assert row is not None
+    advanced = dict(row["result"] or {})["successors"][0]
+    assert advanced["parent_recommendation"] == "WAIT_HUMAN"
+    assert advanced["parent_recommendation_source"] == "overridden by a capsule change"
 
 
 def test_one_change_advances_every_parked_objective_exactly_once(

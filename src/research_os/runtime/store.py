@@ -24,7 +24,7 @@ is always a resumed worker acting on stale state.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from decimal import Decimal
 from typing import Any
 
@@ -66,9 +66,9 @@ from research_os.runtime.models import (
 LOG = logging.getLogger("research_os.runtime.store")
 
 RUN_COLUMNS = (
-    "run_id, project_id, objective, status, terminal_state, autonomy, parent_run_id, "
-    "cycle_index, thread_id, detail, frontier_digest, created_at, started_at, "
-    "finished_at, updated_at"
+    "run_id, project_id, objective, status, terminal_state, next_recommendation, "
+    "autonomy, parent_run_id, cycle_index, thread_id, detail, frontier_digest, "
+    "created_at, started_at, finished_at, updated_at"
 )
 EVENT_COLUMNS = "event_id, project_id, run_id, work_id, kind, payload, dedup_key, created_at, consumed_at"
 APPROVAL_COLUMNS = (
@@ -88,7 +88,8 @@ MODEL_CALL_COLUMNS = (
 )
 FINDING_COLUMNS = (
     "finding_id, project_id, kind, summary, excerpt, source_run_id, source_cycle, "
-    "source_work_id, source_action, experiment_job_id, spec_digest, digest, created_at"
+    "source_work_id, source_action, experiment_job_id, spec_digest, semantic_key, "
+    "digest, created_at"
 )
 INTERPRETATION_COLUMNS = (
     "interpretation_id, job_id, project_id, run_id, work_id, spec_digest, "
@@ -329,12 +330,23 @@ class RuntimeStore:
         *,
         terminal_state: TerminalState | None = None,
         detail: str | None = None,
+        next_recommendation: str | None = None,
     ) -> ResearchRun:
         """Move a run's status, refusing to revive a terminal one.
 
         A resumed worker acting on state it read before a crash is the only
         thing that ever attempts this, and letting it through would resurrect a
         cancelled run.
+
+        ``next_recommendation`` is what the cycle concluded should happen next,
+        and it is written **here** rather than in a second statement -- in the
+        same row update that records that the run concluded, so a crash cannot
+        leave a run terminal with no recorded conclusion. Before this column
+        existed the recommendation lived only in the
+        ``RESEARCH_CYCLE_FINISHED`` event payload and in the work-item payload
+        copied from it, which is how a run whose frontier said ``WAIT_HUMAN``
+        left behind a queued instruction saying ``START_NEXT_CYCLE``. See
+        ``sql/0018_durable_next_recommendation.sql``.
         """
 
         is_terminal = status in TERMINAL_RUN_STATUSES
@@ -344,6 +356,8 @@ class RuntimeStore:
                 update research_runs
                 set status = %(status)s,
                     terminal_state = coalesce(%(terminal_state)s, terminal_state),
+                    next_recommendation = coalesce(%(next_recommendation)s,
+                                                   next_recommendation),
                     detail = coalesce(%(detail)s, detail),
                     started_at = coalesce(started_at,
                         case when %(status)s = 'RUNNING' then now() else null end),
@@ -357,6 +371,7 @@ class RuntimeStore:
                     "run_id": run_id,
                     "status": str(status),
                     "terminal_state": str(terminal_state) if terminal_state else None,
+                    "next_recommendation": next_recommendation,
                     "detail": detail,
                     "is_terminal": is_terminal,
                 },
@@ -1286,11 +1301,12 @@ class RuntimeStore:
                 insert into runtime_findings
                     (finding_id, project_id, kind, summary, excerpt, source_run_id,
                      source_cycle, source_work_id, source_action,
-                     experiment_job_id, spec_digest, digest)
+                     experiment_job_id, spec_digest, semantic_key, digest)
                 values (%(finding_id)s, %(project_id)s, %(kind)s, %(summary)s,
                         %(excerpt)s, %(source_run_id)s, %(source_cycle)s,
                         %(source_work_id)s, %(source_action)s,
-                        %(experiment_job_id)s, %(spec_digest)s, %(digest)s)
+                        %(experiment_job_id)s, %(spec_digest)s, %(semantic_key)s,
+                        %(digest)s)
                 on conflict (project_id, digest) do nothing
                 returning {FINDING_COLUMNS}
                 """,
@@ -1306,6 +1322,7 @@ class RuntimeStore:
                     "source_action": finding.source_action,
                     "experiment_job_id": finding.experiment_job_id,
                     "spec_digest": finding.spec_digest,
+                    "semantic_key": finding.semantic_key,
                     "digest": digest,
                 },
             ).fetchone()
@@ -1383,7 +1400,12 @@ class RuntimeStore:
         detail = str((row["result"] or {}).get("detail") or "").strip()
         return action, detail
 
-    def count_findings(self, *, project_id: str | None = None) -> int:
+    def count_findings(
+        self,
+        *,
+        project_id: str | None = None,
+        exclude_actions: Sequence[str] = (),
+    ) -> int:
         """How many findings this project has, without fetching any.
 
         `noncanonical_science` used to answer this with
@@ -1399,8 +1421,14 @@ class RuntimeStore:
                 """
                 select count(*) as total from runtime_findings
                 where (%(project_id)s::text is null or project_id = %(project_id)s)
+                  and (cardinality(%(exclude_actions)s::text[]) = 0
+                       or source_action is null
+                       or not (source_action = any(%(exclude_actions)s::text[])))
                 """,
-                {"project_id": project_id},
+                {
+                    "project_id": project_id,
+                    "exclude_actions": list(exclude_actions),
+                },
             ).fetchone()
         return int((row or {}).get("total") or 0)
 
@@ -1410,17 +1438,36 @@ class RuntimeStore:
         project_id: str | None = None,
         run_id: str | None = None,
         limit: int = 100,
+        exclude_actions: Sequence[str] = (),
     ) -> tuple[RuntimeFinding, ...]:
+        """Findings, newest first, bounded.
+
+        ``exclude_actions`` filters in SQL rather than in the caller, and that
+        is the whole reason it exists here. Filtering after the fetch would let
+        the excluded rows consume slots of ``limit`` and hand the caller fewer
+        findings than it asked for -- so a project with twelve prior frontier
+        assessments would get an empty list rather than its twelve real
+        findings, which is a worse failure than the one the exclusion is for.
+        """
+
         with self._db.tx() as conn:
             rows = conn.execute(
                 f"""
                 select {FINDING_COLUMNS} from runtime_findings
                 where (%(project_id)s::text is null or project_id = %(project_id)s)
                   and (%(run_id)s::text is null or source_run_id = %(run_id)s)
+                  and (cardinality(%(exclude_actions)s::text[]) = 0
+                       or source_action is null
+                       or not (source_action = any(%(exclude_actions)s::text[])))
                 order by created_at desc, finding_id
                 limit %(limit)s
                 """,
-                {"project_id": project_id, "run_id": run_id, "limit": limit},
+                {
+                    "project_id": project_id,
+                    "run_id": run_id,
+                    "limit": limit,
+                    "exclude_actions": list(exclude_actions),
+                },
             ).fetchall()
             if not rows:
                 return ()
@@ -2174,5 +2221,6 @@ def _finding_from(row: Any, refs: Any = ()) -> RuntimeFinding:
         literature_keys=tuple(by_kind[FindingRefKind.LITERATURE_KEY.value]),
         experiment_job_id=row["experiment_job_id"],
         spec_digest=row["spec_digest"],
+        semantic_key=str(row["semantic_key"] or ""),
         created_at=str(row["created_at"]),
     )

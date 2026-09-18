@@ -553,6 +553,9 @@ def _execute(
             RunStatus.WAITING_HUMAN,
             terminal_state=TerminalState.WAITING_FOR_SCIENTIFIC_DECISION,
             detail=f"awaiting a scientific decision ({approval_id or 'unrecorded'})",
+            # Recorded on the row, not only returned: a cycle sitting on an
+            # interrupt is the state that must survive a restart unchanged.
+            next_recommendation="WAIT_HUMAN",
         )
         store.record_event(
             kind="SCIENTIFIC_DECISION_REQUIRED",
@@ -582,8 +585,21 @@ def _execute(
         if terminal is TerminalState.FATAL_INFRASTRUCTURE_ERROR
         else RunStatus.SUCCEEDED
     )
+    recommendation = str(final.get("next_recommendation") or "DONE_FOR_NOW")
+    # The conclusion and the fact of concluding, in one row update.
+    #
+    # The event below still carries the recommendation, for a reader following
+    # the ledger and for a run finished by a build that predates the column.
+    # It is no longer what decides anything: `_work_continue_objective` reads
+    # the run. An event is notification that a run finished, not the authority
+    # on what the run decided -- see
+    # `sql/0018_durable_next_recommendation.sql`.
     run = store.set_run_status(
-        run.run_id, status, terminal_state=terminal, detail=notes[-1] if notes else None
+        run.run_id,
+        status,
+        terminal_state=terminal,
+        detail=notes[-1] if notes else None,
+        next_recommendation=recommendation,
     )
     store.record_event(
         kind="RESEARCH_CYCLE_FINISHED",
@@ -591,7 +607,7 @@ def _execute(
         run_id=run.run_id,
         payload={
             "terminal_state": str(terminal),
-            "recommendation": final.get("next_recommendation", ""),
+            "recommendation": recommendation,
         },
         dedup_key=f"cycle-finished:{run.run_id}",
     )
@@ -600,7 +616,7 @@ def _execute(
         status=status,
         terminal_state=terminal,
         pending_approval_id=None,
-        recommendation=str(final.get("next_recommendation") or "DONE_FOR_NOW"),
+        recommendation=recommendation,
         notes=notes,
         state=final,
     )

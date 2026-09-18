@@ -291,10 +291,26 @@ def test_the_backfill_attributes_rows_written_before_the_column_existed(
                     (migration.version, migration.checksum),
                 )
 
-        store = RuntimeStore(db)
-        store.upsert_project(project_id="legacy", repo_path="/tmp/legacy")
-        run = store.create_run(project_id="legacy", objective="written before 0015")
+        # The project and the run, written with explicit SQL naming only
+        # columns this schema has.
+        #
+        # Not through ``RuntimeStore``, and that is the point rather than an
+        # inconvenience: the store's column lists describe *today's* schema, so
+        # a store call here fails on every additive migration after the cut
+        # point -- an arrangement problem reported as a fault in the backfill.
+        # ``0017``'s ``research_runs.next_recommendation`` is the first one to
+        # do it. The rows below are the rows the old code really wrote.
+        run_id = "RRUN-19700101T000000Z-legacy00"
         with db.tx() as conn:
+            conn.execute(
+                "insert into projects (project_id, repo_path) values (%s, %s)",
+                ("legacy", "/tmp/legacy"),
+            )
+            conn.execute(
+                "insert into research_runs (run_id, project_id, objective, status, "
+                "thread_id) values (%s, %s, %s, %s, %s)",
+                (run_id, "legacy", "written before 0015", "CREATED", f"cycle:{run_id}"),
+            )
             conn.execute(
                 "insert into artifacts (artifact_id, size_bytes, role) "
                 "values (%s, %s, %s)",
@@ -305,18 +321,18 @@ def test_the_backfill_attributes_rows_written_before_the_column_existed(
             conn.execute(
                 "insert into artifact_links (artifact_id, run_id, role) "
                 "values (%s, %s, %s)",
-                ("a" * 64, run.run_id, "preregistration:beef"),
+                ("a" * 64, run_id, "preregistration:beef"),
             )
             conn.execute(
                 "insert into tool_invocations "
                 "(invocation_id, idempotency_key, run_id, kind) "
                 "values (%s, %s, %s, %s)",
-                ("INV-legacy", "legacy:once", run.run_id, "probe"),
+                ("INV-legacy", "legacy:once", run_id, "probe"),
             )
             conn.execute(
                 "insert into model_calls (call_id, run_id, provider, role, cost_usd) "
                 "values (%s, %s, %s, %s, %s)",
-                ("MC-legacy", run.run_id, "fake", "planner", Decimal("2.5")),
+                ("MC-legacy", run_id, "fake", "planner", Decimal("2.5")),
             )
 
         applied = migrate(db)
@@ -338,7 +354,7 @@ def test_the_backfill_attributes_rows_written_before_the_column_existed(
 
         # And the pruning property holds on the upgraded database, which is the
         # only reason the backfill matters.
-        prune(db, run.run_id)
+        prune(db, run_id)
         with db.tx() as conn:
             link = conn.execute(
                 "select project_id from artifact_links where artifact_id = %s",

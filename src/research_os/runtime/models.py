@@ -196,6 +196,23 @@ class ResearchRun(_Record):
     objective: str
     status: RunStatus
     terminal_state: TerminalState | None = None
+    #: What this cycle concluded should happen next, recorded with the terminal
+    #: state in one statement.
+    #:
+    #: **This, and not an event payload, is what continuation reads.** The
+    #: recommendation used to exist only in the ``RESEARCH_CYCLE_FINISHED``
+    #: event and in the work-item payload copied from it, two messages away
+    #: from the run that reached it -- so a cycle whose frontier concluded
+    #: ``WAIT_HUMAN`` could leave a queued instruction reading
+    #: ``START_NEXT_CYCLE``, and a later build fixing the conclusion could not
+    #: fix the frozen copy. A live thesis run did exactly that.
+    #:
+    #: ``None`` means a build predating the column finished this run. It is not
+    #: the same as "recommended nothing", and
+    #: :meth:`~research_os.runtime.daemon.Daemon._work_continue_objective`
+    #: distinguishes them: it falls back to the payload only for a null, and
+    #: says in its result that it did.
+    next_recommendation: str | None = None
     autonomy: Autonomy
     parent_run_id: str | None = None
     cycle_index: int

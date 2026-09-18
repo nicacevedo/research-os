@@ -23,6 +23,7 @@ unbounded bill.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from collections.abc import Mapping, Sequence
@@ -30,6 +31,7 @@ from typing import Any
 
 from research_os.runtime.actions.base import (
     EXCERPT_KEY,
+    SEMANTIC_KEY,
     ActionOutcome,
     bounded_excerpt,
 )
@@ -38,8 +40,10 @@ from research_os.runtime.context import CycleContext
 from research_os.runtime.failures import FailureClass
 from research_os.runtime.findings import MAX_EXCERPT_CHARS
 from research_os.runtime.interfaces import ModelRequest
+from research_os.runtime.policy import ActionKind
 from research_os.runtime.prompts import FRONTIER, SCIENTIFIC_REVIEWER
 from research_os.runtime.routing import RoutingError
+from research_os.runtime.sciencecontext import noncanonical_science
 
 LOG = logging.getLogger("research_os.runtime.actions.review")
 
@@ -191,20 +195,75 @@ def assess_frontier_ranked(
     if frontier.empty:
         return ActionOutcome.succeeded(
             "the frontier is empty",
-            data={**payload, "recommendation": "DONE_FOR_NOW", "ranked_actions": []},
+            data={
+                **payload,
+                "recommendation": "DONE_FOR_NOW",
+                "ranked_actions": [],
+                # Keyed like every other exit. `decisions` is empty here on
+                # purpose rather than by omission: with nothing outstanding
+                # there is nothing for a proposal to cover, so what is in front
+                # of the researcher cannot change this answer.
+                SEMANTIC_KEY: assessment_identity(
+                    frontier, recommendation="DONE_FOR_NOW", actions=()
+                ),
+            },
             artifacts=(ref,),
         )
 
     depth = context.store.lineage_depth(state["run_id"])
     ceiling = context.config.settings.max_cycles_per_objective
+    # What has already been done, and what has already been asked.
+    #
+    # The same three labelled categories the planner gets, for the reason
+    # `frontier@2` records: @1 saw the capsule frontier and this cycle's
+    # previous result and nothing else, so its highest-ranked candidate -- audit
+    # whether the outstanding proposals already cover the open questions -- was
+    # an action it had no way to perform, and it said so in the rationale it
+    # recorded as a finding. Proposals now arrive with their items and the
+    # capsule objects each item addresses, so coverage is a set intersection
+    # rather than a request for file access.
+    science = noncanonical_science(
+        context.store,
+        project_id=str(state["project_id"]),
+        artifacts=context.artifacts,
+        repo_path=str(state.get("repo_path") or "") or None,
+        # Not its own previous assessments.
+        #
+        # A review pointed out what showing them does: the block is labelled
+        # "work this runtime has already finished", so cycle N+1's frontier
+        # reads cycle N's recommendation and rationale as an established
+        # finding -- and with the identity fix keeping the *first* occurrence's
+        # wording, one early answer would be reinforced indefinitely. The role
+        # whose answer decides whether more money is spent and whether the
+        # system stops for a person is the last one that should be anchored on
+        # what it said last time. The planner passes nothing and sees them.
+        exclude_finding_actions=(str(ActionKind.ASSESS_FRONTIER),),
+    )
+    decisions = decision_context_digest(science)
     prompt = FRONTIER.render(
         fields={
             "objective": state["objective"],
             "cycles_used": str(depth + 1),
             "cycles_remaining": str(max(0, ceiling - depth - 1)),
+            "noncanonical_census": science.census(),
         },
         blocks={
             "frontier": [json.dumps(payload, indent=2, sort_keys=True)],
+            "completed_findings": [
+                json.dumps(entry, indent=2, sort_keys=True)
+                for entry in science.findings
+            ],
+            # Compact. See the same block in `graphs.cycle.plan_one_action`:
+            # `indent=2` cost about 1 600 characters across a twelve-item
+            # proposal and nine of the twelve items with it.
+            "outstanding_proposals": [
+                json.dumps(entry, sort_keys=True, separators=(",", ":"), default=str)
+                for entry in science.proposals
+            ],
+            "preregistered_designs": [
+                json.dumps(entry, indent=2, sort_keys=True, default=str)
+                for entry in science.preregistrations
+            ],
             "recent_outcomes": [
                 json.dumps(
                     dict(state.get("action_result", {}).get("data") or {}),
@@ -231,12 +290,29 @@ def assess_frontier_ranked(
         # The deterministic frontier is still a usable answer. Ranking is an
         # improvement on it, not a prerequisite, so a missing provider degrades
         # to "there is work outstanding" rather than failing the cycle.
+        #
+        # **Keyed, and it was not.** Two reviews found the same hole
+        # independently: the identity fix was applied to the success path only,
+        # so a degraded assessment fell back to the content digest -- and its
+        # summary embeds `BudgetExhaustedError`'s text, which carries the run
+        # id and a moving dollar figure. The summary was therefore *guaranteed*
+        # unique per cycle, so a provider outage or a tight budget minted one
+        # new citable finding every cycle and twenty of them filled the
+        # planner's window. The defect this mechanism exists to stop, on the
+        # path most likely to repeat.
         return ActionOutcome.succeeded(
             f"ranking unavailable ({exc}); the deterministic frontier stands",
             data={
                 **payload,
                 "recommendation": "START_NEXT_CYCLE",
                 "ranked_actions": [],
+                SEMANTIC_KEY: assessment_identity(
+                    frontier,
+                    recommendation="START_NEXT_CYCLE",
+                    actions=(),
+                    decisions=decisions,
+                    degraded=type(exc).__name__,
+                ),
             },
             artifacts=(ref,),
         )
@@ -248,6 +324,13 @@ def assess_frontier_ranked(
                 **payload,
                 "recommendation": "START_NEXT_CYCLE",
                 "ranked_actions": [],
+                SEMANTIC_KEY: assessment_identity(
+                    frontier,
+                    recommendation="START_NEXT_CYCLE",
+                    actions=(),
+                    decisions=decisions,
+                    degraded="unusable_response",
+                ),
             },
             artifacts=(ref,),
         )
@@ -289,9 +372,182 @@ def assess_frontier_ranked(
                 _ranking_lines(recommendation, ranking, actions),
                 limit=MAX_EXCERPT_CHARS,
             ),
+            SEMANTIC_KEY: assessment_identity(
+                frontier,
+                recommendation=recommendation,
+                actions=actions,
+                decisions=decisions,
+            ),
         },
         artifacts=(ref, ranked_ref),
     )
+
+
+def ranked_targets(
+    actions: Sequence[Mapping[str, Any]],
+) -> list[tuple[str, tuple[str, ...]]]:
+    """Each ranked candidate as ``(action, sorted addresses)``, in rank order.
+
+    One normalisation, used by both readers of ``ranked_actions``. It was two,
+    and a review pointed out that both iterated a model-supplied ``addresses``
+    with no guard -- nothing validates the provider's structured output against
+    ``_FRONTIER_SCHEMA``, so ``"addresses": null`` raises ``TypeError``, which
+    is not in the nets the graph catches. One function, one guard, and the
+    identity and the excerpt cannot drift from each other.
+    """
+
+    normalised: list[tuple[str, tuple[str, ...]]] = []
+    for candidate in actions:
+        if not isinstance(candidate, Mapping):
+            continue
+        raw = candidate.get("addresses")
+        targets = raw if isinstance(raw, list | tuple) else ()
+        normalised.append(
+            (
+                str(candidate.get("action") or "").strip(),
+                tuple(
+                    sorted(
+                        {
+                            str(target).strip()
+                            for target in targets
+                            if str(target).strip()
+                        }
+                    )
+                ),
+            )
+        )
+    return normalised
+
+
+def decision_context_digest(science: Any) -> str:
+    """What is in front of the researcher, as one stable hash.
+
+    **Why the frontier digest is not enough on its own.** A security review
+    pointed out that ``frontier_digest`` covers capsule-derived identifiers,
+    the capsule cannot move without a human promotion, and so it is effectively
+    *constant* for a whole autonomous session -- while this release just gave
+    the role three further categories to assess over. Two assessments made
+    before and after a researcher declined an item, or before and after a
+    proposal's basis went stale, would have collapsed onto one finding whose
+    stored rationale described inputs it was not computed from.
+
+    So the decisions already in front of the person are part of the identity:
+    per readable proposal, its id, the items nobody has decided yet, and the
+    *class* of its basis. The class rather than the sentence, because a longer
+    list of changed objects does not change the conclusion that a stale
+    proposal is not a live decision.
+
+    **And the findings deliberately are not.** Including them would put the
+    churn straight back: every cycle records a finding, so every cycle would
+    change the identity, and a repeated assessment over unchanged canonical
+    state would mint a new citable object again -- which is the defect this
+    whole mechanism exists to stop. What is in the key is exactly what moves
+    only when a *person* acts or the science does.
+    """
+
+    entries = [
+        {
+            "proposal_id": str(row.get("proposal_id") or ""),
+            # Unknown coverage is its own state, and it changes the reasoning.
+            "unreadable": bool(row.get("items_unavailable")),
+            "undecided": sorted(
+                str(item.get("item_id") or "")
+                for item in (row.get("items") or ())
+                if isinstance(item, Mapping) and not item.get("decided_by_human")
+            ),
+            "basis": str(row.get("basis") or "").split(":", 1)[0],
+        }
+        for row in getattr(science, "proposals", ())
+    ]
+    entries.sort(key=lambda entry: entry["proposal_id"])
+    material = json.dumps(
+        {"v": 1, "proposals": entries}, sort_keys=True, separators=(",", ":")
+    )
+    return hashlib.sha256(material.encode()).hexdigest()
+
+
+def assessment_identity(
+    frontier: Any,
+    *,
+    recommendation: str,
+    actions: Sequence[Mapping[str, Any]],
+    decisions: str = "",
+    degraded: str = "",
+) -> str:
+    """What makes two frontier assessments the same assessment.
+
+    **The defect this closes.** A finding is identified by a digest over its
+    content, which for this handler includes the model's rationale and the
+    content hash of the artifact holding it. Reach the identical conclusion
+    over the identical scientific state twice and the wording differs, so the
+    digest differs, so a second citable identifier is minted for one
+    observation. Twenty repetitions fill all twelve slots of the planner's
+    finding window and push the project's real findings out of it -- and
+    nothing about the project has changed. That is operational repetition
+    wearing scientific progress as a costume, which is the failure this
+    release exists to stop, one layer below where it was first found.
+
+    **What is material, therefore.** Three things, and they are the three a
+    researcher would name if asked whether two assessments say the same thing:
+
+    - the canonical state assessed. ``frontier_digest`` over the unresolved
+      identifiers, sorted -- so a reordered input is the same input, and a
+      frontier that gained a hypothesis is not;
+    - the decisions already in front of the researcher, through
+      :func:`decision_context_digest`. Added after a review observed that the
+      frontier digest alone is constant for a whole autonomous session, so an
+      assessment made before a person declined an item and one made after it
+      would otherwise have been one observation;
+    - the conclusion. The recommendation, which is the field the runtime acts
+      on;
+    - what was ranked, and about what. Each candidate as ``action`` plus its
+      sorted ``addresses``, in rank order, because a ranking that puts a
+      different action first is a different ranking.
+
+    **What is deliberately not material,** each for a stated reason:
+
+    - the rationales, and every other piece of prose. Two assessments that
+      reach one conclusion over one state, phrased differently, are one
+      assessment; treating them as two is precisely the defect;
+    - importance, information gain, feasibility and cost. They are the
+      *reasoning* toward the recommendation, not the recommendation, and they
+      move between equivalent restatements;
+    - the artifact ids, timestamps, run id, cycle index and work id. Which
+      cycle noticed something is not part of what was noticed --
+      :attr:`research_os.runtime.findings.RuntimeFinding.digest` gives the
+      same reason for excluding the same fields.
+
+    Rank order *is* material, which is a choice worth stating: two assessments
+    recommending the same thing having ranked the same candidates in a
+    different order are recorded as different observations. That is the
+    conservative direction. Collapsing them would mean a genuine change of
+    mind about what to do first could be silently deduplicated away.
+    """
+
+    from research_os.runtime.graphs.cycle import frontier_digest
+
+    material = json.dumps(
+        {
+            "v": 2,
+            "frontier": frontier_digest(frontier),
+            "decisions": decisions,
+            "recommendation": recommendation,
+            "ranked": [
+                {"action": action, "addresses": list(targets)}
+                for action, targets in ranked_targets(actions)
+            ],
+            # Empty for an assessment that actually ran. A degraded one is a
+            # different observation from a completed one that happened to
+            # reach the same words, and the *class* of degradation is the part
+            # that is stable: the message carries a run id and a moving dollar
+            # figure, so hashing it would make every outage a new finding,
+            # which is the churn in a new costume.
+            **({"degraded": degraded} if degraded else {}),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return f"assess_frontier:v2:{hashlib.sha256(material.encode()).hexdigest()}"
 
 
 def _ranking_lines(
@@ -310,13 +566,17 @@ def _ranking_lines(
     rationale = str(ranking.get("recommendation_rationale") or "").strip()
     if rationale:
         lines.append(f"why: {rationale}")
-    for position, candidate in enumerate(actions, start=1):
-        if not isinstance(candidate, Mapping):
-            continue
-        action = str(candidate.get("action") or "").strip() or "unnamed"
-        addresses = ", ".join(
-            str(item) for item in candidate.get("addresses", ()) if item
-        )
+    # Normalised once, by the same function the identity uses, so the excerpt
+    # and the key cannot disagree about what was ranked -- and so the
+    # unguarded iteration over a model-supplied `addresses` exists in one
+    # place rather than two. Nothing validates the provider's structured
+    # output against `_FRONTIER_SCHEMA`, so `"addresses": null` is reachable.
+    targets = dict(enumerate(ranked_targets(actions)))
+    candidates = [item for item in actions if isinstance(item, Mapping)]
+    for position, candidate in enumerate(candidates, start=1):
+        action, addressed = targets[position - 1]
+        action = action or "unnamed"
+        addresses = ", ".join(addressed)
         importance = str(candidate.get("importance") or "").strip()
         reason = str(candidate.get("rationale") or "").strip()
         parts = [f"candidate {position}: {action}"]
