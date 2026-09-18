@@ -249,9 +249,302 @@ class SandboxSpec:
 #: controlled filesystem content" is the ordinary case rather than the exotic
 #: one. A sandbox that can be made to write outside itself during *setup* is not
 #: a weaker boundary here, it is the absence of one.
-SECURITY_FLOORS: Mapping[str, tuple[tuple[int, ...], str]] = {
-    "bubblewrap": ((0, 12, 0), "CVE-2026-87766 / GHSA-pxhw-h44j-8pfx"),
+@dataclass(frozen=True, slots=True)
+class SecurityFloor:
+    """The upstream version that fixes an advisory, and how to name it."""
+
+    minimum: tuple[int, ...]
+    #: For a human reading a report.
+    advisory: str
+    #: The stable identifier :data:`VENDOR_FIXED_RANGES` is keyed by.
+    key: str
+
+
+SECURITY_FLOORS: Mapping[str, SecurityFloor] = {
+    "bubblewrap": SecurityFloor(
+        minimum=(0, 12, 0),
+        advisory="CVE-2026-87766 / GHSA-pxhw-h44j-8pfx",
+        key="CVE-2026-87766",
+    ),
 }
+
+
+#: Vendor package versions in which an advisory is *known* to be fixed.
+#:
+#: Keyed by ``(os id, codename, package, advisory key)``, and the value is a
+#: tuple of half-open intervals ``(fixed_from, reopened_at)`` in Debian version
+#: order: fixed at ``fixed_from`` inclusive, and no longer fixed from
+#: ``reopened_at`` inclusive. ``None`` means "and every version after".
+#:
+#: **Why intervals and not a floor.** A floor assumes vendor fix status is
+#: monotonic in version, and on this very host it is not. Ubuntu noble's
+#: bubblewrap went:
+#:
+#: ```text
+#: 0.9.0-1ubuntu0.1   unfixed
+#: 0.9.0-1ubuntu0.2   FIXED    -- USN-8779-1, two CVE-2026-87766 patches
+#: 0.9.0-1ubuntu0.3   UNFIXED  -- "SECURITY REGRESSION: Incompatibility with
+#:                                 Flatpak (LP: #2167621) - debian: Drop
+#:                                 CVE-2026-87766"
+#: ```
+#:
+#: The patches broke Flatpak's CUPS socket path resolution
+#: (``containers/bubblewrap#801``, ``flatpak/flatpak#6830``) and Canonical
+#: reverted them rather than hold the regression. So ``>= 0.9.0-1ubuntu0.2``
+#: -- the obvious rule, and the one this table was nearly written as -- returns
+#: true for a binary whose CVE fix was deliberately removed. That is the exact
+#: false positive the eligibility gate exists to prevent, and it would have
+#: been produced by trusting a version ordering instead of a changelog.
+#:
+#: **Positive evidence only.** Unlike :data:`SECURITY_FLOORS`, which lists what
+#: is known broken so that an unlisted technology passes, this table lists what
+#: is known *fixed* and anything unlisted does not pass. The polarity is
+#: inverted deliberately: the upstream floor has already declared this version
+#: unsafe, so a vendor entry is a narrow exception, and an exception granted on
+#: absence of evidence is not an exception, it is a hole. A future
+#: ``0.9.0-1ubuntu0.4`` that restores the fix will pass only once somebody adds
+#: it here, having read its changelog.
+VENDOR_FIXED_RANGES: Mapping[
+    tuple[str, str, str, str], tuple[tuple[str, str | None], ...]
+] = {
+    ("ubuntu", "noble", "bubblewrap", "CVE-2026-87766"): (
+        ("0.9.0-1ubuntu0.2", "0.9.0-1ubuntu0.3"),
+    ),
+}
+
+
+@dataclass(frozen=True, slots=True)
+class VendorPackage:
+    """The distribution package that owns a binary, as the package manager says.
+
+    Every field comes from ``dpkg`` or ``/etc/os-release``, never from the
+    program's own ``--version``. A binary can print whatever it likes; what it
+    cannot do is forge its entry in the package database or the checksum the
+    package recorded for it.
+    """
+
+    os_id: str
+    codename: str
+    release: str
+    name: str
+    version: str
+    path: str
+
+
+def dpkg_compare(left: str, operator: str, right: str) -> bool | None:
+    """Compare two Debian versions with ``dpkg --compare-versions``.
+
+    The real implementation rather than a reimplementation of it. Debian
+    version ordering has epochs, tildes that sort *before* the empty string,
+    and a digit/non-digit alternation rule, and a hand-written comparison gets
+    one of those wrong eventually -- on a security decision.
+
+    ``None`` when dpkg cannot be asked, which every caller must treat as
+    "unknown", never as "satisfied".
+    """
+
+    executable = shutil.which("dpkg")
+    if executable is None:
+        return None
+    try:
+        completed = subprocess.run(
+            [executable, "--compare-versions", left, operator, right],
+            check=False,
+            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:  # pragma: no cover
+        LOG.debug("dpkg --compare-versions failed: %s", exc)
+        return None
+    # 0 is true, 1 is false; anything else is an error, not a false.
+    if completed.returncode not in (0, 1):
+        return None
+    return completed.returncode == 0
+
+
+def _os_release() -> dict[str, str]:
+    """``/etc/os-release`` as a dict, or empty when it cannot be read."""
+
+    values: dict[str, str] = {}
+    try:
+        text = Path("/etc/os-release").read_text(encoding="utf-8")
+    except OSError:
+        return values
+    for line in text.splitlines():
+        name, _, value = line.partition("=")
+        if name and value:
+            values[name.strip()] = value.strip().strip('"')
+    return values
+
+
+def detect_vendor_package(executable: str) -> VendorPackage | None:
+    """Which distribution package owns this exact binary, if any.
+
+    Three things have to hold, and the second is the one that matters for
+    §5-style confusion: a hand-built ``/usr/local/bin/bwrap`` must never
+    inherit the distribution package's patch status just because a package of
+    that name is installed.
+
+    1. the path resolves, and ``dpkg -S`` names a package that owns *it*;
+    2. the file still matches the checksum that package recorded, so a
+       replaced binary at a packaged path is not treated as packaged;
+    3. the package is installed, with a version dpkg will report.
+
+    ``None`` on any failure, including on a non-dpkg system. ``None`` means
+    "no vendor evidence", and the caller falls back to the upstream rule.
+    """
+
+    query = shutil.which("dpkg-query")
+    search = shutil.which("dpkg")
+    if query is None or search is None:
+        return None
+    try:
+        resolved = str(Path(executable).resolve())
+    except OSError:  # pragma: no cover - resolve() does not raise on Linux
+        return None
+
+    try:
+        owner = subprocess.run(
+            [search, "-S", resolved],
+            check=False,
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:  # pragma: no cover
+        LOG.debug("dpkg -S failed: %s", exc)
+        return None
+    if owner.returncode != 0:
+        # Not shipped by any package. A locally built binary, which is exactly
+        # the case that must not inherit a package's backport status.
+        return None
+    line = (owner.stdout or "").strip().splitlines()
+    if not line:
+        return None
+    name, _, owned_path = line[0].partition(": ")
+    name = name.split(":")[0].strip()
+    if owned_path.strip() != resolved or not name:
+        return None
+
+    if _package_file_modified(search, name, resolved):
+        LOG.warning(
+            "%s is owned by %s but no longer matches the checksum that package "
+            "recorded; not treating it as vendor-packaged",
+            resolved,
+            name,
+        )
+        return None
+
+    try:
+        version = subprocess.run(
+            [query, "-W", "-f=${Version}", name],
+            check=False,
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:  # pragma: no cover
+        LOG.debug("dpkg-query failed: %s", exc)
+        return None
+    if version.returncode != 0 or not (version.stdout or "").strip():
+        return None
+
+    release = _os_release()
+    return VendorPackage(
+        os_id=release.get("ID", "").lower(),
+        codename=release.get("VERSION_CODENAME", "").lower(),
+        release=release.get("VERSION_ID", ""),
+        name=name,
+        version=version.stdout.strip(),
+        path=resolved,
+    )
+
+
+def _package_file_modified(dpkg: str, package: str, path: str) -> bool:
+    """Whether dpkg reports this file as changed since the package installed it.
+
+    Only a *positive* report counts. ``dpkg --verify`` exits non-zero both when
+    a file has changed and when the package shipped no checksums, and treating
+    the second as tampering would refuse perfectly good packages -- so the
+    output is parsed for a line naming this path, rather than the exit code
+    being trusted.
+    """
+
+    try:
+        completed = subprocess.run(
+            [dpkg, "--verify", package],
+            check=False,
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:  # pragma: no cover
+        LOG.debug("dpkg --verify failed: %s", exc)
+        return False
+    for line in (completed.stdout or "").splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[-1] == path:
+            return True
+    return False
+
+
+def vendor_backport_verdict(
+    package: VendorPackage | None, advisory_key: str
+) -> tuple[bool, str]:
+    """Whether the vendor is known to have fixed ``advisory_key`` in this build.
+
+    Returns ``(fixed, why)``. ``fixed`` is true only on positive evidence: a
+    matching entry in :data:`VENDOR_FIXED_RANGES` and a dpkg comparison that
+    actually ran.
+    """
+
+    if package is None:
+        return False, "not installed from a distribution package"
+    ranges = VENDOR_FIXED_RANGES.get(
+        (package.os_id, package.codename, package.name, advisory_key)
+    )
+    if not ranges:
+        return False, (
+            f"no {advisory_key} backport is recorded for {package.name} on "
+            f"{package.os_id} {package.codename}"
+        )
+    for fixed_from, reopened_at in ranges:
+        at_or_after = dpkg_compare(package.version, "ge", fixed_from)
+        if at_or_after is None:
+            return False, "dpkg could not compare the package versions"
+        if not at_or_after:
+            continue
+        if reopened_at is None:
+            return True, f"{package.version} >= {fixed_from}"
+        before_reopen = dpkg_compare(package.version, "lt", reopened_at)
+        if before_reopen is None:
+            return False, "dpkg could not compare the package versions"
+        if before_reopen:
+            return True, f"{package.version} in [{fixed_from}, {reopened_at})"
+        return False, (
+            f"{package.version} is at or above {reopened_at}, in which this "
+            f"vendor REVERTED the {advisory_key} fix. {_revert_note(package)}"
+        )
+    return False, (
+        f"{package.version} is below {ranges[0][0]}, the first version in "
+        f"which this vendor shipped the {advisory_key} fix"
+    )
+
+
+def _revert_note(package: VendorPackage) -> str:
+    """The sentence a person needs when a vendor has withdrawn a fix."""
+
+    return (
+        f"Read `zcat /usr/share/doc/{package.name}/changelog.Debian.gz | head`: "
+        f"on this host it records 'SECURITY REGRESSION: Incompatibility with "
+        f"Flatpak (LP: #2167621) - debian: Drop CVE-2026-87766'. A later "
+        f"package that restores the fix must be added to VENDOR_FIXED_RANGES "
+        f"after reading its changelog; it will not be trusted for being newer"
+    )
 
 
 def parse_version(text: str) -> tuple[int, ...] | None:
@@ -304,6 +597,15 @@ class SandboxProbe:
     version: str | None = None
     """What ``--version`` reported, verbatim. ``None`` when it was not asked."""
 
+    vendor_package: VendorPackage | None = None
+    """The distribution package that owns the binary, if any.
+
+    Recorded because on a distribution the *package* version, not the
+    program's, is what carries a security backport -- and because "this binary
+    is not owned by any package" is the fact that stops a locally built
+    ``/usr/local/bin/bwrap`` inheriting a packaged one's patch status.
+    """
+
     setuid: bool | None = None
     """Whether the binary is setuid. ``None`` when it could not be stat'd.
 
@@ -341,45 +643,110 @@ class SandboxProbe:
         return self.namespaces_ok and self.security_eligible
 
 
-def security_verdict(technology: str, version: str | None) -> tuple[bool, str]:
-    """Whether a version clears this technology's known-security floor.
+def security_verdict(
+    technology: str,
+    version: str | None,
+    package: VendorPackage | None = None,
+) -> tuple[bool, str]:
+    """Whether this build clears its technology's known-security floor.
 
-    Three answers, and the middle one is the one that matters. A version at or
-    above the floor is eligible. A version below it is **not** eligible and is
-    named with its advisory. A version that could not be determined is *also*
-    not eligible, because "we could not tell" and "it is fine" are different
-    facts and only one of them is a reason to run model-written code in it.
+    Two independent ways to clear it, checked in that order:
 
-    A technology with no floor recorded is eligible: the floors table is a list
-    of things known to be broken, not a list of things known to be good, and
-    refusing everything unlisted would refuse podman for never having had a
-    CVE entered here.
+    1. **upstream** -- the program's own version is at or above the floor;
+    2. **vendor backport** -- the binary is owned by a distribution package
+       whose version appears in :data:`VENDOR_FIXED_RANGES` for this advisory.
+
+    The second exists because a distribution can carry a fix without carrying
+    the version number that fix arrived in upstream, and refusing every such
+    build would refuse most correctly-patched Linux hosts. It is *only* reached
+    when the upstream rule fails, it requires positive evidence, and it reads
+    the package database rather than the program's ``--version`` -- a binary
+    can print whatever it likes, and cannot forge its dpkg entry or the
+    checksum the package recorded for it.
+
+    A version that could not be determined is **not** eligible: "we could not
+    tell" and "it is fine" are different facts and only one of them is a reason
+    to run model-written code inside it.
+
+    A technology with no floor recorded is eligible, because
+    :data:`SECURITY_FLOORS` lists what is known broken rather than what is
+    known good.
     """
 
     floor = SECURITY_FLOORS.get(technology)
     if floor is None:
         return True, "no known-security floor recorded for this technology"
-    minimum, advisory = floor
+
+    minimum = ".".join(str(part) for part in floor.minimum)
     parsed = parse_version(version or "")
+    if parsed is not None and parsed >= floor.minimum:
+        return (
+            True,
+            f"upstream {version} is at or above {minimum} ({floor.advisory} fixed)",
+        )
+
+    fixed, why = vendor_backport_verdict(package, floor.key)
+    if fixed and package is not None:
+        return True, (
+            f"upstream {version or 'unknown'} is below {minimum}, and "
+            f"{package.os_id} {package.release} ships the {floor.key} fix as a "
+            f"vendor backport in {package.name} {package.version} ({why})"
+        )
+
     if parsed is None:
         return False, (
-            f"could not determine the version, so it cannot be shown to be at "
-            f"or above {'.'.join(str(part) for part in minimum)} ({advisory}). "
-            f"An undetermined version is treated as unsafe"
+            f"could not determine the upstream version, and no vendor backport "
+            f"applies ({why}), so it cannot be shown to be at or above "
+            f"{minimum} ({floor.advisory}). An undetermined version is treated "
+            f"as unsafe"
         )
-    if parsed < minimum:
-        return False, (
-            f"{version} is below {'.'.join(str(part) for part in minimum)} and "
-            f"is affected by {advisory}: during sandbox setup a parent symlink "
-            f"can be followed out of the sandbox, writing attacker-chosen paths "
-            f"on the host as the launching user. This runs acceptance commands "
-            f"over a worktree a model has just written, so that is this "
-            f"system's ordinary case. PRESENT_BUT_UNACCEPTABLE"
-        )
-    return True, (
-        f"{version} is at or above "
-        f"{'.'.join(str(part) for part in minimum)} ({advisory} fixed)"
+    return False, (
+        f"upstream {version} is below {minimum} and is affected by "
+        f"{floor.advisory}: during sandbox setup a parent symlink can be "
+        f"followed out of the sandbox, writing attacker-chosen paths on the "
+        f"host as the launching user. This runs acceptance commands over a "
+        f"worktree a model has just written, so that is this system's ordinary "
+        f"case. No vendor backport applies either: {why}. "
+        f"PRESENT_BUT_UNACCEPTABLE"
     )
+
+
+def security_basis(
+    technology: str,
+    version: str | None,
+    package: VendorPackage | None,
+    eligible: bool,
+) -> tuple[tuple[str, str], ...]:
+    """The eligibility decision as labelled fields, for a report to render.
+
+    Separate from the prose in :func:`security_verdict` because a person
+    auditing this wants to see the inputs laid out -- which binary, which
+    package, which advisory -- rather than to parse them back out of a
+    sentence.
+    """
+
+    floor = SECURITY_FLOORS.get(technology)
+    rows: list[tuple[str, str]] = [("upstream_version", version or "unknown")]
+    if package is not None:
+        rows += [
+            ("package", package.name),
+            ("package_version", package.version),
+            ("vendor", package.os_id or "unknown"),
+            ("release", f"{package.release} / {package.codename}".strip(" /")),
+        ]
+    else:
+        rows.append(("package", "none (not owned by a distribution package)"))
+    if floor is not None:
+        parsed = parse_version(version or "")
+        if parsed is not None and parsed >= floor.minimum:
+            state = "upstream_fixed"
+        elif eligible:
+            state = "vendor_backport_fixed"
+        else:
+            state = "affected"
+        rows.append((floor.key, state))
+    rows.append(("security_eligible", "yes" if eligible else "no"))
+    return tuple(rows)
 
 
 def _bwrap_version(executable: str) -> str | None:
@@ -535,7 +902,8 @@ def probe_bubblewrap() -> SandboxProbe:
 
     version = _bwrap_version(executable)
     setuid = _is_setuid(executable)
-    eligible, security_detail = security_verdict("bubblewrap", version)
+    package = detect_vendor_package(executable)
+    eligible, security_detail = security_verdict("bubblewrap", version, package)
     if eligible and setuid:
         # bubblewrap removed setuid support in 0.12.0. A binary claiming to be
         # at the floor while still setuid is not the binary the floor describes,
@@ -551,6 +919,7 @@ def probe_bubblewrap() -> SandboxProbe:
         "technology": "bubblewrap",
         "executable": executable,
         "version": version,
+        "vendor_package": package,
         "setuid": setuid,
         "security_eligible": eligible,
         "security_detail": security_detail,
@@ -627,11 +996,12 @@ def probe_bubblewrap() -> SandboxProbe:
         if not eligible:
             remedy = (
                 "two separate things are wrong here and the order matters. "
-                f"First, {security_detail}. Second, this kernel refuses "
-                f"unprivileged user namespaces. Granting the namespace before "
-                f"replacing the binary would produce a working sandbox with a "
-                f"known escape, which is worse than the present state -- so "
-                f"replace the binary first"
+                "First, this build is not security-eligible (see the sandbox "
+                "line above for why). Second, this kernel refuses unprivileged "
+                "user namespaces. Granting the namespace before replacing the "
+                "binary would produce a working sandbox with a known escape, "
+                "which is worse than the present state -- so replace the "
+                "binary first. docs/CONTAINMENT_OPTIONS.md has the options"
             )
     return SandboxProbe(
         **common,

@@ -3,7 +3,9 @@
 ```text
 Status:   HUMAN_ROOT_ACTION_REQUIRED
 Audited:  2026-09-17, on the workstation running the thesis pilot
-Blocker:  bubblewrap 0.9.0-1ubuntu0.1 is PRESENT_BUT_UNACCEPTABLE
+          re-audited after the 0.9.0-1ubuntu0.3 upgrade
+Blocker:  bubblewrap 0.9.0-1ubuntu0.3 is PRESENT_BUT_UNACCEPTABLE
+          (Ubuntu shipped the fix in 0.2 and REVERTED it in 0.3)
 ```
 
 This document exists because the honest answer to "can Research OS contain a
@@ -12,15 +14,40 @@ reasons, and the order in which they are fixed matters.
 
 ## What is wrong, in order of precedence
 
-**1. The installed bubblewrap has a known sandbox escape.**
+**1. The installed bubblewrap has a known sandbox escape, again.**
 
 ```text
-package        bubblewrap 0.9.0-1ubuntu0.1   (noble-updates, noble-security)
-binary         /usr/bin/bwrap, mode 0755, NOT setuid
+package        bubblewrap 0.9.0-1ubuntu0.3   (noble-security)
+binary         /usr/bin/bwrap, mode 0755, NOT setuid, 72160 bytes
 advisory       CVE-2026-87766 / GHSA-pxhw-h44j-8pfx
-affects        every version below 0.12.0
+affects        every upstream version below 0.12.0
 fixed upstream 0.12.0, released 2026-08-26
 ```
+
+**Ubuntu fixed this and then withdrew the fix.** The archive history is:
+
+```text
+0.9.0-1ubuntu0.1   unfixed
+0.9.0-1ubuntu0.2   FIXED     USN-8779-1, two CVE-2026-87766 patches
+                             (safe_openat from crun; reject symlink mount
+                             destinations)
+0.9.0-1ubuntu0.3   UNFIXED   "SECURITY REGRESSION: Incompatibility with
+                             Flatpak (LP: #2167621) - debian: Drop
+                             CVE-2026-87766"
+```
+
+The patches broke Flatpak applications requesting CUPS access with "Too many
+levels of symbolic links" (`containers/bubblewrap#801`, `flatpak/flatpak#6830`)
+and Canonical reverted them rather than hold the regression.
+`0.9.0-1ubuntu0.2` is **no longer in the archive** -- `apt-cache policy` offers
+only `0.9.0-1ubuntu0.3` from noble-security and `0.9.0-1ubuntu0.1` from
+noble-updates. Corroborating the changelog: the installed binary is 72160
+bytes, byte-size identical to the unpatched `0.9.0-1ubuntu0.1`, and carries no
+`safe_openat`.
+
+So on this host today **there is no installable Ubuntu bubblewrap carrying the
+fix**, and upgrading does not help. Downgrading to `0.9.0-1ubuntu0.2` would
+reintroduce the Flatpak regression and the version is not fetchable anyway.
 
 During sandbox *setup*, creating a file or directory under the new root can
 follow a parent symlink out through `/oldroot` and write an attacker-chosen
@@ -60,7 +87,8 @@ floor is never returned as a production backend however well it runs.
 
 | Option | Verdict |
 |---|---|
-| Ubuntu `noble` security update | **Not available.** Only `0.9.0-1ubuntu0.1` is published in `noble`, `noble-updates` and `noble-security`. The Ubuntu CVE page lists noble as *Vulnerable* with no fixed version. `noble-backports` carries nothing. |
+| Ubuntu `noble` security update | **Withdrawn.** `0.9.0-1ubuntu0.2` carried the fix and was superseded by `0.9.0-1ubuntu0.3`, which drops it (see above). Nothing currently installable from noble carries the patches. `noble-backports` carries nothing. |
+| Waiting for Ubuntu to re-fix it | **Plausible, and not yet real.** Upstream is reworking the fix so it does not break Flatpak. When a `0.9.0-1ubuntu0.4` or later appears, read its changelog and, if it restores the patches, add it to `VENDOR_FIXED_RANGES` in `src/research_os/sandbox.py`. It will not be trusted for being newer. |
 | Another Research OS backend | **None exists.** `podman` and `docker` are probed and reported, and neither has a backend implemented — `ARCHITECTURE.md` §12 keeps both on the postponed list. `podman` is not installed here either. |
 | `systemd-run --user` | **Never usable.** Its sandboxing directives need the same unprivileged user namespaces the kernel is refusing, and it starts the unit anyway without binding them. Probed, recorded, and never selected. |
 | Turning off the restriction machine-wide | **Rejected.** `sysctl kernel.apparmor_restrict_unprivileged_userns=0` lifts it for every binary on the machine, and does nothing about reason 1. |
@@ -121,7 +149,7 @@ sudo apt-get install ./bubblewrap_0.12.0-1_amd64.deb
 
 **What it changes:** replaces `/usr/bin/bwrap` with a 0.12.0 build.
 **Expected output:** `bwrap --version` prints `bubblewrap 0.12.0`.
-**Rollback:** `sudo apt-get install --reinstall --allow-downgrades bubblewrap=0.9.0-1ubuntu0.1`
+**Rollback:** `sudo apt-get install --reinstall --allow-downgrades bubblewrap=0.9.0-1ubuntu0.3`
 **Note:** a locally built package will be overwritten if Ubuntu later publishes
 its own fix with a higher version. That is the desired behaviour. Hold it with
 `sudo apt-mark hold bubblewrap` only if you want to prevent a *downgrade*, and

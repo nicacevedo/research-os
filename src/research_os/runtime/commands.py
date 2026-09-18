@@ -29,6 +29,11 @@ inline and prints the result.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from research_os.sandbox import SandboxProbe
+
 import argparse
 import json
 import socket
@@ -787,24 +792,92 @@ def _sandbox_lines() -> list[str]:
         )
     ]
     for candidate in probe():
-        detail = candidate.detail
-        if candidate.remedy:
-            detail += f" -- {candidate.remedy}"
-        if candidate.namespaces_ok and not candidate.security_eligible:
-            # FAIL, not WARN, and it is the one sandbox row that is. Every
-            # other line here reports a capability this host does not have,
-            # which is a limitation. This one reports a capability it *does*
-            # have and must not use -- and a deployment that installs an
-            # AppArmor userns profile to "fix" a WARN would be granting a
-            # known-escapable binary exactly the namespace it needs.
-            lines.append(
-                f"  FAIL  sandbox       {candidate.technology}: "
-                f"PRESENT_BUT_UNACCEPTABLE -- {candidate.security_detail}"
-                + (f" -- {candidate.remedy}" if candidate.remedy else "")
-                + "\n"
-            )
-            continue
-        lines.append(f"  WARN  sandbox       {candidate.technology}: {detail}\n")
+        lines.extend(_backend_lines(candidate))
+    return lines
+
+
+def _backend_lines(candidate: SandboxProbe) -> list[str]:
+    """One technology, reported as the three separate facts it actually has.
+
+    Kept separate on purpose, because collapsing them is how a deployment acts
+    on the wrong one. "The version is patched", "the kernel will give it a
+    namespace" and "we attacked it and it held" fail independently and are
+    fixed by three different people doing three different things -- and on this
+    host two of them are false at once, in an order that matters.
+    """
+
+    from research_os.sandbox import security_basis
+
+    name = candidate.technology
+    lines: list[str] = []
+
+    if candidate.executable is None:
+        return [f"  WARN  sandbox       {name}: {candidate.detail}\n"]
+
+    if not candidate.security_detail:
+        # Never security-assessed, because it is not a candidate backend: no
+        # floor is recorded for it and no backend is implemented. Rendering the
+        # three-fact triplet here would print "NOT security eligible" about a
+        # technology nothing was ever going to select, which reads as a finding
+        # rather than as the absence of one.
+        return [f"  WARN  sandbox       {name}: {candidate.detail}\n"]
+
+    # 1. security eligibility, with the evidence it was decided from.
+    if candidate.security_eligible:
+        via = (
+            f" via {candidate.vendor_package.os_id} backport"
+            if candidate.vendor_package is not None
+            and not candidate.security_detail.startswith("upstream")
+            else ""
+        )
+        lines.append(f"  OK    sandbox       {name}: security eligible{via}\n")
+    elif candidate.namespaces_ok:
+        # FAIL, not WARN, and it is the one sandbox row that is. Every other
+        # line here reports a capability this host does not have, which is a
+        # limitation. This one reports a capability it *does* have and must not
+        # use -- and a deployment that installs an AppArmor userns profile to
+        # "fix" a WARN would be granting a known-escapable binary exactly the
+        # namespace it needs.
+        lines.append(
+            f"  FAIL  sandbox       {name}: PRESENT_BUT_UNACCEPTABLE -- "
+            f"{candidate.security_detail}\n"
+        )
+    else:
+        lines.append(
+            f"  WARN  sandbox       {name}: NOT security eligible -- "
+            f"{candidate.security_detail}\n"
+        )
+
+    if candidate.version is not None or candidate.vendor_package is not None:
+        basis = security_basis(
+            name,
+            candidate.version,
+            candidate.vendor_package,
+            candidate.security_eligible,
+        )
+        rendered = ", ".join(f"{key}={value}" for key, value in basis)
+        lines.append(f"        basis         {rendered}\n")
+
+    # 2. namespace capability, which is a fact about the kernel.
+    if candidate.namespaces_ok:
+        lines.append(f"  OK    namespace     {name}: user namespace with a uid map\n")
+    else:
+        lines.append(f"  WARN  namespace     {name}: blocked -- {candidate.detail}\n")
+
+    # 3. containment, which is a fact about having tried to break out.
+    if candidate.containment_validated:
+        lines.append(
+            f"  OK    containment   {name}: adversarial suite has held -- "
+            f"{candidate.validation_detail}\n"
+        )
+    else:
+        lines.append(
+            f"  WARN  containment   {name}: not yet validated -- "
+            f"{candidate.validation_detail}\n"
+        )
+
+    if candidate.remedy:
+        lines.append(f"        remedy        {candidate.remedy}\n")
     return lines
 
 

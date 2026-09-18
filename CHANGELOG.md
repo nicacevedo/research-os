@@ -11,6 +11,37 @@ closing the first of them exposed.
 
 ### Fixed
 
+- **A vendor security backport is now recognised, and a withdrawn one is not.**
+  The eligibility gate compared only the program's own `--version` against the
+  upstream floor, which produced a false *negative* on every distribution that
+  patches without renumbering. `VENDOR_FIXED_RANGES` closes that: when the
+  upstream rule fails, the binary's owning package is consulted, and a package
+  version recorded as carrying the fix makes it eligible. The evidence is the
+  package database, never the program's own version string -- `dpkg -S` must
+  name a package that owns *that exact path*, the file must still match the
+  checksum the package recorded, and versions are compared with
+  `dpkg --compare-versions` rather than with a hand-written comparison that
+  would eventually get a tilde or an epoch wrong. A locally built
+  `/usr/local/bin/bwrap` inherits nothing from a packaged one.
+
+  The table holds **ranges, not floors**, and that is not generality for its
+  own sake. Ubuntu noble's bubblewrap went unfixed in `0.9.0-1ubuntu0.1`, fixed
+  in `0.9.0-1ubuntu0.2` under USN-8779-1, and unfixed again in
+  `0.9.0-1ubuntu0.3`, whose changelog reads "SECURITY REGRESSION:
+  Incompatibility with Flatpak (LP: #2167621) - debian: Drop CVE-2026-87766".
+  The patches broke Flatpak's CUPS socket path resolution and Canonical
+  reverted them. So `>= 0.9.0-1ubuntu0.2` -- the obvious rule, and very nearly
+  the one written here -- returns true for a binary whose CVE fix was
+  deliberately removed, which is the precise false positive this gate exists to
+  prevent. Unlike `SECURITY_FLOORS`, which lists what is known broken so an
+  unlisted technology passes, this table lists what is known *fixed* and
+  anything unlisted does not; a future package that restores the fix is trusted
+  only once somebody adds it after reading its changelog.
+
+  `runtime doctor` now reports the three facts on separate rows -- security
+  eligibility with its basis, namespace capability, containment validation --
+  because they fail independently and are fixed by three different actions.
+
 - **A finding could not carry what it found.** A `critique_hypotheses` cycle
   wrote an eleven-kilobyte artifact holding six substantive alternative
   explanations, recorded a finding, and linked the provenance — and the

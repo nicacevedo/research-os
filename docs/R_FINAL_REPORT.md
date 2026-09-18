@@ -260,6 +260,42 @@ docker       not installed, no backend implemented
 configurations §7 names, plus a test that the floor logic mentions no
 distribution by name.
 
+## 5a. The vendor-backport follow-up, and what it caught
+
+After this report was first written the host was upgraded to
+`bubblewrap 0.9.0-1ubuntu0.3` on the reasonable belief that Ubuntu had fixed
+CVE-2026-87766 in `0.9.0-1ubuntu0.2` and that a later version would therefore
+also be fixed. The eligibility gate was to be taught about vendor backports so
+it would stop reporting a false negative.
+
+The backport support was the right thing to build, and it is built. What it
+caught on the way is that the premise was inverted for this particular version:
+
+```text
+0.9.0-1ubuntu0.1   unfixed
+0.9.0-1ubuntu0.2   FIXED     USN-8779-1
+0.9.0-1ubuntu0.3   UNFIXED   "SECURITY REGRESSION: Incompatibility with
+                             Flatpak (LP: #2167621) - debian: Drop
+                             CVE-2026-87766"
+```
+
+Three independent confirmations: the changelog in
+`/usr/share/doc/bubblewrap/changelog.Debian.gz` on this machine; the installed
+binary at 72160 bytes with no `safe_openat`, byte-size identical to the
+unpatched `0.9.0-1ubuntu0.1`; and the upstream and Flatpak issues
+(`containers/bubblewrap#801`, `flatpak/flatpak#6830`) describing the CUPS
+symlink regression that caused the revert.
+
+A `>= 0.9.0-1ubuntu0.2` rule would have marked this host eligible. That is the
+exact false positive the gate exists to prevent, and it would have been
+produced by trusting a version ordering instead of a changelog — so the table
+holds intervals and requires positive evidence per version range.
+
+The practical position is unchanged and slightly worse than before: there is
+now **no installable Ubuntu bubblewrap carrying the fix**, because
+`0.9.0-1ubuntu0.2` has been superseded out of the archive. Upgrading does not
+help; the options in `docs/CONTAINMENT_OPTIONS.md` still apply.
+
 ## 6. HUMAN_ROOT_ACTION_REQUIRED
 
 `docs/CONTAINMENT_OPTIONS.md` has the full audit. In short:

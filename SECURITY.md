@@ -75,6 +75,30 @@ a setup-time symlink traversal that can write outside the sandbox. A version
 that cannot be determined is treated as unsafe, because "we could not tell" and
 "it is fine" are different facts.
 
+**Distribution backports are honoured, from the package database.** A
+distribution can carry a fix without carrying the version number that fix
+arrived in upstream, and refusing every such build would refuse most correctly
+patched Linux hosts. So when the upstream rule fails, `VENDOR_FIXED_RANGES` is
+consulted: it is keyed by `(os id, codename, package, advisory)`, the binary
+must be owned by that package according to `dpkg -S` *and* still match the
+checksum the package recorded, and versions are compared with
+`dpkg --compare-versions` rather than with a hand-written comparison. A locally
+built `/usr/local/bin/bwrap` inherits nothing from a packaged one, and nothing
+here reads the program's own `--version` to decide it is safe.
+
+**The table holds ranges, not floors, because vendor fix status is not
+monotonic.** Ubuntu noble's bubblewrap went unfixed in `0.9.0-1ubuntu0.1`,
+fixed in `0.9.0-1ubuntu0.2` (USN-8779-1), and **unfixed again** in
+`0.9.0-1ubuntu0.3`, whose changelog reads "SECURITY REGRESSION:
+Incompatibility with Flatpak (LP: #2167621) - debian: Drop CVE-2026-87766" --
+the patches broke Flatpak's CUPS socket path resolution and Canonical reverted
+them. A `>= 0.9.0-1ubuntu0.2` rule returns true for a binary whose CVE fix was
+deliberately removed, which is the exact false positive this gate exists to
+prevent. Unlike `SECURITY_FLOORS`, which lists what is known broken so that an
+unlisted technology passes, this table lists what is known *fixed* and anything
+unlisted does not: a later package that restores the fix is trusted only once
+somebody adds it, having read its changelog.
+
 The fourth is reported separately and never inferred: no amount of measuring a
 version establishes that a boundary was attacked and held. It is recorded by
 the adversarial suite, keyed to the binary's *content hash*, so replacing the
