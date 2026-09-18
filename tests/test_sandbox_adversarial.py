@@ -135,6 +135,8 @@ def test_the_suite_covers_the_boundaries_the_release_gate_names(
 
     required = {
         "canonical_repository_0",
+        "protected_paths_inside_a_writable_checkout",
+        "the_writable_checkout_is_writable",
         "closure_shebang_outside_policy",
         "closure_symlink_escape",
         "closure_hostile_declared_base",
@@ -188,6 +190,8 @@ def test_the_control_checks_prove_the_denials_are_denials(
     assert by_name["worktree_is_writable"].held is True
     assert by_name["network_is_a_real_capability"].held is True
     assert by_name["inherited_fd_probe_is_capable"].held is True
+    assert by_name["the_writable_checkout_is_writable"].held is True
+    assert by_name["secret_probe_is_capable"].held is True
     assert by_name["closure_console_script_runs"].held is not False
 
 
@@ -243,6 +247,7 @@ def test_a_record_is_refused_unless_every_check_ran_and_held(
 
     holding = (
         Check("canonical_repository_0", "the repository held", True, ""),
+        Check("protected_paths_inside_a_writable_checkout", "protected held", True, ""),
         Check("b", "b held", True, ""),
     )
     assert module.record(holding, executable="/x", version="0.12.0")
@@ -255,10 +260,19 @@ def test_a_record_is_refused_unless_every_check_ran_and_held(
         assert not module.record(spoiled, executable="/x", version="0.12.0")
     assert len(written) == 1, "a spoiled suite still wrote a record"
 
-    # And a sweep that attacked no canonical repository is not a validation,
-    # however clean it is: the boundary the record is about was never tried.
+    # A sweep that attacked no canonical repository is not a validation, however
+    # clean it is: the boundary the record is about was never tried.
     assert not module.record(
-        (Check("b", "b held", True, ""),), executable="/x", version="0.12.0"
+        (Check("protected_paths_inside_a_writable_checkout", "held", True, ""),),
+        executable="/x",
+        version="0.12.0",
+    )
+    # Nor one that never built a spec with `protected` paths -- the experiment
+    # path's only barrier against `.git/hooks` host code execution.
+    assert not module.record(
+        (Check("canonical_repository_0", "held", True, ""),),
+        executable="/x",
+        version="0.12.0",
     )
     assert len(written) == 1
 

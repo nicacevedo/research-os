@@ -1236,13 +1236,29 @@ def conclude(state: CycleState, runtime: Runtime[CycleContext]) -> dict[str, Any
         "BLOCKED",
     }:
         reason = str(data.get("recommendation_rationale") or "").strip()
+        # `DONE_FOR_NOW`, not `WAITING_FOR_SCIENTIFIC_DECISION`. A review of the
+        # first version of this branch pointed out what the honest-looking word
+        # cost: `WAITING_FOR_SCIENTIFIC_DECISION` is reached everywhere else
+        # alongside a real proposal or nomination, and
+        # `prepare_decision_packet` is the only thing that creates an approval
+        # row -- so this branch told a researcher a scientific decision was
+        # owed, `_surface_approvals` notified nobody, and there was nothing to
+        # decide. The `FRONTIER` role is the cheapest tier this system has;
+        # letting its prose mint a decision that does not exist is a worse
+        # trade than the less precise word.
+        #
+        # The loop still stops, which is the whole point: `should_continue`
+        # reads `next_recommendation`, not the terminal state, and
+        # `parked_objectives` accepts `DONE_FOR_NOW`, so a human changing the
+        # science still wakes the objective.
         return {
             "frontier_digest": digest,
-            "terminal_state": str(TerminalState.WAITING_FOR_SCIENTIFIC_DECISION),
+            "terminal_state": str(TerminalState.DONE_FOR_NOW),
             "next_recommendation": recommended,
             "notes": note(
                 state,
-                f"concluded: the frontier assessment recommends {recommended} -- "
+                f"concluded: the frontier assessment recommends {recommended} "
+                "(its own words, reviewed by nobody) -- "
                 + (reason or "see `researchctl propose list`"),
             ),
         }

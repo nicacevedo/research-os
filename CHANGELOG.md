@@ -285,6 +285,69 @@ release's own fix.
   reason for it, and each candidate with what it addresses and why it ranked
   where it did.
 
+### Fixed, after a third review of the second round's fixes
+
+The third pass confirmed the round-2 fixes hold -- the worktree pointer, the ELF
+loader recursion, the record gate -- and found no critical and no high. What it
+found instead was the same class of defect one layer out, plus two defects this
+release had just introduced.
+
+- **The adversarial suite attacked a spec nobody runs.** Every attack was built
+  on `SandboxSpec(workdir=...)` alone: no `writable`, no `readable`, no
+  `protected`, no `discarded`. Neither production caller looks like that. The
+  experiment path makes the *project checkout itself* writable and relies
+  entirely on `protected` to keep `.git/hooks` and `.research` out of reach; the
+  acceptance path adds a writable environment outside the worktree and a
+  read-only canonical `.git`. So "containment validated" was recorded for a
+  boundary configuration that does not exist, which is the round-2 `record()`
+  defect relocated from *which repository* to *which spec*. The suite now
+  attacks the production shape, with a control that the checkout and the outside
+  writable path still work, and `record()` refuses a sweep that never built a
+  spec carrying `protected` paths. 38/38.
+
+- **A failed userns assertion was reported as the opposite of itself.** This
+  release added `--disable-userns --assert-userns-disabled` so that a host
+  silently ignoring the `max_user_namespaces` write fails closed. The review
+  then read what that failure *says*: the message mentions user namespaces,
+  `_NAMESPACE_DENIED_MARKERS` matches on exactly that, and the operator was told
+  "this kernel refuses unprivileged user namespaces -- a host administrator can
+  permit it, install an AppArmor profile granting bwrap the `userns`
+  permission". The kernel is not too strict there, it is too lax, and granting
+  more namespace permission is the one action that cannot help and that this
+  module warns against elsewhere. Which is the misdiagnosis `NamespaceState` was
+  written to eliminate, reintroduced by two flags added to fix something else.
+  It now has its own marker set, checked first, and its own remedy.
+
+- **A cheap model could mint a decision that did not exist.** The `WAIT_HUMAN`
+  fix above concluded `WAITING_FOR_SCIENTIFIC_DECISION` -- the honest-looking
+  word. Every other route to that state creates an approval row alongside a real
+  proposal or nomination, and this one cannot, so `_surface_approvals` notified
+  nobody and a researcher was told a scientific decision was owed with nothing
+  to clear. The `FRONTIER` role is the cheapest tier this system has. The branch
+  now concludes `DONE_FOR_NOW`, which `parked_objectives` accepts and
+  `should_continue` still stops on, and the note says whose words the reason is.
+
+- **Computing one number for a prompt cost up to 10 001 queries.**
+  `noncanonical_science` counted findings with
+  `len(list_findings(limit=10_000))`, and `list_findings` fetched one references
+  row-set *per finding* -- against a table that now grows by one row per cycle.
+  There is a `count_findings` now, and the references come back in one query.
+
+- **Smaller, from the same review.** `dpkg --verify` failing to run returned "not
+  modified", so a tampered binary at a packaged path could inherit a vendor
+  backport's clean bill of health -- the one fail-open branch in an
+  eligibility gate that is positive-evidence-only everywhere else.
+  `_policy_identity` collapsed to a single constant on any read error, making
+  every such host's records interchangeable. `_POLICY_SOURCES` gained
+  `automation/controller.py`, which decides the writable `uv_project_environment`
+  outside every worktree, and `automation/worktree.py`, which decides where the
+  writable workdir is. `resolved_protected` followed the final symlink, so
+  protecting a `.git` that *was* a symlink would have bound the target and left
+  the name replaceable. `--unshare-all` still carried one `--unshare-cgroup-try`
+  after a docstring arguing at length that `-try` is the shape this file rejects.
+  And `SandboxSpec.wall_seconds` claimed to be "enforced by the caller's own
+  timeout *as well*" while nothing in the sandbox reads it.
+
 ### Added
 
 - **`researchctl runtime containment-audit`, because the record it writes had no

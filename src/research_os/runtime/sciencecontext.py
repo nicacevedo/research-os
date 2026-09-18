@@ -213,7 +213,7 @@ def noncanonical_science(
     """
 
     shown = store.list_findings(project_id=project_id, limit=MAX_PLANNER_FINDINGS)
-    total = len(store.list_findings(project_id=project_id, limit=10_000))
+    total = store.count_findings(project_id=project_id)
     proposals = store.created_proposals(
         project_id=project_id, limit=MAX_PLANNER_PROPOSALS
     )

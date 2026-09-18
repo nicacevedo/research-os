@@ -244,7 +244,7 @@ def _closure_checks(attacker: _Attacker) -> Iterator[Check]:
         "a `#!` line cannot name a host path the caller never declared",
         attacker,
         [str(script)],
-        because="does not get to choose",
+        because="content does not get to choose",
     )
 
     # A virtual environment inside the worktree whose interpreter is a link to
@@ -275,7 +275,7 @@ def _closure_checks(attacker: _Attacker) -> Iterator[Check]:
         attacker,
         [str(linked_script)],
         must_not_bind=prize,
-        because="does not get to choose",
+        because="exposed environment does not get to choose",
     )
 
     # A `pyvenv.cfg` whose declared base escapes through `..`. This is the one
@@ -595,6 +595,59 @@ def _filesystem_checks(
         "no host location outside the declared writable set gained a file",
         not appeared,
         f"host locations written: {appeared or 'none'} (of {sorted(probes)})",
+    )
+
+    # **The production spec shape, not the empty one.** A third review pointed
+    # out that every attack in this file was built on
+    # `SandboxSpec(workdir=...)` alone -- `writable=()`, `readable=()`,
+    # `protected=()`, `discarded=()` -- while neither production caller looks
+    # like that. The experiment path makes the *project checkout* writable and
+    # relies entirely on `protected` to keep `.git/hooks` and `.research` out of
+    # reach; the acceptance path adds a writable environment outside the
+    # worktree and a read-only canonical `.git`. So the record said
+    # "containment validated" for a boundary configuration nobody runs.
+    #
+    # This is the same class of defect the previous round found in `record()`
+    # -- a sweep earning the record without attacking the thing the record is
+    # about -- relocated from *which repository* to *which spec*.
+    checkout = root / "checkout"
+    (checkout / ".git" / "hooks").mkdir(parents=True, exist_ok=True)
+    (checkout / ".research").mkdir(parents=True, exist_ok=True)
+    hook = checkout / ".git" / "hooks" / "post-checkout"
+    claim = checkout / ".research" / "CLAIM-0001.yaml"
+    hook.unlink(missing_ok=True)
+    claim.write_text("status: draft\n", encoding="utf-8")
+    payload = checkout / "data.txt"
+    payload.unlink(missing_ok=True)
+    elsewhere = root / "writable-outside"
+    elsewhere.mkdir(exist_ok=True)
+    production = SandboxSpec(
+        workdir=checkout,
+        writable=(elsewhere,),
+        protected=(checkout / ".git", checkout / ".research"),
+    )
+    seen = attacker.output(
+        f"(printf '#!/bin/sh\\ntouch /tmp/pwned\\n' > {hook} && echo WROTE-HOOK "
+        "|| echo denied-hook); "
+        f"(echo accepted > {claim} && echo WROTE-CLAIM || echo denied-claim); "
+        f"(echo ok > {payload} && echo WROTE-DATA || echo denied-data); "
+        f"(echo ok > {elsewhere / 'out.txt'} && echo WROTE-OUT || echo denied-out)",
+        spec=production,
+    )
+    yield Check(
+        "protected_paths_inside_a_writable_checkout",
+        "`.git` and `.research` are unwritable inside a checkout that is not",
+        not hook.exists() and claim.read_text("utf-8") == "status: draft\n",
+        f"host gained a hook={hook.exists()}; claim preserved="
+        f"{claim.read_text('utf-8') == 'status: draft\n'}; {seen.strip()[:90]}",
+    )
+    yield Check(
+        "the_writable_checkout_is_writable",
+        "the rest of the checkout, and a writable path outside it, still work",
+        payload.is_file() and (elsewhere / "out.txt").is_file(),
+        "without this the check above is satisfied by a sandbox that refuses "
+        f"everything; checkout write={payload.is_file()}, outside write="
+        f"{(elsewhere / 'out.txt').is_file()}",
     )
 
     inside = attacker.workdir / "inside.txt"
@@ -1088,6 +1141,18 @@ def record(checks: tuple[Check, ...], *, executable: str, version: str | None) -
     """
 
     if any(check.held is not True for check in checks):
+        return False
+    if not any(
+        check.name == "protected_paths_inside_a_writable_checkout" for check in checks
+    ):
+        # The experiment path's only barrier between model-parameterised project
+        # code and `.git/hooks` host code execution is `protected`, and a suite
+        # that never built a spec carrying one has not measured it.
+        LOG.warning(
+            "refusing to record a containment validation from a run that never "
+            "attacked a spec with `protected` paths: the production experiment "
+            "path relies on nothing else."
+        )
         return False
     if not any(check.name.startswith("canonical_repository_") for check in checks):
         # The canonical repository is the boundary this system exists to

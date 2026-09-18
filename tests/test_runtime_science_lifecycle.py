@@ -410,8 +410,15 @@ def test_a_frontier_that_recommends_waiting_opens_no_successor(
 
     # The recommendation the daemon reads, and the honest terminal word.
     assert result.recommendation == "WAIT_HUMAN"
-    assert result.terminal_state is TerminalState.WAITING_FOR_SCIENTIFIC_DECISION
+    # `DONE_FOR_NOW`, deliberately. A review of the first version of this branch
+    # showed that `WAITING_FOR_SCIENTIFIC_DECISION` claims a decision exists --
+    # every other route to that state creates an approval row, this one cannot,
+    # so a researcher was told something was owed and had nothing to clear. The
+    # loop must stop without minting a decision.
+    assert result.terminal_state is TerminalState.DONE_FOR_NOW
     assert any("recommends WAIT_HUMAN" in note for note in result.notes), result.notes
+    # And the note says whose words those are.
+    assert any("reviewed by nobody" in note for note in result.notes), result.notes
     assert any("already put these questions" in note for note in result.notes), (
         result.notes
     )

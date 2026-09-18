@@ -1383,6 +1383,27 @@ class RuntimeStore:
         detail = str((row["result"] or {}).get("detail") or "").strip()
         return action, detail
 
+    def count_findings(self, *, project_id: str | None = None) -> int:
+        """How many findings this project has, without fetching any.
+
+        `noncanonical_science` used to answer this with
+        ``len(list_findings(limit=10_000))``, and `list_findings` fetched one
+        refs row-set *per finding* -- so computing a number for a prompt cost up
+        to 10 001 round trips, against a table that grows by one row per cycle.
+        An independent review found it. `count_created_proposals` was already
+        the pattern beside it.
+        """
+
+        with self._db.tx() as conn:
+            row = conn.execute(
+                """
+                select count(*) as total from runtime_findings
+                where (%(project_id)s::text is null or project_id = %(project_id)s)
+                """,
+                {"project_id": project_id},
+            ).fetchone()
+        return int((row or {}).get("total") or 0)
+
     def list_findings(
         self,
         *,
@@ -1401,14 +1422,22 @@ class RuntimeStore:
                 """,
                 {"project_id": project_id, "run_id": run_id, "limit": limit},
             ).fetchall()
-            found = []
-            for row in rows:
-                refs = conn.execute(
-                    "select kind, ref from runtime_finding_refs "
-                    "where finding_id = %s order by kind, ref",
-                    (row["finding_id"],),
-                ).fetchall()
-                found.append(_finding_from(row, refs))
+            if not rows:
+                return ()
+            # One query for every finding's references, not one per finding.
+            # The previous shape was a round trip per row, which a review
+            # measured at up to 10 001 for a single planner prompt.
+            identifiers = [str(row["finding_id"]) for row in rows]
+            grouped: dict[str, list[Any]] = {name: [] for name in identifiers}
+            for ref in conn.execute(
+                "select finding_id, kind, ref from runtime_finding_refs "
+                "where finding_id = any(%s) order by kind, ref",
+                (identifiers,),
+            ).fetchall():
+                grouped.setdefault(str(ref["finding_id"]), []).append(ref)
+            found = [
+                _finding_from(row, grouped[str(row["finding_id"])]) for row in rows
+            ]
         return tuple(found)
 
     def resolve_findings(

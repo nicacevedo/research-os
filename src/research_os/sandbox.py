@@ -215,7 +215,14 @@ class SandboxSpec:
     discarded: tuple[Path, ...] = ()
     #: Network access, as a capability rather than a default.
     network: bool = False
-    #: Wall-clock ceiling, enforced by the caller's own timeout as well.
+    #: Wall-clock ceiling. **Recorded here, enforced by the caller**, which
+    #: passes it to ``subprocess.run(timeout=...)``. Bubblewrap has no
+    #: wall-clock flag and this module adds none, so nothing in the sandbox
+    #: reads this field. The previous wording -- "enforced by the caller's own
+    #: timeout *as well*" -- implied a second enforcement that does not exist,
+    #: which is the same shape as the `max_processes` defect this file already
+    #: documents having fixed once. Both callers do pass an equal `timeout`, so
+    #: there is no live gap; the sentence was the defect.
     wall_seconds: int | None = None
     #: Ceiling on concurrent processes, enforced by the *caller* via RLIMIT.
     #:
@@ -272,7 +279,7 @@ class SandboxSpec:
         """Read-only paths inside a writable tree. Only ones that exist."""
 
         return tuple(
-            dict.fromkeys(item.resolve() for item in self.protected if item.exists())
+            dict.fromkeys(_absolute(item) for item in self.protected if item.exists())
         )
 
     def resolved_discarded(self) -> tuple[Path, ...]:
@@ -489,6 +496,32 @@ class NamespaceState(StrEnum):
     """
 
 
+#: stderr fragments that mean nested user namespaces could *not* be denied.
+#:
+#: Checked before everything else, because this failure is the exact inverse of
+#: the one it would otherwise be read as, and the remedy is the opposite too.
+#:
+#: This release added ``--disable-userns --assert-userns-disabled`` to both the
+#: probe and production, so that a host which silently ignores the
+#: ``max_user_namespaces`` write fails closed instead of running every command
+#: in a sandbox whose nested-namespace denial was a comment in this file. An
+#: independent review then pointed out what the new failure *said*: the message
+#: mentions user namespaces, `_NAMESPACE_DENIED_MARKERS` matches on exactly
+#: that, and the operator was told "this kernel refuses unprivileged user
+#: namespaces -- a host administrator can permit it, install an AppArmor
+#: profile granting bwrap the `userns` permission". The kernel is not too
+#: strict, it is too lax, and granting more namespace permission is the one
+#: action that cannot help and that this module warns against elsewhere.
+#:
+#: Which is the misdiagnosis :class:`NamespaceState` was written to eliminate,
+#: reintroduced by the two flags added to fix something else.
+_USERNS_NOT_DISABLED_MARKERS: tuple[str, ...] = (
+    "was not disabled as requested",
+    "not disabled as requested",
+    "max_user_namespaces",
+    "disable-userns",
+)
+
 #: stderr fragments that mean the kernel or an LSM refused the namespace.
 #:
 #: Checked *after* the exec markers below, because a message can carry both and
@@ -525,6 +558,11 @@ def classify_namespace_failure(message: str) -> NamespaceState:
     """Read one bubblewrap error line as a denial or as a probe defect."""
 
     lowered = message.lower()
+    if any(marker in lowered for marker in _USERNS_NOT_DISABLED_MARKERS):
+        # Not a denial, and the opposite of one. Reported as a probe error
+        # because the sandbox could not be built to policy, and the *remedy*
+        # text is what matters: see `probe_bubblewrap`.
+        return NamespaceState.PROBE_ERROR
     if any(marker in lowered for marker in _PROBE_ERROR_MARKERS):
         return NamespaceState.PROBE_ERROR
     if any(marker in lowered for marker in _NAMESPACE_DENIED_MARKERS):
@@ -767,9 +805,15 @@ def _package_file_modified(dpkg: str, package: str, path: str) -> bool:
             stdin=subprocess.DEVNULL,
             timeout=30,
         )
-    except (OSError, subprocess.SubprocessError) as exc:  # pragma: no cover
-        LOG.debug("dpkg --verify failed: %s", exc)
-        return False
+    except (OSError, subprocess.SubprocessError) as exc:
+        # **Unknown means modified.** Everything else in this file is
+        # positive-evidence-only and this one inverted it: a `--verify` that
+        # times out or cannot run returned "not modified", so a tampered binary
+        # at a packaged path inherited the vendor backport's clean bill of
+        # health. An independent review found the one fail-open branch in the
+        # eligibility gate.
+        LOG.info("could not verify %s against its package: %s", path, exc)
+        return True
     for line in (completed.stdout or "").splitlines():
         parts = line.split()
         if len(parts) >= 2 and parts[-1] == path:
@@ -1115,6 +1159,13 @@ _POLICY_SOURCES: tuple[str, ...] = (
     # mount surface moves with every existing record still standing.
     "paths.py",
     "automation/config.py",
+    # `controller.py` decides `uv_project_environment` -- a read-write bind
+    # outside every worktree -- and passes `sandbox_readable`, `sandbox_network`
+    # and `sandbox_mode`. `worktree.py` decides where the writable workdir is.
+    # A third review found both missing: change either and the mount surface
+    # moves with every record still standing.
+    "automation/controller.py",
+    "automation/worktree.py",
 )
 
 
@@ -1157,7 +1208,10 @@ def _policy_identity() -> str:
             digest.update(name.encode())
             digest.update((Path(__file__).parent / name).read_bytes())
         except OSError:  # pragma: no cover - these ship with the package
-            return "unreadable-policy"
+            # Named, not collapsed. Returning one constant made every record
+            # written while any policy file was unreadable share an identity --
+            # and match every other such host.
+            return f"unreadable-policy:{name}"
     return digest.hexdigest()[:16]
 
 
@@ -1340,6 +1394,31 @@ def probe_bubblewrap() -> SandboxProbe:
     reason = (completed.stderr or completed.stdout or "").strip().splitlines()
     first = reason[0] if reason else f"exit {completed.returncode}"
     state = classify_namespace_failure(first)
+
+    if any(marker in first.lower() for marker in _USERNS_NOT_DISABLED_MARKERS):
+        # The inverse of a denial, and it needs its own sentence. See
+        # `_USERNS_NOT_DISABLED_MARKERS`: the generic probe-error remedy says
+        # "a defect in the probe or an unusual host layout", and the denial
+        # remedy advises granting `userns` -- which here would be granting more
+        # of the thing that could not be taken away.
+        remedy = (
+            "this host cannot deny nested user namespaces to a contained "
+            "command, so a contained process could create one and be root "
+            "inside it. That is where published namespace escapes begin, and "
+            "it is why the sandbox asserts the denial rather than requesting "
+            "it. This is NOT a kernel refusing user namespaces and granting "
+            "bwrap more namespace permission cannot help. Reproduce with: "
+            + " ".join(argv)
+        )
+        return SandboxProbe(
+            **common,
+            namespace_state=NamespaceState.PROBE_ERROR,
+            detail=(
+                "bubblewrap could not confirm that nested user namespaces are "
+                f"disabled inside the sandbox: {first}"
+            ),
+            remedy=remedy,
+        )
 
     if state is NamespaceState.PROBE_ERROR:
         remedy = (
@@ -2648,6 +2727,12 @@ def _bubblewrap(
         # so the sandbox either has its own user namespace or fails -- which is
         # what the probe validates.
         "--unshare-user",
+        # `--unshare-all` includes `--unshare-cgroup-try`, and the module
+        # docstring above argues that `-try` is "exactly the shape this
+        # paragraph rejects". One was left. The cgroup namespace is not a
+        # boundary this system relies on, so the impact was nil and the claim
+        # was still broader than the flags.
+        "--unshare-cgroup",
         # The sandbox dies when this process does. Without it, a command that
         # forks and returns leaves children running with the bind mounts alive.
         "--die-with-parent",
