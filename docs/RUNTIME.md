@@ -1145,6 +1145,235 @@ support would be reporting an experiment it did not run, and the schema
 establish. `DERIVED` is a model's report that a derivation went through. It
 reaches the capsule the way everything else does: a proposal, and a person.
 
+## 15e. The human gate, made durable
+
+Three defects the live thesis runtime exposed, all of them about the same thing:
+a system that stops for a person has to *stay* stopped, and has to know why it
+stopped without asking a model again.
+
+### The frontier could not see what had already been asked
+
+`frontier@1` received two things: the deterministic capsule frontier, and the
+current cycle's previous action result. A real cycle asked it whether another
+autonomous cycle was warranted. It ranked five candidates, put an audit of
+whether the two outstanding proposals already covered the open questions at the
+top, and wrote this into the finding it recorded:
+
+> Absent HYP-0006's pre-specified test, the correct answer would have been
+> WAIT_HUMAN. This judgement rests on the quoted frontier alone, as all
+> file-inspection tools were disabled and the underlying artifacts could not be
+> read.
+
+So the highest-ranked action was one the role structurally could not perform,
+and the recommendation it did give -- `START_NEXT_CYCLE` -- was qualified on
+material it could not open. A role that ranks the next action was reasoning
+about a project it could not see.
+
+**The fix is not file access.** The material was structured scientific state
+this runtime already held. `sciencecontext.noncanonical_science` had been
+assembling it for the planner since the loop was closed, and the frontier was
+simply not given it. `frontier@2` receives the same three labelled, fenced
+categories the planner does -- completed findings, outstanding proposals,
+preregistered designs -- plus the controller-authored census outside every
+fence. It gained no path, no repository handle and no tool, and
+`tests/test_runtime_frontier_context.py` asserts both halves: the context is
+there, and nothing else is.
+
+**One category was not enough as it stood.** A proposal reached the prompt as
+the reservation row: `proposal_id`, `run_id`, `created_at`, and two counts of
+findings. Every field is operational, so "is Q-0004 already in front of the
+researcher" was not answerable from any of them -- which is exactly the audit
+the frontier asked for files to perform. `sciencecontext.proposal_view` now
+reads the proposal document by the id the reservation gives, and each entry
+carries its proposed items with:
+
+| field | what it decides |
+|---|---|
+| `addresses` | which capsule objects this item is about -- coverage, as a set intersection |
+| `decided_by_human` | whether a person has promoted or declined it, so a settled item stops counting |
+| `basis` | `current` / `STALE` / `unchecked`, so a proposal resting on moved objects stops counting |
+
+Three answers on the basis and not two, for the reason §14a.4 gives about
+`checkable=False`: "we did not check" must not read as "we checked and it is
+fine". A caller with no repository path gets `unchecked`; the path comes from
+the runtime's own context and never from the `project_path` recorded inside the
+proposal document, because a reader that dereferenced a path it read out of a
+model-written document would be letting the document choose what gets opened.
+
+A proposal that cannot be read reports `items_unavailable` and says so in the
+census, because a reader that cannot tell "no item addresses this" from "I
+could not read the items" will treat the second as the first, conclude a
+direction is uncovered, and spend a cycle on a question already in front of a
+person.
+
+The planner gets the items too. It has the same coverage question and had the
+same five fields to answer it with.
+
+### A repeated assessment was a new scientific object
+
+A finding is deduplicated on `(project_id, digest)` and the digest is over the
+finding's content. That is right whenever the content *is* the observation, and
+wrong for a handler whose result contains a model's prose. Ask the frontier the
+same question over the same scientific state twice: it reaches the same
+recommendation over the same candidates, phrases the rationale differently, and
+the artifact holding that rationale hashes differently -- so the digest differs,
+and a second citable identifier is minted for one observation. The planner is
+shown at most `MAX_PLANNER_FINDINGS`, so twenty repetitions fill the window and
+push the project's real findings out of it, with nothing about the project
+having changed. Operational repetition wearing scientific progress as a
+costume, which is §16's pilot finding one layer down.
+
+So a handler that knows which part of its result is the observation may say so.
+`RuntimeFinding.semantic_key` is producer-authored, beside the excerpt and for
+the same reasons, and when it is set the digest is computed from it, the
+project, the kind and the producing action, and from nothing else.
+`actions.review.assessment_identity` is the one producer that sets one, over:
+
+```text
+frontier_digest        the scientific state assessed, over sorted identifiers
+recommendation         the conclusion the runtime acts on
+ranked (action, sorted addresses), in rank order
+```
+
+and deliberately not over the rationales, the qualitative scores, the artifact
+ids, the run, the cycle or the clock. Rank order *is* material, which is the
+conservative direction: collapsing it would let a genuine change of mind about
+what to do first be deduplicated away.
+
+Two properties follow and are asserted. A finding with no stated identity keeps
+the digest it has always had, byte for byte, so nothing a proposal already
+rests on is restated. And a repeat keeps the *first* occurrence's wording,
+because a finding is immutable and superseded rather than updated -- if a later
+assessment's substance differs, its key differs and it is a new finding.
+
+### A conclusion lived only in the message that carried it
+
+The worst of the three, and the one that had already happened.
+
+A cycle's recommendation was returned in `CycleResult`, which is memory, and
+written into the `RESEARCH_CYCLE_FINISHED` event payload, which is an
+operational message. The daemon copied it again into the `continue_objective`
+work item, and `should_continue` read *that* -- two copies away from the row
+that concluded it, in a queue row outliving the process, the build, and any
+later correction.
+
+`RRUN-20260918T054218Z-cb4962f4` asked the frontier whether another cycle was
+warranted, was told `WAIT_HUMAN` with the reason that the questions were
+already in front of the researcher, and recorded that in
+`FIND-20260918T054359Z-313e1ec9`. The build of the day reached `WAIT_HUMAN`
+only through `requires_human_promotion`, so the cycle concluded
+`START_NEXT_CYCLE`, and that is the word that reached the event, the work item,
+and the successor the daemon opened. `conclude` now honours the frontier's own
+recommendation -- and that fix did nothing for the work item already on the
+queue. It still said `START_NEXT_CYCLE`, and the next restart would still have
+believed it.
+
+A recommendation that lives only in a message cannot be reconciled, because
+there is nothing to reconcile it against. So `research_runs.next_recommendation`
+records what the run concluded, in the **same row update** that records that it
+concluded, and `_work_continue_objective` reads the run:
+
+```text
+run.next_recommendation is not null  ->  authoritative; the payload is advisory
+run.next_recommendation is null      ->  a build predating the column finished
+                                         this run; fall back to the payload and
+                                         say so in the result
+```
+
+The work item's result records `parent_recommendation_source`, and
+`superseded_payload_recommendation` when the two disagreed -- because a
+continuation decision taken from a message rather than from a run is a thing an
+auditor should be able to find. The event still carries the recommendation, for
+a reader following the ledger; it is no longer the authority on what the run
+decided.
+
+`parent_recommendation` and not `recommendation`, because
+`_cycle_result_payload` already uses the latter for the *successor's*
+conclusion on the success path -- two different facts under one name, which is
+how an auditor ends up reading the wrong cycle.
+
+`_work_continue_objective` also gained the `has_successor` pre-check and the
+`SuccessorExistsError` catch that `_work_advance_objective` has had since
+`sql/0014`. The two handlers disagreed about one invariant, and the live state
+found the gap: a researcher cancelled the successor this item had opened, the
+item's lease expired, and reclaiming it would have hit the unique index as an
+*exception* -- three failed attempts and a dead-lettered work item, for a system
+behaving exactly as designed. A cancelled successor counts as a successor.
+Cancelling a research cycle is a person's act, and a queue row is not entitled
+to undo it by being retried.
+
+### What two independent reviews of this work found
+
+Both were given the diff and told to attack it. The three worth recording are
+each an instance of the same lesson: an assertion placed one layer away from
+the property it names will pass while the property is false.
+
+**The items were being clipped out of the prompt.** A proposal view is one
+block *entry*; `prompt_safe_block` clips each entry at `DEFAULT_FIELD_CHARS`;
+twelve items at `indent=2` serialise to 6 550 characters. Measured on the real
+shape, **three of twelve** reached the model, the JSON was cut mid-object, and
+`census` -- controller-authored, outside every fence -- reported all twelve. So
+the set intersection this section is about was computed over a quarter of the
+data for exactly the two live proposals that motivated it, and a question
+already in front of the researcher read as uncovered.
+
+The fix is in four parts and only one of them is a number: the item view
+carries the fields coverage needs and not the adjudication aids, the title
+bound drops to 80, both render sites serialise compactly, and
+`PromptTemplate.block_limits` gives this block a measured
+`PROPOSAL_BLOCK_CHARS`. The part that keeps it fixed is a test that renders a
+worst-case proposal through the real graph and asserts every item id and every
+address appears in the prompt. The test that missed it asserted on the view
+object and said "so nothing is silently hidden".
+
+**The identity fix had been applied to one exit of four.** `assess_frontier`
+has three degraded exits -- empty frontier, budget or routing failure, unusable
+response -- and none set a semantic key. Two of them conclude
+`START_NEXT_CYCLE`, and their summaries embed the exception text:
+`BudgetExhaustedError` names the run and the remaining budget, so the summary
+was *guaranteed* unique per cycle. A provider outage minted a new citable
+finding every cycle, which is this section's own defect on the path most likely
+to repeat. All four exits are keyed now, over the state and the failure class
+and never the message.
+
+**And the identity covered less than the assessment did.** `frontier_digest` is
+over capsule identifiers; the capsule cannot move without a promotion; so it is
+constant for a whole autonomous session -- while this release had just given the
+role three further categories. Two assessments either side of a researcher
+declining an item would have been one finding, keeping the earlier rationale.
+The key now carries `decision_context_digest` as well: per readable proposal,
+its id, its undecided items, and the class of its basis. Findings stay out,
+deliberately -- they change every cycle, so including them is the churn wearing
+a different costume. What is in the key is what moves only when a person acts or
+the science does.
+
+**What it costs, measured on the real pilot rather than argued.** A reviewer's
+strongest remaining assumption was that this block could take the frontier
+prompt to ~40 KB, on a role called every cycle -- a cost fix that costs. Against
+the live thesis capsule and its two real proposals (eleven items and twelve):
+
+```text
+instruction                  3 431 chars   (frontier@2, up from ~700)
+outstanding proposals        6 109 chars   (both proposals, 23 of 23 items)
+whole prompt                11 081 chars   ~2 770 tokens
+```
+
+Both proposals render in full, `33ec307e` reports `current` and `b9c26fcd`
+reports `STALE` -- correctly: it was written before EXP-0001 completed, and
+`EXP-0001 (specified -> completed)`, `HYP-0001 (active -> supported)` and
+`HYP-0005 (active -> rejected)` have moved under it. So the coverage question
+this section exists for is answerable from the prompt, and the older proposal
+is visibly not a live decision. Three thousand tokens against a cycle that
+costs about fifty cents and was being started for the wrong reason.
+
+Three smaller ones, each with a test: `items_unavailable` carried
+`proposals_root()` into a prompt that tells the role it has no filesystem, and
+a test asserted its arrival; `semantic_key` was an extension point with no
+shape contract, so a producer setting a constant would have merged every
+finding of its kind, permanently and citably; and the frontier was shown its
+own prior assessments in a block labelled as completed work, which on the one
+decision that governs spending and stopping is a self-confirmation loop.
+
 ## 16. What two adversarial reviews and a real pilot changed
 
 Recorded here because the findings are more useful than the fixes, and because

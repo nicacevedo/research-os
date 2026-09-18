@@ -663,6 +663,222 @@ promotions and declines together.
   concluded `WAIT_HUMAN` — which is correct, because the design it needed was
   the thing a human had to decide.
 
+### Fixed, found by leaving the daemon running at a human gate
+
+The three defects below are one property in three places: a system that stops
+for a person has to stay stopped, and has to know why it stopped without
+paying a model to work it out again.
+
+- **The role that ranks the next action could not see what had already been
+  asked.** `frontier@1` received the deterministic capsule frontier and the
+  current cycle's previous result, and nothing else. A real cycle ranked "audit
+  whether the two outstanding proposals already cover the open questions" as
+  its highest-value candidate and then said, in the finding it recorded:
+
+  ```text
+  Absent HYP-0006's pre-specified test, the correct answer would have been
+  WAIT_HUMAN. This judgement rests on the quoted frontier alone, as all
+  file-inspection tools were disabled and the underlying artifacts could not
+  be read.
+  ```
+
+  So its top-ranked action was one it structurally could not perform, and the
+  `START_NEXT_CYCLE` it did give was qualified on material it could not open.
+
+  The fix gives it no file access. The material was structured scientific state
+  the runtime already held and was already assembling for the planner:
+  `frontier@2` gets the same three labelled fenced categories -- completed
+  findings, outstanding proposals, preregistered designs -- and the
+  controller-authored census outside every fence. It gains no path, no
+  repository block and no tool, and the instruction now says plainly that there
+  is no later turn in which it will.
+
+  One category was not usable as it stood. A proposal reached the prompt as its
+  reservation row -- an id, a run, a timestamp, two counts -- every field
+  operational, so "is Q-0004 already in front of the researcher" was not
+  answerable from it, which is precisely the audit it asked for files to do.
+  `sciencecontext.proposal_view` now reads the proposal document by the id the
+  reservation gives, and each entry carries its items with the capsule objects
+  each one `addresses`, whether a person has already promoted or declined it,
+  and whether its scientific basis is `current`, `STALE` or `unchecked`.
+  Coverage becomes a set intersection. A proposal that cannot be read reports
+  `items_unavailable` and the census says so, because "no item addresses this"
+  and "I could not read the items" are different facts and a reader that
+  confuses them concludes a covered direction is open.
+
+  The repository path used for the basis check comes from the runtime's own
+  context, never from the `project_path` recorded inside the proposal document:
+  a reader that dereferenced a path out of a model-written document would be
+  letting the document choose what gets opened.
+
+- **Reaching the same conclusion twice created a second scientific object.** A
+  finding is deduplicated on its content digest, which is right when the
+  content is the observation and wrong when it contains a model's prose. Two
+  frontier assessments over one scientific state reaching one recommendation
+  differ in wording, so they differed in digest, so one observation got two
+  citable identifiers -- and twenty repetitions fill all twelve slots of the
+  planner's finding window and push the project's real findings out of it.
+  Operational repetition dressed as scientific progress.
+
+  `RuntimeFinding.semantic_key` lets the producer state the identity instead,
+  and `actions.review.assessment_identity` is the one producer that does: the
+  frontier digest, the recommendation, and each ranked candidate as its action
+  plus its sorted targets, in rank order. Not the rationales, not the
+  qualitative scores, not the artifact ids, the run, the cycle or the clock.
+  A finding that states no key keeps the digest it has always had, byte for
+  byte, so nothing a proposal already rests on is restated.
+
+- **A cycle's conclusion lived only in the message that carried it.** The
+  recommendation was returned in memory and written into the
+  `RESEARCH_CYCLE_FINISHED` payload; the daemon copied it into the
+  `continue_objective` work item, and `should_continue` read that copy -- two
+  messages away from the row that concluded it.
+
+  `RRUN-20260918T054218Z-cb4962f4` was told `WAIT_HUMAN` by the frontier,
+  recorded it in `FIND-20260918T054359Z-313e1ec9`, and concluded
+  `START_NEXT_CYCLE`, because that build reached `WAIT_HUMAN` only through
+  `requires_human_promotion`. Honouring the frontier's own recommendation fixed
+  how the conclusion is *reached* and did nothing for the work item already
+  queued: it still said `START_NEXT_CYCLE`, and the next restart would have
+  believed it.
+
+  `research_runs.next_recommendation` now records what a cycle concluded, in
+  the same row update that records that it concluded, and
+  `_work_continue_objective` reads the run. The payload is advisory; a null
+  column means a build predating it finished the run, and the handler falls
+  back to the payload and records `parent_recommendation_source` -- with
+  `superseded_payload_recommendation` when the two disagreed, because a
+  continuation decided from a message rather than from a run is a thing an
+  auditor should be able to find. `parent_recommendation` rather than
+  `recommendation`, because on the success path `_cycle_result_payload`
+  already uses that key for the *successor's* conclusion, and two different
+  facts under one name is how a reader audits the wrong cycle.
+
+  The same handler gained the `has_successor` pre-check and the
+  `SuccessorExistsError` catch `_work_advance_objective` has had since
+  `sql/0014`. The two disagreed about one invariant and the live state found
+  the gap: a cancelled successor plus an expired lease would have hit the
+  unique index as an exception -- three failed attempts and a dead-lettered
+  item for a system behaving as designed. A cancelled successor counts.
+  Cancelling a cycle is a person's act and a retried queue row may not undo it.
+
+### Fixed, after two independent reviews of the work above
+
+Both reviewers were given the diff and told to attack it. Between them they
+found one defect that falsified the headline property, one that reproduced the
+defect the release exists to stop on a path the fix had skipped, and a
+documented boundary that was not true.
+
+- **The proposal items the frontier was supposed to intersect were being
+  clipped out of the prompt, while the census asserted they were there.** A
+  proposal view is *one* block entry, `prompt_safe_block` clips each entry at
+  `DEFAULT_FIELD_CHARS` (2 000), and a twelve-item proposal serialised at
+  `indent=2` to 6 550 characters. Measured on the real shape: **three of twelve
+  items reached the model**, the JSON was cut mid-object, nothing set
+  `items_unavailable`, and the controller-authored census -- the text outside
+  every fence, the text the prompt tells the model to trust -- reported all
+  twelve.
+
+  Both live thesis proposals hold eleven and twelve items, so the set
+  intersection this whole change exists to enable was being computed over a
+  quarter of the data, and `frontier@2`'s instruction then licenses exactly the
+  wrong answer: a question already in front of the researcher reads as
+  uncovered, and `START_NEXT_CYCLE` follows. Worse than a plain omission,
+  because `items_unavailable` and the census exist precisely to keep "nothing
+  addresses this" apart from "I could not read it", and truncation produced a
+  third state that reads as the first.
+
+  Three changes make it fit and one test keeps it fitting: the item view
+  carries the fields coverage is computed from and not the adjudication aids,
+  the title bound drops to 80 characters, both render sites serialise compactly
+  (this block is identifiers to intersect, not prose to read), and
+  `PromptTemplate.block_limits` gives the proposals block a measured
+  `PROPOSAL_BLOCK_CHARS = 6 000` against a worst case of 3 595. The bound is
+  not the guard: a new test renders a worst-case twelve-item proposal through
+  the real graph and asserts every item id and every address appears in the
+  prompt, so a future field that pushes the entry over the limit fails a test
+  instead of quietly losing items. `census` now says "N of M" whenever the item
+  bound is hit at all.
+
+  The test that should have caught this asserted on the *view object*. It
+  asserted the wrong layer, and said "so nothing is silently hidden" while
+  nine of twelve items were.
+
+- **The identity fix was applied to the success path only.** Three exits of
+  `assess_frontier_ranked` -- an empty frontier, a budget or routing failure,
+  an unusable response -- recorded a finding with no semantic key. Two of them
+  record `START_NEXT_CYCLE`, and their summaries embed the exception text:
+  `BudgetExhaustedError`'s message names the run and how much budget is left,
+  so the summary was *guaranteed* unique per cycle. A provider outage or a
+  tight budget therefore minted one new citable finding every cycle and twenty
+  of them filled the planner's window -- verbatim the defect `semantic_key`
+  exists to close, on the path most likely to repeat. All three exits are keyed
+  now, over the state and the failure *class*, never the message.
+
+- **`items_unavailable` carried an absolute path into the prompt.**
+  `ProposalStore.open` raises `no proposal <id> under <proposals_root()>`, the
+  first `_why_unreadable` formatted `str(exc)`, and the first version of the
+  test suite *asserted that the string arrived* -- so a role told in the same
+  prompt that it has no filesystem was handed the researcher's home directory
+  layout, with a test holding it in place. It reports the exception class now;
+  the message goes to the log, where a person debugging is looking and a model
+  provider is not. Two new tests assert the absence of `proposals_root()`,
+  `Path.home()` and the repository path on both error branches.
+
+- **The identity covered less state than the assessment was made over.**
+  `frontier_digest` is derived from capsule identifiers, the capsule cannot
+  move without a human promotion, so it is effectively constant for a whole
+  autonomous session -- while this release had just given the role three more
+  categories to assess over. Two assessments made before and after a
+  researcher declined an item would have collapsed onto one finding whose
+  stored rationale described inputs it was not computed from. The key now
+  includes `decision_context_digest`: per readable proposal, its id, its
+  undecided items and the *class* of its basis. Findings are deliberately still
+  excluded -- including them would change the identity every cycle, which is
+  the churn back again. What is in the key is what moves only when a person
+  acts or the science does.
+
+- **The frontier was shown its own previous assessments as completed work.**
+  A `FindingKind.FRONTIER` finding reached the block the instruction describes
+  as "work this runtime has already finished", so cycle N+1 read cycle N's own
+  recommendation and rationale as an established finding -- and with a repeat
+  keeping the first occurrence's wording, one early answer would be reinforced
+  indefinitely, on the decision that governs whether money is spent and whether
+  the system stops for a person. `noncanonical_science` takes
+  `exclude_finding_actions` and the frontier passes its own action. The planner
+  still sees them: it is choosing a verb, not re-deciding whether to continue.
+
+- **Smaller, from the same two reviews.** `semantic_key` is validated against
+  `<producer>:v<n>:<64 hex>` and stripped before use, so a constant or a blank
+  cannot silently merge every finding of its kind; `proposal_view` refuses a
+  document whose recorded `project_id` is not the run's, closing a reserved-id
+  collision between projects sharing one state home; `ranked_targets`
+  normalises the model's `ranked_actions` once for both the excerpt and the
+  identity, so the unguarded iteration over a provider-supplied `addresses`
+  exists in one place; `_work_advance_objective` records the conclusion it
+  deliberately overrode, which `continue_objective` had started doing and its
+  sibling had not; and `sciencecontext`'s docstring no longer claims it "reads
+  two tables", which stopped being true when it gained proposal items and the
+  basis check.
+
+- **Test-only, and worth recording as weakening that was found rather than
+  claimed.** Of the tests shipped with the first version, an audit identified
+  five as vacuous or near-vacuous. `test_assembling_the_context_makes_no_model_call`
+  was fully tautological and is now a structural assertion;
+  `test_the_proposal_reader_dereferences_only_the_path_it_is_given` never ran
+  its own mechanism, because the fixture recorded no basis, and now
+  discriminates between two capsules; the replay test proved only the unique
+  index from `0014` and now asserts refusal-not-failure; the restart and
+  reconnect tests had no disagreeing payload to win against and now do; the
+  whitespace parameter compared two unrelated strings and is now a real
+  variant; and `test_a_real_repeated_assessment_produces_one_finding` claimed a
+  property its assertion could not establish and has been retitled to what it
+  proves. Three of the twelve enumerated identity cases had no test -- identity
+  across a restart, across a reconnect, and under a changed *target* -- and all
+  three now do. The interrupt branch's durable write, and the write-once-sticky
+  `coalesce` semantics of the column, were both executed and unasserted; both
+  are asserted now.
+
 ### Changed
 
 - `runtime doctor`'s check-profile row was a divergence warning, then briefly
@@ -672,7 +888,13 @@ promotions and declines together.
   sets a project's standing ceiling. It refuses to set one at or below what has
   already been spent unless forced, because that stops all further work
   immediately.
-- `RUNTIME_SCHEMA_VERSION` is `0015`.
+- `RUNTIME_SCHEMA_VERSION` is `0018`. `0017` adds
+  `runtime_findings.semantic_key` and `0018` adds
+  `research_runs.next_recommendation` -- one concern per file, like every
+  migration before them. Both are additive, both take a constant default or a
+  null, and neither restates a row any proposal already cites.
+- The frontier prompt is `frontier@2`. A prompt is code and its identity
+  reaches the provenance of every call it produced.
 
 ### Tests
 
