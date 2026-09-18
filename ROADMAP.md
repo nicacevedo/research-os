@@ -99,17 +99,70 @@ and `nominate_insight`. Every action in the policy table now has a handler or is
 one a person performs. `docs/INTEGRATION_BUILD_RECORD.md` is the record and
 `docs/RUNTIME.md` §14a–§14c the specification.
 
-Two things it could not verify here, both genuine external prerequisites rather
-than defects:
+## Two external prerequisites, and the policy on each
 
-- **no Slurm.** No `sbatch`, `squeue`, `sacct`, config or `munge` on this host,
-  so the submission path has still never met a scheduler. The live harness is
-  `tests/test_experiment_slurm_live.py`, behind `-m slurm_live`.
-- **no OS containment.** `research_os/sandbox.py` implements it and this
-  kernel refuses the unprivileged user namespaces every available mechanism
-  needs, so high-autonomy execution of model-written code is *refused* here
-  rather than run uncontained. `runtime doctor` reports the probe and the
-  remedy.
+Neither is a defect. Both are things this workstation cannot establish, and
+both are stated here as decisions rather than left as a gap a reader has to
+infer from a skip count.
+
+### Slurm stays production architecture, and is unvalidated
+
+**Decision: it remains in the architecture, gated on validation elsewhere.**
+
+There is no `sbatch`, `squeue`, `sacct`, config or `munge` on this host, so the
+submission path has never met a scheduler. What exists is the executor, the raw
+state mapping, the failure classification and the reconciliation
+(`docs/RUNTIME.md` §10), held down against a mock by
+`tests/test_experiment_slurm.py`; and a live harness,
+`tests/test_experiment_slurm_live.py`, whose bodies are written, are built from
+the same API, and have never executed. It is deselected by default behind
+`-m slurm_live` and every test in it skips with a reason naming the missing
+prerequisite.
+
+So the claim this release makes is: **the Slurm path is implemented and
+unvalidated.** It must not be described as production-ready until the live
+harness has run against a real cluster, and no test or document may imply that
+it has. This is the FULL-readiness gate for the cluster backend; it does not
+gate the local architecture, whose executor is `LocalExecutor` and which the
+thesis pilot runs entirely through.
+
+Slurm is deliberately *not* installed here to clear the skip. This workstation
+is not the intended scheduler environment, and a single-node Slurm stood up to
+make a checklist green would validate a configuration nobody will run.
+
+### Review independence is achieved where possible, and reported where not
+
+**Decision: cross-provider-family review is not required for a Release
+Candidate. It is required before any claim of independent scientific review,
+and therefore before FULL.**
+
+Only one provider family (anthropic) is installed here. The router gives the
+strongest separation it can — a different model, `sonnet` reviewing `opus` —
+and records what it *achieved* rather than what was asked for, so every
+critical review on this host is marked
+`DEGRADED_SAME_PROVIDER_FAMILY: NOT an independent review` and that note reaches
+the run report. `runtime doctor` says it before a run rather than after.
+`review_independence: require` in `runtime.yaml` turns the degradation into a
+refusal that fails closed into `WAITING_FOR_EXTERNAL_DEPENDENCY`.
+
+The policy is therefore not "same-family models are independent" — the system
+already refuses to say that. It is that a *degraded, labelled* review is
+acceptable for RC, because a different model reading a frozen diff and a frozen
+evidence packet does catch real defects, and because the alternative on a
+one-family machine is no review at all. What it may not do is be *called*
+independent. A consequential review presented as independent requires a second
+provider family, which is an install and not a code change.
+
+### And one that is now closed
+
+Earlier releases listed **no OS containment** here. That is no longer true and
+the entry is retired: `bubblewrap 0.12.0` is present and security-eligible, the
+targeted AppArmor profile in `deploy/apparmor-bwrap` grants it `userns` while
+the global unprivileged-userns restriction stays on, nested user namespaces are
+denied inside the sandbox, and `researchctl runtime containment-audit` records
+38/38 adversarial checks held through the production `contain()` adapter, keyed
+to the binary's own hash and the policy digest. `SECURITY.md` states the scope
+and what the suite does not prove.
 
 ## Postponed until a later release proves them necessary
 
