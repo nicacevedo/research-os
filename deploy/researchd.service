@@ -107,8 +107,28 @@ ProtectSystem=strict
 ProtectHome=false
 ReadWritePaths=%h/.local/state/research-os %h/.local/share/research-os %h/.cache/research-os
 ProtectKernelTunables=true
-ProtectKernelModules=true
 ProtectControlGroups=true
+
+# `ProtectKernelModules=true` is deliberately absent, and its absence was found
+# by installing this file rather than by reading it.
+#
+# It is the one directive here a *user* manager cannot apply. It asks systemd to
+# drop `CAP_SYS_MODULE` from the capability bounding set, an unprivileged
+# manager may not touch the bounding set, and the unit therefore does not
+# degrade -- it fails to start, with `status=218/CAPABILITIES` and
+# `Failed to drop capabilities: Operation not permitted`, then crash-loops into
+# `StartLimitBurst`. Every other directive below and above it applies cleanly.
+#
+# Removing it costs nothing measurable, which was checked rather than assumed. A
+# process started by this user manager reports `CapPrm`, `CapEff` and `CapInh`
+# all zero -- it holds no capabilities at all -- and `NoNewPrivileges=true`,
+# which does apply, forbids it gaining any through a setuid binary. So the
+# bounding set is the ceiling on privileges this service has no route to reach,
+# and lowering that ceiling by one bit changed nothing except whether systemd
+# would start the process.
+#
+# On a *system* unit the directive works and is worth having. This file is a
+# user unit by design -- see the header -- so it is not.
 RestrictSUIDSGID=true
 RemoveIPC=true
 

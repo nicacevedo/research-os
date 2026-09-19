@@ -14,6 +14,27 @@ reboot not require the researcher to remember anything. Without linger the
 control plane stays stopped until the next login; without `researchd-db` it
 comes back and retries against a cluster nobody started.
 
+**Both units have now been installed and exercised on this machine**, which is
+how the one defect in `researchd.service` was found: it had never been
+installed, so nothing had discovered that `ProtectKernelModules=true` cannot be
+applied by a *user* manager. The unit did not degrade -- it failed to start with
+`status=218/CAPABILITIES` and crash-looped. The directive is gone and its
+header says why, including the check that removing it costs no protection a
+user unit actually delivers. What was verified after the fix:
+
+| | |
+|---|---|
+| `systemctl --user start` | active, attached to the configured DSN |
+| `systemctl --user stop` | graceful in 1.7s, "finishing the current pass", zero-work report |
+| `kill -9` the worker | systemd restarted it after `RestartSec`; run/finding/work/model-call counts identical afterwards, and no successor was created |
+| starting twice | second `start` is a no-op; a manual `researchd` beside the service finds the advisory lock held, says so, and exits 0 |
+| the human gate | the parked run's `next_recommendation` survived the crash and the restart |
+
+Not done, because it is a separate decision: `loginctl enable-linger`. Without
+it these units start at your next login and stop when you log out, which is why
+`Linger=no` is the state to check first if the control plane is not running
+after a reboot.
+
 `apparmor-bwrap` is a different kind of prerequisite: without it this machine
 has no working containment backend, so the runtime refuses to *execute* a
 model-written experiment at all -- it will design and preregister one and then
