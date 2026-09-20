@@ -99,6 +99,31 @@ and `nominate_insight`. Every action in the policy table now has a handler or is
 one a person performs. `docs/INTEGRATION_BUILD_RECORD.md` is the record and
 `docs/RUNTIME.md` §14a–§14c the specification.
 
+### R5 lifecycle hardening — provider-failure closure
+
+The first unattended run across a real infrastructure failure, on 2026-09-19,
+found that the runtime could report an outage as science. A planner call died
+on an OAuth refresh collision; three research runs concluded
+`SUCCEEDED / DONE_FOR_NOW` and `runtime status` told the researcher they had
+finished cleanly with a decision waiting. Three more runs were left in flight
+with nothing that could advance them, which removed their objectives from the
+frontier permanently.
+
+Closed: provider failures now leave the graph as exceptions rather than as
+responses a node interprets; retry schedules respect the provider's own
+cooldown and refund attempts for calls that never happened; a generic
+reconciliation pass recovers any run left in flight with no live work;
+objective advancement is fault-isolated with an explicit disposition each; and
+infrastructure failures no longer consume an objective's cycle allowance.
+`docs/RUNTIME.md` §17 is the contract and
+`tests/test_runtime_provider_failure_lifecycle.py` the regression.
+
+Not closed, and a deployment matter rather than a code one: `researchd` shares
+provider credentials with the researcher's interactive sessions unless they
+install an isolated one. `deploy/researchd.service` documents three ways;
+SECURITY.md states the boundary. The runtime recovers from the contention
+either way.
+
 ## Two external prerequisites, and the policy on each
 
 Neither is a defect. Both are things this workstation cannot establish, and

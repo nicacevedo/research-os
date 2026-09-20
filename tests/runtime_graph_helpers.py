@@ -10,6 +10,7 @@ asserted is the graph's control flow rather than a model's mood.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -18,10 +19,12 @@ from research_os.runtime.budgets import BudgetLedger
 from research_os.runtime.config import BudgetDefaults, RuntimeConfig, RuntimeSettings
 from research_os.runtime.context import CycleContext
 from research_os.runtime.db import Database
+from research_os.runtime.failures import FailureClass
 from research_os.runtime.idempotency import InvocationLedger
 from research_os.runtime.interfaces import Independence, ModelRequest, ModelResponse
 from research_os.runtime.kernel import ScientificKernelAdapter
 from research_os.runtime.queue import WorkQueue
+from research_os.runtime.routing import ProviderCallFailedError
 from research_os.runtime.store import RuntimeStore
 from tests.automation_helpers import commit_all
 from tests.fs_helpers import (
@@ -37,15 +40,47 @@ from tests.fs_helpers import (
 
 @dataclass
 class ScriptedRouter:
-    """Answers each role from a script, and records what it was asked."""
+    """Answers each role from a script, and records what it was asked.
+
+    It models the two provider outcomes the real router distinguishes, and
+    keeps them distinct, because conflating them is the defect this double is
+    most likely to hide:
+
+    ``fail_roles`` -- the provider *answered* with something unusable. A
+    returned response with an error, exactly as :class:`ModelRouter` returns
+    for malformed structured output.
+
+    ``unavailable_roles`` / ``unavailable`` -- the provider **did not answer**.
+    A raised :class:`ProviderCallFailedError`, exactly as the real router now
+    raises, carrying the breaker deadline a queue would schedule against. A
+    double that returned here instead would let a test pass against a runtime
+    that folds an outage into a scientific conclusion, which is what shipped.
+    """
 
     answers: dict[str, dict[str, Any]] = field(default_factory=dict)
     requests: list[ModelRequest] = field(default_factory=list)
     fail_roles: set[str] = field(default_factory=set)
+    #: Roles the provider cannot serve at all. Empty set plus ``unavailable``
+    #: true means every role.
+    unavailable_roles: set[str] = field(default_factory=set)
+    unavailable: bool = False
+    #: What the breaker would publish as ``cooldown_until``.
+    cooldown_until: datetime | None = None
+    #: Whether an invocation was actually made before failing. False models
+    #: routing turning the call away because every provider is cooling, which
+    #: must not cost the work item an attempt.
+    attempted: bool = True
 
     def complete(self, request: ModelRequest) -> ModelResponse:
         self.requests.append(request)
         role = str(request.role)
+        if self.unavailable or role in self.unavailable_roles:
+            raise ProviderCallFailedError(
+                f"no healthy provider offers {request.capability} for {role}",
+                failure_class=FailureClass.PROVIDER_UNAVAILABLE,
+                retry_at=self.cooldown_until,
+                attempted=self.attempted,
+            )
         if role in self.fail_roles:
             return ModelResponse(
                 provider="scripted",

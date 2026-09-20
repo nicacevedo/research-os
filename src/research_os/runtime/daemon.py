@@ -60,23 +60,38 @@ from research_os.runtime.cycles import (
     start_cycle,
 )
 from research_os.runtime.db import Database, TransientDatabaseError
-from research_os.runtime.failures import FailureClass
+from research_os.runtime.failures import (
+    PROVIDER_FAILURES,
+    FailureClass,
+    is_infrastructure,
+    retry_delay_seconds,
+)
 from research_os.runtime.idempotency import InvocationLedger, worker_identity
 from research_os.runtime.interfaces import ModelProvider, Notifier
 from research_os.runtime.leases import LeaseKeeper
-from research_os.runtime.locks import RepositoryBusyError, daemon_lock
+from research_os.runtime.locks import (
+    RepositoryBusyError,
+    daemon_lock,
+    runs_being_executed,
+)
 from research_os.runtime.migrations import migrate
 from research_os.runtime.models import (
     Autonomy,
     Event,
     ExternalJobStatus,
+    RunStatus,
+    StrandedRun,
     TerminalState,
     WorkItem,
     WorkStatus,
 )
 from research_os.runtime.notify import FileNotifier
 from research_os.runtime.queue import LeaseLostError, WorkQueue
-from research_os.runtime.store import RuntimeStore, SuccessorExistsError
+from research_os.runtime.store import (
+    RuntimeStateError,
+    RuntimeStore,
+    SuccessorExistsError,
+)
 
 LOG = logging.getLogger("researchd")
 
@@ -161,6 +176,13 @@ class TickReport:
     work_claimed: int = 0
     work_succeeded: int = 0
     work_failed: int = 0
+    #: Items put back on the queue without charging an attempt, because the
+    #: provider they need is in a breaker cooldown and no invocation was made.
+    work_deferred: int = 0
+    #: Stranded runs this pass put back on the queue.
+    runs_rescheduled: int = 0
+    #: Stranded runs this pass gave up on, after `max_run_reschedules`.
+    runs_abandoned: int = 0
     leases_reclaimed: int = 0
     invocations_abandoned: int = 0
     interpretations_abandoned: int = 0
@@ -180,6 +202,9 @@ class TickReport:
                 self.events_ingested,
                 self.work_enqueued,
                 self.work_claimed,
+                self.work_deferred,
+                self.runs_rescheduled,
+                self.runs_abandoned,
                 self.leases_reclaimed,
                 self.invocations_abandoned,
                 self.interpretations_abandoned,
@@ -199,6 +224,9 @@ class TickReport:
             "work_claimed": self.work_claimed,
             "work_succeeded": self.work_succeeded,
             "work_failed": self.work_failed,
+            "work_deferred": self.work_deferred,
+            "runs_rescheduled": self.runs_rescheduled,
+            "runs_abandoned": self.runs_abandoned,
             "leases_reclaimed": self.leases_reclaimed,
             "invocations_abandoned": self.invocations_abandoned,
             "interpretations_abandoned": self.interpretations_abandoned,
@@ -293,10 +321,20 @@ class Daemon:
         before anything looked at it, which is the kind of one-tick lag that is
         invisible in tests and looks like "it did not work" to a researcher who
         has just promoted something.
+
+        Run reconciliation sits between the two, and the position is load
+        bearing in both directions. After ``_recover``, because an expired
+        lease that is about to be requeued is not a stranded run and would be
+        double-counted as one. Before ``_observe_capsules``, because a run
+        stuck RUNNING hides its objective from ``parked_objectives`` -- so a
+        capsule change observed while the orphan still exists finds a smaller
+        frontier than the researcher has. On 2026-09-19 that difference was
+        five parked objectives against two.
         """
 
         report = TickReport()
         self._recover(report)
+        self._reconcile_runs(report)
         self._observe_capsules(report)
         self._ingest_events(report)
         self._fire_schedules(report)
@@ -427,6 +465,209 @@ class Daemon:
                 f"{interpretation.job_id} was abandoned; the next cycle will "
                 f"resume it rather than start a second one"
             )
+
+    # ------------------------------------------------------ reconciliation --
+    def _reconcile_runs(self, report: TickReport) -> None:
+        """Give every stranded run a way out, without naming any of them.
+
+        ``_recover`` answers "what were dead workers holding". This answers a
+        question nothing asked before: **what is holding nothing at all?**
+
+        A run is stranded when it is RUNNING or CREATED and no live work item,
+        and no outstanding external job, could ever advance it -- see
+        :meth:`RuntimeStore.stranded_runs`. There is no path out of that state
+        in the rest of this control plane. Nothing polls it, no event names
+        it, its work item is FAILED and the queue is finished with it. It is
+        RUNNING until someone runs SQL.
+
+        That is not only a stuck run; it is a lost *objective*, and that is
+        the part worth stating. ``parked_objectives`` excludes an objective
+        whose newest run is in flight, deliberately, so that a capsule change
+        cannot open a second thread for work already under way. An orphan is
+        in flight forever, so the objective it belongs to is removed from the
+        research frontier permanently, by a network failure. Three of them
+        were, on 2026-09-19.
+
+        Two dispositions, and the order matters:
+
+        **Reschedule**, when the run has not used up ``max_run_reschedules``.
+        A fresh ``run_cycle`` item, which re-enters the *same* run at its own
+        LangGraph checkpoint. Not a new cycle: no successor, no lineage link,
+        nothing charged to ``max_cycles_per_objective``. The work the cycle
+        already did is in the checkpoint and is reused.
+
+        **Abandon**, past the bound: FAILED / FATAL_INFRASTRUCTURE_ERROR, with
+        the evidence in ``detail``. Honest, and specifically *not* a scientific
+        terminal state -- an abandoned run is not offered to a capsule change
+        as though it had concluded something.
+
+        Idempotence comes from the dedup key, which names the reschedule
+        ordinal. Two daemons, or one restarted mid-pass, compute the same key
+        and the second enqueues nothing. The bound is counted from the event
+        ledger, so it cannot be reset by a restart either.
+        """
+
+        stranded = self._store.stranded_runs(
+            grace_seconds=self._config.settings.run_reconcile_grace_seconds,
+            limit=25,
+        )
+        # A cycle running right now looks exactly like a stranded one from the
+        # outside: `_work_advance_objective` executes inline, so between
+        # `open_cycle` and the ingest pass the run has no work item at all.
+        # The advisory lock is the only thing that knows the difference.
+        in_flight = runs_being_executed(
+            self._db, [entry.run.run_id for entry in stranded]
+        )
+        ceiling = self._config.settings.max_run_reschedules
+        for entry in stranded:
+            run = entry.run
+            if run.run_id in in_flight:
+                continue
+            if not self._blocking_condition_cleared(entry):
+                # The reason it stopped has not lifted. Rescheduling now would
+                # spend a reschedule to reach the same failure, so the pass
+                # says nothing and looks again next tick. Deliberately silent:
+                # an event per tick per waiting run is a log nobody reads.
+                continue
+            used = self._store.event_count(run_id=run.run_id, kind="RUN_RESCHEDULED")
+            if used >= ceiling:
+                self._abandon_run(entry, report, attempts=used)
+                continue
+            enqueued = self._queue.enqueue(
+                project_id=run.project_id,
+                kind=WorkKind.RUN_CYCLE,
+                run_id=run.run_id,
+                payload={
+                    "reason": "reconciliation",
+                    "reschedule": used + 1,
+                    "stranded_after": entry.last_failure_class,
+                },
+                max_attempts=self._config.settings.max_attempts,
+                dedup_key=f"reconcile:{run.run_id}:{used + 1}",
+            )
+            if not enqueued.created:
+                # Another pass got there first, *or* a crash landed between
+                # the enqueue and the event below on a previous tick. The two
+                # are indistinguishable from here and the second one used to
+                # wedge the run permanently: `event_count` stayed at n-1, so
+                # this pass kept computing the same dedup key, the key kept
+                # refusing, and the run was never rescheduled, never
+                # abandoned and never mentioned -- the exact orphan state this
+                # pass exists to end. An independent security review found it.
+                #
+                # Recording the event anyway is safe because the event has its
+                # own dedup key: the genuine concurrent case writes it once.
+                LOG.info(
+                    "%s already has reschedule %d queued; recording it",
+                    run.run_id,
+                    used + 1,
+                )
+            _event, recorded = self._store.record_event(
+                kind="RUN_RESCHEDULED",
+                project_id=run.project_id,
+                run_id=run.run_id,
+                work_id=enqueued.item.work_id,
+                payload={
+                    "reschedule": used + 1,
+                    "of": ceiling,
+                    "stranded_after": entry.last_failure_class,
+                    "last_error": (entry.last_error or "")[:1000],
+                },
+                dedup_key=f"rescheduled:{run.run_id}:{used + 1}",
+            )
+            # Paced: the grace period now applies to the *next* reschedule of
+            # this run too. See `RuntimeStore.touch_run`.
+            self._store.touch_run(run.run_id)
+            if not recorded:
+                # The event was already there, so this pass changed nothing
+                # and must not report that it did.
+                continue
+            report.runs_rescheduled += 1
+            if enqueued.created:
+                report.work_enqueued += 1
+            LOG.info(
+                "%s was %s with nothing to run; rescheduled (%d of %d) after %s",
+                run.run_id,
+                run.status,
+                used + 1,
+                ceiling,
+                entry.last_failure_class or "no recorded failure",
+            )
+
+    def _blocking_condition_cleared(self, entry: StrandedRun) -> bool:
+        """Whether it is worth putting this run back on the queue yet.
+
+        Only one condition is checked, because only one is *checkable*: a
+        provider breaker publishes a ``cooldown_until``, so "the thing that
+        stopped this has lifted" is a fact rather than a guess. Everything
+        else -- a worker that crashed, a daemon killed mid-pass, an item that
+        exhausted its attempts on something unclassified -- has no deadline to
+        wait for, and the grace period in ``stranded_runs`` is already the
+        answer to "has enough time passed".
+
+        A conservative default in the safe direction: unknown means go. A run
+        that is rescheduled too early fails again and is bounded by
+        ``max_run_reschedules``; a run that is never rescheduled is the defect
+        this pass exists to fix.
+        """
+
+        raw = entry.last_failure_class
+        if raw is None:
+            return True
+        try:
+            failure_class = FailureClass(raw)
+        except ValueError:  # pragma: no cover - the column holds known values
+            return True
+        if failure_class not in PROVIDER_FAILURES:
+            return True
+        names = tuple(health.provider for health in self._store.provider_health())
+        if not names:
+            return True
+        # Any provider out of cooldown is enough: routing will find it, and
+        # whether it is the *right* one for this cycle's criticality is
+        # routing's question, asked with a fresh attempt budget.
+        return bool(self._store.usable_providers(names))
+
+    def _abandon_run(
+        self, entry: StrandedRun, report: TickReport, *, attempts: int
+    ) -> None:
+        """Stop trying, in a state that claims nothing about the science."""
+
+        run = entry.run
+        reason = entry.last_failure_class or "no recorded failure"
+        detail = (
+            f"abandoned after {attempts} reconciliation attempt(s): the cycle "
+            f"could not be run ({reason}: {entry.last_error or 'no detail'}). "
+            f"No scientific stage completed, so this run concludes nothing."
+        )
+        try:
+            self._store.set_run_status(
+                run.run_id,
+                RunStatus.FAILED,
+                terminal_state=TerminalState.FATAL_INFRASTRUCTURE_ERROR,
+                detail=detail[:2000],
+                next_recommendation="BLOCKED_INFRASTRUCTURE",
+            )
+        except RuntimeStateError as exc:
+            # Someone finished it between the query and here. Nothing to do.
+            report.notes.append(f"{run.run_id}: not abandoned ({exc})")
+            return
+        self._store.record_event(
+            kind="RUN_ABANDONED",
+            project_id=run.project_id,
+            run_id=run.run_id,
+            payload={
+                "reschedules": attempts,
+                "stranded_after": entry.last_failure_class,
+                "last_error": (entry.last_error or "")[:1000],
+            },
+            dedup_key=f"abandoned:{run.run_id}",
+        )
+        report.runs_abandoned += 1
+        report.notes.append(
+            f"{run.run_id} could not be run after {attempts} reconciliation "
+            f"attempt(s); failed as an infrastructure error"
+        )
 
     # --------------------------------------------- capsule observation ----
     def _observe_capsules(self, report: TickReport) -> None:
@@ -782,12 +1023,16 @@ class Daemon:
                 return
             except TransientDatabaseError as exc:
                 self._finish_failed(
-                    item, FailureClass.DATABASE_TRANSIENT, str(exc), report
+                    item, FailureClass.DATABASE_TRANSIENT, str(exc), report, exc=exc
                 )
                 return
             except ResearchOSError as exc:
                 self._finish_failed(
-                    item, self._classify(exc), f"{type(exc).__name__}: {exc}", report
+                    item,
+                    self._classify(exc),
+                    f"{type(exc).__name__}: {exc}",
+                    report,
+                    exc=exc,
                 )
                 return
             except Exception as exc:
@@ -797,6 +1042,7 @@ class Daemon:
                     FailureClass.CODE_EXCEPTION,
                     f"{type(exc).__name__}: {exc}",
                     report,
+                    exc=exc,
                 )
                 return
 
@@ -818,27 +1064,167 @@ class Daemon:
         failure_class: FailureClass,
         error: str,
         report: TickReport,
+        *,
+        exc: BaseException | None = None,
     ) -> None:
+        """Record a failure, and schedule the retry against reality.
+
+        Two things are read off the exception when it offers them, because the
+        thing that failed knows more about the failure than the queue does:
+
+        ``retry_at`` -- when the blocking condition is known to lift. For a
+        provider breaker that is ``cooldown_until``. Without it the backoff
+        and the breaker were independent clocks and the item burned its
+        attempts inside the cooldown; see :meth:`WorkQueue.fail`.
+
+        ``attempted`` -- whether an invocation actually happened. When routing
+        refuses because every provider is cooling, nothing was tried, and
+        charging an attempt for being turned away at the door is how three
+        attempts become zero real tries. Those are *deferred* instead:
+        rescheduled past the cooldown with the attempt refunded, bounded by
+        ``max_parks`` so an outage that never ends still terminates.
+        """
+
+        retry_at = getattr(exc, "retry_at", None) if exc is not None else None
+        attempted = bool(getattr(exc, "attempted", True)) if exc is not None else True
+        if retry_at is None and failure_class in PROVIDER_FAILURES:
+            # **The deadline is looked up, not only inherited.**
+            #
+            # The exception is the better source when it has one -- the router
+            # knows exactly which breaker it hit. But an exception is not a
+            # reliable channel: an action handler that catches a provider
+            # error and reports it, or a broad `except ResearchOSError` two
+            # frames up, produces a failure with the right *class* and no
+            # deadline, and `perform_action` then re-raises a fresh exception
+            # that never had one. A test audit found several such paths, and
+            # the consequence was D2 intact: retried on the linear backoff,
+            # inside a cooldown, until the attempts ran out.
+            #
+            # The breaker's state is in the database either way, so ask it.
+            # That makes cooldown-aware scheduling a property of the failure
+            # *class* rather than of how carefully each of nine handlers
+            # preserved an exception.
+            retry_at = self._provider_recovery_deadline()
+        deferrable = (
+            not attempted
+            and failure_class in PROVIDER_FAILURES
+            and retry_at is not None
+        )
+
+        if deferrable and retry_at is not None:
+            # The deadline is handed to the queue as a timestamp and compared
+            # there. Converting it to a delay here would mean subtracting a
+            # database timestamp from this worker's clock, which `clock.py`
+            # forbids for exactly this kind of value -- and the first version
+            # of this path did it, producing a nine-month deferral under the
+            # frozen clock the tests inject.
+            #
+            # No check that the cooldown is still in the future either: if it
+            # has already lifted, the ordinary backoff floor applies and the
+            # item comes back in a class-appropriate interval. One branch
+            # fewer, and the branch removed was the one that needed a clock.
+            try:
+                parked = self._queue.wait_for_external(
+                    item.work_id,
+                    owner=self._owner,
+                    detail=error,
+                    retry_after_seconds=retry_delay_seconds(failure_class, attempt=1),
+                    failure_class=failure_class,
+                    not_before=retry_at,
+                )
+            except LeaseLostError:
+                report.notes.append(f"{item.work_id}: deferred after losing its lease")
+                return
+            if parked.status is not WorkStatus.FAILED:
+                report.work_deferred += 1
+                self._record_work_event(
+                    item,
+                    kind="WORK_DEFERRED",
+                    payload={
+                        "failure_class": str(failure_class),
+                        "error": error[:1000],
+                        "retry_at": retry_at.isoformat(),
+                    },
+                    dedup_key=f"work-deferred:{item.work_id}:{retry_at.isoformat()}",
+                )
+                report.notes.append(
+                    f"{item.work_id} ({item.kind}) waits for the provider until "
+                    f"{retry_at.isoformat()}; no attempt was charged because none "
+                    f"could be made"
+                )
+                return
+            # It ran out of parks. Fall through and report it as a failure,
+            # which is what the row now says it is.
+            report.work_failed += 1
+            self._record_work_event(
+                item,
+                kind="WORK_FAILED",
+                payload={"failure_class": str(failure_class), "error": error[:1000]},
+                dedup_key=f"work-failed:{item.work_id}:{item.attempts}",
+            )
+            return
+
         try:
             self._queue.fail(
                 item.work_id,
                 owner=self._owner,
                 failure_class=failure_class,
                 error=error,
+                not_before=retry_at,
             )
         except LeaseLostError:
             report.notes.append(f"{item.work_id}: failed after losing its lease")
             return
         report.work_failed += 1
-        if item.run_id:
-            self._store.record_event(
-                kind="WORK_FAILED",
-                project_id=item.project_id,
-                run_id=item.run_id,
-                work_id=item.work_id,
-                payload={"failure_class": str(failure_class), "error": error[:1000]},
-                dedup_key=f"work-failed:{item.work_id}:{item.attempts}",
-            )
+        self._record_work_event(
+            item,
+            kind="WORK_FAILED",
+            payload={"failure_class": str(failure_class), "error": error[:1000]},
+            dedup_key=f"work-failed:{item.work_id}:{item.attempts}",
+        )
+
+    def _provider_recovery_deadline(self) -> datetime | None:
+        """When the providers come back, or ``None`` if one is already usable.
+
+        ``None`` when any provider can be routed to now: there is nothing to
+        wait for, and delaying would be inventing a reason. Otherwise the
+        earliest moment a breaker lifts, which is the soonest a retry could
+        possibly succeed.
+        """
+
+        names = tuple(health.provider for health in self._store.provider_health())
+        if not names or self._store.usable_providers(names):
+            return None
+        cooling = self._store.provider_cooldowns(names)
+        return min(cooling.values()) if cooling else None
+
+    def _record_work_event(
+        self,
+        item: WorkItem,
+        *,
+        kind: str,
+        payload: dict[str, Any],
+        dedup_key: str,
+    ) -> None:
+        """Record what happened to a work item, run or no run.
+
+        The ``run_id`` guard this replaces is why the 2026-09-19 incident was
+        hard to read from the ledger. The ``advance_objective`` item that
+        exhausted three attempts on the provider outage carries no run -- it
+        is about a project, not a cycle -- so the one work item that explains
+        how five parked objectives became two emitted no event at all. The
+        three cycle failures around it did, which made the trail look
+        complete.
+        """
+
+        self._store.record_event(
+            kind=kind,
+            project_id=item.project_id,
+            run_id=item.run_id,
+            work_id=item.work_id,
+            payload={"kind": item.kind, **payload},
+            dedup_key=dedup_key,
+        )
 
     @staticmethod
     def _classify(exc: ResearchOSError) -> FailureClass:
@@ -847,7 +1233,18 @@ class Daemon:
         Kept small and explicit. An exception with no mapping is ``UNKNOWN``,
         which the policy table makes terminal -- so an unclassified failure
         stops rather than looping, and shows up as something to classify.
+
+        An exception that *states* its class is believed, and that is checked
+        before the table. The table maps a type to a class, which works while
+        one type means one thing; :class:`ProviderCallFailedError` means a
+        timeout or an outage depending on what the provider did, and only the
+        router knows which. Flattening both to ``PROVIDER_UNAVAILABLE`` would
+        have given a timeout the wrong backoff.
         """
+
+        declared = getattr(exc, "failure_class", None)
+        if isinstance(declared, FailureClass):
+            return declared
 
         from research_os.runtime.artifacts import ArtifactMissingError
         from research_os.runtime.budgets import BudgetExhaustedError
@@ -1143,6 +1540,11 @@ class Daemon:
 
         advanced: list[dict[str, Any]] = []
         skipped: list[dict[str, str]] = []
+        blocked: list[dict[str, str]] = []
+        #: The first infrastructure failure seen, kept so the item can be
+        #: retried against the right deadline after every objective has had
+        #: its turn. See the re-raise at the end of this handler.
+        blocker: BaseException | None = None
         for run in parked:
             previous = CycleResult(
                 run=run,
@@ -1212,6 +1614,46 @@ class Daemon:
                 # database. A lost race is not a failure of this work item.
                 skipped.append({"run_id": run.run_id, "reason": str(exc)})
                 continue
+            except ResearchOSError as exc:
+                # **Every other failure, isolated to the objective it belongs
+                # to.**
+                #
+                # This used to be absent, and the shape of that absence is the
+                # reason this handler is on the list. `start_cycle` runs a
+                # whole research cycle, so anything a cycle can hit, this loop
+                # can hit: a provider outage, a capsule that stopped parsing, a
+                # repository lock. One of those in the middle of the loop
+                # abandoned every objective after it -- not skipped with a
+                # reason, not deferred, not logged. They were simply never
+                # reached, and the result recorded the ones before the failure
+                # as though the list had ended there.
+                #
+                # On 2026-09-19 the fourth of five parked objectives hit an
+                # open provider breaker and the fifth was never evaluated. From
+                # the outside that is indistinguishable from "the fifth was not
+                # eligible", which is the one thing it must never be confused
+                # with.
+                #
+                # So each objective gets its own disposition, and the loop
+                # continues. Infrastructure failures are additionally
+                # remembered, because they mean "not yet" rather than "no" and
+                # the item must come back -- see the re-raise below.
+                failure_class = self._classify(exc)
+                blocked.append(
+                    {
+                        "run_id": run.run_id,
+                        "failure_class": str(failure_class),
+                        "reason": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+                if blocker is None and is_infrastructure(failure_class):
+                    blocker = exc
+                LOG.warning(
+                    "advancing %s failed (%s); continuing with the rest",
+                    run.run_id,
+                    failure_class,
+                )
+                continue
             advanced.append(
                 {
                     "parent_run_id": run.run_id,
@@ -1232,11 +1674,50 @@ class Daemon:
                     **self._cycle_result_payload(successor),
                 }
             )
+        # Every objective's disposition, durably, before anything is raised.
+        #
+        # I6 asks that no objective be silently dropped, and a result dict is
+        # not an answer to that: a work item that raises has no result. The
+        # event ledger is where a disposition survives a failed attempt, and
+        # the dedup key -- objective, capsule digest -- means replaying the
+        # same observation records it once rather than once per attempt.
+        for disposition, entries in (
+            ("ADVANCED", advanced),
+            ("STILL_PARKED", skipped),
+            ("FAILED_TO_ADVANCE", blocked),
+        ):
+            for entry in entries:
+                parent = str(entry.get("parent_run_id") or entry.get("run_id") or "")
+                self._store.record_event(
+                    kind="OBJECTIVE_DISPOSITION",
+                    project_id=project_id,
+                    run_id=parent or None,
+                    work_id=item.work_id,
+                    payload={
+                        "disposition": disposition,
+                        "capsule_digest": digest,
+                        "reason": str(entry.get("reason") or "")[:1000],
+                        "successor_run_id": entry.get("successor_run_id"),
+                        "failure_class": entry.get("failure_class"),
+                    },
+                    dedup_key=f"disposition:{parent}:{digest[:16]}",
+                )
+
+        if blocker is not None:
+            # Raised after every objective has been evaluated, not instead of
+            # evaluating them. The ones that advanced are durable -- their
+            # successors exist and `has_successor` skips them -- so the retry
+            # this raise produces resumes where this pass stopped rather than
+            # starting over. That is what keeps I6 and I7 from pulling against
+            # each other: isolation does not cost idempotence.
+            raise blocker
+
         return {
             "advanced": bool(advanced),
             "capsule_digest": digest,
             "successors": advanced,
             "skipped": skipped,
+            "blocked": blocked,
         }
 
     def _work_poll_jobs(self, item: WorkItem) -> dict[str, Any]:
@@ -1339,6 +1820,9 @@ def _accumulate(total: TickReport, report: TickReport) -> None:
         "work_claimed",
         "work_succeeded",
         "work_failed",
+        "work_deferred",
+        "runs_rescheduled",
+        "runs_abandoned",
         "leases_reclaimed",
         "invocations_abandoned",
         "interpretations_abandoned",
@@ -1435,6 +1919,8 @@ def default_model_factory(
             work_id=work_id,
             role_settings=role_settings,
             require_independence=config.settings.review_independence == "require",
+            failure_threshold=config.settings.provider_failure_threshold,
+            cooldown_seconds=config.settings.provider_cooldown_seconds,
         )
 
     return build

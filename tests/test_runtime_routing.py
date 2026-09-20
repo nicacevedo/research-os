@@ -23,6 +23,7 @@ from research_os.automation.models import Access, RoleSetting
 from research_os.runtime.artifacts import FilesystemArtifactStore
 from research_os.runtime.budgets import BudgetExhaustedError, BudgetLedger, Dimension
 from research_os.runtime.db import Database
+from research_os.runtime.failures import FailureClass
 from research_os.runtime.interfaces import (
     Capability,
     Criticality,
@@ -34,6 +35,7 @@ from research_os.runtime.models import BudgetScope, ModelCallStatus
 from research_os.runtime.routing import (
     CriticalCapabilityUnavailableError,
     ModelRouter,
+    ProviderCallFailedError,
     ProviderProfile,
     RoutingError,
     profiles_from_adapters,
@@ -315,8 +317,16 @@ def test_a_failed_call_is_recorded_too(
         adapters={"broken": broken},
         profiles=(ProviderProfile(name="broken", family="a", tier=3),),
     )
-    response = router.complete(_request())
-    assert not response.ok
+    # Raised, not returned. A provider that did not answer is not a response
+    # a caller may reason about: eleven callers used to reason about it, and
+    # the one in the planner node concluded DONE_FOR_NOW. See
+    # `ProviderCallFailedError`.
+    with pytest.raises(ProviderCallFailedError) as raised:
+        router.complete(_request())
+    assert raised.value.failure_class is FailureClass.PROVIDER_UNAVAILABLE
+    assert raised.value.attempted is True
+
+    # And recorded regardless, which is what this test has always been about.
     call = RuntimeStore(runtime_db).list_model_calls(run_id=run_id)[0]
     assert call.status is ModelCallStatus.FAILED
     assert call.error and "boom" in call.error
@@ -943,3 +953,178 @@ def test_require_is_satisfied_when_a_second_family_exists(
     assert reviewer.ok
     assert reviewer.provider != producer.provider
     assert reviewer.independence is Independence.DIFFERENT_FAMILY
+
+
+# ---------------------------------------- a provider that did not answer ----
+#
+# Three ways `ModelRouter.complete` can fail to get an answer, and one way it
+# can get a bad one. The first three raise and the fourth returns, because
+# only the fourth is an answer -- see `ProviderCallFailedError`. Each is
+# checked separately because the classes differ, and the class is what picks
+# the backoff.
+
+
+def test_a_provider_that_cannot_be_invoked_is_transient_not_unknown(
+    runtime_db: Database, tmp_path: Path, run_id: str, runtime_project: str
+) -> None:
+    """An adapter that raises used to fall through to UNKNOWN, which is terminal.
+
+    The daemon's classifier maps exception *types*, and a subprocess failure is
+    an `OSError` or whatever else the adapter produced -- no mapping, so
+    `UNKNOWN`, whose policy is FAIL_PERMANENTLY. A provider process that could
+    not be spawned is about as transient as a failure gets, and it was the one
+    failure this runtime would never retry.
+    """
+
+    class Exploding(FakeProvider):
+        def invoke(self, request: object) -> object:  # type: ignore[override]
+            raise OSError("the provider executable could not be spawned")
+
+    router = _router(
+        runtime_db,
+        tmp_path,
+        run_id=run_id,
+        project_id=runtime_project,
+        adapters={"boom": Exploding(name="boom", family="a")},
+        profiles=(ProviderProfile(name="boom", family="a", tier=3),),
+    )
+    with pytest.raises(ProviderCallFailedError) as raised:
+        router.complete(_request())
+    assert raised.value.failure_class is FailureClass.PROVIDER_TRANSIENT
+    assert raised.value.attempted is True
+    # Recorded, and the breaker advanced, exactly as for any other failure.
+    assert RuntimeStore(runtime_db).list_model_calls(run_id=run_id)[0].status is (
+        ModelCallStatus.FAILED
+    )
+
+
+def test_a_timed_out_provider_is_classified_as_a_timeout(
+    runtime_db: Database, tmp_path: Path, run_id: str, runtime_project: str
+) -> None:
+    """A timeout and an outage want different backoffs, so they are different classes."""
+
+    slow = FakeProvider(
+        name="slow",
+        family="a",
+        responses={
+            "planner": [
+                ScriptedResponse(
+                    structured=None,
+                    exit_code=None,
+                    timed_out=True,
+                    error="provider timed out after 600s",
+                )
+            ]
+        },
+    )
+    router = _router(
+        runtime_db,
+        tmp_path,
+        run_id=run_id,
+        project_id=runtime_project,
+        adapters={"slow": slow},
+        profiles=(ProviderProfile(name="slow", family="a", tier=3),),
+    )
+    with pytest.raises(ProviderCallFailedError) as raised:
+        router.complete(_request())
+    assert raised.value.failure_class is FailureClass.PROVIDER_TIMEOUT
+    assert RuntimeStore(runtime_db).list_model_calls(run_id=run_id)[0].status is (
+        ModelCallStatus.TIMEOUT
+    )
+
+
+def test_being_refused_by_an_open_breaker_carries_its_deadline_and_costs_nothing(
+    runtime_db: Database, tmp_path: Path, run_id: str, runtime_project: str
+) -> None:
+    """The routing refusal, which is the path that must not spend an attempt.
+
+    No invocation happens, so there is nothing to charge for -- and the
+    breaker already knows when it will lift, which is the only number that
+    makes the retry schedule correct. Before this the refusal carried neither,
+    and the item's three attempts were spent inside a five-minute cooldown.
+    """
+
+    store = RuntimeStore(runtime_db)
+    health = None
+    for _ in range(3):
+        health = store.record_provider_result(
+            "sick", ok=False, error="500", threshold=3, cooldown=300
+        )
+    assert health is not None and health.cooldown_until is not None
+
+    adapters = {"sick": _provider("sick", "a")}
+    router = _router(
+        runtime_db,
+        tmp_path,
+        run_id=run_id,
+        project_id=runtime_project,
+        adapters=adapters,
+        profiles=(ProviderProfile(name="sick", family="a", tier=3),),
+    )
+    with pytest.raises(ProviderCallFailedError) as raised:
+        router.complete(_request())
+    assert raised.value.attempted is False, (
+        "an attempt was charged for a call that was never made"
+    )
+    assert raised.value.retry_at == health.cooldown_until
+    assert raised.value.failure_class is FailureClass.PROVIDER_UNAVAILABLE
+    # Nothing was invoked, so nothing was recorded against the run.
+    assert store.list_model_calls(run_id=run_id) == ()
+
+
+def test_critical_work_refused_while_cooling_still_carries_the_deadline(
+    runtime_db: Database, tmp_path: Path, run_id: str, runtime_project: str
+) -> None:
+    """`CriticalCapabilityUnavailableError` is a provider failure with a clock.
+
+    It is raised when the only provider strong enough is unavailable, and
+    "unavailable" is frequently "in a cooldown that ends in four minutes". A
+    sibling class without a deadline would have been retried blind.
+    """
+
+    store = RuntimeStore(runtime_db)
+    health = None
+    for _ in range(3):
+        health = store.record_provider_result(
+            "strong", ok=False, error="500", threshold=3, cooldown=300
+        )
+    assert health is not None
+
+    router = _router(
+        runtime_db,
+        tmp_path,
+        run_id=run_id,
+        project_id=runtime_project,
+        adapters={"strong": _provider("strong", "a")},
+        profiles=(ProviderProfile(name="strong", family="a", tier=3),),
+    )
+    with pytest.raises(CriticalCapabilityUnavailableError) as raised:
+        router.complete(_request(criticality=Criticality.CRITICAL))
+    assert isinstance(raised.value, ProviderCallFailedError)
+    assert raised.value.retry_at == health.cooldown_until
+    assert raised.value.attempted is False
+
+
+def test_a_refusal_with_no_provider_at_all_names_no_deadline(
+    runtime_db: Database, tmp_path: Path, run_id: str, runtime_project: str
+) -> None:
+    """Waiting does not install a provider, and the failure must not imply it does.
+
+    ``retry_at`` is None when nothing is merely cooling. That is the
+    difference between "wait four minutes" and "this machine has no provider
+    that can do this", and a retry policy that could not tell them apart would
+    wait forever for one that will never exist.
+    """
+
+    router = _router(
+        runtime_db,
+        tmp_path,
+        run_id=run_id,
+        project_id=runtime_project,
+        adapters={"weak": _provider("weak", "a")},
+        profiles=(ProviderProfile(name="weak", family="a", tier=1),),
+    )
+    with pytest.raises(ProviderCallFailedError) as raised:
+        router.complete(_request(criticality=Criticality.CRITICAL))
+    assert raised.value.retry_at is None
+    assert raised.value.attempted is False

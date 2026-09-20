@@ -231,6 +231,24 @@ class ResearchRun(_Record):
         return self.status in TERMINAL_RUN_STATUSES
 
 
+class StrandedRun(_Record):
+    """A run that is in flight with nothing left that could advance it.
+
+    A run plus the evidence about why, kept together because a reconciler
+    needs both and reading them separately invites the two to disagree. See
+    :meth:`research_os.runtime.store.RuntimeStore.stranded_runs`.
+    """
+
+    run: ResearchRun
+    #: The failure class of the run's most recent work item, if it had one.
+    #: Evidence for the reconciler's decision, never part of the test for
+    #: whether the run is stranded -- a run stranded by a daemon killed
+    #: between `open_cycle` and the ingest pass has no work item at all.
+    last_failure_class: str | None = None
+    last_error: str | None = None
+    last_work_status: str | None = None
+
+
 class WorkItem(_Record):
     work_id: str
     run_id: str | None

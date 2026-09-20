@@ -30,7 +30,10 @@ right response differs:
 
 from __future__ import annotations
 
+from datetime import datetime
 from enum import StrEnum
+
+from research_os.errors import ResearchOSError
 
 
 class FailureClass(StrEnum):
@@ -164,3 +167,110 @@ def requires_human(failure_class: FailureClass) -> bool:
 def retry_delay_seconds(failure_class: FailureClass, *, attempt: int = 1) -> float:
     base = _BASE_DELAY.get(failure_class, _DEFAULT_DELAY)
     return base * max(1, attempt)
+
+
+#: The classes that mean **the work did not run**, as opposed to "the work ran
+#: and this is what it found".
+#:
+#: The distinction the live pilot of 2026-09-19 proved is load-bearing. A
+#: planner call died on an OAuth refresh collision; the graph node caught the
+#: unusable response, wrote it into ``plan_refusal``, and ``conclude`` mapped
+#: any refusal to ``DONE_FOR_NOW``. Three research runs therefore finished as
+#: ``SUCCEEDED / DONE_FOR_NOW`` and `researchctl runtime status` told the
+#: researcher they had "finished cleanly" and that a scientific decision was
+#: theirs to make. No scientific stage had executed at all.
+#:
+#: So this set exists to make one sentence checkable in code rather than
+#: believed in prose:
+#:
+#:     a transient infrastructure failure must delay science, never impersonate
+#:     it.
+#:
+#: Membership is decided by one question: *if work stopped for this reason, did
+#: any scientific stage produce an answer?* For everything below, no -- the
+#: provider never answered, the database blinked, the worker died, the lease
+#: was lost, the scheduler was unreachable. Whatever the runtime says about the
+#: science afterwards would be made up.
+#:
+#: Deliberately **excluded**, and each for a reason:
+#:
+#: - ``MODEL_OUTPUT_INVALID`` / ``..._REPEATED`` -- a model answered; the answer
+#:   was unusable. That is a fact about the model, and the one re-ask the policy
+#:   table grants it is a scientific retry, not an infrastructure wait.
+#: - ``DETERMINISTIC_CHECK_FAILED`` and ``CODE_EXCEPTION`` -- the work ran. A
+#:   red test is a result.
+#: - the ``SLURM_*`` classes -- an experiment that was preempted or ran out of
+#:   memory is a *job* that did not finish, handled by the external-job
+#:   lifecycle and its own terminal state, not by pretending a cycle failed.
+#: - ``BUDGET_EXHAUSTED``, ``MISSING_SCIENTIFIC_AUTHORITY``, ``CAPABILITY_DENIED``,
+#:   ``POLICY_REFUSED`` -- policy answers. The system worked and said no.
+#: - ``UNKNOWN`` -- the whole point of ``UNKNOWN`` is that nothing may be
+#:   concluded from it, including that it was infrastructure.
+INFRASTRUCTURE: frozenset[FailureClass] = frozenset(
+    {
+        FailureClass.PROVIDER_TRANSIENT,
+        FailureClass.PROVIDER_RATE_LIMIT,
+        FailureClass.PROVIDER_UNAVAILABLE,
+        FailureClass.PROVIDER_TIMEOUT,
+        FailureClass.SCHEDULER_UNAVAILABLE,
+        FailureClass.DATABASE_TRANSIENT,
+        FailureClass.WORKER_CRASH,
+        FailureClass.LEASE_LOST,
+    }
+)
+
+#: The subset of :data:`INFRASTRUCTURE` that is about a model provider, and so
+#: the subset whose retry schedule must respect a provider cooldown. Separate
+#: from the whole set because a database hiccup has no ``cooldown_until``.
+PROVIDER_FAILURES: frozenset[FailureClass] = frozenset(
+    {
+        FailureClass.PROVIDER_TRANSIENT,
+        FailureClass.PROVIDER_RATE_LIMIT,
+        FailureClass.PROVIDER_UNAVAILABLE,
+        FailureClass.PROVIDER_TIMEOUT,
+    }
+)
+
+
+def is_infrastructure(failure_class: FailureClass) -> bool:
+    """Whether this class means no scientific stage executed.
+
+    Never a scientific conclusion, whatever else the runtime does about it.
+    """
+
+    return failure_class in INFRASTRUCTURE
+
+
+class StageExecutionError(ResearchOSError):
+    """A required stage of a cycle could not execute.
+
+    Raised rather than returned, and that is the whole design. A node that
+    *returns* an unusable model response hands the graph something to reason
+    about, and the graph's vocabulary is scientific: every terminal state it
+    can reach is a statement about the science. There is no way to say "no
+    conclusion was reached because nothing ran" in that vocabulary, so the
+    first build said ``DONE_FOR_NOW`` instead.
+
+    An exception leaves the graph entirely. It reaches the work queue, which
+    has exactly the right vocabulary -- a failure class, a retry policy and a
+    schedule -- and the run stays un-concluded while the queue works on it.
+
+    ``retry_at`` is when the blocking condition is known to clear, when that is
+    known: a provider breaker records a ``cooldown_until``, and retrying before
+    it is guaranteed to fail. ``attempted`` says whether a real invocation
+    happened, which decides whether this costs an attempt: being turned away by
+    an open breaker is not a failed try.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        failure_class: FailureClass,
+        retry_at: datetime | None = None,
+        attempted: bool = True,
+    ) -> None:
+        super().__init__(message)
+        self.failure_class = failure_class
+        self.retry_at = retry_at
+        self.attempted = attempted

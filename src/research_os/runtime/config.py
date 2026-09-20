@@ -109,6 +109,27 @@ class RuntimeSettings(BaseModel):
     provider_failure_threshold: int = Field(default=3, ge=1, le=100)
     #: How long an unhealthy provider is left alone before being tried again.
     provider_cooldown_seconds: int = Field(default=300, ge=1, le=86_400)
+    #: How long a run may be RUNNING with nothing to run before reconciliation
+    #: treats it as stranded.
+    #:
+    #: A grace period rather than an immediate check, because "RUNNING with no
+    #: live work" is also the perfectly normal state between a worker failing
+    #: an item and the queue's backoff making it claimable again. The grace has
+    #: to exceed the longest ordinary gap, which is one lease plus the largest
+    #: retry delay; five minutes covers both with room, and a run that really
+    #: is stranded has been stranded for hours by the time anyone looks.
+    run_reconcile_grace_seconds: int = Field(default=300, ge=10, le=86_400)
+    #: How many times reconciliation may put a stranded run back on the queue
+    #: before giving up and failing it.
+    #:
+    #: This is a bound on *recovery*, not on retries: each reschedule happens
+    #: only when the condition that stranded the run has visibly cleared, and
+    #: re-enters the same run at its own LangGraph checkpoint rather than
+    #: opening a new cycle. So it costs no cycle of the objective's ceiling and
+    #: creates no successor. It is bounded anyway, because invariant 14 says
+    #: every loop has a finite stop condition and "the provider recovers and
+    #: immediately breaks again" is a loop.
+    max_run_reschedules: int = Field(default=5, ge=1, le=100)
     #: Whether critical scientific review must be genuinely independent.
     #:
     #: ``prefer`` is the default and the honest one for a single-provider

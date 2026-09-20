@@ -59,7 +59,6 @@ from research_os.runtime.prompts import (
     SKEPTIC,
     PromptTemplate,
 )
-from research_os.runtime.routing import RoutingError
 from research_os.runtime.sciencecontext import MAX_PLANNER_FINDINGS
 
 LOG = logging.getLogger("research_os.runtime.actions.explore")
@@ -204,7 +203,13 @@ def _run_branch(
                 json_schema=template.output_schema,
             )
         )
-    except (BudgetExhaustedError, RoutingError) as exc:
+    except BudgetExhaustedError as exc:
+        # Budget only; a `RoutingError` propagates. A branch that could not
+        # reach a provider used to come back as an empty branch, and two empty
+        # branches were reported as MODEL_OUTPUT_INVALID -- "no branch produced
+        # a usable proposal" -- which is not infrastructure, so nothing
+        # intercepted it and the cycle concluded DONE_FOR_NOW. An outage
+        # described as a model that answered badly.
         return [], "none", f"{template.name} did not run: {exc}", None
 
     if not response.ok or response.structured is None:
@@ -465,10 +470,26 @@ def derive_mathematics(
                 json_schema=DERIVER.output_schema,
             )
         )
-    except (BudgetExhaustedError, RoutingError) as exc:
+    # **Only the budget is caught here.** A `RoutingError` -- which is what a
+    # provider that did not answer now raises -- is deliberately allowed to
+    # propagate out of this handler.
+    #
+    # Catching it looked careful and was the opposite. It converted an outage
+    # into an `ActionOutcome`, and an `ActionOutcome` carries a failure class
+    # and nothing else: not the breaker's `cooldown_until`, not whether an
+    # invocation happened. Both are what the queue needs to schedule the
+    # retry, so every provider failure that came through this door was
+    # rescheduled by the linear backoff alone and charged an attempt even when
+    # routing had refused before calling anything -- the 2026-09-19 arithmetic
+    # exactly, on a second path.
+    #
+    # A budget refusal is genuinely different and stays: it is a policy answer
+    # rather than a malfunction, no amount of waiting changes it, and the
+    # honest terminal state is BUDGET_EXHAUSTED.
+    except BudgetExhaustedError as exc:
         return ActionOutcome.failed(
             f"the deriver did not run: {exc}",
-            failure_class=FailureClass.PROVIDER_UNAVAILABLE,
+            failure_class=FailureClass.BUDGET_EXHAUSTED,
         )
     if not response.ok or response.structured is None:
         return ActionOutcome.failed(

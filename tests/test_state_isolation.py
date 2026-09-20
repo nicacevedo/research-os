@@ -21,6 +21,7 @@ import pytest
 from research_os import paths
 from tests.conftest import (
     STATE_ENV_VARS,
+    _assert_database_is_isolated,
     _assert_state_is_isolated,
     _real_state_inventory,
     resolve_path_entry_points,
@@ -149,6 +150,55 @@ def test_the_guard_rejects_a_path_outside_the_pytest_root(
             _assert_state_is_isolated(_basetemp(tmp_path_factory))
 
     _assert_state_is_isolated(_basetemp(tmp_path_factory))
+
+
+def test_the_runtime_dsn_is_removed_by_default(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """A live control plane is real state, and this suite must not reach it.
+
+    The four XDG roots were the whole story until a control plane existed. It
+    does now, and its systemd unit exports ``RESEARCH_OS_RUNTIME_DSN`` from an
+    ``EnvironmentFile`` -- so every shell descended from one that read it
+    hands ``uv run pytest`` a DSN for the researcher's running PostgreSQL.
+    ``research_os.runtime.config`` reads that variable and ``researchctl``
+    connects to whatever it names.
+    """
+
+    assert os.environ.get("RESEARCH_OS_RUNTIME_DSN") is None
+    _assert_database_is_isolated(_basetemp(tmp_path_factory))
+
+
+def test_the_database_guard_rejects_an_inherited_live_dsn(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """The database guard is not vacuous either.
+
+    Two shapes are rejected: any DSN naming a local cluster outside pytest's
+    root, and -- whatever its shape -- the exact DSN this process inherited,
+    which is the one that arrived by accident rather than by a test's
+    decision.
+    """
+
+    basetemp = _basetemp(tmp_path_factory)
+    with pytest.MonkeyPatch.context() as scoped:
+        scoped.setenv(
+            "RESEARCH_OS_RUNTIME_DSN",
+            "postgresql://postgres@/research_os?host=/var/lib/somebodys-cluster",
+        )
+        with pytest.raises(AssertionError, match="did not start"):
+            _assert_database_is_isolated(basetemp)
+
+    # A literal with no local cluster is allowed, so a test may check
+    # redaction or an unreachable host without starting a server.
+    with pytest.MonkeyPatch.context() as scoped:
+        scoped.setenv(
+            "RESEARCH_OS_RUNTIME_DSN",
+            "postgresql://someone:hunter2@localhost:5432/research_os",
+        )
+        _assert_database_is_isolated(basetemp)
+
+    _assert_database_is_isolated(basetemp)
 
 
 def test_default_resolution_can_still_be_tested_with_a_temporary_home(

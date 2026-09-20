@@ -310,6 +310,46 @@ Two things it deliberately is not:
 Browser subscription interfaces must not be scraped or unofficially automated.
 Authentication and provider terms are respected.
 
+### Provider credentials are shared with the researcher's own sessions
+
+Stated because it is a real property of this deployment rather than a
+hypothetical, and because it was found by running the system rather than by
+reading it.
+
+`researchd` invokes the provider CLI as an ordinary subprocess and does not
+scrub the environment, so it authenticates as the user who started it, from
+that user's configuration directory. On a workstation where the researcher
+also uses the same CLI interactively, **one credential is shared by two
+processes**, and on 2026-09-19 a concurrent OAuth refresh failed for both:
+
+```text
+Failed to refresh OAuth token: another Claude Code process is refreshing it
+or exited mid-refresh.
+```
+
+What this is and is not:
+
+- it is **not** a privilege escalation. The daemon is a user service and has
+  exactly the access the researcher already has; there is no boundary here for
+  it to cross;
+- it **is** an availability coupling, and one that reached the science. The
+  runtime turned the resulting outage into three research runs reported as
+  finished. `docs/RUNTIME.md` §17 is the fix and the contract;
+- it **is** a reason to prefer an isolated credential for the daemon, which
+  `deploy/researchd.service` documents three ways of installing.
+
+The boundary that does not move: **installing a credential is a human act.**
+Nothing in this repository creates, copies, reads, or prints one. The daemon
+receives whatever the researcher put in the `EnvironmentFile` it is pointed at,
+that file is the researcher's to create with `chmod 600`, and the rules under
+**Secrets** above apply to it unchanged — it must never enter Git.
+
+The runtime logs provider *errors*, which are provider-authored text, and the
+error above is an example of one. It names no token. Nothing in the model-call
+ledger, the event ledger or `runtime status` records a credential; what is
+recorded per call is the provider name, the model, the prompt and output
+hashes, tokens, cost, latency and status.
+
 ## Human authorization boundaries
 
 Humans retain authority over credentials, provider subscriptions, system-level

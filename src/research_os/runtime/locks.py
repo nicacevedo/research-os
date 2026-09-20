@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from enum import IntEnum
 
@@ -197,6 +197,38 @@ def daemon_lock(db: Database, *, subject: str = "control-plane"):
     """
 
     return advisory_lock(db, lock_class=LockClass.DAEMON, subject=subject, wait=False)
+
+
+def runs_being_executed(db: Database, run_ids: Sequence[str]) -> set[str]:
+    """Which of these runs a worker is inside right now.
+
+    Exact, not inferred. `research_run_lock` is held for the whole of
+    `cycles._execute`, so the advisory lock is the only thing that knows a
+    cycle is mid-flight -- the run row is written at the start and at the end
+    and not in between, and a cycle can legitimately take minutes.
+
+    Reconciliation needs this because "in flight with no work item" is also
+    what a perfectly healthy cycle looks like from the outside when
+    `_work_advance_objective` runs it inline: the run exists, its
+    RESEARCH_RUN_REQUESTED event has not been ingested yet, and no work item
+    references it. Without this check a cycle slower than the grace period
+    would be diagnosed as stranded and a second worker sent into its
+    LangGraph thread. The run lock would refuse the second worker, so it was
+    never a correctness hole -- but it would have burned a reschedule from a
+    budget meant for real failures, and "safe because something else refuses"
+    is not the same as safe.
+
+    The key derivation is Python's, so the filtering is too: the query returns
+    the held keys in this runtime's namespace and the caller's ids are hashed
+    the same way `advisory_lock` hashes them.
+    """
+
+    if not run_ids:
+        return set()
+    held = {objid for _classid, objid in held_locks(db)}
+    return {
+        run_id for run_id in run_ids if _key(LockClass.RESEARCH_RUN, run_id) in held
+    }
 
 
 def held_locks(db: Database) -> tuple[tuple[int, int], ...]:

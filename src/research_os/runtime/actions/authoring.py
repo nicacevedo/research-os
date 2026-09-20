@@ -45,7 +45,6 @@ from research_os.runtime.context import CycleContext
 from research_os.runtime.failures import FailureClass
 from research_os.runtime.interfaces import ModelRequest
 from research_os.runtime.prompts import AUTHOR, REFEREE
-from research_os.runtime.routing import RoutingError
 
 LOG = logging.getLogger("research_os.runtime.actions.authoring")
 
@@ -118,10 +117,14 @@ def draft_manuscript(
                 json_schema=AUTHOR.output_schema,
             )
         )
-    except (BudgetExhaustedError, RoutingError) as exc:
+    # Budget only; a `RoutingError` propagates. See the other eight sites: an
+    # `ActionOutcome` cannot carry the breaker's deadline or the fact that no
+    # invocation happened, so an outage caught here is rescheduled by the
+    # linear backoff alone and charged an attempt it never spent.
+    except BudgetExhaustedError as exc:
         return ActionOutcome.failed(
             f"the author did not run: {exc}",
-            failure_class=FailureClass.PROVIDER_UNAVAILABLE,
+            failure_class=FailureClass.BUDGET_EXHAUSTED,
         )
     if not response.ok or response.structured is None:
         return ActionOutcome.failed(
@@ -303,10 +306,14 @@ def referee_manuscript(
                 json_schema=REFEREE.output_schema,
             )
         )
-    except (BudgetExhaustedError, RoutingError) as exc:
+    # Budget only; a `RoutingError` propagates. See the other eight sites: an
+    # `ActionOutcome` cannot carry the breaker's deadline or the fact that no
+    # invocation happened, so an outage caught here is rescheduled by the
+    # linear backoff alone and charged an attempt it never spent.
+    except BudgetExhaustedError as exc:
         return ActionOutcome.failed(
             f"the referee did not run: {exc}",
-            failure_class=FailureClass.PROVIDER_UNAVAILABLE,
+            failure_class=FailureClass.BUDGET_EXHAUSTED,
         )
     if not response.ok or response.structured is None:
         return ActionOutcome.failed(

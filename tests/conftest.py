@@ -31,6 +31,7 @@ from __future__ import annotations
 import os
 from collections.abc import Iterator
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -44,6 +45,27 @@ STATE_ENV_VARS = (
 
 #: Kept under the old name because two test docstrings still cite it.
 XDG_ENV_VARS = STATE_ENV_VARS
+
+#: Environment variables that point Research OS at a *live* operational
+#: database rather than at a directory. Removed rather than redirected, because
+#: there is no temporary value that means "a PostgreSQL of your own": a test
+#: that needs one takes the ``pg_dsn`` fixture, which starts its own server.
+#:
+#: The four roots above were the whole isolation story until a control plane
+#: existed. It does now: ``researchd`` is run from a systemd unit whose
+#: ``EnvironmentFile`` exports ``RESEARCH_OS_RUNTIME_DSN``, and any shell that
+#: inherits it hands every ``uv run pytest`` in this repository a live DSN.
+#: ``research_os.runtime.config`` reads it, ``researchctl`` connects to
+#: whatever it names, and the CLI tests that do not set their own would have
+#: been pointed at the researcher's real runtime state.
+DATABASE_ENV_VARS = ("RESEARCH_OS_RUNTIME_DSN",)
+
+#: The runtime DSN this pytest process *inherited*, captured once at import
+#: before any fixture has run. This, and not the variable's mere presence, is
+#: what the guard below looks for: a test that sets its own DSN is doing
+#: something deliberate and visible, while the inherited one arrived by
+#: accident and names the researcher's live control plane.
+INHERITED_RUNTIME_DSN = os.environ.get("RESEARCH_OS_RUNTIME_DSN") or None
 
 #: Every function that derives a writable path from one of the four roots.
 #: Named as ``module:function`` and resolved lazily, because importing all of
@@ -129,6 +151,41 @@ def _assert_state_is_isolated(basetemp: Path) -> None:
             "the default isolation, or an explicitly temporary HOME if the test "
             "is about default resolution."
         )
+    _assert_database_is_isolated(basetemp)
+
+
+def _assert_database_is_isolated(basetemp: Path) -> None:
+    """Fail unless any configured runtime DSN belongs to this pytest run.
+
+    A path check rather than an environment check, for the same reason as
+    above: what matters is where the database *is*, not which variable named
+    it. Every database a test is allowed to use is a ``pgserver`` cluster under
+    pytest's temporary root, and those are addressed by a Unix socket
+    directory that appears in the DSN as ``host=<path>``. A DSN with no such
+    path is a TCP server this suite did not start, which is equally not ours.
+    """
+
+    dsn = os.environ.get("RESEARCH_OS_RUNTIME_DSN")
+    if not dsn:
+        return
+    host = parse_qs(urlsplit(dsn).query).get("host", [""])[0]
+    if host and _is_within(Path(host), basetemp):
+        # A `pgserver` cluster this run started. The only allowed real one.
+        return
+    if dsn != INHERITED_RUNTIME_DSN and not host:
+        # A DSN the test set itself, naming no local cluster -- a literal used
+        # to check redaction or a connection failure. Deliberate, visible in
+        # the test, and not the researcher's database.
+        return
+    raise AssertionError(
+        f"RESEARCH_OS_RUNTIME_DSN names a database this test run did not "
+        f"start, and pytest's temporary root is {basetemp}.\n"
+        "Operational state is as real as scientific state: a test must not be "
+        "able to write to the researcher's running control plane, and a "
+        "`researchd` unit file exports this variable into every shell that "
+        "inherits it. Take the `pg_dsn` fixture, which starts a server of its "
+        "own."
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -158,6 +215,8 @@ def isolate_research_os_state(
         directory = root / leaf
         directory.mkdir(parents=True, exist_ok=True)
         patcher.setenv(name, str(directory))
+    for name in DATABASE_ENV_VARS:
+        patcher.delenv(name, raising=False)
     # Stashed for the hook below, which has no access to the factory.
     _BASETEMP.append(tmp_path_factory.getbasetemp().resolve())
     try:
@@ -169,6 +228,35 @@ def isolate_research_os_state(
 #: One entry, appended by the fixture above. A list rather than a global so the
 #: hook can tell "no test has run yet" from "basetemp is None".
 _BASETEMP: list[Path] = []
+
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+    """``--reverse``: run the collected tests back to front.
+
+    Order dependence between tests is a defect that hides until the day the
+    order changes, and this suite has real reasons to have it -- a
+    session-scoped PostgreSQL shared by every runtime test, a checksum table
+    that one module edits, module-level caches. It has been found here twice
+    before, both times by accident.
+
+    A flag rather than a plugin, because the alternative is a dependency for
+    four lines, and a flag rather than shuffling, because a failure nobody can
+    reproduce is not a finding.
+    """
+
+    parser.addoption(
+        "--reverse",
+        action="store_true",
+        default=False,
+        help="run tests in reverse collection order, to surface order dependence",
+    )
+
+
+def pytest_collection_modifyitems(
+    config: pytest.Config, items: list[pytest.Item]
+) -> None:
+    if config.getoption("--reverse"):
+        items.reverse()
 
 
 @pytest.hookimpl(wrapper=True)

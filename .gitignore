@@ -16,6 +16,13 @@ dist/
 htmlcov/
 
 # Secrets
+# `*.env` rather than a list of known names: the control plane's
+# `EnvironmentFile` is `researchd.env`, which matched none of the patterns
+# below, and it is where the DSN password and -- since the provider-failure
+# closure documented credential isolation -- a provider token live. It
+# belongs under ~/.config and never in a checkout; this is the backstop for
+# the obvious mistake of copying it next to the unit file in `deploy/`.
+*.env
 .env
 .env.*
 !.env.example

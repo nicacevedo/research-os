@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Sequence
+from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
@@ -43,6 +44,7 @@ from research_os.runtime.ids import (
     thread_id_for,
 )
 from research_os.runtime.models import (
+    ACTIVE_JOB_STATUSES,
     TERMINAL_RUN_STATUSES,
     Approval,
     ApprovalStatus,
@@ -60,6 +62,7 @@ from research_os.runtime.models import (
     ResearchRun,
     RunStatus,
     Schedule,
+    StrandedRun,
     TerminalState,
 )
 
@@ -70,6 +73,25 @@ RUN_COLUMNS = (
     "autonomy, parent_run_id, cycle_index, thread_id, detail, frontier_digest, "
     "created_at, started_at, finished_at, updated_at"
 )
+#: The same list, prefixed for a query that joins. A bare ``status`` beside a
+#: work item's ``status`` is ambiguous, and PostgreSQL says so rather than
+#: guessing -- which is the good outcome, but only once.
+_QUALIFIED_RUN_COLUMNS = ", ".join(
+    f"r.{column.strip()}" for column in RUN_COLUMNS.split(",")
+)
+
+#: The active external-job statuses, as a SQL literal list, derived from the
+#: enum rather than written out.
+#:
+#: Written out by hand once, and it was wrong in both directions: it named
+#: ``QUEUED``, which is not a member and which the table's check constraint
+#: rejects, so that third of the test could never match; and it omitted
+#: ``SUBMITTING``, ``PENDING`` and ``UNKNOWN``, which are the statuses a
+#: cluster job actually sits in while it waits. A run whose Slurm job was
+#: pending would have been diagnosed as stranded and re-entered. An
+#: independent security review found it. Derived now, so the two cannot drift
+#: again.
+_ACTIVE_JOB_SQL = ", ".join(f"'{status}'" for status in sorted(ACTIVE_JOB_STATUSES))
 EVENT_COLUMNS = "event_id, project_id, run_id, work_id, kind, payload, dedup_key, created_at, consumed_at"
 APPROVAL_COLUMNS = (
     "approval_id, run_id, project_id, kind, question, packet, status, decision, "
@@ -1942,6 +1964,136 @@ class RuntimeStore:
             ).fetchall()
         return tuple(ResearchRun.model_validate(row) for row in rows)
 
+    def stranded_runs(
+        self, *, grace_seconds: int, limit: int = 50
+    ) -> tuple[StrandedRun, ...]:
+        """Runs that are in flight with nothing left that could advance them.
+
+        The generic shape of the 2026-09-19 orphans, expressed without naming
+        one of them. A run qualifies when **all** of the following hold:
+
+        - its status is ``RUNNING`` or ``CREATED`` -- in flight, not finished,
+          and not parked at a gate. ``WAITING_HUMAN`` and ``WAITING_EXTERNAL``
+          are deliberately excluded: those are waiting for something real, and
+          the things they wait for have their own wake-ups;
+        - **no live work item** references it. Live means PENDING, LEASED or
+          WAITING: something is running, scheduled, or will be. A FAILED or
+          SUCCEEDED item is not going to move this run;
+        - **no outstanding external job** references it, so a run whose Slurm
+          job is still queued is left alone whatever its status says;
+        - nothing has touched it for ``grace_seconds``.
+
+        Note what is *not* in the definition: how the run got here. A worker
+        that segfaulted, a provider that went away mid-cycle, a daemon killed
+        between opening a run and enqueuing its work, an item that exhausted
+        its attempts -- all of them land in the same state, and all of them
+        are equally unreachable by any other mechanism this runtime has. A
+        reconciler that asked *why* would need a case per cause and would miss
+        the next one.
+
+        ``last_failure_class`` and ``last_error`` come from the most recent
+        work item for the run, when there is one, so the caller can decide
+        whether the blocking condition has lifted without a second query. They
+        are evidence, not part of the qualifying test.
+        """
+
+        with self._db.tx() as conn:
+            rows = conn.execute(
+                f"""
+                select {_QUALIFIED_RUN_COLUMNS},
+                       recent.failure_class as last_failure_class,
+                       recent.last_error as last_error,
+                       recent.status as last_work_status
+                from research_runs r
+                left join lateral (
+                    select w.failure_class, w.last_error, w.status
+                    from work_items w
+                    where w.run_id = r.run_id
+                    order by w.updated_at desc, w.work_id desc
+                    limit 1
+                ) recent on true
+                where r.status in ('CREATED','RUNNING')
+                  and r.updated_at < now()
+                      - make_interval(secs => %(grace)s)
+                  and not exists (
+                      select 1 from work_items live
+                      where live.run_id = r.run_id
+                        and live.status in ('PENDING','LEASED','WAITING')
+                  )
+                  and not exists (
+                      select 1 from external_jobs j
+                      where j.run_id = r.run_id
+                        and j.status in ({_ACTIVE_JOB_SQL})
+                  )
+                order by r.updated_at
+                limit %(limit)s
+                """,
+                {"grace": float(grace_seconds), "limit": limit},
+            ).fetchall()
+        # The evidence columns are dropped before the run is validated. The
+        # record models forbid extra fields -- deliberately, so a renamed
+        # column is an error rather than a silently absent attribute -- and
+        # this query selects more than a run on purpose.
+        evidence = ("last_failure_class", "last_error", "last_work_status")
+        return tuple(
+            StrandedRun(
+                run=ResearchRun.model_validate(
+                    {key: value for key, value in row.items() if key not in evidence}
+                ),
+                last_failure_class=(
+                    str(row["last_failure_class"])
+                    if row["last_failure_class"]
+                    else None
+                ),
+                last_error=str(row["last_error"]) if row["last_error"] else None,
+                last_work_status=(
+                    str(row["last_work_status"]) if row["last_work_status"] else None
+                ),
+            )
+            for row in rows
+        )
+
+    def touch_run(self, run_id: str) -> None:
+        """Move a run's ``updated_at`` to now, changing nothing else.
+
+        What reconciliation does after putting a run back on the queue, so the
+        grace period paces the *next* attempt instead of only the first.
+
+        Without it the throttle depended on a coincidence. Reconciliation does
+        not write to the run row, so a rescheduled run kept its old
+        ``updated_at`` and qualified as stranded again the instant its new work
+        item died -- and the whole reschedule budget could be spent in as many
+        seconds as the poll interval allows. For a provider failure that
+        happens to be harmless, because three failed attempts open the breaker
+        and the reconciler then waits; for any other class there is no breaker
+        to wait for, and a bound meant to span half an hour was spendable in
+        ten seconds.
+
+        A bound should not rely on something else happening to be slow.
+        """
+
+        with self._db.tx() as conn:
+            conn.execute(
+                "update research_runs set updated_at = now() where run_id = %s",
+                (run_id,),
+            )
+
+    def event_count(self, *, run_id: str, kind: str) -> int:
+        """How many events of one kind this run has. The reschedule counter.
+
+        Counted from the event ledger rather than kept in a column, because
+        the ledger is append-only and already survives everything a column
+        would have to: a restart, a reconnect, a second daemon. A bound read
+        from durable history cannot be reset by the thing it bounds.
+        """
+
+        with self._db.tx() as conn:
+            row = conn.execute(
+                "select count(*) as n from events where run_id = %s and kind = %s",
+                (run_id, kind),
+            ).fetchone()
+        return int(row["n"]) if row else 0
+
     # ------------------------------------------- capsule observations ------
     def observe_capsule(
         self, *, project_id: str, capsule_digest: str, frontier_digest: str
@@ -2187,6 +2339,27 @@ class RuntimeStore:
             ).fetchall()
         cooling = {str(row["provider"]) for row in rows}
         return tuple(name for name in candidates if name not in cooling)
+
+    def provider_cooldowns(self, candidates: tuple[str, ...]) -> dict[str, datetime]:
+        """When each named provider stops being in cooldown, for those that are.
+
+        The companion to :meth:`usable_providers`, which answers *whether* a
+        provider may be used and throws away *when* that changes. Both facts
+        are in the same row and the second one is what makes a retry schedule
+        correct: an item retried three times inside a five-minute cooldown has
+        spent its whole attempt budget on calls that could not have succeeded,
+        which is what happened on 2026-09-19.
+        """
+
+        if not candidates:
+            return {}
+        with self._db.tx() as conn:
+            rows = conn.execute(
+                "select provider, cooldown_until from provider_status "
+                "where provider = any(%s) and cooldown_until > now()",
+                (list(candidates),),
+            ).fetchall()
+        return {str(row["provider"]): row["cooldown_until"] for row in rows}
 
 
 def _finding_from(row: Any, refs: Any = ()) -> RuntimeFinding:

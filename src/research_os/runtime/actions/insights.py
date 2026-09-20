@@ -351,10 +351,13 @@ def nominate_insight(
         return ActionOutcome.failed(
             str(exc), failure_class=FailureClass.BUDGET_EXHAUSTED
         )
-    except RoutingError as exc:
-        return ActionOutcome.failed(
-            str(exc), failure_class=FailureClass.PROVIDER_UNAVAILABLE
-        )
+    except RoutingError:
+        # Re-raised explicitly, because the broad clause below would otherwise
+        # catch it -- `RoutingError` is a `ResearchOSError` -- and report an
+        # outage as MODEL_OUTPUT_INVALID, which is a different retry policy
+        # for a different kind of failure. Removing the narrow `except` was
+        # not enough on its own; a wider one was standing behind it.
+        raise
     except ResearchOSError as exc:
         return ActionOutcome.failed(
             f"the nomination could not be produced: {exc}",

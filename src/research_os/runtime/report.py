@@ -48,6 +48,8 @@ from research_os.runtime.models import (
     ModelCall,
     ResearchRun,
     RunStatus,
+    StrandedRun,
+    TerminalState,
     WorkItem,
     WorkStatus,
 )
@@ -125,6 +127,19 @@ class StatusReport:
     the next step. Before this it was visible only by reading `runtime runs`.
     """
 
+    stranded: tuple[StrandedRun, ...] = ()
+    """Runs that are in flight with nothing left that could advance them.
+
+    Shown, rather than left to look like ordinary RUNNING work, because the
+    two are indistinguishable in a table of run ids and ages and mean opposite
+    things. Three runs sat under RUNNING for twenty-one hours after the
+    2026-09-19 provider outage, aging quietly, with no work item that could
+    ever move them.
+
+    Reconciliation repairs these; this is what they look like in the window
+    before it does, and what they look like if it cannot.
+    """
+
     observations: tuple[tuple[str, str, int], ...] = ()
     """Per project: ``(project_id, capsule digest, changes seen)``.
 
@@ -151,6 +166,16 @@ class StatusReport:
                     "objective": _safe(run.objective, limit=200),
                 }
                 for project, run in self.parked
+            ],
+            "stranded": [
+                {
+                    "run_id": entry.run.run_id,
+                    "project_id": entry.run.project_id,
+                    "status": str(entry.run.status),
+                    "failure_class": entry.last_failure_class,
+                    "last_error": _safe(entry.last_error, limit=400),
+                }
+                for entry in self.stranded
             ],
             "observations": [
                 {"project_id": project, "capsule_digest": digest, "changes_seen": seen}
@@ -206,7 +231,12 @@ class StatusReport:
         }
 
 
-def collect_status(db: Database, *, project_id: str | None = None) -> StatusReport:
+def collect_status(
+    db: Database,
+    *,
+    project_id: str | None = None,
+    reconcile_grace_seconds: int = 300,
+) -> StatusReport:
     store = RuntimeStore(db)
     queue = WorkQueue(db)
 
@@ -246,6 +276,13 @@ def collect_status(db: Database, *, project_id: str | None = None) -> StatusRepo
             if project_id is None or project.project_id == project_id
             for run in store.parked_objectives(project_id=project.project_id, limit=5)
         ),
+        stranded=tuple(
+            entry
+            for entry in store.stranded_runs(
+                grace_seconds=reconcile_grace_seconds, limit=20
+            )
+            if project_id is None or entry.run.project_id == project_id
+        ),
         observations=tuple(
             (project.project_id, observed[0], observed[2])
             for project in store.list_projects()
@@ -259,23 +296,79 @@ def collect_status(db: Database, *, project_id: str | None = None) -> StatusRepo
 def render_status(report: StatusReport) -> str:
     parts: list[str] = ["Research OS runtime\n"]
 
+    # **Labelled, not filtered.** A stranded run's status really is RUNNING,
+    # so hiding it here would make this table disagree with the database. But
+    # printing it beside genuinely progressing work, with an age of twenty-two
+    # hours and nothing else, is how three dead runs looked busy for a day.
+    stalled_ids = {entry.run.run_id for entry in report.stranded}
     parts.append("\nRUNNING\n")
     parts.append(
         _table(
-            ("run", "cycle", "age", "objective"),
+            ("run", "cycle", "age", "state", "objective"),
             [
                 (
                     run.run_id,
                     str(run.cycle_index),
                     _age(run.started_at),
-                    _safe(run.objective, limit=60),
+                    "stalled" if run.run_id in stalled_ids else "working",
+                    _safe(run.objective, limit=52),
                 )
                 for run in report.active_runs
             ],
         )
     )
 
-    if report.parked:
+    if report.stranded:
+        # First, and before anything that says a person is needed. A stranded
+        # run is the state most likely to be misread as either of the two
+        # around it -- it is not finished and it is not progressing -- and it
+        # is the only one here that is a fault in the runtime rather than a
+        # question for the researcher.
+        parts.append("\nSTALLED (in flight, but nothing is running)\n")
+        parts.append(
+            _table(
+                ("run", "age", "stopped by", "detail"),
+                [
+                    (
+                        entry.run.run_id,
+                        _age(entry.run.updated_at),
+                        entry.last_failure_class or "-",
+                        _safe(entry.last_error, limit=52),
+                    )
+                    for entry in report.stranded
+                ],
+            )
+        )
+        parts.append(
+            "  Operational, not scientific: these runs concluded nothing, and "
+            "nothing is\n  being asked of you. The daemon reschedules them once "
+            "the cause clears. If\n  `researchd` is not running, that is the "
+            "cause.\n"
+        )
+
+    # **Parked, split by whether a decision is genuinely owed.**
+    #
+    # One table used to hold both, under the heading "WAITING FOR A SCIENTIFIC
+    # DECISION (finished; you are next)" and the sentence "These finished
+    # cleanly." That was true of most of its rows and catastrophically false
+    # for the rest: `parked_objectives` accepts DONE_FOR_NOW, and DONE_FOR_NOW
+    # is reached by a cycle that concluded there was nothing it could usefully
+    # do -- including, before the fix in this release, a cycle whose only
+    # model call never happened.
+    #
+    # So on 2026-09-19 a researcher was told that a run whose planner had died
+    # on an authentication error had finished cleanly and was waiting for
+    # their decision. There was no decision. The distinction is now structural
+    # rather than a matter of wording: the claim "you are next" is made only
+    # for the terminal state that means it.
+    owed = [
+        (project, run)
+        for project, run in report.parked
+        if run.terminal_state is TerminalState.WAITING_FOR_SCIENTIFIC_DECISION
+    ]
+    idle = [entry for entry in report.parked if entry not in owed]
+
+    if owed:
         parts.append("\nWAITING FOR A SCIENTIFIC DECISION (finished; you are next)\n")
         parts.append(
             _table(
@@ -287,7 +380,7 @@ def render_status(report: StatusReport) -> str:
                         str(run.terminal_state or "-"),
                         _safe(run.objective, limit=44),
                     )
-                    for project, run in report.parked
+                    for project, run in owed
                 ],
             )
         )
@@ -295,6 +388,32 @@ def render_status(report: StatusReport) -> str:
             "  These finished cleanly. `researchctl propose list` shows what is "
             "waiting;\n  promoting something is what lets the runtime continue "
             "on its own.\n"
+        )
+
+    if idle:
+        parts.append("\nPARKED (nothing is owed; they resume when the science moves)\n")
+        parts.append(
+            _table(
+                ("run", "concluded", "recommended", "why it stopped"),
+                [
+                    (
+                        run.run_id,
+                        str(run.terminal_state or "-"),
+                        # `_safe`, like every other untrusted field here.
+                        # The column is unconstrained text and a future
+                        # writer could put model prose in it; today's values
+                        # are literals, which is a fact about today.
+                        _safe(run.next_recommendation or "-", limit=22),
+                        _safe(run.detail, limit=54),
+                    )
+                    for _project, run in idle
+                ],
+            )
+        )
+        parts.append(
+            "  No decision is waiting on these. A capsule change wakes them; "
+            "read `why it\n  stopped` before assuming the runtime is asking "
+            "you for something.\n"
         )
 
     if report.observations:

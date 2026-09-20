@@ -42,7 +42,6 @@ from research_os.runtime.findings import MAX_EXCERPT_CHARS
 from research_os.runtime.interfaces import ModelRequest
 from research_os.runtime.policy import ActionKind
 from research_os.runtime.prompts import FRONTIER, SCIENTIFIC_REVIEWER
-from research_os.runtime.routing import RoutingError
 from research_os.runtime.sciencecontext import noncanonical_science
 
 LOG = logging.getLogger("research_os.runtime.actions.review")
@@ -94,10 +93,26 @@ def review_science(
                 json_schema=SCIENTIFIC_REVIEWER.output_schema,
             )
         )
-    except (BudgetExhaustedError, RoutingError) as exc:
+    # **Only the budget is caught here.** A `RoutingError` -- which is what a
+    # provider that did not answer now raises -- is deliberately allowed to
+    # propagate out of this handler.
+    #
+    # Catching it looked careful and was the opposite. It converted an outage
+    # into an `ActionOutcome`, and an `ActionOutcome` carries a failure class
+    # and nothing else: not the breaker's `cooldown_until`, not whether an
+    # invocation happened. Both are what the queue needs to schedule the
+    # retry, so every provider failure that came through this door was
+    # rescheduled by the linear backoff alone and charged an attempt even when
+    # routing had refused before calling anything -- the 2026-09-19 arithmetic
+    # exactly, on a second path.
+    #
+    # A budget refusal is genuinely different and stays: it is a policy answer
+    # rather than a malfunction, no amount of waiting changes it, and the
+    # honest terminal state is BUDGET_EXHAUSTED.
+    except BudgetExhaustedError as exc:
         return ActionOutcome.failed(
             f"the scientific reviewer did not run: {exc}",
-            failure_class=FailureClass.PROVIDER_UNAVAILABLE,
+            failure_class=FailureClass.BUDGET_EXHAUSTED,
         )
     if not response.ok or response.structured is None:
         return ActionOutcome.failed(
@@ -286,10 +301,25 @@ def assess_frontier_ranked(
                 json_schema=FRONTIER.output_schema,
             )
         )
-    except (BudgetExhaustedError, RoutingError) as exc:
+    except BudgetExhaustedError as exc:
         # The deterministic frontier is still a usable answer. Ranking is an
-        # improvement on it, not a prerequisite, so a missing provider degrades
-        # to "there is work outstanding" rather than failing the cycle.
+        # improvement on it, not a prerequisite, so an exhausted budget
+        # degrades to "there is work outstanding" rather than failing the
+        # cycle.
+        #
+        # **`RoutingError` used to be caught here too, and that was the worst
+        # instance of it.** This branch returns `succeeded` with
+        # `recommendation: START_NEXT_CYCLE`, so a provider outage produced a
+        # cycle that concluded DONE_FOR_NOW, recorded a citable finding, was
+        # offered to the next capsule change as parked, and opened a successor
+        # -- spending one of the objective's twelve cycles on work that never
+        # ran. Every property the provider-failure closure establishes,
+        # violated through one `except` clause.
+        #
+        # A budget refusal keeps the degradation because it is a different
+        # kind of thing: the researcher said stop spending, waiting will not
+        # change it, and the deterministic frontier is the honest answer to
+        # give. An outage is temporary, and the honest answer is to wait.
         #
         # **Keyed, and it was not.** Two reviews found the same hole
         # independently: the identity fix was applied to the success path only,

@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from research_os.errors import ResearchOSError
@@ -191,7 +192,24 @@ class WorkQueue:
                     "kinds": list(kinds) if kinds else None,
                 },
             ).fetchall()
-        return tuple(_row_to_item(row) for row in rows)
+        # **Sorted here, because `returning` is not ordered.**
+        #
+        # The CTE's `order by` picks the right *set* of rows -- the N most
+        # urgent -- and that is all it does. `UPDATE ... RETURNING` emits rows
+        # in whatever order the update visited them, which PostgreSQL does not
+        # specify and which in practice follows the heap. So a claim of two
+        # items came back in priority order most of the time and in physical
+        # order the rest, and a worker taking `limit > 1` processed the
+        # cheapest item first whenever the layout happened to differ.
+        #
+        # Invisible for a long time because the default `limit` is 1 and
+        # because a freshly truncated table lays rows down in insertion order.
+        # It surfaced in a full-suite run after unrelated tests changed how
+        # much churn the shared session database had seen -- which is the
+        # ordinary way a latent ordering assumption announces itself.
+        items = [_row_to_item(row) for row in rows]
+        items.sort(key=lambda item: (item.priority, item.scheduled_at, item.work_id))
+        return tuple(items)
 
     def renew(self, work_id: str, *, owner: str, lease_seconds: int) -> None:
         """Extend the lease, or raise :class:`LeaseLostError`.
@@ -248,6 +266,7 @@ class WorkQueue:
         failure_class: FailureClass,
         error: str,
         force_terminal: bool = False,
+        not_before: datetime | None = None,
     ) -> WorkItem:
         """Record a failure and apply the retry policy for its class.
 
@@ -255,6 +274,24 @@ class WorkQueue:
         here so that "should this be retried" is answered once, from the class
         of the failure, rather than by each worker's opinion. A scientifically
         negative result never reaches this method at all -- it is a success.
+
+        ``not_before`` is a floor under the next attempt, supplied by a caller
+        that knows when the blocking condition lifts -- in practice a provider
+        breaker's ``cooldown_until``. The backoff still applies; the schedule
+        is the later of the two.
+
+        Without it the retry schedule and the breaker were two independent
+        clocks, and on 2026-09-19 they disagreed by three and a half minutes.
+        A provider failure opened a 300-second cooldown; the item's three
+        attempts were spent 30 and 60 seconds apart, every one of them inside
+        a window where routing was guaranteed to refuse. The item was
+        exhausted before the provider was well, and a transient failure became
+        permanent by arithmetic.
+
+        Note that the floor is applied *without* extending the attempt budget.
+        Raising ``max_attempts`` until the numbers happened to overlap would
+        have hidden the same defect behind a different set of magic numbers,
+        and would break again the first time either setting changed.
         """
 
         retryable = (not force_terminal) and is_retryable(failure_class)
@@ -268,7 +305,10 @@ class WorkQueue:
                         else 'FAILED' end,
                     scheduled_at = case
                         when %(retryable)s and attempts < max_attempts
-                        then now() + make_interval(secs => %(delay)s * greatest(attempts, 1))
+                        then greatest(
+                            now() + make_interval(
+                                secs => %(delay)s * greatest(attempts, 1)),
+                            coalesce(%(not_before)s, to_timestamp(0)))
                         else scheduled_at end,
                     lease_owner = null,
                     lease_expires_at = null,
@@ -283,6 +323,7 @@ class WorkQueue:
                     "owner": owner,
                     "retryable": retryable,
                     "delay": float(delay),
+                    "not_before": not_before,
                     "failure_class": str(failure_class),
                     "error": error[:4000],
                 },
@@ -299,12 +340,24 @@ class WorkQueue:
         detail: str,
         retry_after_seconds: float,
         max_parks: int = 240,
+        failure_class: FailureClass | None = None,
+        not_before: datetime | None = None,
     ) -> WorkItem:
         """Park an item until an external dependency is expected to have moved.
 
         Distinct from failing: nothing went wrong, and the attempt is refunded
         so that waiting for a cluster does not consume the retry budget that
         exists for things that break.
+
+        ``not_before`` is a known deadline for the thing being waited on -- a
+        provider breaker's ``cooldown_until``. Supplied as a timestamp rather
+        than converted to a delay by the caller, because the caller's clock is
+        not the database's: this module's rule is that every deadline is
+        computed by PostgreSQL, and the first version of the provider-cooldown
+        path broke it by subtracting a ``Clock.now()`` from a database
+        timestamp. Under the frozen clock the tests inject, that arithmetic
+        produced a nine-month deferral which the assertions -- written as
+        "at or after the cooldown" -- accepted.
 
         Bounded, though. Refunding the attempt means ``attempts`` never
         approaches ``max_attempts``, so an item that always parks would be
@@ -323,7 +376,9 @@ class WorkQueue:
                 set status = case
                         when coalesce((payload ->> 'parks')::int, 0) + 1 > %(max_parks)s
                         then 'FAILED' else 'PENDING' end,
-                    scheduled_at = now() + make_interval(secs => %(delay)s),
+                    scheduled_at = greatest(
+                        now() + make_interval(secs => %(delay)s),
+                        coalesce(%(not_before)s, to_timestamp(0))),
                     attempts = greatest(attempts - 1, 0),
                     payload = jsonb_set(
                         payload, '{{parks}}',
@@ -331,7 +386,7 @@ class WorkQueue:
                     ),
                     failure_class = case
                         when coalesce((payload ->> 'parks')::int, 0) + 1 > %(max_parks)s
-                        then %(failure_class)s else null end,
+                        then %(exhausted_class)s else %(waiting_class)s end,
                     lease_owner = null,
                     lease_expires_at = null,
                     last_error = %(detail)s,
@@ -343,9 +398,21 @@ class WorkQueue:
                     "work_id": work_id,
                     "owner": owner,
                     "delay": float(retry_after_seconds),
+                    "not_before": not_before,
                     "detail": detail[:4000],
                     "max_parks": max_parks,
-                    "failure_class": str(FailureClass.SCHEDULER_UNAVAILABLE),
+                    # What it is waiting for, kept on the row while it waits.
+                    # This used to be nulled on every park, so `runtime status`
+                    # showed an item with a reason in `last_error` and no class
+                    # beside it -- readable as "something went wrong and we do
+                    # not know what". A parked item knows exactly what it is
+                    # waiting for.
+                    "waiting_class": (
+                        str(failure_class) if failure_class is not None else None
+                    ),
+                    "exhausted_class": str(
+                        failure_class or FailureClass.SCHEDULER_UNAVAILABLE
+                    ),
                 },
             ).fetchone()
         if row is None:

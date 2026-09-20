@@ -62,6 +62,11 @@ from research_os.runtime.adjudication import (
     unresolved_adjudications,
 )
 from research_os.runtime.budgets import BudgetExhaustedError
+from research_os.runtime.failures import (
+    PROVIDER_FAILURES,
+    FailureClass,
+    StageExecutionError,
+)
 from research_os.runtime.findings import (
     MAX_REFS_PER_KIND,
     FindingKind,
@@ -304,10 +309,29 @@ def plan_one_action(
         }
 
     if not response.ok or response.structured is None:
-        return {
-            "plan_refusal": f"the planner returned no usable plan: {response.error}",
-            "notes": note(state, f"planner failed: {response.error}"),
-        }
+        # Raised, not folded into `plan_refusal`.
+        #
+        # A refusal is a *scientific* statement -- there is nothing this cycle
+        # is permitted to usefully do -- and `conclude` is entitled to read it
+        # as one. "The planner produced no plan" is not that statement. It is
+        # the absence of one, and the absence of a plan cannot be concluded
+        # from.
+        #
+        # The live pilot showed the difference costs three research runs. A
+        # provider failure reached this branch, became a refusal, and
+        # `conclude` mapped every refusal to DONE_FOR_NOW -- so runs whose only
+        # model call never happened were reported to the researcher as
+        # finished, with a decision waiting that did not exist.
+        #
+        # A provider that did not answer at all no longer arrives here: the
+        # router raises for that. What is left is a provider that answered with
+        # something unusable, which is MODEL_OUTPUT_INVALID -- one re-ask, per
+        # the policy table, then terminal. Either way the queue decides, and
+        # this cycle stays un-concluded until a plan actually exists.
+        raise StageExecutionError(
+            f"the planner returned no usable plan: {response.error}",
+            failure_class=FailureClass.MODEL_OUTPUT_INVALID,
+        )
     plan = dict(response.structured)
     return {
         "plan": plan,
@@ -533,6 +557,37 @@ def perform_action(state: CycleState, runtime: Runtime[CycleContext]) -> dict[st
 
     def perform() -> dict[str, Any]:
         outcome: ActionOutcome = registered.handler(state, context, plan)
+        if outcome.failure_class in PROVIDER_FAILURES:
+            # Raised rather than returned, and the reason is the ledger.
+            #
+            # Scoped to the provider classes rather than to all of
+            # INFRASTRUCTURE, and the narrowing was a correction. This guard
+            # exists for a provider that did not answer, and the handlers now
+            # let that propagate on their own -- so what reaches here is a
+            # handler that caught one and reported it, which is the case worth
+            # defending against. Widening it to every infrastructure class
+            # swept in `SCHEDULER_UNAVAILABLE`, which two handlers use for
+            # "this machine has no such executor" and "the job is still
+            # queued; nothing to interpret yet". Neither is a failed call, and
+            # turning the second into a retry would make an ordinary wait look
+            # like a fault.
+            #
+            # A `perform` that *returns* marks the invocation COMPLETED, and a
+            # completed invocation is reused forever -- that is what the
+            # ledger is for. So an action that returned "the provider was
+            # unavailable" wrote that answer into the run's permanent record:
+            # every later attempt at this cycle would find the completed
+            # invocation, reuse the failure, and reach `conclude` with a
+            # result that could never improve. The cycle was sealed around a
+            # network hiccup.
+            #
+            # Raising marks it FAILED instead, which the ledger reopens on the
+            # next entry. Nothing scientific is lost: an action that could not
+            # reach a provider produced no observation to preserve.
+            raise StageExecutionError(
+                f"{action} could not run: {outcome.detail}",
+                failure_class=outcome.failure_class,
+            )
         return {
             "ok": outcome.ok,
             "detail": outcome.detail,
@@ -1172,6 +1227,42 @@ def conclude(state: CycleState, runtime: Runtime[CycleContext]) -> dict[str, Any
     result = state.get("action_result") or {}
     data = dict(result.get("data") or {})
     check = state.get("check_result") or {}
+
+    # **Infrastructure, checked before anything scientific is said.**
+    #
+    # Defence in depth, and deliberately redundant: `perform_action` already
+    # raises on an infrastructure failure class, so a cycle should never reach
+    # here carrying one. "Should never" is how the original defect was
+    # described too. If one does arrive, the branch below would call it
+    # "checks failed; a repair cycle is warranted" and recommend another
+    # cycle -- a scientific reading of a network problem, and one that spends
+    # a cycle of the objective's ceiling to reach the same failure again.
+    #
+    # FATAL_INFRASTRUCTURE_ERROR pairs with RunStatus.FAILED in `_execute`, so
+    # the run is not among those `parked_objectives` offers to a capsule
+    # change and not among those `runtime status` says finished.
+    failed_class = str(result.get("failure_class") or "")
+    if not result.get("ok", True) and failed_class:
+        try:
+            # Provider classes only, for the reason given in `perform_action`:
+            # `SCHEDULER_UNAVAILABLE` reaches here meaning "the job has not
+            # finished yet", and FATAL_INFRASTRUCTURE_ERROR is the wrong thing
+            # to say about a cluster that is merely still working.
+            outage = FailureClass(failed_class) in PROVIDER_FAILURES
+        except ValueError:  # pragma: no cover - the column is a known enum
+            outage = False
+        if outage:
+            return {
+                "frontier_digest": digest,
+                "terminal_state": str(TerminalState.FATAL_INFRASTRUCTURE_ERROR),
+                "next_recommendation": "BLOCKED_INFRASTRUCTURE",
+                "notes": note(
+                    state,
+                    "did not conclude: the cycle could not run "
+                    f"({failed_class}: {result.get('detail') or 'no detail'}). "
+                    "Nothing scientific is being claimed by this run.",
+                ),
+            }
 
     if data.get("requires_human_promotion"):
         # This cycle produced something a person must decide about. The honest

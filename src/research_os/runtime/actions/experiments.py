@@ -73,7 +73,6 @@ from research_os.runtime.ids import new_external_job_id
 from research_os.runtime.interfaces import ExecutionSpec, ModelRequest
 from research_os.runtime.models import ExternalJobStatus, InterpretationStatus
 from research_os.runtime.prompts import EXPERIMENTALIST
-from research_os.runtime.routing import RoutingError
 
 LOG = logging.getLogger("research_os.runtime.actions.experiments")
 
@@ -236,10 +235,26 @@ def design_experiment(
                 json_schema=EXPERIMENTALIST.output_schema,
             )
         )
-    except (BudgetExhaustedError, RoutingError) as exc:
+    # **Only the budget is caught here.** A `RoutingError` -- which is what a
+    # provider that did not answer now raises -- is deliberately allowed to
+    # propagate out of this handler.
+    #
+    # Catching it looked careful and was the opposite. It converted an outage
+    # into an `ActionOutcome`, and an `ActionOutcome` carries a failure class
+    # and nothing else: not the breaker's `cooldown_until`, not whether an
+    # invocation happened. Both are what the queue needs to schedule the
+    # retry, so every provider failure that came through this door was
+    # rescheduled by the linear backoff alone and charged an attempt even when
+    # routing had refused before calling anything -- the 2026-09-19 arithmetic
+    # exactly, on a second path.
+    #
+    # A budget refusal is genuinely different and stays: it is a policy answer
+    # rather than a malfunction, no amount of waiting changes it, and the
+    # honest terminal state is BUDGET_EXHAUSTED.
+    except BudgetExhaustedError as exc:
         return ActionOutcome.failed(
             f"the experimentalist did not run: {exc}",
-            failure_class=FailureClass.PROVIDER_UNAVAILABLE,
+            failure_class=FailureClass.BUDGET_EXHAUSTED,
         )
     if not response.ok or response.structured is None:
         return ActionOutcome.failed(

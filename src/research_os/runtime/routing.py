@@ -38,6 +38,7 @@ import logging
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from datetime import datetime
 from decimal import Decimal
 
 from research_os.automation.models import Role as AutomationRole
@@ -51,6 +52,7 @@ from research_os.automation.providers import (
 from research_os.errors import ResearchOSError
 from research_os.runtime.artifacts import FilesystemArtifactStore
 from research_os.runtime.budgets import BudgetLedger, Dimension, Grant
+from research_os.runtime.failures import FailureClass
 from research_os.runtime.interfaces import (
     ArtifactRef,
     Capability,
@@ -60,7 +62,7 @@ from research_os.runtime.interfaces import (
     ModelResponse,
     ModelRole,
 )
-from research_os.runtime.models import ModelCallStatus
+from research_os.runtime.models import ModelCallStatus, ProviderHealth
 from research_os.runtime.store import RuntimeStore
 
 LOG = logging.getLogger("research_os.runtime.routing")
@@ -70,11 +72,60 @@ class RoutingError(ResearchOSError):
     """Raised when no provider can serve a request at the required standard."""
 
 
-class CriticalCapabilityUnavailableError(RoutingError):
+class ProviderCallFailedError(RoutingError):
+    """Raised when the provider did not answer. Never returned as a response.
+
+    **This is the choke point the 2026-09-19 incident was missing.** Before it,
+    a provider that failed came back as a ``ModelResponse`` with ``ok`` false,
+    and the caller decided what that meant. Eleven callers decided eleven
+    times. Most of them got it right and called it ``MODEL_OUTPUT_INVALID`` --
+    which is wrong in a quiet way, because the model did not produce invalid
+    output, it produced none. The planner node got it wrong in a loud way: it
+    folded the failure into ``plan_refusal``, and "nothing I am permitted to
+    do" concluded ``DONE_FOR_NOW``.
+
+    An OAuth token that could not be refreshed became three research runs
+    reported to a researcher as finished, with a scientific decision waiting
+    for them that did not exist.
+
+    So the router no longer offers that choice. "The provider answered
+    something unusable" is a response; "the provider did not answer" is an
+    exception, and the only place that may decide what to do about it is the
+    work queue, which retries against the provider's actual availability.
+
+    ``retry_at`` carries the breaker's ``cooldown_until`` when one is open, so
+    the queue can schedule past guaranteed unavailability instead of spending
+    its attempts inside it. ``attempted`` is false when routing refused before
+    any invocation, which means the attempt should not be charged: being turned
+    away by an open breaker is not a failed try.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        failure_class: FailureClass = FailureClass.PROVIDER_UNAVAILABLE,
+        retry_at: datetime | None = None,
+        attempted: bool = True,
+    ) -> None:
+        super().__init__(message)
+        self.failure_class = failure_class
+        self.retry_at = retry_at
+        self.attempted = attempted
+
+
+class CriticalCapabilityUnavailableError(ProviderCallFailedError):
     """Raised when critical work cannot be done well enough, so it is not done.
 
     Deliberately an error rather than a downgrade. The architecture degrades
     *explicitly*.
+
+    A :class:`ProviderCallFailedError` because that is what it is -- no
+    provider answered -- and because the reason may be temporary. The strongest
+    provider being in a breaker cooldown is exactly how critical work becomes
+    unservable on a machine whose weaker providers are healthy, and that heals
+    by itself. Making it a sibling rather than a subclass would have meant
+    retrying it without a cooldown deadline.
     """
 
 
@@ -189,6 +240,8 @@ class ModelRouter:
         "_adapters",
         "_artifacts",
         "_budgets",
+        "_cooldown_seconds",
+        "_failure_threshold",
         "_loaded_groups",
         "_profiles",
         "_project_id",
@@ -213,6 +266,8 @@ class ModelRouter:
         work_id: str | None = None,
         role_settings: Mapping[str, RoleSetting] | None = None,
         require_independence: bool = False,
+        failure_threshold: int = 3,
+        cooldown_seconds: int = 300,
     ) -> None:
         self._adapters = dict(adapters)
         #: The researcher's ``automation.yaml`` role settings, keyed by the v1
@@ -237,6 +292,17 @@ class ModelRouter:
         #: family and recorded as a fresh context rather than a degradation.
         self._used_families: dict[str, set[str]] = {}
         self._loaded_groups: set[str] = set()
+        #: The breaker settings, from ``runtime.yaml``.
+        #:
+        #: Passed in rather than left to `record_provider_result`'s defaults,
+        #: which is what the first version did -- so
+        #: ``provider_failure_threshold`` and ``provider_cooldown_seconds``
+        #: were settings a researcher could write, `runtime doctor` would
+        #: print, and nothing would read. Both defaults happen to equal the
+        #: store's, which is why nobody noticed: changing either in
+        #: configuration changed nothing at all.
+        self._failure_threshold = int(failure_threshold)
+        self._cooldown_seconds = int(cooldown_seconds)
 
     def _model_and_effort(
         self, request: ModelRequest, profile: ProviderProfile
@@ -278,24 +344,48 @@ class ModelRouter:
         return setting.model or profile.model, setting.effort
 
     # --------------------------------------------------------------- routing --
-    def _candidates(self, request: ModelRequest) -> tuple[ProviderProfile, ...]:
+    def _eligible(self, request: ModelRequest) -> tuple[ProviderProfile, ...]:
+        """Every profile that *could* serve this request, health aside.
+
+        Split out from :meth:`_candidates` so that "no provider can do this"
+        and "no provider can do this *right now*" are answerable separately.
+        The second has a deadline attached and the first does not, and a retry
+        policy that cannot tell them apart either waits forever for a provider
+        that will never exist or gives up on one that is back in four minutes.
+        """
+
         floor = MINIMUM_TIER[request.criticality]
-        healthy = set(
-            self._store.usable_providers(tuple(p.name for p in self._profiles))
-        )
         return tuple(
             sorted(
                 (
                     profile
                     for profile in self._profiles
                     if profile.name in self._adapters
-                    and profile.name in healthy
                     and request.capability in profile.capabilities
                     and profile.tier >= floor
                 ),
                 key=lambda profile: (-profile.tier, profile.estimated_cost_usd),
             )
         )
+
+    def _candidates(self, request: ModelRequest) -> tuple[ProviderProfile, ...]:
+        eligible = self._eligible(request)
+        healthy = set(self._store.usable_providers(tuple(p.name for p in eligible)))
+        return tuple(profile for profile in eligible if profile.name in healthy)
+
+    def _recovers_at(self, request: ModelRequest) -> datetime | None:
+        """When the first provider that could serve this request comes back.
+
+        ``None`` when no cooldown explains the refusal -- which means waiting
+        will not help, and the failure is about configuration or installation
+        rather than about weather.
+        """
+
+        eligible = self._eligible(request)
+        if not eligible:
+            return None
+        cooling = self._store.provider_cooldowns(tuple(p.name for p in eligible))
+        return min(cooling.values()) if cooling else None
 
     def route(self, request: ModelRequest) -> Routed:
         """Pick a provider, and say honestly how independent it is.
@@ -308,15 +398,32 @@ class ModelRouter:
         candidates = self._candidates(request)
         if not candidates:
             floor = MINIMUM_TIER[request.criticality]
+            # No invocation happens on this path, so ``attempted=False``: the
+            # work item must not be charged an attempt for being turned away.
+            # ``recovers_at`` is when the refusal is known to lift, and it is
+            # None when nothing is merely cooling -- the difference between
+            # "wait four minutes" and "install a provider".
+            recovers_at = self._recovers_at(request)
+            waiting = (
+                f" The soonest any of them is usable again is "
+                f"{recovers_at.isoformat()}."
+                if recovers_at is not None
+                else ""
+            )
             if request.criticality is Criticality.CRITICAL:
                 raise CriticalCapabilityUnavailableError(
                     f"{request.role} is critical work needing {request.capability} at "
                     f"tier >= {floor}, and no healthy provider offers it. Refusing "
                     f"rather than answering critical work with a weaker model."
+                    + waiting,
+                    retry_at=recovers_at,
+                    attempted=False,
                 )
-            raise RoutingError(
+            raise ProviderCallFailedError(
                 f"no healthy provider offers {request.capability} at tier >= {floor} "
-                f"for {request.role}"
+                f"for {request.role}." + waiting,
+                retry_at=recovers_at,
+                attempted=False,
             )
 
         group = request.independence_group
@@ -380,6 +487,19 @@ class ModelRouter:
                 else Independence.NONE
             ),
             note="fresh context",
+        )
+
+    def _record_health(
+        self, provider: str, *, ok: bool, error: str | None = None
+    ) -> ProviderHealth:
+        """Advance the breaker for one provider, under the configured policy."""
+
+        return self._store.record_provider_result(
+            provider,
+            ok=ok,
+            error=error,
+            threshold=self._failure_threshold,
+            cooldown=self._cooldown_seconds,
         )
 
     def _families_for(self, group: str) -> set[str]:
@@ -478,7 +598,7 @@ class ModelRouter:
             latency = int((time.monotonic() - started) * 1000)
             self._budgets.release_all(cost_grants)
             self._budgets.settle_all(grants)
-            self._store.record_provider_result(profile.name, ok=False, error=str(exc))
+            health = self._record_health(profile.name, ok=False, error=str(exc))
             self._record(
                 request,
                 routed,
@@ -488,7 +608,19 @@ class ModelRouter:
                 latency_ms=latency,
                 error=f"{type(exc).__name__}: {exc}",
             )
-            raise
+            # Re-raised *as a provider failure* rather than bare. The bare
+            # exception was an `OSError` or whatever else the adapter's
+            # subprocess produced, and the daemon's classifier has no mapping
+            # for those -- so it fell through to `UNKNOWN`, whose policy is
+            # `FAIL_PERMANENTLY`. A provider process that could not be spawned
+            # is about as transient as a failure gets, and it was the one
+            # failure this runtime would never retry.
+            raise ProviderCallFailedError(
+                f"{profile.name} could not be invoked for {request.role}: "
+                f"{type(exc).__name__}: {exc}",
+                failure_class=FailureClass.PROVIDER_TRANSIENT,
+                retry_at=health.cooldown_until,
+            ) from exc
 
         latency = int((time.monotonic() - started) * 1000)
         raw = result.stdout or result.text or ""
@@ -502,9 +634,8 @@ class ModelRouter:
             )
             self._budgets.release_all(cost_grants)
             self._budgets.settle_all(grants)
-            self._store.record_provider_result(
-                profile.name, ok=False, error=result.error or "non-zero exit"
-            )
+            detail = result.error or f"exit {result.exit_code}"
+            health = self._record_health(profile.name, ok=False, error=detail)
             self._record(
                 request,
                 routed,
@@ -512,22 +643,33 @@ class ModelRouter:
                 prompt_ref=prompt_ref,
                 output_ref=output_ref,
                 latency_ms=latency,
-                error=result.error or f"exit {result.exit_code}",
+                error=detail,
                 resolved_model=result.resolved_model,
             )
-            return ModelResponse(
-                provider=profile.name,
-                model=result.resolved_model or profile.model,
-                independence=routed.independence,
-                independence_note=routed.note,
-                latency_ms=latency,
-                error=result.error or f"exit {result.exit_code}",
+            # Everything above is unchanged: the call is recorded, the budget
+            # is settled, the breaker is advanced. What changed is the last
+            # line. This used to return a `ModelResponse` carrying the error,
+            # and see `ProviderCallFailedError` for the three research runs
+            # that cost.
+            #
+            # The invocation really happened, so `attempted` stays true and
+            # the attempt is charged -- but `retry_at` carries the breaker's
+            # deadline, so the *next* attempt is scheduled for when the
+            # provider can answer rather than thirty seconds from now.
+            raise ProviderCallFailedError(
+                f"{profile.name} did not answer {request.role}: {detail}",
+                failure_class=(
+                    FailureClass.PROVIDER_TIMEOUT
+                    if result.timed_out
+                    else FailureClass.PROVIDER_UNAVAILABLE
+                ),
+                retry_at=health.cooldown_until,
             )
 
         if request.json_schema is not None and result.structured is None:
             self._budgets.settle_all(cost_grants, actual=result.total_cost_usd)
             self._budgets.settle_all(grants)
-            self._store.record_provider_result(profile.name, ok=True)
+            self._record_health(profile.name, ok=True)
             self._record(
                 request,
                 routed,
@@ -556,7 +698,7 @@ class ModelRouter:
 
         self._budgets.settle_all(cost_grants, actual=result.total_cost_usd)
         self._budgets.settle_all(grants)
-        self._store.record_provider_result(profile.name, ok=True)
+        self._record_health(profile.name, ok=True)
         if request.independence_group:
             self._loaded_groups.add(request.independence_group)
             self._used_families.setdefault(request.independence_group, set()).add(

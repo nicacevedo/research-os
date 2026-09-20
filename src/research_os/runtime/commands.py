@@ -396,7 +396,11 @@ def _start(args: argparse.Namespace) -> int:
 def _status(args: argparse.Namespace) -> int:
     config = load_config()
     with _database(config) as db:
-        report = views.collect_status(db, project_id=args.project)
+        report = views.collect_status(
+            db,
+            project_id=args.project,
+            reconcile_grace_seconds=config.settings.run_reconcile_grace_seconds,
+        )
     return _emit(report.payload(), views.render_status(report), as_json=args.json)
 
 

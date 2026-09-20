@@ -25,6 +25,7 @@ from research_os.runtime.cycles import (
     start_cycle,
 )
 from research_os.runtime.db import Database
+from research_os.runtime.failures import FailureClass, StageExecutionError
 from research_os.runtime.graphs import build_cycle_graph
 from research_os.runtime.idempotency import InvocationLedger
 from research_os.runtime.models import (
@@ -174,20 +175,35 @@ def test_an_unknown_action_is_refused_rather_than_interpreted(
     assert any("not an action this build knows" in n for n in result.notes)
 
 
-def test_a_planner_that_returns_nothing_usable_ends_the_cycle_cleanly(
+def test_a_planner_that_returns_nothing_usable_does_not_end_the_cycle(
     graph_env: dict[str, Any],
 ) -> None:
+    """A cycle with no plan has not concluded; it has not started.
+
+    The previous name of this test was "ends the cycle cleanly", and the
+    assertion was ``status is SUCCEEDED``. Both were wrong in the same way:
+    the cycle had done nothing, and "cleanly" described the absence of a
+    crash rather than the presence of a result. `conclude` obliged by mapping
+    the planner's refusal to DONE_FOR_NOW, and a real provider outage then
+    produced three research runs reported to a researcher as finished.
+
+    A planner that answers with something unusable is MODEL_OUTPUT_INVALID --
+    one re-ask, per the policy table. A planner that could not be reached at
+    all is a provider failure and never reaches this node. Neither is a
+    conclusion.
+    """
+
     router = ScriptedRouter(fail_roles={"planner"})
-    result = start_cycle(
-        config=graph_env["config"],
-        db=graph_env["db"],
-        project_id="alpha-project",
-        repo_path=graph_env["repo"],
-        objective="o",
-        models=router,
-    )
-    assert result.status is RunStatus.SUCCEEDED
-    assert any("planner failed" in n for n in result.notes)
+    with pytest.raises(StageExecutionError) as raised:
+        start_cycle(
+            config=graph_env["config"],
+            db=graph_env["db"],
+            project_id="alpha-project",
+            repo_path=graph_env["repo"],
+            objective="o",
+            models=router,
+        )
+    assert raised.value.failure_class is FailureClass.MODEL_OUTPUT_INVALID
 
 
 # --------------------------------------------------------- state discipline --

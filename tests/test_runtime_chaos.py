@@ -60,6 +60,7 @@ from research_os.runtime.models import (
 from research_os.runtime.notify import CollectingNotifier
 from research_os.runtime.policy import ActionKind
 from research_os.runtime.queue import LeaseLostError, WorkQueue
+from research_os.runtime.routing import ProviderCallFailedError
 from research_os.runtime.store import RuntimeStore
 from tests.runtime_graph_helpers import (
     ScriptedRouter,
@@ -825,17 +826,32 @@ def test_every_provider_being_down_does_not_corrupt_anything(
 
     store: RuntimeStore = chaos["store"]
     run = store.create_run(project_id="alpha-project", objective="o")
-    dead = ScriptedRouter(fail_roles={"planner", "scientific_reviewer"})
-    result = resume_cycle(
-        config=chaos["config"],
-        db=chaos["db"],
-        run_id=run.run_id,
-        repo_path=chaos["repo"],
-        models=dead,
+    dead = ScriptedRouter(unavailable=True)
+
+    # **Not a clean ending.** This test used to assert
+    # `SUCCEEDED / DONE_FOR_NOW` here, on the reasoning that nothing was
+    # corrupted -- and nothing was. What was wrong was the report: a cycle
+    # whose every provider was down was recorded as a cycle that had finished
+    # its work. A live pilot then did exactly this to three real research runs
+    # and told the researcher a scientific decision was waiting for them.
+    #
+    # Corrupting nothing is still the property under test. It now includes not
+    # corrupting the *account of what happened*.
+    with pytest.raises(ProviderCallFailedError):
+        resume_cycle(
+            config=chaos["config"],
+            db=chaos["db"],
+            run_id=run.run_id,
+            repo_path=chaos["repo"],
+            models=dead,
+        )
+
+    unchanged = store.require_run(run.run_id)
+    assert unchanged.status is not RunStatus.SUCCEEDED
+    assert unchanged.terminal_state is None, (
+        f"an outage recorded the conclusion {unchanged.terminal_state}"
     )
-    assert result.status is RunStatus.SUCCEEDED
-    assert result.terminal_state is TerminalState.DONE_FOR_NOW
-    assert any("planner failed" in note for note in result.notes)
+    assert unchanged.finished_at is None
     assert BudgetExhaustedError  # imported for the neighbouring tests
 
 

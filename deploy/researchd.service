@@ -7,11 +7,16 @@
 #
 # To use it, deliberately:
 #
-#   mkdir -p ~/.config/systemd/user
+#   mkdir -p ~/.config/systemd/user ~/.config/research-os
 #   cp deploy/researchd.service ~/.config/systemd/user/
-#   # put the DSN somewhere only you can read:
-#   install -m 600 /dev/null ~/.config/research-os/researchd.env
-#   printf 'RESEARCH_OS_RUNTIME_DSN=%s\n' '<your dsn>' >> ~/.config/research-os/researchd.env
+#   # Put the DSN somewhere only you can read. `touch` and `chmod`, not
+#   # `install -m 600 /dev/null`, which silently truncates the file -- so
+#   # re-running this after adding a provider credential would delete it.
+#   touch ~/.config/research-os/researchd.env
+#   chmod 600 ~/.config/research-os/researchd.env
+#   # Then *edit* that file and add the line, rather than echoing a password
+#   # onto a command line where your shell history keeps it:
+#   #   RESEARCH_OS_RUNTIME_DSN=<your dsn>
 #   systemctl --user daemon-reload
 #   systemctl --user enable --now researchd
 #   journalctl --user -u researchd -f
@@ -56,6 +61,59 @@ Type=simple
 
 # The DSN may contain a password, so it is read from a file the researcher owns
 # rather than written here. A unit file is world-readable; this is not.
+#
+# The same file is where provider credentials belong, and there is a reason to
+# put them there that was learned the hard way.
+#
+# PROVIDER CREDENTIAL ISOLATION, and why you may want it.
+#
+# This daemon runs the provider CLI as a subprocess with this user's
+# environment, so by default it reads the same configuration directory and the
+# same OAuth token as every interactive session on the machine. On 2026-09-19
+# an interactive session and this daemon refreshed that token at the same
+# moment; the refresh failed for both, and the runtime spent five minutes
+# unable to reach any provider:
+#
+#   Failed to refresh OAuth token: another Claude Code process is refreshing
+#   it or exited mid-refresh.
+#
+# The runtime now survives that -- work waits for the breaker's cooldown and
+# resumes, and docs/RUNTIME.md §17 is the contract -- so this is an
+# optimisation, not a prerequisite. It stops the collision instead of
+# recovering from it.
+#
+# Three ways, all of which require YOU to authenticate. Nothing in this
+# repository installs a credential, copies one, or reads one, and none of them
+# may be committed:
+#
+#   1. a separate configuration directory with its own login. Verified on this
+#      machine: the CLI honours CLAUDE_CONFIG_DIR and an empty directory
+#      reports `loggedIn: false`, so the daemon gets a credential store of its
+#      own rather than sharing yours.
+#
+#        mkdir -p ~/.config/research-os/provider-home
+#        CLAUDE_CONFIG_DIR=~/.config/research-os/provider-home claude auth login
+#        printf 'CLAUDE_CONFIG_DIR=%s\n' "$HOME/.config/research-os/provider-home" \
+#          >> ~/.config/research-os/researchd.env
+#
+#      (One `%s`, not two. `%%` is printf's escape for a literal percent, so
+#      the doubled form writes `CLAUDE_CONFIG_DIR=%s` and throws the path
+#      away -- a relative path the CLI then resolves against its working
+#      directory, which is an artifact root or a project worktree. The
+#      isolation silently does not happen and a directory named `%s` appears
+#      in a checkout. An independent security review found this in the first
+#      version of these instructions.)
+#
+#   2. a long-lived token from `claude setup-token`, written into the
+#      EnvironmentFile under the variable that command tells you to use;
+#
+#   3. an API key in ANTHROPIC_API_KEY, which the CLI documents. Different
+#      billing, so it is a decision rather than a default.
+#
+# Whichever you choose: `chmod 600` the file, and never copy it into a
+# checkout -- not even into `deploy/` beside this unit, which is the obvious
+# mistake and the one `.gitignore` is now widened to catch. The file lives
+# under ~/.config and stays there. SECURITY.md is the full boundary.
 EnvironmentFile=%h/.config/research-os/researchd.env
 
 # uv run, so the daemon uses the project environment the tests ran against
@@ -84,11 +142,36 @@ RestartSec=10s
 # researchd` beside a daemon already running in a terminal is a no-op rather
 # than two loops competing for the same work rows.
 
-# Hardening. The daemon reads and writes the researcher's repositories and XDG
-# directories and nothing else, so most of the filesystem can be hidden from it.
-# Note what is NOT locked down: it runs project acceptance commands, which means
-# running project code, so this is defence in depth and not a sandbox.
-# docs/RUNTIME.md and SECURITY.md state that boundary in full.
+# Hardening -- and read the next paragraph before believing any of it.
+#
+# MEASURED, NOT ASSUMED: on this reference host the mount-namespace directives
+# below (`ProtectSystem=`, `PrivateTmp=`, `ReadWritePaths=`) are accepted, the
+# unit starts, and **they do not bind**. A user manager cannot build the
+# namespace they need while `kernel.apparmor_restrict_unprivileged_userns=1`,
+# and systemd does not fail the unit when it cannot. Checked rather than
+# reasoned about:
+#
+#   systemd-run --user -p PrivateTmp=true /bin/sh -c 'touch /tmp/probe'
+#   # /tmp/probe is visible on the host afterwards -> PrivateTmp did not bind
+#
+#   systemd-run --user -p ProtectSystem=strict /bin/sh -c 'touch $HOME/probe'
+#   # succeeds -> the hierarchy is not read-only
+#
+# This is the same silent ineffectiveness SECURITY.md records for
+# `systemd-run --user` as a containment backend, and `sandbox.py` refuses that
+# backend for exactly this reason. The directives are kept because they are
+# correct and do bind on a *system* unit, and because a host without that
+# AppArmor restriction gets them -- but on this machine they are a statement
+# of intent, not a boundary.
+#
+# Two that DO apply here, because they need no namespace: `NoNewPrivileges=`
+# and the `Restrict*`/`Remove*` set below, which are prctl and seccomp
+# operations.
+#
+# Note also what is not locked down even where these do bind: the daemon runs
+# project acceptance commands, which means running project code, so this is
+# defence in depth and not a sandbox. docs/RUNTIME.md and SECURITY.md state
+# that boundary in full.
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict

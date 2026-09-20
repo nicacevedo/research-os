@@ -456,6 +456,8 @@ def parse_literature(
         )
     )
     parsed: list[dict[str, Any]] = []
+    #: The first provider outage seen, if any. See the handler below.
+    blocking_outage: RoutingError | None = None
     for ref in refs:
         try:
             text = context.artifacts.get_text(str(ref["artifact_id"]))
@@ -478,7 +480,22 @@ def parse_literature(
                 )
             )
         except (BudgetExhaustedError, RoutingError) as exc:
-            parsed.append({"artifact_id": ref["artifact_id"], "error": str(exc)})
+            # Caught per document, unlike everywhere else, because the
+            # tolerance is the point here: one unreadable paper among four
+            # must not lose the other three. The first outage is kept so it
+            # can be re-raised below if *nothing* was extracted -- an
+            # exception carries the breaker's deadline and an
+            # `ActionOutcome` does not, and re-raising the original is how
+            # this path keeps both properties at once.
+            if blocking_outage is None and isinstance(exc, RoutingError):
+                blocking_outage = exc
+            parsed.append(
+                {
+                    "artifact_id": ref["artifact_id"],
+                    "error": str(exc),
+                    "failure_class": str(_class_of(exc)),
+                }
+            )
             continue
         parsed.append(
             {
@@ -487,8 +504,43 @@ def parse_literature(
                 "error": response.error,
             }
         )
+
+    # **Partial extraction is a result; no extraction is not.**
+    #
+    # Per-document tolerance is deliberate and stays: one unreadable PDF among
+    # four should not lose the other three, and "extracted fields from 3 of 4"
+    # is a real observation. What was wrong was the boundary. When *every*
+    # document failed, this still reported success -- "extracted fields from 4
+    # document(s)" -- and that sentence became a citable finding with nothing
+    # behind it. During the 2026-09-19 outage the same shape, one level up,
+    # turned a dead provider into three finished research runs.
+    #
+    # So the outcome is failed when nothing was extracted, classified by what
+    # stopped it, which is what routes it to the retry policy instead of to a
+    # conclusion.
+    extracted = [entry for entry in parsed if entry.get("fields")]
+    if refs and not extracted:
+        if blocking_outage is not None:
+            # Re-raised, not reported. The original exception carries the
+            # breaker's `cooldown_until` and whether an invocation happened,
+            # and those are what the queue schedules the retry against.
+            raise blocking_outage
+        blocking = next(
+            (entry["failure_class"] for entry in parsed if entry.get("failure_class")),
+            str(FailureClass.MODEL_OUTPUT_INVALID),
+        )
+        first = next(
+            (str(entry.get("error")) for entry in parsed if entry.get("error")), ""
+        )
+        return ActionOutcome.failed(
+            f"no fields could be extracted from any of {len(parsed)} document(s): "
+            f"{first}",
+            failure_class=FailureClass(blocking),
+            data={"parsed": parsed},
+        )
+
     return ActionOutcome.succeeded(
-        f"extracted fields from {len(parsed)} document(s)",
+        f"extracted fields from {len(extracted)} of {len(parsed)} document(s)",
         data={
             "parsed": parsed,
             "queries": previous.get("queries", []),
@@ -506,6 +558,22 @@ def parse_literature(
             ),
         },
     )
+
+
+def _class_of(exc: Exception) -> FailureClass:
+    """What stopped one document's extraction.
+
+    A budget refusal is a policy answer and terminal; anything the router
+    raises carries its own class, and the fallback is the one that says a
+    provider did not answer.
+    """
+
+    if isinstance(exc, BudgetExhaustedError):
+        return FailureClass.BUDGET_EXHAUSTED
+    declared = getattr(exc, "failure_class", None)
+    if isinstance(declared, FailureClass):
+        return declared
+    return FailureClass.PROVIDER_UNAVAILABLE
 
 
 def rebuild_literature_index(

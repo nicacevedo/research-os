@@ -1625,3 +1625,296 @@ is `read_only=True` with no `access`, which resolves to `CONTEXT_ONLY` and
 force-empties the tool set. Every runtime model call is tool-less — it cannot
 read a file, run a command, or reach the network, whatever its role says.
 `tests/test_runtime_routing.py` asserts it for five roles.
+
+## 17. The provider-failure lifecycle
+
+Added after the pilot of 2026-09-19, which is the first time this runtime ran
+unattended across a real infrastructure failure. Everything in §14a worked: a
+researcher committed a question, the capsule observer noticed exactly one
+change, the digests moved, the parked objectives were found, successor
+uniqueness and replay deduplication held. Then a provider went away for five
+minutes, and the runtime said things that were not true.
+
+This section is the contract that replaced the assumptions.
+
+### What happened
+
+An interactive Claude Code session was running on the same workstation as
+`researchd`, sharing one OAuth token. Their refreshes collided:
+
+```text
+Failed to refresh OAuth token: another Claude Code process is refreshing it
+or exited mid-refresh.
+```
+
+Three planner calls failed, the breaker opened for 300 seconds, and five
+defects followed from one root cause plus four gaps it fell through.
+
+| # | defect | consequence |
+|---|---|---|
+| D1 | a failed model call became `plan_refusal`, and `conclude` mapped any refusal to `DONE_FOR_NOW` | three runs reported as `SUCCEEDED / DONE_FOR_NOW`, and `runtime status` told the researcher they had "finished cleanly" and a decision was theirs |
+| D2 | retry backoff (30s, 60s) fitted inside the breaker cooldown (300s) | every attempt fell in a window where routing was guaranteed to refuse; a transient failure became permanent by arithmetic |
+| D3 | an exhausted work item left its run `RUNNING` with no live work and no reaper | three runs in flight for twenty-one hours |
+| D4 | `parked_objectives` excludes objectives whose newest run is in flight | those three objectives left the research frontier permanently; five parked objectives became two |
+| D5 | `advance_objective` isolated only `SuccessorExistsError` | the fifth objective was never evaluated and received no disposition |
+| — | every failed cycle still opened a lineage link | six of twelve cycles spent on runs in which no science occurred |
+
+D1 is the one that matters. The other four are recoverable; D1 is a false
+scientific statement, made to a person, by a system whose entire purpose is to
+be trusted with the parts of science that are not judgement.
+
+### I1. A conclusion requires an execution
+
+> No run may reach `SUCCEEDED`, `DONE_FOR_NOW` or `WAITING_FOR_SCIENTIFIC_DECISION`
+> because a provider or model call failed.
+
+Enforced at one place rather than eleven. **The router raises when the provider
+did not answer**, and returns a response only when it did:
+
+| what happened | what `ModelRouter.complete` does |
+|---|---|
+| the adapter could not be invoked | raises `ProviderCallFailedError(PROVIDER_TRANSIENT)` |
+| the provider exited non-zero, or reported an error | raises `ProviderCallFailedError(PROVIDER_UNAVAILABLE)` |
+| the provider timed out | raises `ProviderCallFailedError(PROVIDER_TIMEOUT)` |
+| the provider answered, but not in the shape asked for | **returns** a response with `error="malformed structured output"` |
+
+The last row is the whole distinction. A model that answered badly is a fact
+about the model, and a node may reason about it. A provider that did not answer
+is not an answer at all, and there is nothing to reason about — so it leaves
+the graph as an exception and reaches the work queue, which has the right
+vocabulary for it: a failure class, a retry policy and a schedule.
+
+Before this, eleven call sites each decided what a non-`ok` response meant.
+Most called it `MODEL_OUTPUT_INVALID`, which is wrong quietly. The planner node
+called it a refusal, which was wrong loudly.
+
+**And the handlers stopped catching it.** Nine action handlers wrapped their
+model call in `except (BudgetExhaustedError, RoutingError)` and returned an
+`ActionOutcome`. That looked careful and was the opposite, for two reasons an
+independent audit found after the first version of this fix:
+
+- an `ActionOutcome` carries a failure class and nothing else — not the
+  breaker's `cooldown_until`, not whether an invocation happened. Both are
+  what the queue needs, so every provider failure through that door was
+  rescheduled by the linear backoff alone and charged an attempt it had not
+  spent. D2, intact, on a second path;
+- `assess_frontier_ranked` returned **`succeeded`** with
+  `recommendation: START_NEXT_CYCLE`, so an outage there produced a cycle that
+  concluded `DONE_FOR_NOW`, recorded a citable finding, was offered to the
+  next capsule change as parked, and opened a successor. D1 and the
+  cycle-budget loss together, on the action the planner reaches for most.
+
+So `RoutingError` now propagates out of every handler. `BudgetExhaustedError`
+is still caught, and the difference is the point: a budget refusal is a policy
+answer, no amount of waiting changes it, and degrading to the deterministic
+frontier is the honest thing to do. An outage is temporary and the honest
+thing is to wait.
+
+`parse_literature` is the one exception, and keeps a per-*document* catch: one
+unreadable paper among four must not lose the other three. When nothing at all
+was extracted it re-raises the first outage rather than reporting it, so both
+properties hold at once.
+
+### I2. Infrastructure and science are different states
+
+No new states were added; four existing ones were being conflated.
+
+| state | means |
+|---|---|
+| `SUCCEEDED / DONE_FOR_NOW` | the cycle ran and there is nothing further it may usefully do |
+| `SUCCEEDED / WAITING_FOR_SCIENTIFIC_DECISION` | the cycle ran and reached a gate only a person can pass |
+| `RUNNING`, retry scheduled | transient infrastructure blockage; the queue is working on it |
+| `FAILED / FATAL_INFRASTRUCTURE_ERROR` | the cycle could not be run, and recovery gave up |
+
+`FATAL_INFRASTRUCTURE_ERROR` is deliberately **not** accepted by
+`parked_objectives`: a run that concluded nothing is not offered to the next
+capsule change as though it had.
+
+### I3/I4. No run stays in flight with nothing to run
+
+`Daemon._reconcile_runs` runs every tick, between `_recover` and
+`_observe_capsules`. It asks one question, of every run, without naming any:
+
+> Is this run `RUNNING` or `CREATED`, with no live work item, no outstanding
+> external job, and untouched for `run_reconcile_grace_seconds`?
+
+Deliberately not *why*. A worker that segfaulted, a daemon killed between
+`open_cycle` and the ingest pass, a provider that vanished mid-cycle, an item
+that exhausted its attempts — all land in the same state, and a reconciler with
+a case per cause would have missed the next one.
+
+Two exclusions are load-bearing and were both found by review rather than by
+design. A run holding the **advisory run lock** is being executed right now —
+`_work_advance_objective` runs cycles inline, so between `open_cycle` and the
+ingest pass a healthy run has no work item at all, and a cycle slower than the
+grace period would otherwise be diagnosed as stranded. And the **active
+external-job** list is derived from `ACTIVE_JOB_STATUSES` rather than written
+out: the hand-written version named `QUEUED`, which is not a member and which
+the check constraint rejects, and omitted `SUBMITTING`, `PENDING` and
+`UNKNOWN` — the statuses a cluster job actually waits in.
+
+Two dispositions:
+
+- **reschedule**, while the run is under `max_run_reschedules` *and* the
+  blocking condition has visibly lifted. A fresh `run_cycle` item re-enters the
+  **same** run at its own LangGraph checkpoint. No successor, no lineage link,
+  no cycle charged, and the planning already done is reused;
+- **abandon**, past the bound: `FAILED / FATAL_INFRASTRUCTURE_ERROR`, with the
+  failure class and error in `detail`.
+
+Idempotence comes from a dedup key naming the reschedule ordinal, which two
+daemons compute identically; the bound is counted from `RUN_RESCHEDULED` events
+in the append-only ledger, so a restart cannot reset it.
+
+Recovery needs no capsule change and no SQL. That is the point: a capsule
+change is a *scientific* act, and needing one to recover from a network failure
+would mean the runtime could only be repaired by doing science.
+
+### I5. Retry against availability, not against a stopwatch
+
+The backoff and the breaker were two clocks that had never been compared. Now:
+
+```text
+scheduled_at = max(now + backoff × attempts, provider cooldown_until)
+```
+
+and, separately, **a call that never happened does not cost an attempt**. When
+routing refuses because every eligible provider is cooling, the item is
+*deferred* — rescheduled past the deadline with the attempt refunded, bounded by
+`max_parks` so an outage that never ends still terminates. A real invocation
+that fails still costs its attempt; it is simply not rescheduled into a window
+where it cannot succeed.
+
+**And the deadline is looked up, not only inherited.** The router attaches the
+breaker's `cooldown_until` to what it raises, which is enough for the planner
+call and not enough in general: a handler that catches a provider error and
+reports it, or a broad `except ResearchOSError` two frames up, yields a
+failure with the right class and no deadline. So `_finish_failed` asks the
+breaker directly whenever a provider-class failure arrives without one. That
+makes cooldown-aware scheduling a property of the failure *class* rather than
+of how carefully each of nine call sites preserved an exception — which is the
+same reasoning as I1, applied to the retry policy instead of to the terminal
+state. It returns nothing when some provider is already usable, so an ordinary
+transient error still retries on its ordinary backoff.
+
+Note what was *not* done: `max_attempts` was not raised until the numbers
+happened to overlap. That hides the same defect behind different magic numbers
+and breaks again the first time either setting changes.
+
+While fixing this, a second defect surfaced: `provider_failure_threshold` and
+`provider_cooldown_seconds` were settings nothing read. The router called the
+store with default arguments that happened to equal them, so changing either in
+`runtime.yaml` changed nothing. They are wired now.
+
+### I6. One objective's failure is one objective's failure
+
+`_work_advance_objective` isolates every objective, records a disposition for
+each as an `OBJECTIVE_DISPOSITION` event keyed by `(objective run, capsule
+digest)`, and only then re-raises the first infrastructure failure so the item
+is retried. Objectives that advanced already have successors, so the retry
+skips them: isolation does not cost idempotence.
+
+Dispositions: `ADVANCED`, `STILL_PARKED(reason)`, `FAILED_TO_ADVANCE(reason)`.
+"Never reached" is no longer expressible.
+
+A related observability gap is closed with it. `_finish_failed` recorded
+`WORK_FAILED` only when the item had a `run_id`, and `advance_objective` has
+none — so the one work item that explains how five objectives became two
+emitted no event at all, while the three cycle failures around it did. The
+trail looked complete.
+
+### I8. Infrastructure does not spend the cycle budget
+
+> A failed provider refresh, network failure or breaker cooldown must not count
+> against `max_cycles_per_objective`.
+
+`max_cycles_per_objective` is a *scientific* allowance. It exists because the
+runtime cannot change canonical state, so repeating a cycle repeats its cost
+without adding information (§16). An OAuth collision adds no information
+either, and must not be charged the same way.
+
+The mechanism is structural rather than a counter: **recovery re-enters the
+existing run**, and a run has exactly one lineage link whatever happens inside
+it. `lineage_depth` is measured over `parent_run_id`, so a run rescheduled
+fifty times is still one cycle.
+
+What *does* still cost lineage is a successor opened by a cycle that genuinely
+concluded. That is correct, and it is why I1 matters to I8: before the fix, a
+cycle that failed on a provider concluded `DONE_FOR_NOW`, and the runs it went
+on to open were real lineage spent on nothing.
+
+### I9. The operator surface says what is true
+
+`runtime status` put every parked run under **"WAITING FOR A SCIENTIFIC
+DECISION (finished; you are next)"** and added "These finished cleanly." That
+was true of most rows and catastrophically false for the rest.
+
+Three sections now, and the claim "you are next" is made only for the terminal
+state that means it:
+
+- **STALLED (in flight, but nothing is running)** — runs the reconciler is about
+  to repair, or cannot. Shown first, because a stranded run is neither of the
+  states around it and is the only one here that is a fault rather than a
+  question;
+- **WAITING FOR A SCIENTIFIC DECISION** — `WAITING_FOR_SCIENTIFIC_DECISION`
+  only;
+- **PARKED (nothing is owed; they resume when the science moves)** — everything
+  else, with its recommendation and the reason it stopped.
+
+### Provider authentication, and what this deployment can promise
+
+The trigger was not random noise. `researchd` invokes the provider CLI as a
+subprocess, inheriting this user's environment, so it reads the same
+`~/.claude` and the same OAuth token as every interactive session on the
+machine. Concurrent refreshes collide. This will recur.
+
+What was checked rather than assumed, on this machine:
+
+- `claude auth status` reports `configDirectory: ~/.claude` and
+  `authMethod: claude.ai` — shared credential state, confirmed;
+- `CLAUDE_CONFIG_DIR` **is** honoured: pointed at an empty directory the CLI
+  reports `loggedIn: false` and a config directory of its own. An isolated
+  credential store for the daemon is therefore possible;
+- the CLI documents `ANTHROPIC_API_KEY`, and `claude setup-token` creates a
+  long-lived token.
+
+All three require the researcher to authenticate. Installing a credential is a
+human act, this runtime does not copy secrets, and nothing here may enter Git —
+so isolation is **available and not configured**, and `deploy/researchd.service`
+says how to configure it.
+
+That is why the recovery path above is the load-bearing answer rather than the
+fallback. The acceptable outcomes for concurrent use are:
+
+```text
+A. independent credentials      -> both processes work
+B. shared credentials collide   -> the provider is briefly unavailable, work
+                                   waits, work resumes, and no lifecycle state
+                                   is corrupted
+```
+
+B is what this deployment provides, and B is what the regression suite holds.
+Unacceptable — contention producing `DONE_FOR_NOW`, a decision request, a
+permanent orphan, or a lost objective — is what each of I1 through I9 forbids.
+
+### What the two independent reviews found in this fix
+
+Recorded because the findings are more useful than the fixes, and because four
+of them were defects the first version of this closure introduced.
+
+| review | finding | disposition |
+|---|---|---|
+| test | the action layer dropped `retry_at` and `attempted`, so D2 survived on every path through a handler | fixed: `RoutingError` propagates |
+| test | `assess_frontier_ranked` turned an outage into `succeeded / START_NEXT_CYCLE` | fixed: only the budget degrades |
+| test | `lineage_depth(run_id)` on a parentless run is `0` unconditionally — the cycle-budget assertion could not fail | fixed: measured over every run of the objective, with a control that moves it to 1 |
+| test | the end-to-end reachability check scanned rows the scenario never touches, and could not detect D4 | fixed: measured through `parked_objectives`, with a positive control asserting D4 reproduced first |
+| test | the replay test replayed the *ingest* dedup key, so the handler ran once | fixed: the handler is invoked three times directly |
+| test | one test asserted the behaviour of its own test double | deleted; the real proof is in `test_runtime_routing.py` |
+| test | nothing exercised `default_model_factory`, so the newly-wired breaker settings could be deleted with the suite green | fixed: a test through the real factory, and one through the real router and daemon with no router double |
+| security | `printf 'CLAUDE_CONFIG_DIR=%%s\n'` writes a literal `%s` — the documented remedy for the incident did not work | fixed |
+| security | `stranded_runs` tested external jobs against a status the schema forbids and missed three real ones | fixed: derived from the enum |
+| security | a crash between the reschedule enqueue and its event wedged the run permanently | fixed: the event is recorded either way, and it has its own dedup key |
+| security | `.gitignore` did not match `researchd.env`, the file the new guidance fills with secrets | fixed: `*.env` |
+| security | `next_recommendation` was the one field rendered without `_safe` | fixed |
+| security | the unit's hardening block claims a filesystem boundary that does not bind in a user manager on this host | corrected, with the measurement in the file |
+| security | `sandbox.py:_declared_base` lets a model-written `pyvenv.cfg` choose which host Python prefix is bound | **not fixed, reported.** Containment is not implicated in this incident and the mission scopes it out. Read-only exposure of a real Python runtime, not an escape. It belongs in a containment work package with the `SECURITY.md` §190 wording it contradicts |

@@ -732,45 +732,85 @@ def test_an_unknown_recommendation_falls_back_conservatively(
     assert outcome.data["recommendation"] == "START_NEXT_CYCLE"
 
 
-def test_ranking_degrades_to_the_deterministic_frontier(
+class _Refusing:
+    """A provider that raises whatever it is given, and counts."""
+
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+        self.calls = 0
+
+    def complete(self, _request: Any) -> Any:
+        self.calls += 1
+        raise self.error
+
+
+def test_ranking_degrades_to_the_deterministic_frontier_when_the_budget_is_gone(
     action_env: dict[str, Any],
 ) -> None:
-    """Ranking is an improvement on the frontier, not a prerequisite for it."""
+    """Ranking is an improvement on the frontier, not a prerequisite for it.
 
-    from research_os.runtime.artifacts import FilesystemArtifactStore
-    from research_os.runtime.budgets import BudgetLedger
-    from research_os.runtime.routing import ModelRouter, ProviderProfile
-    from tests.fake_providers import FakeProvider, ScriptedResponse
+    Scoped to the budget, which is the case the degradation was written for:
+    the researcher said stop spending, no amount of waiting changes that, and
+    the deterministic frontier -- computed locally from the capsule -- is the
+    honest answer to give instead.
+    """
 
-    store = RuntimeStore(action_env["db"])
-    broken = FakeProvider(
-        name="broken",
-        family="a",
-        responses={
-            "planner": [ScriptedResponse(structured=None, exit_code=1, error="down")]
-        },
-    )
-    router = ModelRouter(
-        adapters={"broken": broken},
-        profiles=(ProviderProfile(name="broken", family="a", tier=3),),
-        store=store,
-        artifacts=FilesystemArtifactStore(action_env["artifacts_root"], store=store),
-        budgets=BudgetLedger(action_env["db"]),
-        run_id=action_env["run"].run_id,
-        project_id="alpha-project",
+    from research_os.runtime.budgets import BudgetExhaustedError, Dimension
+    from research_os.runtime.models import BudgetScope
+
+    exhausted = BudgetExhaustedError(
+        "model_calls: 8 of 8 used",
+        dimension=Dimension.MODEL_CALLS,
+        scope=BudgetScope.RUN,
+        scope_id=action_env["run"].run_id,
     )
     context = make_context(
         db=action_env["db"],
         repo=action_env["repo"],
         artifacts_root=action_env["artifacts_root"],
         dsn=action_env["dsn"],
-        models=router,
+        models=_Refusing(exhausted),
         permitted=(),
     )
     outcome = assess_frontier_ranked(action_env["state"], context, {})
-    assert outcome.ok, "a missing ranker must not fail the cycle"
+    assert outcome.ok, "an exhausted ranker budget must not fail the cycle"
     assert outcome.data["recommendation"] == "START_NEXT_CYCLE"
     assert outcome.data["summary"]["open_questions"] >= 1
+
+
+def test_ranking_does_not_degrade_when_the_provider_is_merely_unavailable(
+    action_env: dict[str, Any],
+) -> None:
+    """The same degradation applied to an outage was the worst instance of D1.
+
+    This branch returns `succeeded` with `recommendation: START_NEXT_CYCLE`.
+    So a provider outage during `assess_frontier` used to produce a cycle that
+    concluded DONE_FOR_NOW, recorded a citable finding, was offered to the
+    next capsule change as parked, and opened a successor -- one of the
+    objective's twelve cycles spent on work that never ran. Every property the
+    provider-failure closure establishes, defeated through one `except`
+    clause, on the single action the planner reaches for most often.
+
+    An outage is temporary. The honest answer is to wait, which means the
+    exception must reach the queue.
+    """
+
+    from research_os.runtime.routing import ProviderCallFailedError
+
+    outage = ProviderCallFailedError(
+        "no healthy provider offers ranking",
+        failure_class=FailureClass.PROVIDER_UNAVAILABLE,
+    )
+    context = make_context(
+        db=action_env["db"],
+        repo=action_env["repo"],
+        artifacts_root=action_env["artifacts_root"],
+        dsn=action_env["dsn"],
+        models=_Refusing(outage),
+        permitted=(),
+    )
+    with pytest.raises(ProviderCallFailedError):
+        assess_frontier_ranked(action_env["state"], context, {})
 
 
 # -------------------------------------------------------------------- coding --
