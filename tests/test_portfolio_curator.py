@@ -286,3 +286,47 @@ def test_a_real_escape_is_still_detected(
     )
     after = canonical_fingerprint(repository)
     assert escaped(before, after)
+
+
+def test_the_bank_branch_carries_none_of_the_researchers_work(
+    portfolio: PortfolioStore,
+    runtime_db: Database,
+    runtime_project: str,
+    repository: Path,
+) -> None:
+    """A true orphan, and the first version of this was not one.
+
+    Branching from HEAD put a copy of the researcher's `.research/` capsule on
+    the bank branch -- which is the exact thing §12 of the architecture says
+    must not happen, because a capsule directory on an autonomous branch is one
+    the kernel validator would try to read and a person could merge without
+    noticing. A smoke test against a real repository found it while the
+    docstring claimed the right behaviour.
+    """
+
+    seed_idea(portfolio, runtime_project)
+    _curate(runtime_db, runtime_project, repository)
+
+    listing = subprocess.run(
+        ["git", "ls-tree", "-r", "--name-only", AUTONOMOUS_BANK_BRANCH],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.split()
+    assert listing
+    assert all(name.startswith(BANK_ROOT) for name in listing), listing
+    assert not any(name.startswith(".research/") for name in listing)
+    assert "README.md" not in listing
+
+    # And it shares no history with the science.
+    merge_base = subprocess.run(
+        ["git", "merge-base", "HEAD", AUTONOMOUS_BANK_BRANCH],
+        cwd=repository,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert merge_base.returncode != 0, (
+        "the bank branch must share no ancestor with the researcher's work"
+    )

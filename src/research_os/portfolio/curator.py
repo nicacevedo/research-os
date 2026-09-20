@@ -574,13 +574,25 @@ def _write(
     return gitutil.head_commit(target)
 
 
-def _ensure_branch(repository: Path) -> str:
-    """Create the autonomous branch if it does not exist, as an orphan.
+#: The empty tree, which every Git repository has whether or not anything
+#: references it. Used to root the bank's first commit.
+EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 
-    An orphan rather than a branch off the researcher's work: the bank shares
-    no history with the science, has no reason to carry it, and a branch that
-    started from `main` would make `git log` on it show the researcher's
-    commits underneath the Curator's.
+
+def _ensure_branch(repository: Path) -> str:
+    """Create the autonomous branch if it does not exist, as a true orphan.
+
+    An orphan, and the first version of this was not one -- it branched from
+    ``HEAD``, which put a copy of the researcher's ``.research/`` capsule on
+    the bank branch. That is the specific thing §12 of the architecture says
+    must not happen: a capsule directory on an autonomous branch is one the
+    kernel validator would try to read and a person could merge without
+    noticing. A smoke test against a real repository found it; the docstring
+    had claimed the right behaviour while the code did something else.
+
+    Rooted on the empty tree via ``commit-tree``, so the branch shares no
+    history with the science, ``git log`` on it shows only the Curator's
+    commits, and it carries nothing the researcher wrote.
     """
 
     if gitutil.branch_exists(repository, AUTONOMOUS_BANK_BRANCH):
@@ -590,10 +602,22 @@ def _ensure_branch(repository: Path) -> str:
             f"{repository} has no commits; the Curator will not be the first "
             f"thing to write to a repository"
         )
-    gitutil.git(
-        ["branch", AUTONOMOUS_BANK_BRANCH, gitutil.head_commit(repository)],
+    root = gitutil.git(
+        [
+            "-c",
+            "user.name=Research OS Curator",
+            "-c",
+            "user.email=curator@research-os.invalid",
+            "commit-tree",
+            EMPTY_TREE,
+            "-m",
+            "Autonomous bank: root",
+        ],
         cwd=repository,
-    )
+    ).stdout.strip()
+    if not root:
+        raise CuratorError(f"could not root {AUTONOMOUS_BANK_BRANCH} in {repository}")
+    gitutil.git(["branch", AUTONOMOUS_BANK_BRANCH, root], cwd=repository)
     return AUTONOMOUS_BANK_BRANCH
 
 
