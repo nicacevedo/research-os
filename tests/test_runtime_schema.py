@@ -15,10 +15,14 @@ import re
 
 import pytest
 
+from research_os.portfolio.models import (
+    ENUM_CONSTRAINTS as PORTFOLIO_ENUM_CONSTRAINTS,
+)
+from research_os.portfolio.models import POLICY_CONSTRAINTS
 from research_os.runtime.db import Database, RuntimeDatabaseError
 from research_os.runtime.findings import FindingKind, RuntimeFinding
 from research_os.runtime.migrations import current_version, discover, migrate, pending
-from research_os.runtime.models import ENUM_CONSTRAINTS
+from research_os.runtime.models import ENUM_CONSTRAINTS as RUNTIME_ENUM_CONSTRAINTS
 from research_os.runtime.store import RuntimeStore
 
 pytestmark = pytest.mark.usefixtures("runtime_db")
@@ -68,6 +72,17 @@ def _constraint_values(runtime_db: Database, name: str) -> frozenset[str]:
     return frozenset(re.findall(r"'([^']+)'::text", str(row["src"])))
 
 
+#: Both halves of the schema, in one mapping. The portfolio's enums live in
+#: their own module because the runtime must not import the layer above it
+#: (``tests/test_runtime_layering.py``), and this test is where the two halves
+#: are allowed to meet -- a test may import anything.
+ENUM_CONSTRAINTS = {**RUNTIME_ENUM_CONSTRAINTS, **PORTFOLIO_ENUM_CONSTRAINTS}
+
+assert len(ENUM_CONSTRAINTS) == len(RUNTIME_ENUM_CONSTRAINTS) + len(
+    PORTFOLIO_ENUM_CONSTRAINTS
+), "a constraint name is claimed by both the runtime and the portfolio"
+
+
 @pytest.mark.parametrize(("name", "expected"), sorted(ENUM_CONSTRAINTS.items()))
 def test_each_status_constraint_matches_its_python_enum(
     runtime_db: Database, name: str, expected: frozenset[str]
@@ -107,18 +122,32 @@ def test_every_value_list_constraint_in_the_database_is_mirrored(
     # A value-list constraint is one whose definition enumerates string
     # literals. `check (source_cycle >= 0)` and the lease-shape constraints do
     # not, and there is no enum for them to mirror.
+    #
+    # Three forms, because PostgreSQL renders three. `x in ('a','b')` becomes
+    # `= ANY (ARRAY[...])` for a scalar column; a multi-value column's
+    # membership test is written `col <@ ARRAY[...]` and survives verbatim; and
+    # a constraint written with an explicit `IN` list on a non-indexable
+    # expression keeps it. The third form was the only one this test knew when
+    # `idea_versions_adjudication_ck` was added, so the constraint that decides
+    # which quality gate applies to an idea was invisible to the check that
+    # exists to make sure nothing is invisible.
     found = {
         str(row["name"])
         for row in rows
         if re.search(r"= ANY \(ARRAY\[", str(row["src"]))
+        or re.search(r"<@ ARRAY\[", str(row["src"]))
         or re.search(r" IN \('", str(row["src"]))
     }
-    unmirrored = found - set(ENUM_CONSTRAINTS)
+    unmirrored = found - set(ENUM_CONSTRAINTS) - set(POLICY_CONSTRAINTS)
     assert unmirrored == set(), (
         f"these check constraints enumerate values with no Python enum "
         f"mirroring them: {sorted(unmirrored)}. Add the enum and the "
-        f"ENUM_CONSTRAINTS entry, so the two definitions cannot drift."
+        f"ENUM_CONSTRAINTS entry, so the two definitions cannot drift -- or, "
+        f"if it states a relationship between columns rather than a closed "
+        f"set, name it in POLICY_CONSTRAINTS with the rule it expresses."
     )
+    # A policy constraint that stops existing must not keep its entry either.
+    assert set(POLICY_CONSTRAINTS) - found == set()
     # And the dictionary must not name a constraint the database does not have,
     # which is how an entry survives the table it described being dropped.
     assert set(ENUM_CONSTRAINTS) - found == set()

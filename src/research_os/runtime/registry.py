@@ -69,7 +69,7 @@ from research_os.runtime.actions.literature import (
 from research_os.runtime.actions.proposals import propose_capsule_change
 from research_os.runtime.actions.review import assess_frontier_ranked, review_science
 from research_os.runtime.context import CycleContext
-from research_os.runtime.policy import ACTIONS, ActionKind
+from research_os.runtime.policy import ACTIONS, ActionKind, Dispatch
 
 __all__ = [
     "ACTION_HANDLERS",
@@ -262,14 +262,26 @@ def register(
 def unimplemented_actions() -> tuple[ActionKind, ...]:
     """Actions whose authority is defined but whose handler is not written.
 
-    Human-executed actions are excluded: they have no handler by design, because
-    the person performs them. Surfaced by ``researchctl runtime doctor`` so the
-    gap between "the policy knows about this" and "this build can do it" is
-    visible rather than discovered when a planner picks one.
+    Two kinds of action are excluded, and both have handlers somewhere that is
+    not this table.
+
+    **Human-executed** actions have no handler by design: the person performs
+    them.
+
+    **Portfolio-dispatched** actions are performed by the idea track and the
+    portfolio tick, which select them deterministically rather than having a
+    planner choose one. Reporting them here would have made doctor print
+    fifteen gaps that are not gaps, and a warning nobody can act on is a
+    warning nobody reads.
+
+    What remains is the real question: an action a planner may pick that this
+    build cannot perform. Surfaced by ``researchctl runtime doctor`` so the gap
+    between "the policy knows about this" and "this build can do it" is visible
+    rather than discovered when a planner picks one.
     """
 
     return tuple(
         action
         for action, policy in ACTIONS.items()
-        if action not in ACTION_HANDLERS and not policy.human_executes
+        if action not in ACTION_HANDLERS and policy.dispatch is Dispatch.CYCLE
     )

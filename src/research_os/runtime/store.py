@@ -60,6 +60,7 @@ from research_os.runtime.models import (
     ProposalReservationStatus,
     ProviderHealth,
     ResearchRun,
+    RunKind,
     RunStatus,
     Schedule,
     StrandedRun,
@@ -70,8 +71,8 @@ LOG = logging.getLogger("research_os.runtime.store")
 
 RUN_COLUMNS = (
     "run_id, project_id, objective, status, terminal_state, next_recommendation, "
-    "autonomy, parent_run_id, cycle_index, thread_id, detail, frontier_digest, "
-    "created_at, started_at, finished_at, updated_at"
+    "autonomy, run_kind, parent_run_id, cycle_index, thread_id, detail, "
+    "frontier_digest, created_at, started_at, finished_at, updated_at"
 )
 #: The same list, prefixed for a query that joins. A bare ``status`` beside a
 #: work item's ``status`` is ambiguous, and PostgreSQL says so rather than
@@ -246,6 +247,8 @@ class RuntimeStore:
         autonomy: Autonomy = Autonomy.HIGH,
         parent_run_id: str | None = None,
         cycle_index: int = 0,
+        run_kind: RunKind = RunKind.CYCLE,
+        thread_id: str | None = None,
     ) -> ResearchRun:
         """Open one bounded cycle.
 
@@ -257,6 +260,15 @@ class RuntimeStore:
         a successor. One parent, at most one successor, enforced by
         ``research_runs_one_successor_idx`` rather than by a lock the caller
         holds -- see ``sql/0014_one_successor_per_run.sql``.
+
+        ``run_kind`` distinguishes an objective cycle from an idea-track stage.
+        It defaults to ``CYCLE``, so nothing that predates the portfolio layer
+        changes, and the two reconciliation queries that walk every run in a
+        project filter on it -- see ``sql/0023_research_run_kind.sql`` for why
+        a column rather than a convention on the objective text.
+
+        ``thread_id`` overrides the derived one, for a run whose workflow is
+        not the cycle graph. It stays unique per run either way.
         """
 
         run_id = new_run_id()
@@ -268,6 +280,8 @@ class RuntimeStore:
                 autonomy=autonomy,
                 parent_run_id=parent_run_id,
                 cycle_index=cycle_index,
+                run_kind=run_kind,
+                thread_id=thread_id or thread_id_for(run_id),
             )
         except RuntimeDatabaseError as exc:
             # `research_runs_one_successor_idx`, not any unique violation: a
@@ -289,15 +303,17 @@ class RuntimeStore:
         autonomy: Autonomy,
         parent_run_id: str | None,
         cycle_index: int,
+        run_kind: RunKind = RunKind.CYCLE,
+        thread_id: str | None = None,
     ) -> ResearchRun:
         with self._db.tx() as conn:
             row = conn.execute(
                 f"""
                 insert into research_runs
-                    (run_id, project_id, objective, autonomy, parent_run_id,
-                     cycle_index, thread_id)
+                    (run_id, project_id, objective, autonomy, run_kind,
+                     parent_run_id, cycle_index, thread_id)
                 values (%(run_id)s, %(project_id)s, %(objective)s, %(autonomy)s,
-                        %(parent)s, %(cycle_index)s, %(thread_id)s)
+                        %(run_kind)s, %(parent)s, %(cycle_index)s, %(thread_id)s)
                 returning {RUN_COLUMNS}
                 """,
                 {
@@ -305,9 +321,10 @@ class RuntimeStore:
                     "project_id": project_id,
                     "objective": objective,
                     "autonomy": str(autonomy),
+                    "run_kind": str(run_kind),
                     "parent": parent_run_id,
                     "cycle_index": cycle_index,
-                    "thread_id": thread_id_for(run_id),
+                    "thread_id": thread_id or thread_id_for(run_id),
                 },
             ).fetchone()
         return ResearchRun.model_validate(row)
@@ -1936,6 +1953,9 @@ class RuntimeStore:
                        {RUN_COLUMNS}
                 from research_runs r
                 where r.project_id = %(project_id)s
+                  -- Idea-track stages are advanced by the portfolio, not by
+                  -- objective continuation. See sql/0023_research_run_kind.sql.
+                  and r.run_kind = 'cycle'
                   and r.status in ('SUCCEEDED','FAILED')
                   and r.terminal_state in (
                       'DONE_FOR_NOW','WAITING_FOR_SCIENTIFIC_DECISION')
@@ -2012,7 +2032,12 @@ class RuntimeStore:
                     order by w.updated_at desc, w.work_id desc
                     limit 1
                 ) recent on true
-                where r.status in ('CREATED','RUNNING')
+                where r.run_kind = 'cycle'
+                  -- A stranded idea-track stage is reconciled by the portfolio
+                  -- tick, which knows how to re-open one. This reconciler
+                  -- enqueues `resume_cycle`, which resumes a CycleGraph
+                  -- thread, and a track's thread is not one.
+                  and r.status in ('CREATED','RUNNING')
                   and r.updated_at < now()
                       - make_interval(secs => %(grace)s)
                   and not exists (

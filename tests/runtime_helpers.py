@@ -36,6 +36,22 @@ from research_os.runtime.migrations import migrate
 #: Every table the runtime owns. Truncated between tests, in one statement so
 #: foreign keys do not dictate an order.
 RUNTIME_TABLES = (
+    # The portfolio layer, listed first only because it references the runtime
+    # and not the other way round. `truncate ... cascade` would reach most of
+    # these through `projects` anyway; they are named explicitly because
+    # "it happens to cascade" is not a property anyone checks, and
+    # `test_portfolio_store.py::test_every_table_is_truncated_between_tests`
+    # asserts this tuple covers the live schema.
+    "portfolio_digests",
+    "portfolio_seeds",
+    "portfolio_state",
+    "idea_objections",
+    "idea_reviews",
+    "idea_evidence",
+    "idea_actions",
+    "idea_edges",
+    "idea_versions",
+    "ideas",
     "artifact_links",
     "artifacts",
     "capsule_observations",

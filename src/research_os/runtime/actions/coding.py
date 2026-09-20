@@ -78,6 +78,7 @@ from research_os.runtime.context import CycleContext
 from research_os.runtime.failures import FailureClass
 from research_os.runtime.idempotency import idempotency_key
 from research_os.runtime.locks import RepositoryBusyError, repository_lock
+from research_os.runtime.refs import is_reserved_ref
 from research_os.runtime.spend import DelegatedSpendAuthority
 from research_os.sandbox import SandboxError, SandboxMode
 
@@ -127,6 +128,17 @@ def canonical_fingerprint(
     ``owned_ref_prefixes`` is the narrow, named exemption: refs under a prefix
     this run reserved before it started. Anything else -- a new branch outside
     it, a moved existing ref, a deleted one -- still fails, and now says which.
+
+    :data:`research_os.runtime.refs.RESERVED_REF_PREFIXES` is the second and
+    last exemption, and it is a *system* namespace rather than a run's. The
+    Curator commits the autonomous idea bank to a branch in this same
+    repository on its own schedule, and this window spans the whole pipeline
+    with the repository lock deliberately released -- so without the exemption,
+    running the portfolio and a coding cycle on one project at the same time
+    makes the coding cycle report an escape that did not happen. That is the
+    identical failure recorded two paragraphs above, with a different writer.
+    ``runtime/refs.py`` records what the blind spot costs and what covers it
+    instead.
 
     One deliberate blind spot: ``.research/runtime/`` is excluded. It is
     gitignored scratch space that the capsule specification reserves and nothing
@@ -183,6 +195,8 @@ def canonical_fingerprint(
         if len(parts) != 2:
             continue
         sha, ref = parts[0].strip(), parts[1].strip()
+        if is_reserved_ref(ref):
+            continue
         if any(ref.startswith(prefix) for prefix in owned_ref_prefixes):
             # **Recorded, not dropped.** An exempt ref is allowed to come into
             # existence and is not allowed to be anything else.

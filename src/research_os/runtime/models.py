@@ -65,6 +65,21 @@ class TerminalState(StrEnum):
     CANCELLED = "CANCELLED"
 
 
+class RunKind(StrEnum):
+    """What kind of run a ``research_runs`` row is.
+
+    ``CYCLE`` is the R5 bounded objective cycle and is the default, so nothing
+    written before the portfolio layer changes meaning. ``IDEA_TRACK`` is one
+    bounded stage of one portfolio idea: it borrows the run row for budgets,
+    provenance and ``researchctl runtime run <id>``, and is deliberately
+    invisible to objective continuation and to cycle reconciliation. See
+    ``sql/0023_research_run_kind.sql``.
+    """
+
+    CYCLE = "cycle"
+    IDEA_TRACK = "idea_track"
+
+
 class WorkStatus(StrEnum):
     PENDING = "PENDING"
     LEASED = "LEASED"
@@ -214,6 +229,7 @@ class ResearchRun(_Record):
     #: says in its result that it did.
     next_recommendation: str | None = None
     autonomy: Autonomy
+    run_kind: RunKind = RunKind.CYCLE
     parent_run_id: str | None = None
     cycle_index: int
     thread_id: str | None = None
@@ -496,6 +512,7 @@ ENUM_CONSTRAINTS: dict[str, frozenset[str]] = {
     "research_runs_status_ck": frozenset(s.value for s in RunStatus),
     "research_runs_terminal_ck": frozenset(s.value for s in TerminalState),
     "research_runs_autonomy_ck": frozenset(s.value for s in Autonomy),
+    "research_runs_kind_ck": frozenset(s.value for s in RunKind),
     "work_items_status_ck": frozenset(s.value for s in WorkStatus),
     "approvals_status_ck": frozenset(s.value for s in ApprovalStatus),
     "tool_invocations_status_ck": frozenset(s.value for s in InvocationStatus),

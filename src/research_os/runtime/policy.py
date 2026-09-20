@@ -110,6 +110,28 @@ class ActionKind(StrEnum):
     NOMINATE_INSIGHT = "nominate_insight"
     PROPOSE_CAPSULE_CHANGE = "propose_capsule_change"
 
+    # --- A0/A1: the discovery portfolio -----------------------------------
+    #
+    # Dispatched by the idea track and the portfolio tick, never by a planner.
+    # They are in this table anyway, because one authority model that covers
+    # everything is worth more than a tidy separation that would let a second
+    # table quietly disagree with this one about what needs a person.
+    GENERATE_IDEAS = "generate_ideas"
+    DEDUPLICATE_IDEAS = "deduplicate_ideas"
+    SCREEN_NOVELTY = "screen_novelty"
+    FALSIFY_IDEA = "falsify_idea"
+    SHARPEN_IDEA = "sharpen_idea"
+    AUDIT_NOVELTY = "audit_novelty"
+    REVIEW_IDEA = "review_idea"
+    META_REVIEW_IDEA = "meta_review_idea"
+    REPLICATE_IDEA = "replicate_idea"
+    BRANCH_IDEA = "branch_idea"
+    ASSIGN_QUALITY_TIER = "assign_quality_tier"
+    RETIRE_IDEA = "retire_idea"
+    REVIVE_IDEA = "revive_idea"
+    PRODUCE_PORTFOLIO_DIGEST = "produce_portfolio_digest"
+    CURATE_IDEA_BANK = "curate_idea_bank"
+
     # --- A2: human scientific authority ----------------------------------
     CHANGE_PRIMARY_ENDPOINT = "change_primary_endpoint"
     CHANGE_PREREGISTRATION = "change_preregistration"
@@ -119,6 +141,26 @@ class ActionKind(StrEnum):
     INTEGRATE_TO_CANONICAL_BRANCH = "integrate_to_canonical_branch"
     PUBLISH_EXTERNALLY = "publish_externally"
     DELETE_SCIENTIFIC_STATE = "delete_scientific_state"
+
+
+class Dispatch(StrEnum):
+    """Which layer performs an action, once it is authorised.
+
+    Added when the discovery portfolio arrived. Before it there was one
+    dispatcher -- the cycle graph's ``ACTION_HANDLERS`` -- so "has a policy but
+    no handler" and "this build cannot do it" were the same statement, and
+    ``runtime doctor`` reported the second by computing the first.
+
+    They are no longer the same statement. A portfolio stage is authorised out
+    of this same table, because one authority model is the point, and is
+    dispatched by the idea track rather than by a planner choosing it. Without
+    this field doctor would report fifteen gaps that are not gaps, which is how
+    a warning stops being read.
+    """
+
+    CYCLE = "cycle"
+    PORTFOLIO = "portfolio"
+    HUMAN = "human"
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,6 +189,8 @@ class ActionPolicy:
     #: What to tell the researcher to run, when ``human_executes`` is true.
     #: ``{subject}`` is filled from the plan where available.
     follow_up: str = ""
+    #: Which layer performs it. See :class:`Dispatch`.
+    dispatch: Dispatch = Dispatch.CYCLE
 
 
 #: The policy table. Every :class:`ActionKind` appears exactly once;
@@ -264,6 +308,120 @@ ACTIONS: dict[ActionKind, ActionPolicy] = {
         frozenset({Permission.READ_REPO}),
         "Writes a proposal the v1 proposal layer requires a person to promote.",
     ),
+    # ---- the discovery portfolio ----------------------------------------
+    #
+    # Every one of these is A0 except the Curator, and the reason is uniform: a
+    # portfolio idea is a *candidate direction*, it is not scientific state,
+    # and no action here can make it into any. The one that touches the world
+    # outside the database is the Curator, which commits to a reserved branch
+    # in the project repository and never to the researcher's own.
+    ActionKind.GENERATE_IDEAS: ActionPolicy(
+        AutonomyLevel.A0,
+        frozenset({Permission.READ_REPO}),
+        "Produces candidate directions. A candidate is not a hypothesis and "
+        "nothing about producing one changes what the project holds.",
+        dispatch=Dispatch.PORTFOLIO,
+    ),
+    ActionKind.DEDUPLICATE_IDEAS: ActionPolicy(
+        AutonomyLevel.A0,
+        frozenset(),
+        "Compares candidates with each other; the durable identity is a "
+        "deterministic hash and never a model's opinion.",
+        dispatch=Dispatch.PORTFOLIO,
+    ),
+    ActionKind.SCREEN_NOVELTY: ActionPolicy(
+        AutonomyLevel.A0,
+        frozenset({Permission.NETWORK_READ}),
+        "A cheap read-only search, to kill obvious duplicates before anything "
+        "is spent on them.",
+        dispatch=Dispatch.PORTFOLIO,
+    ),
+    ActionKind.FALSIFY_IDEA: ActionPolicy(
+        AutonomyLevel.A0,
+        frozenset({Permission.READ_REPO}),
+        "Tries to kill the idea. Producing a fatal objection is the successful "
+        "outcome, not the failed one.",
+        dispatch=Dispatch.PORTFOLIO,
+    ),
+    ActionKind.SHARPEN_IDEA: ActionPolicy(
+        AutonomyLevel.A0,
+        frozenset({Permission.READ_REPO}),
+        "Makes a candidate precise, or reports that it cannot be made precise, "
+        "which ends the track.",
+        dispatch=Dispatch.PORTFOLIO,
+    ),
+    ActionKind.AUDIT_NOVELTY: ActionPolicy(
+        AutonomyLevel.A0,
+        frozenset({Permission.NETWORK_READ}),
+        "Retrieves primary sources and builds a novelty matrix from them. Every "
+        "row cites a work that was actually retrieved.",
+        dispatch=Dispatch.PORTFOLIO,
+    ),
+    ActionKind.REVIEW_IDEA: ActionPolicy(
+        AutonomyLevel.A0,
+        frozenset(),
+        "Reads a frozen packet and returns a structured verdict. Records no "
+        "approval and reaches no repository.",
+        dispatch=Dispatch.PORTFOLIO,
+    ),
+    ActionKind.META_REVIEW_IDEA: ActionPolicy(
+        AutonomyLevel.A0,
+        frozenset(),
+        "Synthesises completed reviews into a recommendation the deterministic "
+        "gate may lower and may never raise.",
+        dispatch=Dispatch.PORTFOLIO,
+    ),
+    ActionKind.REPLICATE_IDEA: ActionPolicy(
+        AutonomyLevel.A0,
+        frozenset(),
+        "Second-line verification. What it is allowed to be is fixed per "
+        "adjudication type and is not the replicator's choice.",
+        dispatch=Dispatch.PORTFOLIO,
+    ),
+    ActionKind.BRANCH_IDEA: ActionPolicy(
+        AutonomyLevel.A0,
+        frozenset(),
+        "Opens child directions with recorded lineage, under the configured "
+        "branching bounds.",
+        dispatch=Dispatch.PORTFOLIO,
+    ),
+    ActionKind.ASSIGN_QUALITY_TIER: ActionPolicy(
+        AutonomyLevel.A0,
+        frozenset(),
+        "Records how far an idea got through this system's own gates. It is "
+        "not a scientific status and no capsule object changes.",
+        dispatch=Dispatch.PORTFOLIO,
+    ),
+    ActionKind.RETIRE_IDEA: ActionPolicy(
+        AutonomyLevel.A0,
+        frozenset(),
+        "Rejects, parks or supersedes a candidate. Nothing is deleted and the "
+        "reason is required.",
+        dispatch=Dispatch.PORTFOLIO,
+    ),
+    ActionKind.REVIVE_IDEA: ActionPolicy(
+        AutonomyLevel.A0,
+        frozenset(),
+        "Opens a new candidate whose lineage names a retired one, carrying its "
+        "unanswered objections forward.",
+        dispatch=Dispatch.PORTFOLIO,
+    ),
+    ActionKind.PRODUCE_PORTFOLIO_DIGEST: ActionPolicy(
+        AutonomyLevel.A0,
+        frozenset(),
+        "Renders what happened from stored fields. Deterministic; no model "
+        "writes a word of it.",
+        dispatch=Dispatch.PORTFOLIO,
+    ),
+    ActionKind.CURATE_IDEA_BANK: ActionPolicy(
+        AutonomyLevel.A1,
+        frozenset({Permission.READ_REPO, Permission.WRITE_WORKTREE}),
+        "Commits a deterministic rendering of the bank to a reserved branch in "
+        "the project repository, from a worktree of its own. It never writes "
+        "under .research/, never touches the researcher's branch, and never "
+        "merges or pushes.",
+        dispatch=Dispatch.PORTFOLIO,
+    ),
     ActionKind.CHANGE_PRIMARY_ENDPOINT: ActionPolicy(
         AutonomyLevel.A2,
         frozenset({Permission.WRITE_CAPSULE}),
@@ -271,6 +429,7 @@ ACTIONS: dict[ActionKind, ActionPolicy] = {
         "turn a null result into a positive one. Only a person may do it, and the "
         "change becomes a recorded Decision.",
         human_executes=True,
+        dispatch=Dispatch.HUMAN,
         follow_up="Edit the Experiment manifest and record a Decision object, then re-run `researchctl validate-project`.",
     ),
     ActionKind.CHANGE_PREREGISTRATION: ActionPolicy(
@@ -278,6 +437,7 @@ ACTIONS: dict[ActionKind, ActionPolicy] = {
         frozenset({Permission.WRITE_CAPSULE}),
         "A materially different experiment is a new preregistration, not an edit.",
         human_executes=True,
+        dispatch=Dispatch.HUMAN,
         follow_up="Create a new Experiment rather than editing the existing one, and supersede the old manifest.",
     ),
     ActionKind.PROMOTE_CONTESTED_CLAIM: ActionPolicy(
@@ -285,6 +445,7 @@ ACTIONS: dict[ActionKind, ActionPolicy] = {
         frozenset({Permission.WRITE_CAPSULE}),
         "Contrary evidence exists and has not been answered.",
         human_executes=True,
+        dispatch=Dispatch.HUMAN,
         follow_up="Run `researchctl review {subject}` to record your Review interactively.",
     ),
     ActionKind.ACCEPT_CLAIM: ActionPolicy(
@@ -292,6 +453,7 @@ ACTIONS: dict[ActionKind, ActionPolicy] = {
         frozenset({Permission.WRITE_CAPSULE}),
         "Acceptance requires a qualifying human Review. No agent may record one.",
         human_executes=True,
+        dispatch=Dispatch.HUMAN,
         follow_up="Run `researchctl review {subject}` to record your Review interactively.",
     ),
     ActionKind.CHANGE_PROJECT_OBJECTIVE: ActionPolicy(
@@ -299,6 +461,7 @@ ACTIONS: dict[ActionKind, ActionPolicy] = {
         frozenset({Permission.WRITE_CAPSULE}),
         "The objective is the researcher's, not the runtime's.",
         human_executes=True,
+        dispatch=Dispatch.HUMAN,
         follow_up="Start a new objective with `researchctl runtime start` rather than redirecting this one.",
     ),
     ActionKind.INTEGRATE_TO_CANONICAL_BRANCH: ActionPolicy(
@@ -306,6 +469,7 @@ ACTIONS: dict[ActionKind, ActionPolicy] = {
         frozenset({Permission.WRITE_WORKTREE}),
         "Merging is a human act in this repository, by policy and by habit.",
         human_executes=True,
+        dispatch=Dispatch.HUMAN,
         follow_up=(
             "Inspect the worktree's branch (`researchctl runtime run <id>` names "
             "it), commit what you want, and merge it yourself. The runtime "
@@ -317,6 +481,7 @@ ACTIONS: dict[ActionKind, ActionPolicy] = {
         frozenset({Permission.PUBLISH}),
         "Publication is irreversible in the way that matters: other people read it.",
         human_executes=True,
+        dispatch=Dispatch.HUMAN,
         follow_up="Submit or release it yourself. Nothing here talks to the outside world on your behalf.",
     ),
     ActionKind.DELETE_SCIENTIFIC_STATE: ActionPolicy(
@@ -324,6 +489,7 @@ ACTIONS: dict[ActionKind, ActionPolicy] = {
         frozenset({Permission.DELETE}),
         "Deleting science is never routine maintenance.",
         human_executes=True,
+        dispatch=Dispatch.HUMAN,
         follow_up="Delete it yourself with an ordinary reviewable Git commit.",
     ),
 }

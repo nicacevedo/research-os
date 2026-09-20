@@ -28,6 +28,7 @@ import pytest
 
 SRC = Path(__file__).resolve().parents[1] / "src" / "research_os"
 RUNTIME_DIR = SRC / "runtime"
+PORTFOLIO_DIR = SRC / "portfolio"
 
 #: The v1 packages that are the scientific kernel and the layers above it.
 #: None of them may import the runtime.
@@ -72,20 +73,56 @@ def test_the_scientific_kernel_does_not_import_the_runtime() -> None:
 
 
 def test_no_v1_layer_imports_the_runtime() -> None:
-    """The runtime wraps the v1 layers. Nothing may wrap it back."""
+    """The runtime wraps the v1 layers. Nothing may wrap it back.
+
+    Two exemptions, and both are layers *above* the runtime rather than below
+    it: ``cli.py``, which is the composition root, and ``portfolio/``, which is
+    the discovery layer. "Nothing may wrap it back" is a statement about the
+    layers the runtime wraps, and the portfolio is not one of them -- it wraps
+    the runtime, which is the permitted direction. The test that keeps that
+    honest is the next one.
+    """
 
     offenders: list[str] = []
     for path in sorted(SRC.rglob("*.py")):
         if RUNTIME_DIR in path.parents or path.parent == RUNTIME_DIR:
+            continue
+        if PORTFOLIO_DIR in path.parents or path.parent == PORTFOLIO_DIR:
             continue
         offenders.extend(
             f"{path.relative_to(SRC)}:{lineno}: imports {module}"
             for lineno, module in _imports(path)
             if module.startswith("research_os.runtime")
         )
-    # cli.py is allowed to, because it is the composition root.
     offenders = [line for line in offenders if not line.startswith("cli.py")]
     assert offenders == [], "; ".join(offenders)
+
+
+def test_the_runtime_does_not_import_the_portfolio() -> None:
+    """The portfolio wraps the runtime. The runtime must not know it exists.
+
+    The converse of the test above, and the one that actually costs something
+    to keep. Every temptation runs this way: the daemon needs a portfolio tick
+    handler, ``policy.py`` names portfolio actions, and the obvious way to
+    write either is an import. Both are written without one -- the handler is
+    resolved through the same string-keyed table every other work kind uses,
+    and the action kinds are plain enum members in the runtime's own module.
+
+    What the direction buys: deleting ``research_os/portfolio`` leaves a
+    runtime that still imports, still migrates, still runs an objective cycle.
+    A researcher who does not want autonomous discovery is not carrying it.
+    """
+
+    offenders = [
+        f"{path.relative_to(SRC)}:{lineno}: imports {module}"
+        for path in sorted(RUNTIME_DIR.rglob("*.py"))
+        for lineno, module in _imports(path)
+        if module.startswith("research_os.portfolio")
+    ]
+    assert offenders == [], (
+        "the runtime must not depend on the discovery layer above it: "
+        + "; ".join(offenders)
+    )
 
 
 def _graph_sources() -> list[Path]:

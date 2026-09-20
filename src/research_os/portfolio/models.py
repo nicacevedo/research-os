@@ -1,0 +1,650 @@
+"""Typed portfolio records, and the enums the database checks against.
+
+Same contract as :mod:`research_os.runtime.models`: every status enum here has
+a matching ``check`` constraint in the SQL, the duplication is deliberate, and
+``tests/test_portfolio_schema.py`` reads the constraints out of the live
+catalog and asserts they hold exactly these values in both directions.
+
+These are read models. Nothing here writes; :mod:`research_os.portfolio.store`
+does that and hands back instances of these.
+
+The class is ``PortfolioIdea`` and not ``Idea``. ``research_os.models.Idea`` is
+a capsule object -- scientific state a person owns -- and a module that imports
+both would have to rename one at the import site, which is exactly the kind of
+ambiguity the authority model cannot afford. See
+`docs/AUTONOMOUS_DISCOVERY_ARCHITECTURE.md` §3.1a.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+from decimal import Decimal
+from enum import StrEnum
+from typing import Any
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from research_os.runtime.adjudication import AdjudicationKind
+from research_os.runtime.interfaces import Independence
+
+
+# ------------------------------------------------------------- lifecycle --
+class IdeaStatus(StrEnum):
+    """Where an idea is *scientifically*.
+
+    Orthogonal to :class:`OperationalState`. Conflating them is how a provider
+    outage comes to read as a scientific rejection, which
+    ``docs/RUNTIME.md`` §17 records actually happening once.
+    """
+
+    CANDIDATE = "CANDIDATE"
+    PROMISING = "PROMISING"
+    INVESTIGATING = "INVESTIGATING"
+    REVIEW = "REVIEW"
+    VALIDATED = "VALIDATED"
+    HUMAN_READY = "HUMAN_READY"
+    PARKED = "PARKED"
+    REJECTED = "REJECTED"
+    SUPERSEDED = "SUPERSEDED"
+
+
+#: Statuses from which no further work is allocated without a deliberate act.
+#: ``HUMAN_READY`` is here, and that is the release-critical part: its track has
+#: ended, so it occupies no capacity and blocks nothing.
+TERMINAL_IDEA_STATUSES: frozenset[IdeaStatus] = frozenset(
+    {
+        IdeaStatus.HUMAN_READY,
+        IdeaStatus.PARKED,
+        IdeaStatus.REJECTED,
+        IdeaStatus.SUPERSEDED,
+    }
+)
+
+#: Statuses an idea can never leave by an autonomous act.
+CLOSED_IDEA_STATUSES: frozenset[IdeaStatus] = frozenset(
+    {IdeaStatus.REJECTED, IdeaStatus.SUPERSEDED}
+)
+
+
+class OperationalState(StrEnum):
+    """Whether anything can happen to this idea right now, and if not why."""
+
+    ACTIVE = "ACTIVE"
+    IDLE = "IDLE"
+    BLOCKED_PROVIDER = "BLOCKED_PROVIDER"
+    BLOCKED_BUDGET = "BLOCKED_BUDGET"
+    BLOCKED_EXTERNAL = "BLOCKED_EXTERNAL"
+    BLOCKED_DEPENDENCY = "BLOCKED_DEPENDENCY"
+
+
+BLOCKED_STATES: frozenset[OperationalState] = frozenset(
+    {
+        OperationalState.BLOCKED_PROVIDER,
+        OperationalState.BLOCKED_BUDGET,
+        OperationalState.BLOCKED_EXTERNAL,
+        OperationalState.BLOCKED_DEPENDENCY,
+    }
+)
+
+
+class QualityTier(StrEnum):
+    """The high-water mark of gates this idea has passed.
+
+    Not a duplicate of :class:`IdeaStatus`. An idea rejected after reaching
+    ``PROMISING`` is a different fact from one rejected as a candidate, and the
+    digest is asked to report demotions.
+    """
+
+    NONE = "NONE"
+    PROMISING = "PROMISING"
+    VALIDATED = "VALIDATED"
+    HUMAN_READY = "HUMAN_READY"
+
+
+TIER_ORDER: dict[QualityTier, int] = {
+    QualityTier.NONE: 0,
+    QualityTier.PROMISING: 1,
+    QualityTier.VALIDATED: 2,
+    QualityTier.HUMAN_READY: 3,
+}
+
+
+class IdeaOrigin(StrEnum):
+    BLIND_EXPLORER = "BLIND_EXPLORER"
+    SEEDED_EXPLORER = "SEEDED_EXPLORER"
+    FAILURE_MINING_EXPLORER = "FAILURE_MINING_EXPLORER"
+    RESEARCHER_SEED = "RESEARCHER_SEED"
+    BRANCH = "BRANCH"
+    REVIVAL = "REVIVAL"
+    MERGE = "MERGE"
+
+
+class EdgeKind(StrEnum):
+    DERIVED_FROM = "DERIVED_FROM"
+    GENERALIZES = "GENERALIZES"
+    SPECIALIZES = "SPECIALIZES"
+    MERGED_FROM = "MERGED_FROM"
+    REVIVES = "REVIVES"
+    CONTRADICTS = "CONTRADICTS"
+    DUPLICATE_OF = "DUPLICATE_OF"
+
+
+#: The kinds that are lineage, mirroring the generated ``is_lineage`` column.
+#: A traversal filters on the column; this exists so Python can answer the same
+#: question without a round trip, and the schema test asserts they agree.
+LINEAGE_KINDS: frozenset[EdgeKind] = frozenset(
+    {
+        EdgeKind.DERIVED_FROM,
+        EdgeKind.GENERALIZES,
+        EdgeKind.SPECIALIZES,
+        EdgeKind.MERGED_FROM,
+        EdgeKind.REVIVES,
+    }
+)
+
+
+#: How an idea could be settled. Controls routing, never conclusions.
+#:
+#: :class:`research_os.runtime.adjudication.AdjudicationKind`, reused verbatim.
+#: An earlier draft defined a parallel enum -- ``MATHEMATICAL``, ``EMPIRICAL``,
+#: ``LITERATURE_PRIORITY``, ``COMPUTATIONAL``, ``MIXED`` -- which was the
+#: runtime's set with one member renamed, one added and one dropped. Three
+#: things were wrong with that, in increasing order of seriousness:
+#:
+#: 1. two enums meaning the same thing eventually disagree;
+#: 2. it dropped ``UNDETERMINED``, which is the member that makes the existing
+#:    routing guard conservative: it refuses an action only on a *positive*
+#:    determination, so a target nothing understands behaves as it did before;
+#: 3. it would have been assigned by a model. ``adjudication.classify`` reads
+#:    the falsification clause -- the sentence in which someone already wrote
+#:    down what would settle the thing -- and its docstring is explicit that
+#:    this is *reading, not inference*. Letting the generator choose its own
+#:    adjudication type is letting it choose its own evidentiary bar, because
+#:    every quality gate is parameterised by it.
+#:
+#: ``COMPUTATIONAL`` is not lost: an idea settled by running a program is
+#: ``EMPIRICAL`` about that program, which is what ``DIAGNOSTIC`` already
+#: means when the program is the subject.
+AdjudicationType = AdjudicationKind
+
+
+class EvidenceKind(StrEnum):
+    LITERATURE = "literature"
+    EXPERIMENT = "experiment"
+    DERIVATION = "derivation"
+    NUMERICAL = "numerical"
+    CODE = "code"
+    REPLICATION = "replication"
+    INSPECTION = "inspection"
+
+
+class EvidenceStrength(StrEnum):
+    """What the evidence does to the idea.
+
+    ``CONSISTENT_WITH`` is the strongest thing a numerical witness may say, and
+    the database enforces that rather than trusting the caller: a numerical
+    check is not a proof, and the one place that could be forgotten is the one
+    place a mathematical idea reaches ``VALIDATED``.
+    """
+
+    SUPPORTS = "SUPPORTS"
+    CONTRADICTS = "CONTRADICTS"
+    CONSISTENT_WITH = "CONSISTENT_WITH"
+    INCONCLUSIVE = "INCONCLUSIVE"
+
+
+class ReviewerRole(StrEnum):
+    FALSIFIER = "falsifier"
+    METHODOLOGY = "methodology_reviewer"
+    NOVELTY = "novelty_reviewer"
+    SKEPTIC = "skeptic_reviewer"
+    REPLICATOR = "replicator"
+    META = "meta_reviewer"
+
+
+#: The three whose presence, live and on the current version, `VALIDATED`
+#: requires. The falsifier is not among them: its job is to kill the idea
+#: before this point, and a passing falsifier is not a review of the finished
+#: work.
+INDEPENDENT_REVIEW_ROLES: tuple[ReviewerRole, ...] = (
+    ReviewerRole.METHODOLOGY,
+    ReviewerRole.NOVELTY,
+    ReviewerRole.SKEPTIC,
+)
+
+
+class ReviewVerdict(StrEnum):
+    PASS = "PASS"
+    PASS_WITH_OBJECTIONS = "PASS_WITH_OBJECTIONS"
+    REVISE = "REVISE"
+    REJECT = "REJECT"
+    INCONCLUSIVE = "INCONCLUSIVE"
+
+
+class Severity(StrEnum):
+    NONE = "NONE"
+    MINOR = "MINOR"
+    MAJOR = "MAJOR"
+    CRITICAL = "CRITICAL"
+    FATAL = "FATAL"
+
+
+SEVERITY_ORDER: dict[Severity, int] = {
+    Severity.NONE: 0,
+    Severity.MINOR: 1,
+    Severity.MAJOR: 2,
+    Severity.CRITICAL: 3,
+    Severity.FATAL: 4,
+}
+
+#: Severities that block promotion outright while unresolved.
+BLOCKING_SEVERITIES: frozenset[Severity] = frozenset(
+    {Severity.CRITICAL, Severity.FATAL}
+)
+
+
+#: The separation actually achieved between a producer and its reviewer.
+#:
+#: :class:`research_os.runtime.interfaces.Independence`, reused verbatim rather
+#: than a second vocabulary meaning the same thing. An earlier draft defined
+#: ``DIFFERENT_FAMILY / DIFFERENT_MODEL / SAME_MODEL_CLEAN_CONTEXT``, which is
+#: the runtime's enum with one member renamed -- and two enums that mean the
+#: same thing eventually disagree.
+#:
+#: What *is* different is the question being answered, which is why the column
+#: is called ``independence_vs_origin`` and not ``independence``.
+#: ``model_calls.independence`` is the router's per-group value: which provider
+#: family has already answered inside this independence group. This is the
+#: comparison the gate needs: the review's call against the *version's origin
+#: call*. Same words, different subjects, so they get different column names.
+#:
+#: There is deliberately no ``SAME_CALL`` member. A review whose model call is
+#: the origin call is not a weak review, it is a defect, and
+#: :func:`research_os.portfolio.gates.classify_independence` raises rather than
+#: returning something storable.
+IndependenceClass = Independence
+
+INDEPENDENCE_ORDER: dict[Independence, int] = {
+    Independence.NONE: 0,
+    Independence.DIFFERENT_CONTEXT: 1,
+    Independence.DIFFERENT_MODEL: 2,
+    Independence.DIFFERENT_FAMILY: 3,
+}
+
+
+class ContextClass(StrEnum):
+    FROZEN_PACKET = "FROZEN_PACKET"
+    SHARED_CONTEXT = "SHARED_CONTEXT"
+
+
+class Stage(StrEnum):
+    """The bounded units an idea track advances through, one per invocation."""
+
+    DEDUP = "dedup"
+    NOVELTY_SCREEN = "novelty_screen"
+    FALSIFY = "falsify"
+    DISCOVER = "discover"
+    ADJUDICATE = "adjudicate"
+    EVIDENCE = "evidence"
+    LITERATURE_AUDIT = "literature_audit"
+    REVIEW_BOARD = "review_board"
+    META_REVIEW = "meta_review"
+    REPLICATE = "replicate"
+    BRANCH = "branch"
+
+
+class ActionStatus(StrEnum):
+    ACTIVE = "ACTIVE"
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+    SUPERSEDED = "SUPERSEDED"
+
+
+class Disposition(StrEnum):
+    """What a completed stage concluded should happen to the idea."""
+
+    REJECT = "REJECT"
+    PARK = "PARK"
+    REVISE = "REVISE"
+    DEEPEN = "DEEPEN"
+    BRANCH = "BRANCH"
+    PROMISING = "PROMISING"
+    VALIDATED = "VALIDATED"
+    HUMAN_READY = "HUMAN_READY"
+    CONTINUE = "CONTINUE"
+    DUPLICATE = "DUPLICATE"
+
+
+#: The dispositions that are *gated*: the meta-reviewer may recommend one and
+#: `gates.evaluate` decides whether it happens. Every other disposition is
+#: ungated, because killing or pausing an idea needs no ceremony and that
+#: asymmetry is the design.
+GATED_DISPOSITIONS: frozenset[Disposition] = frozenset(
+    {Disposition.PROMISING, Disposition.VALIDATED, Disposition.HUMAN_READY}
+)
+
+
+class PortfolioStatus(StrEnum):
+    """Why the portfolio is or is not running.
+
+    Closed, and complete. There is no ``WAIT_HUMAN``: one idea needing the
+    researcher must never stop the others, and the way that is guaranteed is
+    that there is no state to reach.
+    """
+
+    RUNNING = "RUNNING"
+    PAUSED_BY_RESEARCHER = "PAUSED_BY_RESEARCHER"
+    PAUSED_BUDGET_EXHAUSTED = "PAUSED_BUDGET_EXHAUSTED"
+    PAUSED_NO_FRONTIER = "PAUSED_NO_FRONTIER"
+    PAUSED_BLOCKED_EXTERNAL = "PAUSED_BLOCKED_EXTERNAL"
+
+
+# ---------------------------------------------------------------- records --
+class _Record(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+class QualityDimensions(BaseModel):
+    """The dimensions the scientific record keeps separate.
+
+    §8 of the brief: *do not implement one opaque idea score*. A scalar
+    scheduling utility exists and lives on ``idea_actions``; it is an
+    operational number and it never replaces these.
+
+    Every field is optional. ``None`` means "not assessed", which is different
+    from 0.0 ("assessed as worthless") and the difference matters to the
+    allocator: an unassessed novelty is a reason to run the novelty screen, and
+    a zero is a reason not to bother.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    novelty: float | None = Field(default=None, ge=0.0, le=1.0)
+    potential_impact: float | None = Field(default=None, ge=0.0, le=1.0)
+    plausibility: float | None = Field(default=None, ge=0.0, le=1.0)
+    falsifiability: float | None = Field(default=None, ge=0.0, le=1.0)
+    tractability: float | None = Field(default=None, ge=0.0, le=1.0)
+    evidence_strength: float | None = Field(default=None, ge=0.0, le=1.0)
+    reproducibility: float | None = Field(default=None, ge=0.0, le=1.0)
+    reviewer_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    literature_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+
+    def merged(self, other: QualityDimensions) -> QualityDimensions:
+        """Overlay ``other``'s assessed dimensions onto this one.
+
+        A stage that assesses novelty must not blank out the plausibility a
+        previous stage assessed, and a stage that assesses nothing must change
+        nothing.
+        """
+
+        values = self.model_dump()
+        for name, value in other.model_dump().items():
+            if value is not None:
+                values[name] = value
+        return QualityDimensions(**values)
+
+
+class PortfolioIdea(_Record):
+    """One candidate research direction. Not a capsule object."""
+
+    idea_id: str
+    project_id: str
+    depth: int
+    lineage_root: str
+    origin: IdeaOrigin
+    current_version: int
+    status: IdeaStatus
+    operational_state: OperationalState
+    quality_tier: QualityTier
+    curated_digest: str | None = None
+    curated_at: datetime | None = None
+    #: Why this idea was retired, and what would bring it back. Required by the
+    #: schema on REJECTED, PARKED and SUPERSEDED, for the reason
+    #: ``docs/CAPSULE.md`` gives for a discarded capsule Idea: so the project
+    #: can tell "we ruled this out" from "we forgot about it".
+    retire_reason: str | None = None
+    revisit_if: str | None = None
+    created_at: datetime
+    updated_at: datetime
+
+    @property
+    def allocatable(self) -> bool:
+        """Whether the allocator may spend on this idea at all."""
+
+        return (
+            self.status not in TERMINAL_IDEA_STATUSES
+            and self.operational_state is OperationalState.IDLE
+        )
+
+    @property
+    def occupies_capacity(self) -> bool:
+        """Whether this idea counts against the active-track ceiling.
+
+        A ``HUMAN_READY`` idea does not, and that single line is how the
+        portfolio keeps running while one idea waits for the researcher.
+        """
+
+        return self.operational_state is OperationalState.ACTIVE
+
+
+class IdeaVersion(_Record):
+    """Immutable scientific content. Nothing updates one of these."""
+
+    idea_id: str
+    version: int
+    title: str
+    research_question: str
+    core_idea: str
+    mechanism: str = ""
+    why_it_matters: str = ""
+    falsifier: str = ""
+    adjudication_types: tuple[AdjudicationType, ...] = ()
+    closest_prior_work: str = ""
+    claimed_difference: str = ""
+    assumptions: tuple[str, ...] = ()
+    alternative_explanations: tuple[str, ...] = ()
+    open_uncertainties: tuple[str, ...] = ()
+    next_best_action: str = ""
+    dimensions: QualityDimensions = QualityDimensions()
+    addressed_objections: tuple[str, ...] = ()
+    content_digest: str
+    canonical_digest: str
+    origin_call_id: str | None = None
+    origin_role: str
+    origin_stage: str | None = None
+    created_at: datetime
+
+
+class IdeaEdge(_Record):
+    parent_idea_id: str
+    child_idea_id: str
+    kind: EdgeKind
+    parent_depth: int
+    child_depth: int
+    detail: str = ""
+    created_at: datetime
+
+    @property
+    def is_lineage(self) -> bool:
+        return self.kind in LINEAGE_KINDS
+
+
+class IdeaEvidence(_Record):
+    evidence_id: str
+    idea_id: str
+    idea_version: int
+    kind: EvidenceKind
+    strength: EvidenceStrength
+    summary: str
+    artifact_id: str | None = None
+    finding_id: str | None = None
+    job_id: str | None = None
+    literature_key: str | None = None
+    source_call_id: str | None = None
+    created_at: datetime
+
+
+class IdeaReview(_Record):
+    review_id: str
+    idea_id: str
+    idea_version: int
+    reviewer_role: ReviewerRole
+    verdict: ReviewVerdict
+    severity: Severity
+    summary: str
+    recommendation: Disposition | None = None
+    detail_artifact_id: str | None = None
+    #: The two digests this review is bound to. Both, not one: the content is
+    #: what it read, and the evidence set is what it read it against. A
+    #: revision stales it through the first; swapping the evidence beneath a
+    #: standing approval stales it through the second.
+    reviewed_content_digest: str
+    reviewed_evidence_digest: str
+    packet_digest: str
+    #: ``role@version``. A review produced by a prompt this build has since
+    #: superseded answered a question no longer being asked.
+    prompt_version: str
+    call_id: str | None = None
+    provider: str
+    model: str | None = None
+    provider_family: str
+    independence_vs_origin: Independence
+    context_class: ContextClass
+    independence_note: str = ""
+    created_at: datetime
+
+
+class IdeaObjection(_Record):
+    objection_id: str
+    idea_id: str
+    raised_in_review: str
+    raised_at_version: int
+    objection_key: str
+    severity: Severity
+    summary: str
+    addressed_at_version: int | None = None
+    response: str | None = None
+    #: The review that established the answer. Never the producing side, and
+    #: never the role that raised the objection: an objection is answered to
+    #: somebody else's satisfaction or it is not answered.
+    resolved_by_review: str | None = None
+    resolved_at: datetime | None = None
+    created_at: datetime
+
+    @property
+    def open(self) -> bool:
+        return self.resolved_at is None
+
+    @property
+    def blocking(self) -> bool:
+        return self.open and self.severity in BLOCKING_SEVERITIES
+
+
+class IdeaAction(_Record):
+    action_id: str
+    idea_id: str
+    idea_version: int
+    stage: Stage
+    basis_digest: str
+    status: ActionStatus
+    work_id: str | None = None
+    thread_id: str | None = None
+    utility: Decimal | None = None
+    disposition: Disposition | None = None
+    detail: str | None = None
+    failure_class: str | None = None
+    cost_usd: Decimal
+    model_calls: int
+    created_at: datetime
+    updated_at: datetime
+    completed_at: datetime | None = None
+
+
+class PortfolioState(_Record):
+    project_id: str
+    status: PortfolioStatus
+    charter_digest: str | None = None
+    detail: str | None = None
+    paused_at: datetime | None = None
+    paused_by: str | None = None
+    last_tick_at: datetime | None = None
+    last_digest_at: datetime | None = None
+    bounds: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime
+    updated_at: datetime
+
+    @property
+    def running(self) -> bool:
+        return self.status is PortfolioStatus.RUNNING
+
+
+class PortfolioSeed(_Record):
+    seed_id: str
+    project_id: str
+    text: str
+    note: str = ""
+    consumed_at: datetime | None = None
+    consumed_by: str | None = None
+    created_at: datetime
+
+
+class PortfolioDigestRecord(_Record):
+    digest_id: str
+    project_id: str
+    period_start: datetime
+    period_end: datetime
+    payload: dict[str, Any]
+    artifact_id: str | None = None
+    created_at: datetime
+
+
+#: Every ``check`` constraint in the portfolio schema that mirrors an enum
+#: above. Read by ``tests/test_portfolio_schema.py`` in both directions: every
+#: constraint named here allows exactly the enum's values, and every value-list
+#: constraint on a portfolio table appears here.
+ENUM_CONSTRAINTS: dict[str, frozenset[str]] = {
+    "ideas_status_ck": frozenset(s.value for s in IdeaStatus),
+    "ideas_operational_ck": frozenset(s.value for s in OperationalState),
+    "ideas_quality_tier_ck": frozenset(s.value for s in QualityTier),
+    "ideas_origin_ck": frozenset(s.value for s in IdeaOrigin),
+    "idea_versions_adjudication_ck": frozenset(s.value for s in AdjudicationType),
+    "idea_edges_kind_ck": frozenset(s.value for s in EdgeKind),
+    "idea_evidence_kind_ck": frozenset(s.value for s in EvidenceKind),
+    "idea_evidence_strength_ck": frozenset(s.value for s in EvidenceStrength),
+    "idea_reviews_role_ck": frozenset(s.value for s in ReviewerRole),
+    "idea_reviews_verdict_ck": frozenset(s.value for s in ReviewVerdict),
+    "idea_reviews_severity_ck": frozenset(s.value for s in Severity),
+    "idea_reviews_independence_ck": frozenset(s.value for s in Independence),
+    "idea_reviews_context_ck": frozenset(s.value for s in ContextClass),
+    # NONE is not storable on an objection: an objection with no severity is
+    # not an objection. The enum is shared with reviews, where NONE means "this
+    # reviewer raised nothing".
+    "idea_objections_severity_ck": frozenset(
+        s.value for s in Severity if s is not Severity.NONE
+    ),
+    "idea_actions_status_ck": frozenset(s.value for s in ActionStatus),
+    "idea_actions_stage_ck": frozenset(s.value for s in Stage),
+    "idea_actions_disposition_ck": frozenset(s.value for s in Disposition),
+    "portfolio_state_status_ck": frozenset(s.value for s in PortfolioStatus),
+}
+
+
+#: The one value-list check constraint on a portfolio table that is *policy*
+#: rather than an enum mirror, with the rule it expresses.
+#:
+#: The schema-agreement test scans the live database for any constraint that
+#: enumerates string literals and demands a Python enum for it, which is the
+#: right default -- it is how two constraints escaped once before. These three
+#: enumerate values while expressing a relationship between two columns, so
+#: there is no closed set for an enum to be. Naming them here is the
+#: acknowledgement; a new one still fails the test until somebody decides which
+#: list it belongs in.
+POLICY_CONSTRAINTS: dict[str, str] = {
+    "idea_evidence_numerical_ck": (
+        "a numerical witness may be CONSISTENT_WITH, CONTRADICTS or "
+        "INCONCLUSIVE, and never SUPPORTS. A finite computation does not "
+        "establish a universally quantified proposition, and this is the one "
+        "place a MATHEMATICAL idea could reach VALIDATED on arithmetic."
+    ),
+}

@@ -1,0 +1,80 @@
+"""Portfolio identifiers.
+
+Same shape as the runtime's -- ``PREFIX-<UTC timestamp>-<8 hex>`` -- and for
+the same reason: a person reading a log can tell what kind of thing an id names
+without looking it up.
+
+The prefix that matters most is ``PIDEA``. The capsule already has an object
+type called Idea whose ids look like ``IDEA-0001``, and
+:mod:`research_os.runtime.ids` states the rule this obeys: *a runtime id and a
+scientific id must never be mistakable for one another, because the entire
+authority model rests on them being different kinds of thing.* ``IDEA-0001`` is
+science the researcher owns. ``PIDEA-20260920T181500Z-3fa17b0c`` is a candidate
+direction with no scientific status at all.
+"""
+
+from __future__ import annotations
+
+import re
+from datetime import datetime
+
+from research_os.runtime.ids import new_id
+
+IDEA_ID_RE = re.compile(r"^PIDEA-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$")
+IDEA_ACTION_ID_RE = re.compile(r"^IACT-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$")
+IDEA_REVIEW_ID_RE = re.compile(r"^IREV-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$")
+IDEA_EVIDENCE_ID_RE = re.compile(r"^IEVD-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$")
+OBJECTION_ID_RE = re.compile(r"^IOBJ-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$")
+PORTFOLIO_DIGEST_ID_RE = re.compile(r"^PDIG-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$")
+SEED_ID_RE = re.compile(r"^SEED-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$")
+
+#: Every id pattern this package mints, so a test can assert none of them can
+#: match a capsule id and none can match another runtime id.
+ID_PATTERNS: dict[str, re.Pattern[str]] = {
+    "idea": IDEA_ID_RE,
+    "idea_action": IDEA_ACTION_ID_RE,
+    "idea_review": IDEA_REVIEW_ID_RE,
+    "idea_evidence": IDEA_EVIDENCE_ID_RE,
+    "objection": OBJECTION_ID_RE,
+    "portfolio_digest": PORTFOLIO_DIGEST_ID_RE,
+    "seed": SEED_ID_RE,
+}
+
+
+def new_idea_id(*, moment: datetime | None = None) -> str:
+    return new_id("PIDEA", moment=moment)
+
+
+def new_idea_action_id(*, moment: datetime | None = None) -> str:
+    return new_id("IACT", moment=moment)
+
+
+def new_idea_review_id(*, moment: datetime | None = None) -> str:
+    return new_id("IREV", moment=moment)
+
+
+def new_idea_evidence_id(*, moment: datetime | None = None) -> str:
+    return new_id("IEVD", moment=moment)
+
+
+def new_objection_id(*, moment: datetime | None = None) -> str:
+    return new_id("IOBJ", moment=moment)
+
+
+def new_portfolio_digest_id(*, moment: datetime | None = None) -> str:
+    return new_id("PDIG", moment=moment)
+
+
+def new_seed_id(*, moment: datetime | None = None) -> str:
+    return new_id("SEED", moment=moment)
+
+
+def track_thread_id(idea_id: str, version: int, stage: str) -> str:
+    """The LangGraph thread for one bounded stage of one idea version.
+
+    One thread per *stage attempt*, not one per idea: a thread is the unit of
+    checkpoint retention, and a thread that lives as long as an idea is a
+    checkpoint table that grows for the idea's whole life.
+    """
+
+    return f"idea:{idea_id}:{version}:{stage}"
