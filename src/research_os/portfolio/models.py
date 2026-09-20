@@ -571,6 +571,12 @@ class PortfolioState(_Record):
     last_tick_at: datetime | None = None
     last_digest_at: datetime | None = None
     bounds: dict[str, Any] = Field(default_factory=dict)
+    #: The Curator's watermark: the commit it last wrote to the autonomous
+    #: branch, and the snapshot digest that commit carries. See
+    #: ``sql/0024_bank_watermark.sql``.
+    bank_commit: str | None = None
+    bank_digest: str | None = None
+    bank_written_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
 

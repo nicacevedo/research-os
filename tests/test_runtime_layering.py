@@ -75,9 +75,9 @@ def test_the_scientific_kernel_does_not_import_the_runtime() -> None:
 def test_no_v1_layer_imports_the_runtime() -> None:
     """The runtime wraps the v1 layers. Nothing may wrap it back.
 
-    Two exemptions, and both are layers *above* the runtime rather than below
-    it: ``cli.py``, which is the composition root, and ``portfolio/``, which is
-    the discovery layer. "Nothing may wrap it back" is a statement about the
+    Three exemptions, and all are layers *above* the runtime rather than below
+    it: ``cli.py`` and ``service.py``, which are the two composition roots, and
+    ``portfolio/``, which is the discovery layer. "Nothing may wrap it back" is a statement about the
     layers the runtime wraps, and the portfolio is not one of them -- it wraps
     the runtime, which is the permitted direction. The test that keeps that
     honest is the next one.
@@ -94,7 +94,12 @@ def test_no_v1_layer_imports_the_runtime() -> None:
             for lineno, module in _imports(path)
             if module.startswith("research_os.runtime")
         )
-    offenders = [line for line in offenders if not line.startswith("cli.py")]
+    # The two composition roots. `cli.py` is `researchctl`; `service.py` is
+    # `researchd`, and it exists only so that the daemon's own module does not
+    # have to import the layer above it -- see the test below.
+    offenders = [
+        line for line in offenders if not line.startswith(("cli.py", "service.py"))
+    ]
     assert offenders == [], "; ".join(offenders)
 
 

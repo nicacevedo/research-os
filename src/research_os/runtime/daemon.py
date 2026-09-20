@@ -48,7 +48,7 @@ from research_os.errors import (
     CapsuleError,
     ResearchOSError,
 )
-from research_os.runtime import checkpoints
+from research_os.runtime import checkpoints, extensions
 from research_os.runtime.budgets import BudgetLedger
 from research_os.runtime.capsulewatch import observed_digests
 from research_os.runtime.clock import Clock, SystemClock
@@ -101,66 +101,14 @@ _MAINTENANCE_INTERVAL = 3600.0
 
 
 # --------------------------------------------------------------- work kinds --
-class WorkKind:
-    """The operational work kinds the daemon knows how to run.
-
-    Plain constants rather than an enum because these are queue payload
-    discriminators rather than a domain model, and the queue stores them as
-    text. An unknown kind is failed as ``POLICY_REFUSED`` rather than skipped:
-    work nobody can run must not sit claimable forever.
-    """
-
-    RUN_CYCLE = "run_cycle"
-    RESUME_CYCLE = "resume_cycle"
-    CONTINUE_OBJECTIVE = "continue_objective"
-    ADVANCE_OBJECTIVE = "advance_objective"
-    POLL_EXTERNAL_JOBS = "poll_external_jobs"
-    PRUNE_CHECKPOINTS = "prune_checkpoints"
-    INTEGRITY_AUDIT = "integrity_audit"
-
-
-#: Which event kind produces which work. The whole event-to-work mapping, in one
-#: table, so "why did this run" is answerable by reading twelve lines.
-EVENT_WORK: dict[str, str] = {
-    "RESEARCH_RUN_REQUESTED": WorkKind.RUN_CYCLE,
-    "SCIENTIFIC_DECISION_RECORDED": WorkKind.RESUME_CYCLE,
-    "EXTERNAL_JOB_FINISHED": WorkKind.RESUME_CYCLE,
-    "RESEARCH_CYCLE_FINISHED": WorkKind.CONTINUE_OBJECTIVE,
-    # A person changed the canonical science. Not a resume -- the thread that
-    # was waiting has finished, and reviving it would be turning a bounded
-    # cycle into an immortal one. A *successor* cycle, with recorded lineage.
-    "CAPSULE_CHANGED": WorkKind.ADVANCE_OBJECTIVE,
-}
-
-#: Deliberately absent above: ``WORKER_RECOVERED``.
-#:
-#: A reclaimed work item *is* its own retry -- ``reclaim_expired`` puts it back
-#: on the queue -- so mapping the recovery event to a second item only ever
-#: duplicated it, and because the two had different kinds they had different
-#: dedup keys, so the duplication was not even caught.
-#:
-#: The per-run key introduced to bound that duplication then collided with the
-#: real resume events, which is the failure recorded in ``_dedup_key``. Removing
-#: the mapping fixes both: there is nothing to bound, and the key can go back to
-#: being per event.
-
-
-#: Which work kind runs which handler, by method name.
-#:
-#: Method *names* rather than bound methods so the table is a module constant a
-#: test can read. The previous version built the same mapping inside
-#: ``_run_item`` and a separate test listed the runnable kinds by hand -- so
-#: adding a kind meant editing two places, and forgetting the second one made a
-#: test fail for a reason unrelated to the defect it was written to catch.
-WORK_HANDLERS: dict[str, str] = {
-    WorkKind.RUN_CYCLE: "_work_run_cycle",
-    WorkKind.RESUME_CYCLE: "_work_resume_cycle",
-    WorkKind.CONTINUE_OBJECTIVE: "_work_continue_objective",
-    WorkKind.ADVANCE_OBJECTIVE: "_work_advance_objective",
-    WorkKind.POLL_EXTERNAL_JOBS: "_work_poll_jobs",
-    WorkKind.PRUNE_CHECKPOINTS: "_work_prune_checkpoints",
-    WorkKind.INTEGRITY_AUDIT: "_work_integrity_audit",
-}
+# The three tables live in their own module so that reading them does not cost
+# an import of LangGraph. See `runtime/workkinds.py`. Re-exported here because
+# several tests and this module's own handlers name them from `daemon`.
+from research_os.runtime.workkinds import (
+    EVENT_WORK,
+    WORK_HANDLERS,
+    WorkKind,
+)
 
 
 @dataclass
@@ -775,7 +723,9 @@ class Daemon:
         )
         report.events_ingested = len(events)
         for event in events:
-            kind = EVENT_WORK.get(event.kind)
+            kind = EVENT_WORK.get(event.kind) or extensions.work_kind_for_event(
+                event.kind
+            )
             if kind is None:
                 # Informational. Consumed so it is not claimed again; it
                 # deliberately produces no work.
@@ -997,6 +947,13 @@ class Daemon:
     def _run_item(self, item: WorkItem, report: TickReport) -> None:
         method = WORK_HANDLERS.get(item.kind)
         handler = getattr(self, method) if method is not None else None
+        if handler is None:
+            # A layer above this one may have registered the kind. The daemon
+            # never imports such a layer; it consults a registry that whoever
+            # composed the process filled. See runtime/extensions.py.
+            extension = extensions.handler_for(item.kind)
+            if extension is not None:
+                handler = self._extension_handler(extension)
 
         if handler is None:
             self._queue.fail(
@@ -1286,6 +1243,36 @@ class Daemon:
         return FailureClass.UNKNOWN
 
     # ------------------------------------------------------- work handlers --
+    def _extension_handler(
+        self, extension: extensions.WorkExtension
+    ) -> Callable[[WorkItem], dict[str, Any]]:
+        """Bind an extension to this daemon's services for one work item.
+
+        The extension is given a :class:`~research_os.runtime.extensions.
+        WorkContext` and not the daemon, so the control plane's private methods
+        do not become an extension contract nobody wrote down.
+        """
+
+        def run(item: WorkItem) -> dict[str, Any]:
+            repo: Path | None
+            try:
+                repo = self._repo_for(item.project_id)
+            except ResearchOSError:
+                repo = None
+            return extension(
+                extensions.WorkContext(
+                    config=self._config,
+                    db=self._db,
+                    store=self._store,
+                    queue=self._queue,
+                    item=item,
+                    models=self._models,
+                    repo_path=repo,
+                )
+            )
+
+        return run
+
     def _work_run_cycle(self, item: WorkItem) -> dict[str, Any]:
         """Enter a cycle's graph, whether or not it has run before.
 

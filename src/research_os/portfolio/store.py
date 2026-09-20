@@ -115,7 +115,8 @@ ACTION_COLUMNS = (
 )
 STATE_COLUMNS = (
     "project_id, status, charter_digest, detail, paused_at, paused_by, "
-    "last_tick_at, last_digest_at, bounds, created_at, updated_at"
+    "last_tick_at, last_digest_at, bounds, bank_commit, bank_digest, "
+    "bank_written_at, created_at, updated_at"
 )
 SEED_COLUMNS = "seed_id, project_id, text, note, consumed_at, consumed_by, created_at"
 
@@ -218,6 +219,11 @@ class PortfolioStore:
         content = pdigests.content_digest(digest_input)
         canonical = pdigests.canonical_digest(digest_input)
         idea_id = new_idea_id()
+        # An idea belongs to a portfolio, so the portfolio exists once an idea
+        # does. Without this, `researchctl portfolio status` on a project whose
+        # ideas arrived by some other route reported that there was no
+        # portfolio -- while listing its ideas perfectly well.
+        self.upsert_state(project_id=project_id)
 
         with self._db.tx() as conn:
             if parent_idea_id is None:
@@ -1604,7 +1610,7 @@ class PortfolioStore:
             row = conn.execute(
                 f"""
                 insert into portfolio_state (project_id, bounds)
-                values (%(project_id)s, %(bounds)s)
+                values (%(project_id)s, coalesce(%(bounds)s, %(empty)s))
                 on conflict (project_id) do update
                     set bounds = coalesce(%(bounds)s, portfolio_state.bounds),
                         updated_at = now()
@@ -1613,6 +1619,10 @@ class PortfolioStore:
                 {
                     "project_id": project_id,
                     "bounds": jsonb(dict(bounds)) if bounds is not None else None,
+                    # An f-string cannot carry a literal `'{}'::jsonb`, and the
+                    # SQL needs a default because `bounds` is NOT NULL and a
+                    # caller that supplies none means "the configured ones".
+                    "empty": jsonb({}),
                 },
             ).fetchone()
         return PortfolioState.model_validate(row)
@@ -1657,6 +1667,22 @@ class PortfolioStore:
         if row is None:
             raise PortfolioStateError(f"{project_id} has no portfolio state")
         return PortfolioState.model_validate(row)
+
+    def record_bank_write(self, *, project_id: str, commit: str, digest: str) -> None:
+        """Record the commit and the snapshot the Curator just wrote.
+
+        Read back before the next curation. A tip that is not this commit was
+        written by something else, and the Curator refuses rather than
+        committing on top of it -- which is what covers the blind spot the
+        reserved ref namespace creates in the coding pipeline's escape check.
+        """
+
+        with self._db.tx() as conn:
+            conn.execute(
+                "update portfolio_state set bank_commit = %s, bank_digest = %s, "
+                "bank_written_at = now(), updated_at = now() where project_id = %s",
+                (commit, digest, project_id),
+            )
 
     def touch_tick(self, project_id: str, *, charter_digest: str | None = None) -> None:
         with self._db.tx() as conn:

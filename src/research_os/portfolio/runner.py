@@ -38,6 +38,7 @@ from research_os.portfolio.contracts import (
     ContractError,
     DiscoveryOutput,
     DuplicateAdjudication,
+    ExplorerOutput,
     FalsifierOutput,
     MetaReviewOutput,
     NoveltyAuditOutput,
@@ -1314,6 +1315,210 @@ def run_branch(context: TrackContext, snapshot: stages.TrackSnapshot) -> StageOu
         model_calls=1,
         data={"children": opened},
     )
+
+
+# ------------------------------------------------------------ explorers --
+@dataclass(frozen=True, slots=True)
+class ExplorerContext:
+    """What an explorer needs, which is not an idea.
+
+    Separate from :class:`TrackContext` because an explorer has no idea to
+    track -- it produces them. Sharing the type would have meant a required
+    ``idea_id`` that the one role which has none must supply.
+    """
+
+    config: PortfolioConfig
+    portfolio: PortfolioStore
+    runtime: RuntimeStore
+    models: ModelProvider
+    artifacts: ArtifactStore
+    project_id: str
+    run_id: str
+    charter: str = ""
+    problem: str = ""
+    established_facts: tuple[str, ...] = ()
+    constraints: tuple[str, ...] = ()
+
+
+#: Which template each explorer name uses, and the origin an idea it produced
+#: carries. One table, so a new explorer cannot be half-registered.
+EXPLORERS: dict[str, tuple[str, IdeaOrigin]] = {
+    "blind_explorer": ("portfolio_blind_explorer", IdeaOrigin.BLIND_EXPLORER),
+    "seeded_explorer": ("portfolio_seeded_explorer", IdeaOrigin.SEEDED_EXPLORER),
+    "failure_mining_explorer": (
+        "portfolio_failure_mining_explorer",
+        IdeaOrigin.FAILURE_MINING_EXPLORER,
+    ),
+}
+
+
+def run_explorer(context: ExplorerContext, explorer: str) -> StageOutcome:
+    """Generate candidate directions, and keep only what is not already there.
+
+    Every candidate goes through the deterministic deduplication layers before
+    it becomes a row. A duplicate is *recorded* as a duplicate rather than
+    dropped: the fact that the system had the idea twice is itself information,
+    and §29 of the brief says nothing explored is deleted.
+    """
+
+    from research_os.portfolio import dedup as _dedup
+
+    template_name, origin = EXPLORERS[explorer]
+    template = PORTFOLIO_TEMPLATES[template_name]
+    fields, blocks = _explorer_inputs(context, explorer, template)
+    try:
+        request = ModelRequest(
+            role=template.role,
+            capability=template.capability,
+            prompt=template.render(fields=fields, blocks=blocks),
+            prompt_version=template.identity,
+            criticality=template.criticality,
+            independence=template.independence,
+            json_schema=template.output_schema,
+            max_cost_usd=float(context.config.cost_for(Stage.DEDUP)),
+        )
+        response = context.models.complete(request)
+    except ProviderCallFailedError as exc:
+        return StageOutcome.failed(
+            f"{explorer} could not be reached: {exc}",
+            failure_class=FailureClass.PROVIDER_UNAVAILABLE,
+        )
+    if not response.ok:
+        return StageOutcome.failed(
+            f"{explorer} returned nothing usable: {response.error}",
+            failure_class=FailureClass.MODEL_OUTPUT_INVALID,
+            cost_usd=_cost(response),
+            model_calls=1,
+        )
+    try:
+        result = parse(
+            ExplorerOutput,
+            structured=response.structured,
+            text=response.text,
+            role=explorer,
+        )
+    except ContractError as exc:
+        return StageOutcome.failed(
+            str(exc),
+            failure_class=FailureClass.MODEL_OUTPUT_INVALID,
+            cost_usd=_cost(response),
+            model_calls=1,
+        )
+
+    created: list[str] = []
+    duplicates = 0
+    for candidate in result.candidates:
+        fields_for = candidate.as_fields()
+        outcome = _dedup.screen(
+            context.portfolio,
+            project_id=context.project_id,
+            fields=fields_for,
+            config=context.config,
+        )
+        if outcome.is_duplicate:
+            duplicates += 1
+            continue
+        idea, _version = context.portfolio.create_idea(
+            project_id=context.project_id,
+            origin=origin,
+            fields=fields_for,
+            origin_call_id=response.call_id,
+            origin_role=str(template.role),
+            origin_stage="explore",
+            dimensions=candidate.dimensions,
+        )
+        created.append(idea.idea_id)
+
+    if not result.candidates and result.nothing_to_propose:
+        return StageOutcome.succeeded(
+            f"{explorer} had nothing to propose: {result.nothing_to_propose[:160]}",
+            cost_usd=_cost(response),
+            model_calls=1,
+        )
+    return StageOutcome.succeeded(
+        f"{explorer} produced {len(created)} new idea(s); {duplicates} were "
+        f"already in the portfolio",
+        cost_usd=_cost(response),
+        model_calls=1,
+        data={"created": created, "duplicates": duplicates},
+    )
+
+
+def _explorer_inputs(
+    context: ExplorerContext, explorer: str, template: PromptTemplate
+) -> tuple[dict[str, str], dict[str, Sequence[str]]]:
+    """What each explorer is given, and -- for the blind one -- what it is not.
+
+    The blind explorer's template declares no bank field, so this cannot leak
+    one into it even by mistake. That is the enforcement; this function is
+    where the *other* two are assembled.
+    """
+
+    store = context.portfolio
+    fields = {"charter": context.charter}
+    if "problem" in template.fields:
+        fields["problem"] = context.problem
+    blocks: dict[str, Sequence[str]] = {}
+    if "established_facts" in {name for name, _fence in template.blocks}:
+        blocks["established_facts"] = list(context.established_facts)
+    if "constraints" in {name for name, _fence in template.blocks}:
+        blocks["constraints"] = list(context.constraints)
+
+    if explorer == "seeded_explorer":
+        blocks["researcher_seeds"] = [
+            item.text for item in store.pending_seeds(project_id=context.project_id)
+        ]
+        blocks["current_ideas"] = _idea_lines(
+            store,
+            project_id=context.project_id,
+            statuses=(
+                IdeaStatus.PROMISING,
+                IdeaStatus.INVESTIGATING,
+                IdeaStatus.VALIDATED,
+            ),
+        )
+        blocks["negative_findings"] = _idea_lines(
+            store, project_id=context.project_id, statuses=(IdeaStatus.REJECTED,)
+        )
+    elif explorer == "failure_mining_explorer":
+        blocks["rejected_ideas"] = _idea_lines(
+            store,
+            project_id=context.project_id,
+            statuses=(IdeaStatus.REJECTED, IdeaStatus.PARKED),
+            with_reason=True,
+        )
+        blocks["standing_objections"] = [
+            f"[{item.severity}] {item.summary}"
+            for idea in store.list_ideas(project_id=context.project_id, limit=40)
+            for item in store.open_objections(idea_id=idea.idea_id)
+        ][:20]
+    return fields, blocks
+
+
+def _idea_lines(
+    store: PortfolioStore,
+    *,
+    project_id: str,
+    statuses: Sequence[IdeaStatus],
+    with_reason: bool = False,
+    limit: int = 12,
+) -> list[str]:
+    lines: list[str] = []
+    for idea in store.list_ideas(
+        project_id=project_id, statuses=list(statuses), limit=limit
+    ):
+        version = store.get_version(idea.idea_id)
+        if version is None:
+            continue
+        entry = (
+            f"id: {idea.idea_id} ({idea.status})\n"
+            f"question: {version.research_question}\n"
+            f"core: {version.core_idea}"
+        )
+        if with_reason and idea.retire_reason:
+            entry += f"\nwhy it stopped: {idea.retire_reason}"
+        lines.append(entry)
+    return lines
 
 
 # -------------------------------------------------------------- helpers --

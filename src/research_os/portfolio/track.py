@@ -24,10 +24,7 @@ import logging
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, TypedDict
-
-from langgraph.graph import END, START, StateGraph
-from langgraph.runtime import Runtime
+from typing import TYPE_CHECKING, Any, TypedDict
 
 from research_os.errors import ResearchOSError
 from research_os.portfolio import runner, stages
@@ -54,6 +51,10 @@ from research_os.runtime.interfaces import ModelProvider
 from research_os.runtime.locks import research_run_lock
 from research_os.runtime.models import Autonomy, RunKind, RunStatus, TerminalState
 from research_os.runtime.store import RuntimeStore
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from langgraph.graph import StateGraph
+    from langgraph.runtime import Runtime
 
 LOG = logging.getLogger("research_os.portfolio.track")
 
@@ -213,6 +214,8 @@ def build_track_graph() -> StateGraph:
     board gets its own nodes, because only there does a checkpoint between
     steps save a call.
     """
+
+    from langgraph.graph import END, START, StateGraph
 
     graph = StateGraph(TrackState, context_schema=runner.TrackContext)
     graph.add_node("hydrate_idea", hydrate_idea)

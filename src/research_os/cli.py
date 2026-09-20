@@ -36,6 +36,18 @@ from research_os.literature.commands import dispatch as lit_dispatch
 from research_os.models import Reviewable, Verdict
 from research_os.paper.commands import add_paper_parser
 from research_os.paper.commands import dispatch as paper_dispatch
+
+# The discovery portfolio, imported here because `cli.py` is a composition
+# root. The runtime must not import this layer -- `tests/test_runtime_layering.
+# py` asserts it -- so importing it is what the two roots exist to do. The
+# import also *registers* the portfolio's work kinds with the control plane,
+# which is why `researchctl runtime daemon` can run a portfolio and a bare
+# `researchd` from an older build cannot.
+from research_os.portfolio import extensions as portfolio_extensions  # noqa: F401
+from research_os.portfolio.commands import add_parsers as add_portfolio_parsers
+from research_os.portfolio.commands import dispatch_ideas as ideas_dispatch
+from research_os.portfolio.commands import dispatch_portfolio as portfolio_dispatch
+from research_os.portfolio.commands import dispatch_seed as seed_dispatch
 from research_os.proposal.commands import add_propose_parser
 from research_os.proposal.commands import dispatch as propose_dispatch
 from research_os.registry import (
@@ -552,6 +564,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     add_research_parser(subparsers)
     add_runtime_parser(subparsers)
+    add_portfolio_parsers(subparsers)
     add_auto_parser(subparsers)
     add_lit_parser(subparsers)
     add_propose_parser(subparsers)
@@ -596,6 +609,12 @@ def main() -> None:
             code = research_dispatch(args)
         elif args.command == "runtime":
             code = runtime_dispatch(args)
+        elif args.command == "portfolio":
+            code = portfolio_dispatch(args)
+        elif args.command == "ideas":
+            code = ideas_dispatch(args)
+        elif args.command == "seed":
+            code = seed_dispatch(args)
         elif args.command == "auto":
             code = auto_dispatch(args)
         elif args.command == "lit":
