@@ -494,6 +494,60 @@ Agents must stop at the authorized milestone. They must not push, merge, enable
 services, or modify the host outside the repository except ordinary uv-managed
 project environment operations.
 
+## 13a. The autonomous discovery portfolio
+
+Above the R5 runtime, and outside it, sits `research_os.portfolio`
+(`researchctl portfolio`, `researchctl ideas`, `researchctl seed`).
+`docs/AUTONOMOUS_DISCOVERY_ARCHITECTURE.md` is its live specification and
+`docs/adr/0001`–`0004` record its four hard-to-reverse choices.
+
+It exists because R5 advances **one objective** and stops when that objective
+needs a person, which is correct for one objective and makes the researcher's
+absence into the system's idleness. This layer makes the unit of continuation
+the *portfolio*: an idea that reaches `HUMAN_READY` leaves the active set, and
+nothing else stops.
+
+What it adds is one object and the machinery around it:
+
+```text
+Idea            a candidate research direction, PIDEA-<stamp>-<hex>
+idea_versions   immutable content; a review binds to a version's digests
+idea_reviews    version-bound verdicts with the independence achieved
+idea_objections standing objections that survive the revision claiming to
+                answer them
+```
+
+**A portfolio Idea is not a capsule Idea.** `docs/CAPSULE.md` already defines
+one, at `.research/ideas/IDEA-0001.yaml`, and it is scientific state the
+researcher owns. This layer's is a candidate direction with no scientific
+status at all, and the two are kept apart by the same rule `runtime/ids.py`
+states: a runtime id and a scientific id must never be mistakable for one
+another. The Python class is `PortfolioIdea`, never `Idea`.
+
+The authority boundary is unchanged and is enforced structurally. Nothing under
+`research_os/portfolio` writes a capsule file, authors a Review, accepts a
+Claim, promotes a proposal or an insight, merges, or pushes;
+`tests/test_portfolio_authority.py` asserts it by parsing the package. The one
+edge into science is the one that already exists: a `HUMAN_READY` idea becomes
+a `Proposal`, and a person promotes it.
+
+Three small things were added to the runtime for it, each forced rather than
+convenient, and all three keep the direction of dependency intact — the runtime
+does not import the portfolio, and deleting `research_os/portfolio` leaves a
+runtime that still migrates and still runs a cycle:
+
+- `runtime/workkinds.py`, the three work tables, split out so that consulting
+  them costs nothing;
+- `runtime/extensions.py`, a registry the daemon reads and a composition root
+  fills;
+- `runtime/refs.py`, the ref namespace the Curator writes and the coding
+  pipeline's escape check therefore ignores.
+
+`research_os/service.py` is `researchd`'s composition root, for the same
+reason `cli.py` is `researchctl`'s.
+
+No technology left the postponed list in §12. No dependency was added.
+
 ## 14. The autonomous runtime
 
 `research_os.runtime` is the durable operational layer. `docs/RUNTIME.md` is its

@@ -17,20 +17,59 @@ and the failure taxonomy, and describes only what is new.
 ## Implementation status
 
 This document states what the system does, and every enforcement claim names
-the test that holds it. Where a section describes something not yet built, it
-says so in that section. As of this revision the following exist and pass:
+the test that holds it. As of this revision the following exist and pass:
 
 ```text
-sql/0019 .. 0023                     the schema, head 0023
-research_os/portfolio/{ids,digests,models,store}.py
-tests/test_portfolio_store.py        39 tests: the seven §3.4 invariants
-tests/test_runtime_schema.py         extended to both halves of the schema
-tests/test_runtime_layering.py       extended: the runtime must not import this layer
+sql/0019 .. 0024                     the schema, head 0024
+research_os/portfolio/
+    ids, digests, models, config     identity, the three digests, the bounds
+    store                            every read and write
+    gates                            the deterministic quality gates
+    dedup                            four layers, three of them arithmetic
+    contracts, prompts               fourteen role contracts and templates
+    packets                          the frozen review packet
+    stages                           the stage machine: pure, total
+    runner                           the stage handlers
+    track                            the IdeaTrackGraph
+    allocation, tick                 the deterministic portfolio pass
+    curator                          the Git bank
+    digest                           the periodic rendering
+    commands, extensions             the CLI and the control-plane registration
+research_os/runtime/
+    refs, workkinds, extensions      three small additions the above needed
+research_os/service.py               researchd's composition root
+
+tests/
+    test_portfolio_store.py          the seven §3.4 invariants
+    test_portfolio_gates.py          the gates, with a positive control
+    test_portfolio_dedup.py          determinism five ways
+    test_portfolio_stages.py         the machine's domain, and termination
+    test_portfolio_contracts.py      one refusal per way prose could get in
+    test_portfolio_track.py          a whole idea, stage by stage
+    test_portfolio_tick.py           capacity, bounds, pauses, determinism
+    test_portfolio_curator.py        the bank, and the escape-check regression
+    test_portfolio_digest.py         the Pareto front, and what it must say
+    test_portfolio_chaos.py          §34's eight failures and six prohibitions
+    test_portfolio_cli.py            the commands a researcher types
+    test_portfolio_daemon.py         schedule -> event -> work -> handler
+    test_portfolio_authority.py      what this layer structurally cannot do
 ```
 
-Sections marked **(specified, not yet built)** describe the intended contract
-and have no code behind them yet. Nothing in this document should be read as a
-claim that a test exists when the section does not name one.
+**What is implemented and what is proven are different claims**, and this
+document uses them precisely. Everything above is implemented and tested
+against scripted providers on a real PostgreSQL. Nothing here has been run
+against a real provider on a real project: there has been no dogfood, no
+unattended soak and no scientific-quality audit. See
+`docs/AUTONOMOUS_DISCOVERY_REPORT.md` for the evidence table, which
+distinguishes *implemented*, *unit-tested*, *integration-tested*,
+*dogfood-proven* and *unattended-proven* per claim.
+
+Two capabilities are deliberately absent and say so at the point of use: the
+evidence stage has no wiring to the derivation path or the experiment
+pipeline, so a mathematical or an empirical idea stops below `VALIDATED` on
+this build with a message naming what is missing. That is the correct
+behaviour rather than a gap papered over -- an idea that cannot be settled
+here must not be validated on prose -- and §18 records it as a limit.
 
 ---
 
@@ -116,9 +155,8 @@ Two directions are asserted by tests rather than by this paragraph:
 
 - nothing under `research_os/portfolio` writes a capsule file, authors a
   Review, accepts a Claim, promotes a proposal or an insight, merges, or
-  pushes -- **(specified, not yet built:** `tests/test_portfolio_authority.py`,
-  which will parse the package the way `tests/test_runtime_authority.py`
-  already parses the runtime**)**;
+  pushes -- `tests/test_portfolio_authority.py`, which parses the package the
+  way `tests/test_runtime_authority.py` parses the runtime;
 - nothing under `research_os/runtime` imports `research_os.portfolio`, so
   deleting this layer leaves a runtime that still migrates and still runs an
   objective cycle --
@@ -420,7 +458,7 @@ them budgets.
 
 ## 5. Role contracts
 
-**(specified, not yet built.)** Thirteen roles. Eleven do the work the brief
+Fourteen roles. Eleven do the work the brief
 names; the twelfth is the duplicate adjudicator §7 layer 4 calls; the
 thirteenth is the dedup screen's tie-break, which is the same model with a
 different question. Each is a versioned `PromptTemplate` with a declared JSON
@@ -486,8 +524,6 @@ them are recorded.
 ---
 
 ## 6. IdeaTrackGraph
-
-**(specified, not yet built.)**
 
 ### One stage per invocation
 
@@ -573,7 +609,7 @@ condition.
 
 ## 7. Deduplication
 
-**(specified, not yet built above the store primitives.)** Four layers,
+Four layers,
 cheapest first, and the durable identity is never a model's output.
 
 ```text
@@ -667,7 +703,7 @@ a check on the evidence table, not an instruction in a prompt.
 
 ## 9. Quality gates
 
-**(specified, not yet built.)** Deterministic minimum requirements, evaluated
+Deterministic minimum requirements, evaluated
 by `research_os.portfolio.gates.evaluate`, which takes the idea, its current
 version, its **live** reviews, its **standing objections** and its evidence,
 and returns `GateResult(tier, passed, unmet, notes)`.
@@ -800,8 +836,6 @@ The gate never fabricates the difference.
 
 ## 11. The Portfolio Manager and the portfolio tick
 
-**(specified, not yet built.)**
-
 ### Allocation is deterministic, with no model in it at all
 
 ```text
@@ -890,8 +924,6 @@ invokes the next one.
 ---
 
 ## 12. The autonomous bank and the Curator
-
-**(specified, not yet built.)**
 
 ### Two views, one underlying set
 
@@ -1080,8 +1112,6 @@ properties that must survive.
 ---
 
 ## 17. Human interaction
-
-**(specified, not yet built.)**
 
 ```text
 researchctl seed add <project> --text ...

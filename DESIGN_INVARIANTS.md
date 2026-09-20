@@ -164,3 +164,41 @@ unchanged frontier. It can ask now, and everything about how that ask reaches a
 person — a separate type, a separate store, a deterministic grounding check, an
 independent assessment, an interactive confirmation, a draft and nothing
 stronger — exists so that asking never becomes making.
+
+## Change control record: the autonomous discovery portfolio
+
+Per the change-control section above, a dedicated record. **No invariant
+changed, and no technology was added** — this layer uses PostgreSQL, LangGraph,
+the existing daemon, the existing artifact store, the existing router and
+ordinary Git, all of which `ARCHITECTURE.md` §12a and §12b already permit.
+
+What changed is that the unit of continuation is now the *portfolio* rather
+than the objective. Invariant by invariant:
+
+| # | invariant | how the portfolio holds it |
+|---|---|---|
+| 1 | local before LLM | deduplication is three deterministic layers before a model is asked at all; the adjudication type is read from the falsifier by `runtime.adjudication.classify`; the allocator, the gates, the digest and the Curator are ordinary Python and consult no model |
+| 2 | no continuously thinking agents | the tick is deterministic, sub-second and makes no model call; `tests/test_portfolio_authority.py` asserts the allocator and the tick have no way to make one, because `researchd` runs them |
+| 3 | expensive reasoning is event-triggered | every model call happens inside one claimed work item, against a reserved budget, in one bounded stage that ends; nothing polls a model |
+| 4 | project-isolated science | every idea row carries `project_id`; both digests are project-scoped, so an idea copied into another project inherits no reviewed identity |
+| 5 | shared literature | unchanged; the novelty audit reads the existing shared index through an injected source |
+| 6 | Git-tracked files are truth | the bank is written to a **reserved branch** under `.research-os/`, never `.research/`, and the Curator refuses any path under the capsule. Nothing in the package imports anything that writes one |
+| 7 | rebuildable indexes | the bank is a deterministic *view* of PostgreSQL; `researchctl portfolio status` reports the uncurated count, so the one thing losing the database would lose is a number rather than an assumption |
+| 8 | no agent approves its own work | a review whose model call *is* the version's origin call raises rather than degrading; `board_independence` counts distinct reviewer models and nothing rendered may say "independent" when it is 1 |
+| 9 | reviewers start from clean context | `ReviewPacket` is frozen and has no field for another reviewer's verdict; three tests assert the type's shape |
+| 10 | claims traceable to evidence | unchanged, and extended: literature evidence with no retrieved source key is refused by a check constraint, so model memory is not storable as evidence at all |
+| 11 | experiments traceable | unchanged; an idea settled by measurement stops below VALIDATED on a host that cannot execute, rather than being concluded from reasoning about what the measurement would have shown |
+| 12 | paid use has budgets | portfolio, project and run ceilings through the existing ledger; idea and lineage ceilings in the allocator before a stage is enqueued; a stage ceiling on the request itself |
+| 13 | no unofficial automation | unchanged |
+| 14 | finite stop conditions | five bounds where a portfolio can loop and a single objective cannot: breadth, lineage depth, branching factor, revisions and spend. The stage machine's termination test drives it to a fixed point, and found a real loop |
+| 15 | explicit cross-project transfer | unchanged; nothing here nominates or promotes |
+
+The property worth stating as new rather than preserved:
+
+```text
+a portfolio that keeps working  !=  a portfolio that keeps deciding
+```
+
+Every idea it produces is a candidate. The two acts that make one scientific --
+promoting a proposal and recording a Review -- are unchanged, are human, and
+are not reachable from this package.

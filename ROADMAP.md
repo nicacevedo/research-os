@@ -124,6 +124,32 @@ install an isolated one. `deploy/researchd.service` documents three ways;
 SECURITY.md states the boundary. The runtime recovers from the contention
 either way.
 
+## R6 — Autonomous discovery portfolio — beta, on a branch
+
+`architecture/autonomous-discovery-v1` adds the layer above R5 that keeps a
+research portfolio running while individual ideas wait for the researcher. It
+is **not merged and not released**; the branch carries
+`docs/AUTONOMOUS_DISCOVERY_ARCHITECTURE.md` as its specification and
+`docs/AUTONOMOUS_DISCOVERY_REPORT.md` as its build record.
+
+Implemented and integration-tested: the Idea object and its nine tables, the
+deterministic quality gates, four-layer deduplication, fourteen role contracts,
+the bounded idea track, the deterministic portfolio pass, the Git bank and its
+Curator, the digest, and the human-facing commands. 211 new tests.
+
+**Not demonstrated, and the gap is the point of this entry:** no provider was
+called, no project was dogfooded, no soak was run, and no scientific-quality
+audit was performed. The verdict recorded on the branch is
+`AUTONOMOUS_DISCOVERY_BETA` rather than a release candidate, because §43 of the
+mission that authorised it requires all three and none happened.
+
+Two evidence routes are deliberately unwired on that branch: a mathematical
+idea needs an executed counterexample search and an empirical one needs the
+experiment pipeline, and neither is connected to the idea track. Both stop
+below `VALIDATED` with a message naming what is missing, which is the correct
+behaviour — an idea that cannot be settled here must not be validated on prose
+— and it means the only route to `VALIDATED` today is the literature one.
+
 ## Two external prerequisites, and the policy on each
 
 Neither is a defect. Both are things this workstation cannot establish, and
