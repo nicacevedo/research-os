@@ -219,7 +219,18 @@ def select_stage(
         )
 
     # --- sharpen ----------------------------------------------------------
-    if not snapshot.is_precise or Stage.DISCOVER not in snapshot.succeeded_stages:
+    #
+    # The test is "is it precise", plus "has it ever been sharpened", and
+    # deliberately *not* "has discover run against this version". The version
+    # form is what an earlier draft had, and it loops: discover appends a
+    # version, the new version has no succeeded stages, so discover is selected
+    # again, forever -- three cheap calls and one expensive one per pass until
+    # the revision bound runs out. The integration test caught it on its first
+    # run.
+    #
+    # `revision_count` counts versions produced by discover, so it is zero
+    # exactly until the idea has been sharpened once.
+    if not snapshot.is_precise or snapshot.revision_count == 0:
         if snapshot.revision_count > config.bounds.max_revisions_per_idea:
             return None, (
                 f"this idea has been rewritten {snapshot.revision_count} times and "
@@ -255,15 +266,12 @@ def select_stage(
         )
 
     # --- deepen selectively ----------------------------------------------
-    if not _evidence_sufficient(snapshot) and _permits(snapshot.status, Stage.EVIDENCE):
-        if snapshot.depth_without_evidence > config.bounds.max_depth_without_evidence:
-            return None, (
-                "this lineage has gone "
-                f"{snapshot.depth_without_evidence} levels deep without new "
-                "evidence; deepening on reasoning alone stops here"
-            )
-        return Stage.EVIDENCE, "get the evidence this kind of idea would be settled by"
-
+    # The audit before the evidence stage, and not only because it is
+    # cheaper. For a literature-adjudicated idea the audit *is* the evidence,
+    # so running the evidence stage first would either duplicate it under
+    # another name or refuse. For every other type the audit is required for
+    # VALIDATED anyway, and doing the $1.50 stage before the $2.50 one is the
+    # same cheapest-first rule the rest of this function follows.
     if (
         Stage.LITERATURE_AUDIT not in snapshot.succeeded_stages
         or len(snapshot.literature_keys()) < config.thresholds.novelty_min_sources
@@ -272,6 +280,15 @@ def select_stage(
             "establish what is already known, from retrieved sources rather than "
             "from recollection"
         )
+
+    if not _evidence_sufficient(snapshot) and _permits(snapshot.status, Stage.EVIDENCE):
+        if snapshot.depth_without_evidence > config.bounds.max_depth_without_evidence:
+            return None, (
+                "this lineage has gone "
+                f"{snapshot.depth_without_evidence} levels deep without new "
+                "evidence; deepening on reasoning alone stops here"
+            )
+        return Stage.EVIDENCE, "get the evidence this kind of idea would be settled by"
 
     # --- verify independently --------------------------------------------
     if snapshot.missing_review_roles and _permits(snapshot.status, Stage.REVIEW_BOARD):

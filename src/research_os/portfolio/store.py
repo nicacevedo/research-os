@@ -118,6 +118,13 @@ STATE_COLUMNS = (
     "last_tick_at, last_digest_at, bounds, created_at, updated_at"
 )
 SEED_COLUMNS = "seed_id, project_id, text, note, consumed_at, consumed_by, created_at"
+
+#: The same version list, prefixed, for the queries that join ``ideas``. A bare
+#: ``idea_id`` beside the ideas table's own is ambiguous, and PostgreSQL says
+#: so rather than guessing -- which is the good outcome, but only once.
+_QUALIFIED_VERSION_COLUMNS = ", ".join(
+    f"v.{name.strip()}" for name in VERSION_COLUMNS.split(",")
+)
 DIGEST_COLUMNS = (
     "digest_id, project_id, period_start, period_end, payload, artifact_id, created_at"
 )
@@ -411,7 +418,7 @@ class PortfolioStore:
             if version is None:
                 row = conn.execute(
                     f"""
-                    select {VERSION_COLUMNS} from idea_versions v
+                    select {_QUALIFIED_VERSION_COLUMNS} from idea_versions v
                     join ideas i on i.idea_id = v.idea_id
                                 and i.current_version = v.version
                     where v.idea_id = %s
@@ -1421,6 +1428,113 @@ class PortfolioStore:
                 (idea_id, idea_version),
             ).fetchall()
         return frozenset(Stage(str(row["stage"])) for row in rows)
+
+    def set_adjudication_types(
+        self, *, idea_id: str, version: int, types: Sequence[str]
+    ) -> None:
+        """Write the adjudication types the falsifier implies, in place.
+
+        One of two columns on an otherwise append-only table that is updated,
+        and the reason is the same as ``dimensions``': it is *derived*, not
+        authored. The falsifier is in ``content_digest`` and the types are a
+        pure function of it, so writing them changes no review's binding --
+        while appending a version to write them would stale every review and
+        re-run every cheap stage, to record a value nobody wrote.
+
+        Only ``run_adjudicate`` calls this, and it computes the value with
+        ``runtime.adjudication.classify``. Nothing a model returns reaches
+        here.
+        """
+
+        with self._db.tx() as conn:
+            conn.execute(
+                "update idea_versions set adjudication_types = %s "
+                "where idea_id = %s and version = %s",
+                ([str(item) for item in types], idea_id, version),
+            )
+
+    def revision_count(self, idea_id: str) -> int:
+        """How many times this idea has been *rewritten*, not versioned.
+
+        Counts versions produced by the ``discover`` stage. The distinction
+        matters because the revision bound exists to stop "revise until a
+        stochastic reviewer stops objecting", and a version appended by
+        ``adjudicate`` -- which writes the adjudication type read from the
+        falsifier and changes no prose -- is not a rewrite. Counting every
+        version would spend the bound on bookkeeping.
+        """
+
+        with self._db.tx() as conn:
+            row = conn.execute(
+                "select count(*) as n from idea_versions "
+                "where idea_id = %s and origin_stage = 'discover'",
+                (idea_id,),
+            ).fetchone()
+        return int(row["n"])
+
+    def review_count(self, idea_id: str) -> int:
+        """Every review this idea has attracted, across every version."""
+
+        with self._db.tx() as conn:
+            row = conn.execute(
+                "select count(*) as n from idea_reviews where idea_id = %s",
+                (idea_id,),
+            ).fetchone()
+        return int(row["n"])
+
+    def lineage_family(self, idea_id: str) -> tuple[str, ...]:
+        """Every idea sharing this one's lineage root, including itself."""
+
+        with self._db.tx() as conn:
+            rows = conn.execute(
+                """
+                select i.idea_id from ideas i
+                 where i.lineage_root = (
+                     select lineage_root from ideas where idea_id = %s
+                 )
+                 order by i.created_at, i.idea_id
+                """,
+                (idea_id,),
+            ).fetchall()
+        return tuple(str(row["idea_id"]) for row in rows)
+
+    def depth_without_evidence(self, idea_id: str) -> int:
+        """How many lineage levels have passed with no new evidence.
+
+        Measured as this idea's depth minus the depth of the deepest ancestor
+        (or itself) that has any evidence row. Bounds "deepening on reasoning
+        alone", which is the way a portfolio can spend indefinitely while
+        looking busy.
+        """
+
+        with self._db.tx() as conn:
+            row = conn.execute(
+                """
+                with recursive up (idea_id, depth) as (
+                    select i.idea_id, i.depth from ideas i where i.idea_id = %(id)s
+                    union all
+                    select p.idea_id, p.depth
+                      from idea_edges e
+                      join up on e.child_idea_id = up.idea_id
+                      join ideas p on p.idea_id = e.parent_idea_id
+                     where e.is_lineage
+                ) cycle idea_id set looped using path
+                select
+                    (select depth from ideas where idea_id = %(id)s) as here,
+                    coalesce(max(up.depth) filter (
+                        where exists (
+                            select 1 from idea_evidence ev
+                             where ev.idea_id = up.idea_id
+                        )
+                    ), -1) as grounded
+                  from up
+                """,
+                {"id": idea_id},
+            ).fetchone()
+        if row is None:
+            return 0
+        grounded = int(row["grounded"])
+        return 0 if grounded < 0 else max(0, int(row["here"]) - grounded)
 
     def stale_actions(
         self, *, project_id: str, older_than_seconds: float, limit: int = 50

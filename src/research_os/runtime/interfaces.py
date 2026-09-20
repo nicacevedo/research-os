@@ -117,6 +117,27 @@ class ModelRole(StrEnum):
     produce a precise-looking version of everything.
     """
 
+    BRANCHER = "brancher"
+    """Proposes the child directions a surviving idea opens.
+
+    Its own role rather than a second use of the seeded explorer, for the
+    reason every other split here has: provenance must be able to say which
+    question was asked. "An explorer proposed this" and "this was branched
+    from a validated result" are different claims about where an idea came
+    from, and the lineage graph is built on the difference.
+    """
+
+    NOVELTY_SCREENER = "novelty_screener"
+    """Says cheaply whether a direction looks like something already known.
+
+    Its own role rather than a cheap call to the scout, because provenance has
+    to be able to say which question was asked. "A screen thought this was
+    known" and "an audit established it against retrieved sources" are
+    different claims, and only the second can satisfy a gate -- so a system
+    that recorded both under one role would make the weaker one look like the
+    stronger one afterwards.
+    """
+
     LITERATURE_SCOUT = "literature_scout"
     """Reads retrieved sources and produces a structured novelty matrix.
 
@@ -272,6 +293,18 @@ class ModelResponse:
     independence: Independence = Independence.NONE
     independence_note: str = ""
     error: str | None = None
+    #: The ``model_calls`` row this call was recorded as.
+    #:
+    #: Added for the discovery portfolio, which has to be able to *name* the
+    #: call. Its review-independence check compares a review's call against the
+    #: call that produced the work under review, and refuses when they are the
+    #: same -- a check that needs an identifier, not a provider name. Reading
+    #: the newest row for the run afterwards was the alternative and is a race
+    #: between two workers on one run.
+    #:
+    #: ``None`` when no row was written, which happens only when routing
+    #: refused before any invocation.
+    call_id: str | None = None
 
     @property
     def ok(self) -> bool:

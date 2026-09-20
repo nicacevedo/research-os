@@ -70,6 +70,19 @@ class ScriptedRouter:
     #: routing turning the call away because every provider is cooling, which
     #: must not cost the work item an attempt.
     attempted: bool = True
+    #: When set, every answered call writes a real ``model_calls`` row and the
+    #: response names it.
+    #:
+    #: The real router does this and the discovery portfolio depends on it:
+    #: ``idea_reviews.call_id`` has a foreign key, and the independence check
+    #: compares a review's call against the call that produced the work under
+    #: review. A double that returned no call id would let a test pass against
+    #: a review whose independence could not be established.
+    store: Any = None
+    #: Which provider answers each role, so a test can arrange a board with
+    #: one family or with three. Falls back to ``scripted``.
+    providers: dict[str, str] = field(default_factory=dict)
+    models_by_role: dict[str, str] = field(default_factory=dict)
 
     def complete(self, request: ModelRequest) -> ModelResponse:
         self.requests.append(request)
@@ -89,15 +102,30 @@ class ScriptedRouter:
                 independence=Independence.NONE,
             )
         structured = self.answers.get(role)
+        provider = self.providers.get(role, "scripted")
+        model = self.models_by_role.get(role, "scripted-1")
+        call_id = None
+        if self.store is not None:
+            from research_os.runtime.models import ModelCallStatus
+
+            call_id = self.store.record_model_call(
+                provider=provider,
+                model=model,
+                role=role,
+                status=ModelCallStatus.OK,
+                prompt_version=request.prompt_version,
+                cost_usd=0.001,
+            ).call_id
         return ModelResponse(
-            provider="scripted",
-            model="scripted-1",
+            provider=provider,
+            model=model,
             text=None,
             structured=structured,
             tokens_in=10,
             tokens_out=5,
             cost_usd=0.001,
             latency_ms=1,
+            call_id=call_id,
             independence=Independence.DIFFERENT_CONTEXT,
             independence_note="scripted",
         )

@@ -69,12 +69,20 @@ def new_seed_id(*, moment: datetime | None = None) -> str:
     return new_id("SEED", moment=moment)
 
 
-def track_thread_id(idea_id: str, version: int, stage: str) -> str:
-    """The LangGraph thread for one bounded stage of one idea version.
+def track_thread_id(run_id: str) -> str:
+    """The LangGraph thread for one entry into an idea track.
 
-    One thread per *stage attempt*, not one per idea: a thread is the unit of
-    checkpoint retention, and a thread that lives as long as an idea is a
-    checkpoint table that grows for the idea's whole life.
+    Derived from the *run*, for two reasons. One thread per stage *attempt*
+    rather than per stage: a stage that failed on a provider outage and is
+    tried again is a second attempt, and keying the thread on
+    ``(idea, version, stage)`` made the second one collide with the first on
+    ``research_runs.thread_id``'s unique index. And a thread keyed on the run
+    is prunable by the existing retention, which deletes threads whose runs
+    finished long enough ago.
+
+    Named distinctly from :func:`research_os.runtime.ids.thread_id_for`, whose
+    threads are cycle-graph threads. A resumer that fed one to the other graph
+    would deserialise a state schema it does not have.
     """
 
-    return f"idea:{idea_id}:{version}:{stage}"
+    return f"idea-track:{run_id}"

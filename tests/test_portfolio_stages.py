@@ -179,6 +179,7 @@ def test_an_idea_with_no_adjudication_type_is_classified_before_evidence() -> No
             succeeded_stages=frozenset(
                 {Stage.DEDUP, Stage.NOVELTY_SCREEN, Stage.FALSIFY, Stage.DISCOVER}
             ),
+            revision_count=1,
         ),
         CONFIG,
     )
@@ -200,6 +201,7 @@ def test_an_undetermined_type_sends_the_idea_back_to_be_sharpened() -> None:
             succeeded_stages=frozenset(
                 {Stage.DEDUP, Stage.NOVELTY_SCREEN, Stage.FALSIFY, Stage.DISCOVER}
             ),
+            revision_count=1,
         ),
         CONFIG,
     )
@@ -217,15 +219,37 @@ def test_an_unpromising_idea_does_not_reach_the_evidence_stage() -> None:
     """
 
     ready = frozenset(
-        {Stage.DEDUP, Stage.NOVELTY_SCREEN, Stage.FALSIFY, Stage.DISCOVER}
+        {
+            Stage.DEDUP,
+            Stage.NOVELTY_SCREEN,
+            Stage.FALSIFY,
+            Stage.DISCOVER,
+            Stage.LITERATURE_AUDIT,
+        }
+    )
+    audited = tuple(
+        evidence(EvidenceKind.LITERATURE, literature_key=f"openalex:W{i}", index=i)
+        for i in range(3)
     )
     stage, _why = select_stage(
-        snapshot(status=IdeaStatus.CANDIDATE, succeeded_stages=ready), CONFIG
+        snapshot(
+            status=IdeaStatus.CANDIDATE,
+            succeeded_stages=ready,
+            evidence=audited,
+            revision_count=1,
+        ),
+        CONFIG,
     )
     assert stage is not Stage.EVIDENCE
 
     promoted, _why = select_stage(
-        snapshot(status=IdeaStatus.PROMISING, succeeded_stages=ready), CONFIG
+        snapshot(
+            status=IdeaStatus.PROMISING,
+            succeeded_stages=ready,
+            evidence=audited,
+            revision_count=1,
+        ),
+        CONFIG,
     )
     assert promoted is Stage.EVIDENCE
 
@@ -238,6 +262,7 @@ def test_replication_is_not_reachable_before_validated() -> None:
             succeeded_stages=everything,
             evidence=_complete_evidence(),
             live_reviews=_complete_reviews(),
+            revision_count=1,
         ),
         CONFIG,
     )
@@ -249,6 +274,7 @@ def test_replication_is_not_reachable_before_validated() -> None:
             succeeded_stages=everything,
             evidence=_complete_evidence(),
             live_reviews=_complete_reviews(),
+            revision_count=1,
         ),
         CONFIG,
     )
@@ -305,6 +331,7 @@ def test_the_review_loop_has_a_stop_condition() -> None:
             status=IdeaStatus.INVESTIGATING,
             succeeded_stages=frozenset(STAGE_ORDER) - {Stage.REVIEW_BOARD},
             evidence=_complete_evidence(),
+            revision_count=1,
             review_count=CONFIG.bounds.max_reviews_per_idea,
         ),
         CONFIG,
@@ -318,8 +345,21 @@ def test_deepening_on_reasoning_alone_has_a_stop_condition() -> None:
         snapshot(
             status=IdeaStatus.PROMISING,
             succeeded_stages=frozenset(
-                {Stage.DEDUP, Stage.NOVELTY_SCREEN, Stage.FALSIFY, Stage.DISCOVER}
+                {
+                    Stage.DEDUP,
+                    Stage.NOVELTY_SCREEN,
+                    Stage.FALSIFY,
+                    Stage.DISCOVER,
+                    Stage.LITERATURE_AUDIT,
+                }
             ),
+            evidence=tuple(
+                evidence(
+                    EvidenceKind.LITERATURE, literature_key=f"openalex:W{i}", index=i
+                )
+                for i in range(3)
+            ),
+            revision_count=1,
             depth_without_evidence=CONFIG.bounds.max_depth_without_evidence + 1,
         ),
         CONFIG,
@@ -335,6 +375,7 @@ def test_branching_stops_at_the_lineage_ceiling() -> None:
             succeeded_stages=frozenset(STAGE_ORDER) - {Stage.BRANCH},
             evidence=_complete_evidence(),
             live_reviews=_complete_reviews(),
+            revision_count=1,
             lineage_active=CONFIG.bounds.max_active_per_lineage,
         ),
         CONFIG,
@@ -378,6 +419,7 @@ def test_the_machine_terminates_from_any_starting_point() -> None:
                 succeeded_stages=frozenset(done),
                 evidence=_complete_evidence(),
                 live_reviews=_complete_reviews(),
+                revision_count=1,
             ),
             CONFIG,
         )
@@ -410,6 +452,7 @@ def test_a_mixed_idea_is_split_rather_than_investigated() -> None:
                 succeeded_stages=frozenset(
                     {Stage.DEDUP, Stage.NOVELTY_SCREEN, Stage.FALSIFY, Stage.DISCOVER}
                 ),
+                revision_count=1,
             ),
             CONFIG,
         )
@@ -430,8 +473,21 @@ def test_a_mixed_idea_with_a_concrete_component_does_proceed() -> None:
                 )
             ),
             succeeded_stages=frozenset(
-                {Stage.DEDUP, Stage.NOVELTY_SCREEN, Stage.FALSIFY, Stage.DISCOVER}
+                {
+                    Stage.DEDUP,
+                    Stage.NOVELTY_SCREEN,
+                    Stage.FALSIFY,
+                    Stage.DISCOVER,
+                    Stage.LITERATURE_AUDIT,
+                }
             ),
+            evidence=tuple(
+                evidence(
+                    EvidenceKind.LITERATURE, literature_key=f"openalex:W{i}", index=i
+                )
+                for i in range(3)
+            ),
+            revision_count=1,
         ),
         CONFIG,
     )
@@ -449,6 +505,7 @@ def test_the_selector_consults_no_model_and_no_clock() -> None:
     state = snapshot(
         status=IdeaStatus.PROMISING,
         succeeded_stages=frozenset({Stage.DEDUP, Stage.NOVELTY_SCREEN}),
+        revision_count=1,
     )
     assert select_stage(state, CONFIG) == select_stage(state, CONFIG)
 

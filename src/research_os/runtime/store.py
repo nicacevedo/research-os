@@ -424,6 +424,22 @@ class RuntimeStore:
             )
         return ResearchRun.model_validate(row)
 
+    def set_thread_id(self, run_id: str, thread_id: str) -> None:
+        """Name the workflow thread this run's graph executes in.
+
+        Separate from :meth:`create_run` because a track's thread is derived
+        from the run id, which does not exist until the row does. ``thread_id``
+        is unique across runs, so this is also the guard against two runs
+        claiming one thread.
+        """
+
+        with self._db.tx() as conn:
+            conn.execute(
+                "update research_runs set thread_id = %s, updated_at = now() "
+                "where run_id = %s",
+                (thread_id, run_id),
+            )
+
     def set_frontier_digest(self, run_id: str, digest: str) -> None:
         """Record what the frontier looked like when this cycle concluded.
 

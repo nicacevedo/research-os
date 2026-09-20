@@ -55,7 +55,6 @@ MATERIAL_FIELDS: tuple[str, ...] = (
     "mechanism",
     "why_it_matters",
     "falsifier",
-    "adjudication_types",
     "closest_prior_work",
     "claimed_difference",
     "assumptions",
@@ -66,6 +65,15 @@ MATERIAL_FIELDS: tuple[str, ...] = (
 #: Deliberately excluded, with the reason each is excluded, because "we forgot"
 #: and "we decided" look identical in a field list.
 IMMATERIAL_FIELDS: dict[str, str] = {
+    "adjudication_types": (
+        "derived from the falsifier, which *is* in the digest. Two versions "
+        "with the same falsifier have the same adjudication types by "
+        "construction, so hashing it adds nothing -- and hashing it would "
+        "cost a whole version bump to write a value nobody authored, which "
+        "would stale every review and re-run every cheap stage. It is written "
+        "in place, like `dimensions`, and only by `run_adjudicate`, which "
+        "computes it with `runtime.adjudication.classify`."
+    ),
     "next_best_action": "an operational plan, not a claim about the world",
     "dimensions": "scores assigned to the idea, not part of the idea",
     "addressed_objections": "a pointer to prior objections; changing it "

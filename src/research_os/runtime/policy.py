@@ -556,6 +556,8 @@ ROLE_PERMISSIONS: dict[ModelRole, frozenset[Permission]] = {
     # input is the portfolio's own record of what failed, handed to it.
     ModelRole.FAILURE_MINING_EXPLORER: frozenset(),
     ModelRole.SCIENTIFIC_DISCOVERY: frozenset({Permission.READ_REPO}),
+    ModelRole.BRANCHER: frozenset({Permission.READ_REPO}),
+    ModelRole.NOVELTY_SCREENER: frozenset({Permission.NETWORK_READ}),
     ModelRole.LITERATURE_SCOUT: frozenset({Permission.NETWORK_READ}),
     ModelRole.FALSIFIER: frozenset({Permission.READ_REPO}),
     ModelRole.METHODOLOGY_REVIEWER: frozenset(),

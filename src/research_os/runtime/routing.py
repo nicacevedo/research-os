@@ -599,7 +599,7 @@ class ModelRouter:
             self._budgets.release_all(cost_grants)
             self._budgets.settle_all(grants)
             health = self._record_health(profile.name, ok=False, error=str(exc))
-            self._record(
+            call_id = self._record(
                 request,
                 routed,
                 status=ModelCallStatus.FAILED,
@@ -636,7 +636,7 @@ class ModelRouter:
             self._budgets.settle_all(grants)
             detail = result.error or f"exit {result.exit_code}"
             health = self._record_health(profile.name, ok=False, error=detail)
-            self._record(
+            call_id = self._record(
                 request,
                 routed,
                 status=status,
@@ -670,7 +670,7 @@ class ModelRouter:
             self._budgets.settle_all(cost_grants, actual=result.total_cost_usd)
             self._budgets.settle_all(grants)
             self._record_health(profile.name, ok=True)
-            self._record(
+            call_id = self._record(
                 request,
                 routed,
                 status=ModelCallStatus.MALFORMED,
@@ -687,6 +687,7 @@ class ModelRouter:
                 provider=profile.name,
                 model=result.resolved_model or profile.model,
                 text=result.text,
+                call_id=call_id,
                 independence=routed.independence,
                 independence_note=routed.note,
                 latency_ms=latency,
@@ -704,7 +705,7 @@ class ModelRouter:
             self._used_families.setdefault(request.independence_group, set()).add(
                 profile.family
             )
-        self._record(
+        call_id = self._record(
             request,
             routed,
             status=ModelCallStatus.OK,
@@ -722,6 +723,7 @@ class ModelRouter:
             model=result.resolved_model or profile.model,
             text=result.text,
             structured=result.structured,
+            call_id=call_id,
             tokens_in=result.input_tokens,
             tokens_out=result.output_tokens,
             cost_usd=result.total_cost_usd,
@@ -744,8 +746,16 @@ class ModelRouter:
         tokens_out: int | None = None,
         cost: float | None = None,
         resolved_model: str | None = None,
-    ) -> None:
-        self._store.record_model_call(
+    ) -> str:
+        """Write the provenance row, and return the id of what was written.
+
+        Returning it rather than discarding it is what lets a caller name the
+        call afterwards. The discovery portfolio's review-independence check
+        needs exactly that: "was this review produced by the same call that
+        produced the work" is not answerable from a provider name.
+        """
+
+        recorded = self._store.record_model_call(
             run_id=self._run_id,
             work_id=self._work_id,
             provider=routed.profile.name,
@@ -771,6 +781,7 @@ class ModelRouter:
         )
         if routed.note.startswith("DEGRADED"):
             LOG.warning("%s: %s", request.role, routed.note)
+        return recorded.call_id
 
 
 def profiles_from_adapters(
