@@ -80,81 +80,117 @@ IMMATERIAL_FIELDS: dict[str, str] = {
     "version": "identity",
 }
 
+#: Keys the projections require that are not columns of ``idea_versions``.
+#: ``project`` is one: it is the scope of the identity rather than part of the
+#: idea, and the store supplies it from the ``ideas`` row.
+PROJECTION_CONTEXT: tuple[str, ...] = ("project",)
+
 #: Stopwords dropped by the canonical projection. Short and fixed: the purpose
 #: is to make "a method for X" and "an approach to X" collide, not to do
 #: linguistics. Extending it changes every canonical digest, which is why the
 #: digest carries a version.
+#:
+#: **What must never go in here**, and the rule is absolute: no word whose
+#: removal can flip a meaning. Negation (``no``, ``not``, ``never``,
+#: ``without``), comparison (``same``, ``different``, ``more``, ``less``),
+#: quantification (``all``, ``some``, ``any``, ``every``, ``each``) and
+#: conditionality (``if``, ``only``, ``unless``) all stay, because "the
+#: trajectories are the same" and "the trajectories are not the same" must not
+#: normalise to one idea. ``if`` and ``than`` were in the first version of this
+#: list and were removed for exactly that reason.
+#:
+#: What is in here is articles, copulas, auxiliaries, prepositions, pronouns,
+#: discourse markers, and the handful of contentless research nouns that appear
+#: in the title of everything ever written.
 _STOPWORDS: frozenset[str] = frozenset(
     [
         "a",
+        "about",
+        "also",
+        "among",
         "an",
-        "the",
-        "this",
-        "that",
-        "these",
-        "those",
-        "of",
-        "for",
-        "to",
-        "in",
-        "on",
-        "at",
-        "by",
-        "with",
-        "from",
-        "into",
-        "over",
-        "under",
-        "is",
+        "analysis",
+        "and",
+        "approach",
         "are",
-        "was",
-        "were",
+        "as",
+        "at",
+        "based",
         "be",
         "been",
         "being",
-        "do",
-        "does",
-        "did",
+        "between",
+        "but",
+        "by",
         "can",
         "could",
-        "may",
-        "might",
-        "must",
-        "shall",
-        "should",
-        "will",
-        "would",
-        "and",
-        "or",
-        "but",
-        "if",
-        "then",
-        "than",
-        "as",
+        "did",
+        "do",
+        "does",
+        "for",
+        "framework",
+        "from",
+        "he",
+        "hence",
+        "her",
+        "here",
+        "hers",
+        "him",
+        "his",
+        "however",
+        "in",
+        "into",
+        "is",
         "it",
         "its",
-        "we",
-        "our",
-        "you",
-        "your",
+        "itself",
+        "may",
+        "method",
+        "might",
+        "moreover",
+        "must",
         "new",
         "novel",
-        "approach",
-        "method",
-        "technique",
-        "framework",
+        "of",
+        "on",
+        "or",
+        "our",
+        "over",
+        "shall",
+        "she",
+        "should",
         "study",
-        "analysis",
-        "using",
-        "use",
-        "uses",
-        "based",
-        "via",
+        "technique",
+        "that",
+        "the",
+        "their",
+        "theirs",
+        "them",
+        "themselves",
+        "then",
+        "there",
+        "these",
+        "they",
+        "this",
+        "those",
+        "thus",
+        "to",
         "toward",
         "towards",
-        "about",
-        "between",
-        "among",
+        "under",
+        "us",
+        "use",
+        "uses",
+        "using",
+        "via",
+        "was",
+        "we",
+        "were",
+        "will",
+        "with",
+        "would",
+        "you",
+        "your",
     ]
 )
 
@@ -196,9 +232,16 @@ def _string_list(value: object) -> list[str]:
 
 
 def content_projection(fields: Mapping[str, Any]) -> dict[str, Any]:
-    """The fixed-key material projection of one idea version."""
+    """The fixed-key material projection of one idea version.
+
+    ``project`` is a key of the projection and is required. Reviewed identity
+    is project-local: an idea copied into another project must not arrive
+    carrying the first project's reviews, which is exactly the rule
+    :func:`research_os.digests.semantic_projection` states for capsule objects.
+    """
 
     return {
+        "project": _text(fields.get("project")),
         "title": _text(fields.get("title")),
         "research_question": _text(fields.get("research_question")),
         "core_idea": _text(fields.get("core_idea")),
@@ -247,6 +290,7 @@ def canonical_projection(fields: Mapping[str, Any]) -> dict[str, Any]:
     """The normalised projection two rephrasings of one idea share."""
 
     return {
+        "project": _text(fields.get("project")),
         "question": list(normalise(_text(fields.get("research_question")))),
         "core": list(normalise(_text(fields.get("core_idea")))),
     }
