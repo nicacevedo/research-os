@@ -1063,3 +1063,46 @@ def test_a_branch_opens_children_with_recorded_lineage(
     assert child.lineage_root == parent.lineage_root
     kinds = {edge.kind for edge in portfolio.edges_of(child.idea_id)}
     assert EdgeKind.GENERALIZES in kinds
+
+
+def test_every_call_a_track_makes_is_attributed_to_its_own_run(
+    portfolio: PortfolioStore,
+    runtime_db: Database,
+    pg_dsn: str,
+    checkpoint_tables: str,
+    tmp_path: Path,
+    runtime_project: str,
+) -> None:
+    """Cost attribution, which is what `sql/0015` exists to keep.
+
+    ``record_model_call`` derives ``project_id`` by looking the run up. A
+    router built before the run exists therefore carries a run id naming
+    nothing, and the whole track's spend lands on a row with no project --
+    silently, because the foreign key on ``model_calls.run_id`` was dropped
+    precisely so effect rows could outlive their runs.
+
+    Driven through the factory form, which is what the daemon's handler
+    passes.
+    """
+
+    idea, _ = seed_idea(portfolio, runtime_project)
+    router = _router(runtime_db)
+    seen: list[str] = []
+
+    def factory(run_id: str):
+        seen.append(run_id)
+        return router
+
+    result = advance_idea(
+        runtime_config=make_config(pg_dsn, tmp_path / "artifacts"),
+        portfolio_config=load_config(),
+        db=runtime_db,
+        project_id=runtime_project,
+        idea_id=idea.idea_id,
+        models=factory,
+    )
+    assert result.run_id
+    assert seen == [result.run_id], seen
+
+    runtime = RuntimeStore(runtime_db)
+    assert runtime.get_run(result.run_id) is not None

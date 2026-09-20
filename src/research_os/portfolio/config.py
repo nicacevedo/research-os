@@ -171,6 +171,15 @@ STAGE_MINIMUM_STATUS: dict[Stage, str] = {
 }
 
 
+#: What one explorer call may cost.
+#:
+#: Its own number rather than a stage's, because exploration is not a stage of
+#: an idea -- it is what produces one. An earlier version charged it against
+#: the deduplication ceiling, which is ten cents, and would have made every
+#: explorer call on a real provider fail for being too expensive to make.
+DEFAULT_EXPLORER_COST_USD = Decimal("0.60")
+
+
 class Cadence(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -197,6 +206,7 @@ class ConfigDocument(BaseModel):
     weights: Weights | None = None
     cadence: Cadence | None = None
     stage_cost_usd: dict[str, Decimal] | None = None
+    explorer_cost_usd: Decimal | None = None
 
 
 class PortfolioConfig(BaseModel):
@@ -211,6 +221,7 @@ class PortfolioConfig(BaseModel):
     stage_cost_usd: dict[Stage, Decimal] = Field(
         default_factory=lambda: dict(DEFAULT_STAGE_COST_USD)
     )
+    explorer_cost_usd: Decimal = DEFAULT_EXPLORER_COST_USD
     source: Path | None = None
 
     def cost_for(self, stage: Stage) -> Decimal:
@@ -275,5 +286,10 @@ def load_config(path: Path | None = None) -> PortfolioConfig:
         weights=document.weights or Weights(),
         cadence=document.cadence or Cadence(),
         stage_cost_usd=costs,
+        explorer_cost_usd=(
+            document.explorer_cost_usd
+            if document.explorer_cost_usd is not None
+            else DEFAULT_EXPLORER_COST_USD
+        ),
         source=target if target.exists() else None,
     )

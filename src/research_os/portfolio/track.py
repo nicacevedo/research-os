@@ -21,6 +21,7 @@ the crashed one did.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
@@ -57,6 +58,24 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from langgraph.runtime import Runtime
 
 LOG = logging.getLogger("research_os.portfolio.track")
+
+
+class _UnusedProvider:
+    """Stands in where a provider is required and must not be reached.
+
+    `advance_idea` selects the stage before it opens a run, and selection is
+    deterministic. Handing it a real provider would be harmless and handing it
+    one that raises says something true: nothing on that path may ask a model.
+    """
+
+    def complete(self, request: object) -> object:  # pragma: no cover
+        raise TrackError(
+            "stage selection consults no model; something on the probe path "
+            "tried to make a call"
+        )
+
+
+_UNUSED_PROVIDER = _UnusedProvider()
 
 
 class TrackError(ResearchOSError):
@@ -256,7 +275,7 @@ def advance_idea(
     db: Database,
     project_id: str,
     idea_id: str,
-    models: ModelProvider,
+    models: ModelProvider | Callable[[str], ModelProvider],
     repo_path: Path | None = None,
     literature: runner.LiteratureSource | None = None,
     charter: str = "",
@@ -303,7 +322,10 @@ def advance_idea(
         config=portfolio_config,
         portfolio=store,
         runtime=runtime_store,
-        models=models,
+        # Never used: the probe asks `select_stage`, which consults no model.
+        # It is here because the type requires one, and a factory has nothing
+        # to build against until a run exists.
+        models=_UNUSED_PROVIDER,
         artifacts=FilesystemArtifactStore(
             root=runtime_config.artifacts_root, store=runtime_store
         ),
@@ -368,7 +390,13 @@ def advance_idea(
         config=portfolio_config,
         portfolio=store,
         runtime=runtime_store,
-        models=models,
+        # Built *after* the run exists, so every call this track makes is
+        # recorded against it. A router constructed earlier would carry a run
+        # id naming nothing, and `record_model_call` derives `project_id` by
+        # looking the run up -- so the cost of the whole track would land on a
+        # row with no project, which is the attribution `sql/0015` exists to
+        # keep.
+        models=models(run.run_id) if callable(models) else models,
         artifacts=context_probe.artifacts,
         project_id=project_id,
         idea_id=idea_id,

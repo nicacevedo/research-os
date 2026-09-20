@@ -97,6 +97,12 @@ _PATH_ENTRY_POINTS = (
     "research_os.runtime.config:artifacts_root",
     "research_os.runtime.config:dev_db_root",
     "research_os.sandbox:containment_root",
+    # The discovery portfolio. Two writable paths: its configuration file, and
+    # the Curator's worktree root -- which is a *Git checkout* under the state
+    # home, so a test that resolved it to the real one would leave a worktree
+    # registered in the researcher's own repository.
+    "research_os.portfolio.config:config_path",
+    "research_os.portfolio.curator:worktree_root",
 )
 
 

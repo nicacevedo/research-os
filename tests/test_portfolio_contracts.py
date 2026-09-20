@@ -425,3 +425,31 @@ def test_json_wrapped_in_prose_is_extracted_but_not_repaired() -> None:
             text='{"verdict": "PASS", "summary": "fine",}',
             role="methodology_reviewer",
         )
+
+
+def test_every_template_has_a_spending_ceiling() -> None:
+    """A template with no ceiling would make an unbounded call.
+
+    The three explorers have one of their own -- exploration is not a stage of
+    an idea -- and every other template maps to a stage. A default would have
+    meant a new template silently taking the cheapest ceiling in the table,
+    which on a real provider looks like the provider refusing to answer.
+    """
+
+    from research_os.portfolio.config import load_config
+    from research_os.portfolio.runner import EXPLORERS, _stage_for
+
+    config = load_config()
+    explorer_templates = {name for name, _origin in EXPLORERS.values()}
+    for name in pprompts.TEMPLATES:
+        if name in explorer_templates:
+            assert config.explorer_cost_usd > 0
+            continue
+        assert config.cost_for(_stage_for(name)) >= 0, name
+
+
+def test_an_unmapped_template_raises_rather_than_taking_a_default() -> None:
+    from research_os.portfolio.runner import _stage_for
+
+    with pytest.raises(KeyError, match="no stage ceiling"):
+        _stage_for("a_template_nobody_registered")

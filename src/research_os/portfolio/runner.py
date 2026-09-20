@@ -243,9 +243,7 @@ def _ask(
         independence=template.independence,
         independence_group=independence_group,
         json_schema=template.output_schema,
-        max_cost_usd=float(
-            context.config.cost_for(_STAGE_FOR_TEMPLATE.get(template.name, Stage.DEDUP))
-        ),
+        max_cost_usd=float(context.config.cost_for(_stage_for(template.name))),
     )
     return context.models.complete(request)
 
@@ -253,10 +251,14 @@ def _ask(
 #: Which stage's ceiling each template's calls are charged against. A table
 #: rather than a parameter, so a new template that forgets to say which stage
 #: it belongs to is a missing key rather than an unbounded call.
+#:
+#: The three explorers are absent on purpose: exploration is not a stage of an
+#: idea, it is what produces one, and it has a ceiling of its own.
+#: :func:`_stage_for` raises for them, and for anything else unmapped -- a
+#: default would have meant a new template silently taking the cheapest
+#: ceiling in the table, which is the failure mode that looks like a provider
+#: refusing to answer.
 _STAGE_FOR_TEMPLATE: dict[str, Stage] = {
-    "portfolio_blind_explorer": Stage.DEDUP,
-    "portfolio_seeded_explorer": Stage.DEDUP,
-    "portfolio_failure_mining_explorer": Stage.DEDUP,
     "duplicate_adjudicator": Stage.DEDUP,
     "novelty_screen": Stage.NOVELTY_SCREEN,
     "falsifier": Stage.FALSIFY,
@@ -269,6 +271,17 @@ _STAGE_FOR_TEMPLATE: dict[str, Stage] = {
     "replicator": Stage.REPLICATE,
     "brancher": Stage.BRANCH,
 }
+
+
+def _stage_for(template_name: str) -> Stage:
+    stage = _STAGE_FOR_TEMPLATE.get(template_name)
+    if stage is None:
+        raise KeyError(
+            f"{template_name!r} has no stage ceiling. Add it to "
+            f"_STAGE_FOR_TEMPLATE, or -- if it is not a stage of an idea -- "
+            f"give it a ceiling of its own the way the explorers have."
+        )
+    return stage
 
 
 def _independence_group(context: TrackContext, version_digest: str) -> str:
@@ -1375,7 +1388,7 @@ def run_explorer(context: ExplorerContext, explorer: str) -> StageOutcome:
             criticality=template.criticality,
             independence=template.independence,
             json_schema=template.output_schema,
-            max_cost_usd=float(context.config.cost_for(Stage.DEDUP)),
+            max_cost_usd=float(context.config.explorer_cost_usd),
         )
         response = context.models.complete(request)
     except ProviderCallFailedError as exc:

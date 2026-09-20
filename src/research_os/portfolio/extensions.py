@@ -83,8 +83,11 @@ def run_advance_idea(context: WorkContext) -> dict[str, Any]:
         db=context.db,
         project_id=context.item.project_id,
         idea_id=idea_id,
-        models=context.models(
-            _run_for(context, idea_id), context.item.project_id, context.item.work_id
+        # A *factory*, not a provider: `advance_idea` opens its own run and
+        # builds the router against it, so every call is attributed to the run
+        # that made it.
+        models=lambda run_id: context.models(
+            run_id, context.item.project_id, context.item.work_id
         ),
         repo_path=context.repo_path,
         literature=None,
@@ -198,18 +201,6 @@ def run_digest(context: WorkContext) -> dict[str, Any]:
         config=_config(context),
     )
     return {"digest_id": record.digest_id, "counts": record.payload.get("counts", {})}
-
-
-def _run_for(context: WorkContext, idea_id: str) -> str:
-    """A placeholder run id for the router's provenance before a run exists.
-
-    ``advance_idea`` opens its own run and builds its own router; this one is
-    only used to satisfy the factory's signature for the *probe* it makes
-    first. It never records a call, because the probe asks the selector and not
-    a model.
-    """
-
-    return f"pending:{idea_id}"
 
 
 def _charter(repo_path: Path | None) -> str:
