@@ -430,18 +430,31 @@ def test_declaring_a_second_type_adds_requirements_and_removes_none(
     assert any("experiment" in item for item in result.unmet)
 
 
-def test_an_undetermined_idea_cannot_be_validated(
-    portfolio: PortfolioStore, runtime_db: Database, runtime_project: str
+@pytest.mark.parametrize(
+    "declared", [AdjudicationType.UNDETERMINED, AdjudicationType.MIXED]
+)
+def test_an_idea_with_no_concrete_type_cannot_be_validated(
+    portfolio: PortfolioStore,
+    runtime_db: Database,
+    runtime_project: str,
+    declared: AdjudicationType,
 ) -> None:
+    """Neither UNDETERMINED nor MIXED names a kind of work, so nothing settles it.
+
+    MIXED is the one the stage machine's termination property caught: it has no
+    evidence rule, so an earlier build would have run the evidence stage
+    against it forever.
+    """
+
     built = _build(
         portfolio,
         runtime_db,
         runtime_project,
-        adjudication=[AdjudicationType.UNDETERMINED],
+        adjudication=[declared],
     )
     result = built.gate(requested=QualityTier.VALIDATED)
     assert not result.passed
-    assert any("Sharpen the falsifier" in item for item in result.unmet)
+    assert any("no evidence would" in item for item in result.unmet)
 
 
 def test_a_standing_critical_objection_blocks_validated(

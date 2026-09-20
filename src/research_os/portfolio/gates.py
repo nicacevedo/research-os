@@ -381,12 +381,18 @@ def _validated_unmet(
     config: PortfolioConfig,
 ) -> list[str]:
     unmet: list[str] = []
-    declared, evidence_rules, _ = _rules_for(version)
+    _declared, evidence_rules, _ = _rules_for(version)
 
-    if AdjudicationType.UNDETERMINED in declared and not evidence_rules:
+    if not evidence_rules:
+        # No declared type carries an evidence rule, so nothing would satisfy
+        # one. UNDETERMINED means the falsifier said nothing; MIXED means it
+        # said "several kinds", which is a decomposition rather than a route.
+        # Either way there is no evidence that would settle this idea as
+        # stated, and saying so is more useful than listing what is missing.
         unmet.append(
-            "the falsifier does not say how this would be settled, so no kind of "
-            "evidence would settle it. Sharpen the falsifier first."
+            "the falsifier does not name one kind of work that would settle "
+            "this, so no evidence would. Sharpen it, or split the idea into "
+            "components that each have their own."
         )
 
     for role in INDEPENDENT_REVIEW_ROLES:

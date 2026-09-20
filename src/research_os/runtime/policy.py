@@ -543,6 +543,30 @@ ROLE_PERMISSIONS: dict[ModelRole, frozenset[Permission]] = {
     # Reads the capsule, because a derivation that does not quote the
     # assumption it rests on is a derivation of nothing. Writes nothing.
     ModelRole.DERIVER: frozenset({Permission.READ_REPO}),
+    # --- the discovery portfolio -----------------------------------------
+    #
+    # Every reviewer holds nothing, which is the same rule the scientific
+    # reviewer already follows: it reads a frozen packet and returns a verdict,
+    # so no amount of prompt injection in the material it reviews can turn it
+    # into an actor.
+    #
+    # The explorers and the falsifier read the repository because a direction
+    # proposed without reference to what the project has already established is
+    # a direction about nothing. The failure-mining explorer does not: its
+    # input is the portfolio's own record of what failed, handed to it.
+    ModelRole.FAILURE_MINING_EXPLORER: frozenset(),
+    ModelRole.SCIENTIFIC_DISCOVERY: frozenset({Permission.READ_REPO}),
+    ModelRole.LITERATURE_SCOUT: frozenset({Permission.NETWORK_READ}),
+    ModelRole.FALSIFIER: frozenset({Permission.READ_REPO}),
+    ModelRole.METHODOLOGY_REVIEWER: frozenset(),
+    ModelRole.NOVELTY_REVIEWER: frozenset(),
+    ModelRole.SKEPTIC_REVIEWER: frozenset(),
+    ModelRole.REPLICATOR: frozenset(),
+    ModelRole.META_REVIEWER: frozenset(),
+    # Nothing. It is shown two pieces of text and asked whether they are the
+    # same idea; a repository would tell it nothing it needs and would give it
+    # somewhere to go.
+    ModelRole.DUPLICATE_ADJUDICATOR: frozenset(),
 }
 
 #: What the runtime may hold at each configured autonomy setting. The *setting*

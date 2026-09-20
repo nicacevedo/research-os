@@ -90,6 +90,73 @@ class ModelRole(StrEnum):
     no experiment can settle.
     """
 
+    # --- the discovery portfolio's roles ---------------------------------
+    #
+    # Declared here rather than in `research_os.portfolio`, because the runtime
+    # must not import the layer above it and `model_calls.role` is written by
+    # the router. A role is a routing and provenance fact; the *contract* for
+    # what each one returns lives in `portfolio.contracts`, where it belongs.
+    #
+    # BLIND_EXPLORER and SEEDED_EXPLORER are reused rather than duplicated: the
+    # portfolio asks them a differently-shaped question with a different
+    # template, and the thing recorded against a call is still "a blind
+    # explorer said this".
+    FAILURE_MINING_EXPLORER = "failure_mining_explorer"
+    """Asks what becomes interesting *because* something failed.
+
+    Its own role rather than a second use of the seeded explorer, because its
+    input is the set of rejections, contradictions and standing objections --
+    the material every other generator is steered away from.
+    """
+
+    SCIENTIFIC_DISCOVERY = "scientific_discovery"
+    """Turns a candidate direction into something that could be settled.
+
+    The one generator whose *failure* is a complete answer: "this cannot be
+    made precise" ends a track, and a role that could only ever succeed would
+    produce a precise-looking version of everything.
+    """
+
+    LITERATURE_SCOUT = "literature_scout"
+    """Reads retrieved sources and produces a structured novelty matrix.
+
+    Distinct from EXTRACTOR, which pulls fields out of one paper. This one
+    compares a proposal against a corpus and its output is checked against the
+    keys it was actually given.
+    """
+
+    FALSIFIER = "falsifier"
+    """Tries to kill an idea before anything is spent on it.
+
+    The only role whose successful outcome is a negative result, which is why
+    it is not a reviewer: a reviewer that produced nothing but objections would
+    be failing, and this one would be working.
+    """
+
+    METHODOLOGY_REVIEWER = "methodology_reviewer"
+    NOVELTY_REVIEWER = "novelty_reviewer"
+    SKEPTIC_REVIEWER = "skeptic_reviewer"
+    """The three independent readings a VALIDATED idea requires.
+
+    Separate from SKEPTIC, which attacks a set of proposals inside one cycle.
+    These read a frozen packet about one idea version and their verdicts are
+    version-bound rows a gate counts.
+    """
+
+    REPLICATOR = "replicator"
+    """Second-line verification, along a line the adjudication type fixes."""
+
+    META_REVIEWER = "meta_reviewer"
+    """Synthesises completed reviews into a recommendation a gate may lower."""
+
+    DUPLICATE_ADJUDICATOR = "duplicate_adjudicator"
+    """Decides sameness only where arithmetic could not.
+
+    Its verdict is recorded as an edge with provenance and is never an
+    identity: a stochastic identity would mean the same idea has a different
+    identity on two runs.
+    """
+
     NOMINATOR = "nominator"
     """Judges whether one project's finding is candidate knowledge for others.
 
