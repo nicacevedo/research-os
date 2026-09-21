@@ -45,8 +45,11 @@ class Bounds(BaseModel):
     """The anti-explosion controls. Every one of them a finite stop condition.
 
     Invariant 14 says no workflow may recurse or retry indefinitely, and a
-    portfolio has five ways to do it that a single objective does not: breadth,
-    lineage depth, branching factor, revision, and spend. One bound each.
+    portfolio has six ways to do it that a single objective does not: breadth,
+    lineage depth, branching factor, revision, spend, and generating forever
+    without generating anything. One bound each. The sixth was found by
+    running the tick twice against a real project and watching the queue
+    grow.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -78,6 +81,14 @@ class Bounds(BaseModel):
     candidate_pool_floor: int = Field(default=6, ge=0, le=200)
     #: And the ceiling, so a run of explorers cannot fill the table.
     candidate_pool_ceiling: int = Field(default=40, ge=1, le=1_000)
+    #: How many explorer runs may succeed without producing a single new idea
+    #: before the portfolio stops exploring. The sixth loop, and the one the
+    #: other five do not cover: every explorer generating a near-duplicate
+    #: that the screen rejects leaves the pool below its floor forever, so the
+    #: tick buys another explorer every cadence until the budget is gone.
+    #: The budget does stop it, eventually, and "you have spent your ceiling"
+    #: is the wrong diagnosis for "this project's idea space is exhausted".
+    max_barren_explorations: int = Field(default=6, ge=1, le=100)
 
 
 class Thresholds(BaseModel):

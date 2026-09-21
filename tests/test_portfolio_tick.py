@@ -340,6 +340,12 @@ def test_the_same_state_produces_the_same_plan(
     for index in range(4):
         idea, _ = seed_idea(portfolio, runtime_project, title=f"idea {index}")
         portfolio.set_status(idea_id=idea.idea_id, status=IdeaStatus.PROMISING)
+    # Enough CANDIDATEs that the pool is at its floor, so no explorer is
+    # bought and the two ticks really do read the same state. With the pool
+    # empty the first tick queues an explorer and the second legitimately
+    # plans differently -- which is the bound below, not nondeterminism.
+    for index in range(load_config().bounds.candidate_pool_floor):
+        seed_idea(portfolio, runtime_project, title=f"candidate {index}")
     moment = datetime.now(UTC)
     first = _tick(runtime_db, pg_dsn, tmp_path, runtime_project, now=moment)
     second = _tick(runtime_db, pg_dsn, tmp_path, runtime_project, now=moment)
@@ -470,3 +476,207 @@ def test_no_operational_state_makes_an_idea_allocatable_while_in_flight(
     portfolio.set_operational_state(idea_id=idea.idea_id, state=blocked)
     refreshed = portfolio.require_idea(idea.idea_id)
     assert allocation.allocatable(refreshed) is (blocked is OperationalState.IDLE)
+
+
+def test_a_block_is_not_cleared_while_no_provider_is_healthy(
+    portfolio: PortfolioStore,
+    runtime_db: Database,
+    pg_dsn: str,
+    tmp_path,
+    runtime_project: str,
+) -> None:
+    """The control for `_clear_blocks`, which is deliberately coarse.
+
+    It clears ``BLOCKED_PROVIDER`` for every idea when *any* provider is
+    healthy, because nothing records which provider blocked which idea -- and
+    on a one-provider machine that distinction does not exist. What it must
+    not do is clear a block when nothing has recovered, which would put the
+    idea straight back into the allocator to fail again.
+    """
+
+    idea, _ = seed_idea(portfolio, runtime_project)
+    portfolio.set_operational_state(
+        idea_id=idea.idea_id, state=OperationalState.BLOCKED_PROVIDER
+    )
+    RuntimeStore(runtime_db).record_provider_result(
+        provider="claude", ok=False, error="down", threshold=1, cooldown=600
+    )
+    report = _tick(runtime_db, pg_dsn, tmp_path, runtime_project)
+    assert report.blocks_cleared == 0
+    assert portfolio.require_idea(idea.idea_id).operational_state is (
+        OperationalState.BLOCKED_PROVIDER
+    )
+
+
+def test_the_explorer_rotates_towards_what_is_under_represented(
+    portfolio: PortfolioStore,
+    runtime_db: Database,
+    pg_dsn: str,
+    tmp_path,
+    runtime_project: str,
+) -> None:
+    """Failure mining is chosen when there are failures and little of it.
+
+    Rotation rather than a fixed ratio: the counts decide, so a portfolio that
+    has drifted towards one origin corrects itself without anybody tuning a
+    weight. Only the seeded branch had a test.
+    """
+
+    for index in range(4):
+        idea, _ = seed_idea(portfolio, runtime_project, title=f"blind {index}")
+        portfolio.set_status(
+            idea_id=idea.idea_id,
+            status=IdeaStatus.REJECTED,
+            retire_reason="the falsifier killed it",
+        )
+    report = _tick(runtime_db, pg_dsn, tmp_path, runtime_project)
+    explores = [item for item in report.allocations if item.kind == allocation.EXPLORE]
+    assert explores and explores[0].explorer == "failure_mining_explorer", [
+        item.reason for item in explores
+    ]
+
+
+def test_a_second_tick_does_not_buy_a_second_explorer(
+    portfolio: PortfolioStore,
+    runtime_db: Database,
+    pg_dsn: str,
+    tmp_path,
+    runtime_project: str,
+) -> None:
+    """One explorer in flight at a time, across ticks and not only within one.
+
+    `Allocation.dedup_key` buckets by the minute, which stops two explorers in
+    one tick and nothing at all across ticks: with a 120 s cadence and an
+    explorer that takes longer, every tick added another at full price. Found
+    by running two ticks against a real project and watching the queue grow.
+    """
+
+    portfolio.add_seed(project_id=runtime_project, text="somewhere to look")
+    first = _tick(runtime_db, pg_dsn, tmp_path, runtime_project)
+    assert [item.kind for item in first.allocations] == [allocation.EXPLORE]
+
+    # A minute later, so the dedup bucket is a different one and the queue
+    # would happily take a second item.
+    later = datetime.now(UTC) + timedelta(minutes=1)
+    second = _tick(runtime_db, pg_dsn, tmp_path, runtime_project, now=later)
+    assert [item.kind for item in second.allocations] == []
+
+    with runtime_db.tx() as conn:
+        queued = conn.execute(
+            "select count(*) as n from work_items where kind = 'portfolio_explore'"
+        ).fetchone()
+    assert queued is not None and queued["n"] == 1
+
+
+def test_an_explorer_that_finished_does_not_block_the_next(
+    portfolio: PortfolioStore,
+    runtime_db: Database,
+    pg_dsn: str,
+    tmp_path,
+    runtime_project: str,
+) -> None:
+    """The control. The bound is on work in flight, not on work ever done."""
+
+    portfolio.add_seed(project_id=runtime_project, text="somewhere to look")
+    _tick(runtime_db, pg_dsn, tmp_path, runtime_project)
+    with runtime_db.tx() as conn:
+        conn.execute("update work_items set status = 'SUCCEEDED'")
+
+    later = datetime.now(UTC) + timedelta(minutes=1)
+    second = _tick(runtime_db, pg_dsn, tmp_path, runtime_project, now=later)
+    assert [item.kind for item in second.allocations] == [allocation.EXPLORE]
+
+
+def test_exploration_that_produces_nothing_stops(
+    portfolio: PortfolioStore,
+    runtime_db: Database,
+    pg_dsn: str,
+    tmp_path,
+    runtime_project: str,
+) -> None:
+    """The sixth loop: every explorer succeeds, no idea appears, forever.
+
+    The budget ceiling did stop this, after spending all of it, and reported
+    it as `PAUSED_BUDGET_EXHAUSTED` -- the wrong diagnosis for a project whose
+    idea space the available explorers have exhausted.
+    """
+
+    bound = load_config().bounds.max_barren_explorations
+    with runtime_db.tx() as conn:
+        for index in range(bound):
+            conn.execute(
+                """
+                insert into work_items
+                       (work_id, project_id, kind, payload, status, dedup_key)
+                values (%(work_id)s, %(project_id)s, 'portfolio_explore',
+                        '{}'::jsonb, 'SUCCEEDED', %(work_id)s)
+                """,
+                {"work_id": f"WORK-barren-{index}", "project_id": runtime_project},
+            )
+    report = _tick(runtime_db, pg_dsn, tmp_path, runtime_project)
+    assert report.status is PortfolioStatus.PAUSED_NO_FRONTIER
+    assert "idea space" in " ".join(report.notes)
+    assert not report.allocations
+
+
+def test_a_seed_is_what_restarts_exhausted_exploration(
+    portfolio: PortfolioStore,
+    runtime_db: Database,
+    pg_dsn: str,
+    tmp_path,
+    runtime_project: str,
+) -> None:
+    """Its control, and the reason the pause is safe to enter automatically.
+
+    A pause nothing can leave is a stop, and this one is left by the one
+    action that supplies what the count says is missing: somewhere new to
+    look.
+    """
+
+    bound = load_config().bounds.max_barren_explorations
+    with runtime_db.tx() as conn:
+        for index in range(bound):
+            conn.execute(
+                """
+                insert into work_items
+                       (work_id, project_id, kind, payload, status, dedup_key)
+                values (%(work_id)s, %(project_id)s, 'portfolio_explore',
+                        '{}'::jsonb, 'SUCCEEDED', %(work_id)s)
+                """,
+                {"work_id": f"WORK-barren-{index}", "project_id": runtime_project},
+            )
+    assert (
+        _tick(runtime_db, pg_dsn, tmp_path, runtime_project).status
+        is PortfolioStatus.PAUSED_NO_FRONTIER
+    )
+
+    portfolio.add_seed(project_id=runtime_project, text="a direction nobody tried")
+    later = datetime.now(UTC) + timedelta(minutes=1)
+    report = _tick(runtime_db, pg_dsn, tmp_path, runtime_project, now=later)
+    assert report.status is PortfolioStatus.RUNNING
+    assert [item.kind for item in report.allocations] == [allocation.EXPLORE]
+
+
+def test_an_explorer_in_flight_is_not_an_empty_frontier(
+    portfolio: PortfolioStore,
+    runtime_db: Database,
+    pg_dsn: str,
+    tmp_path,
+    runtime_project: str,
+) -> None:
+    """The bound above must not turn waiting into stopping.
+
+    Buying one explorer and then declining to buy a second leaves a tick with
+    no allocations and no ideas, which is exactly the shape of `no frontier`.
+    Reporting that would tell the researcher to seed a project that is at that
+    moment generating, which is advice to do the thing already in progress.
+    """
+
+    portfolio.add_seed(project_id=runtime_project, text="somewhere to look")
+    assert _tick(runtime_db, pg_dsn, tmp_path, runtime_project).status is (
+        PortfolioStatus.RUNNING
+    )
+    later = datetime.now(UTC) + timedelta(minutes=2)
+    second = _tick(runtime_db, pg_dsn, tmp_path, runtime_project, now=later)
+    assert second.status is PortfolioStatus.RUNNING
+    assert not second.allocations

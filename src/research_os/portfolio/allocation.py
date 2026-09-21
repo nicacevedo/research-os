@@ -227,6 +227,7 @@ def plan(
     origin_counts: Mapping[IdeaOrigin, int],
     minable_failures: int,
     tick_bucket: str,
+    explorers_in_flight: int = 0,
 ) -> tuple[Allocation, ...]:
     """The ordered, bounded list of work this tick buys.
 
@@ -238,7 +239,11 @@ def plan(
     allocations: list[Allocation] = []
     remaining = max(0, free_slots)
 
-    if remaining and candidate_pool < config.bounds.candidate_pool_floor:
+    if (
+        remaining
+        and candidate_pool < config.bounds.candidate_pool_floor
+        and explorers_in_flight == 0
+    ):
         explorer, why = choose_explorer(
             pending_seeds=pending_seeds,
             origin_counts=origin_counts,
@@ -275,6 +280,21 @@ def plan(
                 config.bounds.max_active_per_lineage
             ):
                 continue
+            # The novelty floor. Only for an idea whose novelty has actually
+            # been *assessed*: an unassessed one is not below the floor, it is
+            # unmeasured, and the cheap screen that measures it is the next
+            # thing this allocation would buy.
+            #
+            # It was documented as "applied by the allocator" and read by
+            # nothing -- an independent test audit found the identifier
+            # appeared only in its own config line.
+            novelty = item.dimensions.novelty
+            if (
+                novelty is not None
+                and novelty < config.thresholds.novelty_floor
+                and _screened(item)
+            ):
+                continue
             if item.spent >= config.bounds.idea_spend_ceiling_usd:
                 continue
             if item.lineage_spent >= config.bounds.lineage_spend_ceiling_usd:
@@ -301,8 +321,16 @@ def plan(
 
     # Whatever is left over goes to exploration, up to the pool ceiling. A
     # portfolio with capacity and nothing to deepen should be generating, not
-    # idling.
-    if remaining and candidate_pool < config.bounds.candidate_pool_ceiling:
+    # idling -- but only one explorer at a time, for the reason
+    # `PortfolioStore.explorations_in_flight` gives. This branch is where it
+    # mattered: it fires whenever there is a free slot and the pool is under
+    # its *ceiling*, which on a quiet portfolio is every tick, so it bought an
+    # explorer every cadence whether or not the last one had even started.
+    if (
+        remaining
+        and candidate_pool < config.bounds.candidate_pool_ceiling
+        and explorers_in_flight == 0
+    ):
         explorer, why = choose_explorer(
             pending_seeds=pending_seeds,
             origin_counts=origin_counts,
@@ -318,6 +346,16 @@ def plan(
                 )
             )
     return tuple(allocations)
+
+
+def _screened(candidate: Candidate) -> bool:
+    """Whether this idea's novelty is a measurement rather than a default.
+
+    The floor must not remove an idea nobody has looked at. A candidate whose
+    next stage is still the cheap screen has not been looked at.
+    """
+
+    return candidate.stage not in {Stage.DEDUP, Stage.NOVELTY_SCREEN}
 
 
 def idle_seconds(idea: PortfolioIdea, *, now: datetime | None = None) -> float:

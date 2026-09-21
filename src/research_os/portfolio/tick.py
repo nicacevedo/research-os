@@ -136,6 +136,8 @@ def tick(
     counts = store.counts_by_status(project_id)
     report.candidate_pool = counts.get(IdeaStatus.CANDIDATE, 0)
 
+    pending_seeds = len(store.pending_seeds(project_id=project_id))
+
     # --- the four reasons a portfolio may stop ---------------------------
     # Read the project and system ceilings directly rather than through
     # `exhausted_dimensions`, which takes a run id: a tick is not a run, and
@@ -162,6 +164,23 @@ def tick(
             f"resumes; nothing here converts that into a scientific rejection.",
         )
 
+    in_flight = store.explorations_in_flight(project_id=project_id)
+
+    # Exploration that produces nothing is the sixth way a portfolio can loop,
+    # and before this the budget ceiling was the only thing that stopped it --
+    # which worked, and reported the wrong cause. A new seed clears the pause,
+    # because a seed is exactly the information the count says is missing.
+    barren = store.barren_explorations(project_id=project_id)
+    if barren >= config.bounds.max_barren_explorations and not pending_seeds:
+        return _pause(
+            store,
+            report,
+            PortfolioStatus.PAUSED_NO_FRONTIER,
+            f"{barren} explorer run(s) in a row produced no new idea: this "
+            f"project's idea space looks exhausted to the explorers available "
+            f"here. `researchctl seed add` gives them somewhere else to look.",
+        )
+
     candidates = _candidates(store, project_id, config, moment)
     ideas = store.list_ideas(project_id=project_id, limit=500)
     blocked_externally = [
@@ -184,31 +203,36 @@ def tick(
         free_slots=report.free_slots,
         lineage_active=store.lineage_active_counts(project_id),
         candidate_pool=report.candidate_pool,
-        pending_seeds=len(store.pending_seeds(project_id=project_id)),
+        pending_seeds=pending_seeds,
         origin_counts=_origin_counts(ideas),
         minable_failures=counts.get(IdeaStatus.REJECTED, 0)
         + counts.get(IdeaStatus.PARKED, 0),
         tick_bucket=moment.strftime("%Y%m%dT%H%M"),
+        explorers_in_flight=in_flight,
     )
     report.allocations = allocations
 
-    if not allocations and report.active_tracks == 0:
-        if live and blocked_externally and len(blocked_externally) >= len(live):
-            return _pause(
-                store,
-                report,
-                PortfolioStatus.PAUSED_BLOCKED_EXTERNAL,
-                f"every one of {len(live)} live idea(s) is waiting on something "
-                f"outside this machine",
-            )
-        if not candidates and report.candidate_pool == 0 and not live:
-            return _pause(
-                store,
-                report,
-                PortfolioStatus.PAUSED_NO_FRONTIER,
-                "no idea is allocatable and nothing can be generated. Seed one "
-                "with `researchctl seed add`.",
-            )
+    # There was a second branch here -- `PAUSED_NO_FRONTIER` when nothing was
+    # allocatable and the pool was empty -- and it could not fire. An empty
+    # pool with a free slot is exactly the state in which the allocator buys a
+    # blind explorer, so `allocations` was never empty while the rest of the
+    # condition held. The status it reached for is real; what detects it is
+    # `barren_explorations` above, which asks whether generating has *worked*
+    # rather than whether it is possible.
+    if (
+        not allocations
+        and report.active_tracks == 0
+        and live
+        and blocked_externally
+        and len(blocked_externally) >= len(live)
+    ):
+        return _pause(
+            store,
+            report,
+            PortfolioStatus.PAUSED_BLOCKED_EXTERNAL,
+            f"every one of {len(live)} live idea(s) is waiting on something "
+            f"outside this machine",
+        )
 
     # --- launch ----------------------------------------------------------
     for item in allocations:

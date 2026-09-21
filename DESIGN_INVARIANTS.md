@@ -190,7 +190,7 @@ than the objective. Invariant by invariant:
 | 11 | experiments traceable | unchanged; an idea settled by measurement stops below VALIDATED on a host that cannot execute, rather than being concluded from reasoning about what the measurement would have shown |
 | 12 | paid use has budgets | portfolio, project and run ceilings through the existing ledger; idea and lineage ceilings in the allocator before a stage is enqueued; a stage ceiling on the request itself |
 | 13 | no unofficial automation | unchanged |
-| 14 | finite stop conditions | five bounds where a portfolio can loop and a single objective cannot: breadth, lineage depth, branching factor, revisions and spend. The stage machine's termination test drives it to a fixed point, and found a real loop |
+| 14 | finite stop conditions | six bounds where a portfolio can loop and a single objective cannot: breadth, lineage depth, branching factor, revisions, spend, and generating forever without generating anything. The stage machine's termination test drives it to a fixed point and found a real loop; the sixth bound was missing entirely and was found by running the tick twice against a real project — every bound was per idea or per lineage, and exploration is neither |
 | 15 | explicit cross-project transfer | unchanged; nothing here nominates or promotes |
 
 The property worth stating as new rather than preserved:
