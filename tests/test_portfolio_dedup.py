@@ -234,3 +234,77 @@ def test_similarity_is_symmetric_and_bounded() -> None:
     assert 0.0 <= pdigests.trigram_similarity(a, b) <= 1.0
     assert pdigests.trigram_similarity(a, a) == 1.0
     assert pdigests.trigram_similarity((), a) == 0.0
+
+
+def test_nothing_close_says_how_close_nothing_was(
+    portfolio: PortfolioStore, runtime_project: str
+) -> None:
+    """The first dogfood's calibration measurement, kept as a property.
+
+    Two explorers produced the same research direction in different words and
+    this layer said "nothing close", because character-trigram Jaccard over
+    the two phrasings is 0.297 against a threshold of 0.72. Across 46 pairs
+    from two real projects nothing exceeded 0.377, so the semantic
+    adjudicator was never consulted once.
+
+    The threshold is a researcher's judgement and is unchanged. What must not
+    happen again is that the observation is invisible: "nothing close" with no
+    number cannot be checked, and a researcher cannot calibrate a threshold
+    against a sentence.
+    """
+
+    config = load_config()
+    seed_idea(
+        portfolio,
+        runtime_project,
+        research_question=(
+            "Is the bounded-pricing reduced-cost test in the conic column-generation "
+            "decomposition algebraically identical to the LASSO dual-feasibility "
+            "condition, and does its selection rule coincide with an existing "
+            "working-set construction rule?"
+        ),
+        core_idea=(
+            "Derive the KKT stationarity conditions for the conic reformulation and "
+            "show the pricing subproblem's reduced cost reduces to the standard LASSO "
+            "dual residual."
+        ),
+    )
+    outcome = screen(
+        portfolio,
+        project_id=runtime_project,
+        fields={
+            "research_question": (
+                "Given that the conic model is an exact LASSO reformulation, does the "
+                "column-generation decomposition offer any computational advantage "
+                "over established safe-screening and working-set LASSO solvers, or is "
+                "it structurally equivalent to them?"
+            ),
+            "core_idea": (
+                "Column generation prices out violated dual constraints from a "
+                "restricted master; safe-screening methods add coordinates using dual "
+                "feasibility certificates from the same KKT system."
+            ),
+        },
+        config=config,
+    )
+
+    assert outcome.verdict is DedupVerdict.DISTINCT
+    assert 0.0 < outcome.similarity < config.thresholds.duplicate_similarity
+    assert f"{outcome.similarity:.2f}" in outcome.detail
+    assert str(config.thresholds.duplicate_similarity) in outcome.detail
+
+
+def test_the_first_idea_in_a_portfolio_has_no_nearest_neighbour(
+    portfolio: PortfolioStore, runtime_project: str
+) -> None:
+    """And must not report one, or `0.00` reads as "measured, and far"."""
+
+    outcome = screen(
+        portfolio,
+        project_id=runtime_project,
+        fields={"research_question": "anything at all", "core_idea": "anything"},
+        config=load_config(),
+    )
+    assert outcome.verdict is DedupVerdict.DISTINCT
+    assert outcome.similarity == 0.0
+    assert "first idea" in outcome.detail

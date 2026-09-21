@@ -104,7 +104,21 @@ def classify_db_error(exc: BaseException) -> RuntimeDatabaseError:
         return TransientDatabaseError(str(exc).strip() or exc.__class__.__name__)
     if isinstance(exc, psycopg.Error):
         return RuntimeDatabaseError(str(exc).strip() or exc.__class__.__name__)
-    return RuntimeDatabaseError(str(exc))
+    # Not a database error at all: `tx()` wraps the whole `with` body, so any
+    # exception raised by *caller* code inside it arrives here. Reclassifying
+    # it is deliberate -- it must not be retried as though the server had
+    # blinked -- but rendering it as `str(exc)` alone erased which exception it
+    # was, and the first dogfood paid for that. A missing routing-table entry
+    # surfaced to the operator as
+    #
+    #     RuntimeDatabaseError: <ModelRole.NOVELTY_SCREENER: 'novelty_screener'>
+    #
+    # in `researchctl runtime status`: a database error naming an enum member,
+    # with the word `KeyError` nowhere on the screen. Keeping the class name is
+    # the whole difference between that and a message that says what happened.
+    return RuntimeDatabaseError(
+        f"{exc.__class__.__name__}: {exc}" if str(exc) else exc.__class__.__name__
+    )
 
 
 def _reset_session(conn: Any) -> None:

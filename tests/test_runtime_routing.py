@@ -33,6 +33,7 @@ from research_os.runtime.interfaces import (
 )
 from research_os.runtime.models import BudgetScope, ModelCallStatus
 from research_os.runtime.routing import (
+    _ADAPTER_ROLE,
     CriticalCapabilityUnavailableError,
     ModelRouter,
     ProviderCallFailedError,
@@ -1128,3 +1129,140 @@ def test_a_refusal_with_no_provider_at_all_names_no_deadline(
         router.complete(_request(criticality=Criticality.CRITICAL))
     assert raised.value.retry_at is None
     assert raised.value.attempted is False
+
+
+# ------------------------------------------------- the adapter role table --
+#
+# Found by the first dogfood, not by this file. Every test above routes a role
+# the coding pipeline already had, and `ScriptedRouter` -- which every one of
+# the 244 discovery-portfolio tests uses -- never reaches `_ADAPTER_ROLE` at
+# all. So the seam between a role existing and a role being routable had no
+# test on either side of it, and twelve roles fell through it.
+def test_every_model_role_has_an_adapter_role() -> None:
+    """A role the router cannot bucket is a role that cannot be called.
+
+    ``_ADAPTER_ROLE`` is subscripted, not ``.get``-ed, so a missing entry is a
+    ``KeyError`` raised inside ``complete()`` after the budget is reserved and
+    before any provider is asked. On the first dogfood that was twelve of the
+    fourteen roles the discovery portfolio added: an idea could be generated
+    and then nothing could be done to it -- no screen, no falsifier, no
+    review -- while the suite stayed green.
+
+    This is the cheap half of the fix and the one that holds: adding a
+    ``ModelRole`` without a line in the table fails here.
+    """
+
+    missing = sorted(role for role in ModelRole if role not in _ADAPTER_ROLE)
+    assert not missing, (
+        "these ModelRole members have no _ADAPTER_ROLE entry, so every call "
+        f"made with one raises KeyError inside the router: {missing}"
+    )
+
+
+@pytest.mark.parametrize(
+    "role",
+    [
+        ModelRole.NOVELTY_SCREENER,
+        ModelRole.FALSIFIER,
+        ModelRole.SCIENTIFIC_DISCOVERY,
+        ModelRole.LITERATURE_SCOUT,
+        ModelRole.METHODOLOGY_REVIEWER,
+        ModelRole.NOVELTY_REVIEWER,
+        ModelRole.SKEPTIC_REVIEWER,
+        ModelRole.REPLICATOR,
+        ModelRole.META_REVIEWER,
+        ModelRole.DUPLICATE_ADJUDICATOR,
+        ModelRole.BRANCHER,
+        ModelRole.FAILURE_MINING_EXPLORER,
+    ],
+)
+def test_a_portfolio_role_routes_through_the_real_router(
+    runtime_db: Database,
+    tmp_path: Path,
+    run_id: str,
+    runtime_project: str,
+    role: ModelRole,
+) -> None:
+    """The other half: drive each portfolio role through ``ModelRouter`` itself.
+
+    The exhaustiveness test above would pass against a table whose entries
+    named buckets no adapter serves. This one makes the call.
+    """
+
+    router = _router(
+        runtime_db,
+        tmp_path,
+        run_id=run_id,
+        project_id=runtime_project,
+        adapters={"one": _provider("one", "a")},
+        profiles=(ProviderProfile(name="one", family="a", tier=3),),
+    )
+    response = router.complete(_request(role=role, capability=Capability.CRITIQUE))
+
+    assert response.ok, response.error
+    assert response.call_id is not None
+    call = RuntimeStore(runtime_db).get_model_call(response.call_id)
+    assert call is not None
+    assert call.role == role
+
+
+def test_a_routing_failure_after_reserving_releases_the_reservation(
+    runtime_db: Database,
+    tmp_path: Path,
+    run_id: str,
+    runtime_project: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Nothing was asked, so nothing may stay held.
+
+    The dogfood's second finding, and a consequence of the first. Both grant
+    sets are taken before the provider is chosen; the one line that stood
+    between the reservation and the invocation was outside the guard that
+    releases them. Eight failed stages left $0.40 of a $15 project ceiling
+    reserved forever, and the portfolio's eventual stop would have been
+    reported as ``PAUSED_BUDGET_EXHAUSTED`` -- money it never spent.
+
+    The failure is injected rather than reproduced through a missing table
+    entry, because the table is exhaustive now and this must keep holding for
+    whatever raises there next.
+    """
+
+    ledger = BudgetLedger(runtime_db)
+    ledger.set_limit(
+        scope=BudgetScope.PROJECT,
+        scope_id=runtime_project,
+        dimension=Dimension.MODEL_COST_USD,
+        limit_value=Decimal("15.00"),
+    )
+    router = _router(
+        runtime_db,
+        tmp_path,
+        run_id=run_id,
+        project_id=runtime_project,
+        adapters={"one": _provider("one", "a")},
+        profiles=(
+            ProviderProfile(
+                name="one", family="a", tier=3, estimated_cost_usd=Decimal("0.05")
+            ),
+        ),
+    )
+
+    def boom(*_args: object, **_kwargs: object) -> tuple[str | None, str | None]:
+        raise KeyError(ModelRole.NOVELTY_SCREENER)
+
+    # The class, not the instance: ``ModelRouter`` has ``__slots__``.
+    monkeypatch.setattr(ModelRouter, "_model_and_effort", boom)
+
+    with pytest.raises(KeyError):
+        router.complete(_request())
+
+    for dimension in (Dimension.MODEL_COST_USD, Dimension.MODEL_CALLS):
+        budget = ledger.get(
+            scope=BudgetScope.PROJECT, scope_id=runtime_project, dimension=dimension
+        )
+        if budget is None:
+            continue
+        assert budget.reserved == Decimal(0), (
+            f"{dimension} kept a reservation for a call that never happened"
+        )
+        assert budget.spent == Decimal(0)

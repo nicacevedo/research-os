@@ -156,6 +156,36 @@ def test_driver_errors_are_classified_and_only_some_retry() -> None:
     assert response_for(FailureClass.DATABASE_TRANSIENT) is Response.RETRY_AFTER_BACKOFF
 
 
+def test_a_non_database_error_keeps_the_name_of_what_actually_failed() -> None:
+    """`tx()` wraps the whole `with` body, so caller code lands here too.
+
+    Reclassifying it is right -- it must not be retried as though the server
+    had blinked. Rendering it as `str(exc)` alone was not: the first dogfood's
+    missing routing-table entry reached `researchctl runtime status` as
+
+        RuntimeDatabaseError: <ModelRole.NOVELTY_SCREENER: 'novelty_screener'>
+
+    a database error naming an enum member, with `KeyError` nowhere on the
+    screen. A `KeyError`'s `str()` is the bare key, which is exactly the case
+    where the class name carries all the information.
+    """
+
+    from enum import StrEnum
+
+    class Role(StrEnum):
+        NOVELTY_SCREENER = "novelty_screener"
+
+    classified = classify_db_error(KeyError(Role.NOVELTY_SCREENER))
+    assert isinstance(classified, RuntimeDatabaseError)
+    assert not isinstance(classified, TransientDatabaseError)
+    assert "KeyError" in str(classified)
+    assert "novelty_screener" in str(classified)
+
+    # An exception with no message must still name itself rather than printing
+    # nothing at all.
+    assert str(classify_db_error(RuntimeError())) == "RuntimeError"
+
+
 def test_the_loop_survives_the_database_being_unreachable(
     chaos: dict[str, Any],
 ) -> None:

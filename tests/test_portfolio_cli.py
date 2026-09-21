@@ -408,3 +408,119 @@ def test_a_seed_on_a_portfolio_nothing_ticks_says_so(
     capsys.readouterr()
     assert run_cli(monkeypatch, "seed", "add", cli, "--text", "and a cold one") == 0
     assert "no next pass yet" not in capsys.readouterr().out
+
+
+# ------------------------------------------------ what the first dogfood hit --
+def test_a_seed_before_the_portfolio_exists_says_what_to_run(
+    runtime_db: Database,
+    pg_dsn: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Not a foreign-key violation. The fixture above is why this needs its own.
+
+    Every other test in this file uses the ``cli`` fixture, which calls
+    ``upsert_project`` -- so the operational ``projects`` row that
+    ``portfolio_state`` references always existed, and the path a researcher
+    actually takes after ``register-project`` was never exercised. The first
+    dogfood took it, following this layer's own documented command order, and
+    got
+
+        insert or update on table "portfolio_state" violates foreign key
+        constraint "portfolio_state_project_id_fkey"
+
+    from a command set in which every other failure explains itself.
+    """
+
+    monkeypatch.setenv(DSN_ENV, pg_dsn)
+    code = run_cli(monkeypatch, "seed", "add", "unregistered", "--text", "a direction")
+    out = capsys.readouterr().out
+
+    assert code != 0
+    assert "foreign key" not in out
+    assert "portfolio enable unregistered" in out
+    # And it must not have started anything on the way to explaining itself.
+    assert PortfolioStore(runtime_db).get_state("unregistered") is None
+
+
+def test_status_does_not_call_a_portfolio_whose_work_is_failing_healthy(
+    cli: str,
+    runtime_db: Database,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Nine ideas, no tracks, every advance failing -- and it printed RUNNING.
+
+    The first dogfood's routing defect failed every ``portfolio_advance_idea``
+    item, and this command said nothing about it. The failures were in
+    ``researchctl runtime status``, which is a different layer's view.
+    """
+
+    from research_os.portfolio.allocation import ADVANCE_IDEA
+    from research_os.runtime.failures import FailureClass
+    from research_os.runtime.queue import WorkQueue
+
+    assert run_cli(monkeypatch, "portfolio", "enable", cli) == 0
+    capsys.readouterr()
+
+    queue = WorkQueue(runtime_db)
+    item = queue.enqueue(
+        project_id=cli,
+        kind=ADVANCE_IDEA,
+        payload={"idea_id": "PIDEA-x"},
+        max_attempts=1,
+        dedup_key="advance:PIDEA-x",
+    ).item
+    owner = "worker-under-test"
+    queue.claim(owner=owner, lease_seconds=60, limit=1)
+    queue.fail(
+        item.work_id,
+        owner=owner,
+        failure_class=FailureClass.CODE_EXCEPTION,
+        error="KeyError: <ModelRole.NOVELTY_SCREENER: 'novelty_screener'>",
+        force_terminal=True,
+    )
+
+    assert run_cli(monkeypatch, "portfolio", "status", cli) == 0
+    out = capsys.readouterr().out
+    assert "failed" in out
+    assert ADVANCE_IDEA in out
+    assert "NOVELTY_SCREENER" in out
+    assert "not making progress" in out
+
+    # And once work succeeds again, the same eight rows must stop reading as a
+    # diagnosis. The soak's first project spent an hour being told it was not
+    # making progress while it advanced nine ideas.
+    later = queue.enqueue(
+        project_id=cli,
+        kind=ADVANCE_IDEA,
+        payload={"idea_id": "PIDEA-y"},
+        max_attempts=1,
+        dedup_key="advance:PIDEA-y",
+    ).item
+    queue.claim(owner=owner, lease_seconds=60, limit=1)
+    queue.succeed(later.work_id, owner=owner, result={})
+
+    assert run_cli(monkeypatch, "portfolio", "status", cli) == 0
+    after = capsys.readouterr().out
+    assert "history rather than a diagnosis" in after
+    assert "not making progress" not in after
+
+
+def test_status_json_carries_the_failures_too(
+    cli: str,
+    runtime_db: Database,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A machine reading this must see what a person reading it sees."""
+
+    import json as _json
+
+    assert run_cli(monkeypatch, "portfolio", "enable", cli) == 0
+    capsys.readouterr()
+    assert run_cli(monkeypatch, "portfolio", "status", cli, "--json") == 0
+    payload = _json.loads(capsys.readouterr().out)
+
+    assert payload["failed_work"] == 0
+    assert payload["failures"] == []

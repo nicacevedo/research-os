@@ -142,6 +142,8 @@ def screen(
     question = pdigests.normalise(str(fields.get("research_question", "")))
     core = pdigests.normalise(str(fields.get("core_idea", "")))
     scored: list[tuple[str, float]] = []
+    nearest = 0.0
+    nearest_id = ""
     for idea_id, other_question, other_core in store.similarity_corpus(
         project_id=project_id, exclude=exclude
     ):
@@ -149,12 +151,44 @@ def screen(
             pdigests.trigram_similarity(question, pdigests.normalise(other_question)),
             pdigests.trigram_similarity(core, pdigests.normalise(other_core)),
         )
+        if score > nearest:
+            nearest, nearest_id = score, idea_id
         if score >= config.thresholds.duplicate_similarity:
             scored.append((idea_id, score))
     scored.sort(key=lambda item: (-item[1], item[0]))
 
     if not scored:
-        return DedupOutcome(verdict=DedupVerdict.DISTINCT, detail="nothing close")
+        # The nearest score goes in the detail, and it is the reason this
+        # branch is worth a number at all. The first dogfood produced two
+        # ideas that are the same research direction in different words --
+        # "is the pricing rule a re-derivation of known working-set theory"
+        # asked twice, by two explorers -- and this layer said "nothing
+        # close", because character-trigram Jaccard over the two phrasings is
+        # 0.297 against a threshold of 0.72.
+        #
+        # Across 46 pairs from two real projects nothing exceeded 0.377, so
+        # the semantic adjudicator -- layer 4, the one that exists precisely
+        # for differently-worded duplicates -- was never consulted once.
+        # `config.py` says 0.72 is "a starting value, not a measurement"; this
+        # is the measurement, and choosing the number it implies is a
+        # judgement about how aggressively research directions should be
+        # merged, which is the researcher's.
+        #
+        # So the threshold is unchanged and the observation is no longer
+        # invisible: a researcher reading `ideas show` sees what "nothing
+        # close" actually meant.
+        return DedupOutcome(
+            verdict=DedupVerdict.DISTINCT,
+            similarity=nearest,
+            detail=(
+                f"nothing close: nearest is {nearest:.2f} "
+                f"({nearest_id or 'no other idea'}), below the "
+                f"{config.thresholds.duplicate_similarity} threshold at which a "
+                f"model is asked"
+                if nearest_id
+                else "nothing close: this is the first idea in the portfolio"
+            ),
+        )
     return DedupOutcome(
         verdict=DedupVerdict.NEEDS_ADJUDICATION,
         match_idea_id=scored[0][0],

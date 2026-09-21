@@ -141,11 +141,27 @@ rather than the researcher's.
 researchctl register-project "$DOG/project"      # prints the project id
 PROJ='<the id it printed>'
 
+researchctl portfolio enable "$DOG/project"      # FIRST, and see below
 researchctl runtime budget "$PROJ" --max-cost-usd 15.00
 researchctl seed add "$PROJ" --text "<one direction, in the researcher's words>"
-researchctl portfolio enable "$PROJ"
 researchd --log-level INFO
 ```
+
+**`portfolio enable` comes first, and this document had it last.** Running it
+on 2026-09-21 in the order printed here originally, `runtime budget` answered
+
+```text
+'cg-sparse-regression' is neither a path nor a project this runtime knows.
+```
+
+and `seed add` answered with a raw PostgreSQL foreign-key violation. Both need
+the operational `projects` row, and `portfolio enable` is the only command in
+this layer that creates one -- `ARCHITECTURE.md` §13a says so, deliberately, so
+that a portfolio does not require an R5 objective first. Three of the four
+commands in a twenty-minute procedure failed in the order the procedure gave.
+
+`enable` takes the path here rather than `$PROJ`, because it is the command
+that runs before the runtime knows the id.
 
 Three ceilings are already in force without being set, and they are the ones
 that matter more than the wall-clock:

@@ -44,7 +44,21 @@ def envelope(**updates: Any) -> str:
         "is_error": False,
         "session_id": "abc",
         "total_cost_usd": 0.25,
-        "usage": {"input_tokens": 11, "output_tokens": 7},
+        # Shaped like a real envelope, which is the whole point of the
+        # numbers. The first version of this fixture had `input_tokens` and
+        # `output_tokens` and nothing else, so it agreed with a parser that
+        # read only `input_tokens` -- and the two shared the assumption that a
+        # usage block has one input field. A real one splits input across
+        # three, and the first dogfood recorded `tokens_in = 4` for a call that
+        # returned nearly fourteen thousand output tokens.
+        "usage": {
+            "input_tokens": 11,
+            "cache_creation_input_tokens": 120,
+            "cache_read_input_tokens": 4_300,
+            "output_tokens": 7,
+            "output_tokens_details": {"thinking_tokens": 0},
+            "service_tier": "standard",
+        },
         "modelUsage": {
             "claude-haiku-4-5-20251001": {"outputTokens": 2},
             "claude-sonnet-5": {"outputTokens": 7},
@@ -155,11 +169,56 @@ def test_the_result_envelope_is_parsed(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result.text == "done"
     assert result.structured == {"tasks": []}
     assert result.session_id == "abc"
-    assert result.input_tokens == 11
+    assert result.input_tokens == 11 + 120 + 4_300
     assert result.output_tokens == 7
     assert result.total_cost_usd == pytest.approx(0.25)
     assert result.permission_denials == 0
     assert result.resolved_model == "claude-sonnet-5"
+
+
+def test_input_tokens_served_from_cache_are_still_input_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A warm prefix must not read as a call that consumed almost nothing.
+
+    The dogfood case exactly: a large prompt whose prefix was cached, so
+    ``input_tokens`` is a handful and the other two fields hold the rest.
+    Recording the handful makes ``model_calls.tokens_in`` describe the cache
+    rather than the call.
+    """
+
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        Recorder(
+            stdout=envelope(
+                usage={
+                    "input_tokens": 4,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 31_902,
+                    "output_tokens": 13_854,
+                }
+            )
+        ),
+    )
+    result = ClaudeCodeProvider().invoke(request())
+
+    assert result.input_tokens == 31_906
+    assert result.output_tokens == 13_854
+
+
+def test_a_usage_block_naming_no_input_field_stays_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Zero and "the provider did not say" must stay different answers."""
+
+    monkeypatch.setattr(
+        subprocess, "run", Recorder(stdout=envelope(usage={"output_tokens": 7}))
+    )
+    result = ClaudeCodeProvider().invoke(request())
+
+    assert result.input_tokens is None
+    assert result.output_tokens == 7
 
 
 def test_an_unreported_cost_stays_unknown(monkeypatch: pytest.MonkeyPatch) -> None:

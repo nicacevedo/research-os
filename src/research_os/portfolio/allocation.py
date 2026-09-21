@@ -88,21 +88,40 @@ class Allocation:
     stage: Stage | None = None
     explorer: str | None = None
     payload: Mapping[str, object] = field(default_factory=dict)
+    #: How many times this ``(idea, stage)`` pair has already failed
+    #: terminally. Part of the dedup key, and nothing else reads it.
+    failed_attempts: int = 0
 
     @property
     def dedup_key(self) -> str:
         """What stops two ticks buying the same thing twice.
 
-        For an idea advance it is the idea and the stage: the *action* row is
-        the real idempotency (a partial unique index on the scientific basis),
-        and this only has to stop two work items existing at once. For an
-        explorer it is the explorer and the tick's own bucket, because two
-        blind explorations in one tick is a duplicate and two in successive
-        ticks is the system working.
+        For an idea advance it is the idea, the stage, and how many times that
+        pair has already failed: the *action* row is the real idempotency (a
+        partial unique index on the scientific basis), and this only has to
+        stop two work items existing at once. For an explorer it is the
+        explorer and the tick's own bucket, because two blind explorations in
+        one tick is a duplicate and two in successive ticks is the system
+        working.
+
+        **The failure count is load-bearing and was missing.** The sentence
+        above says this key only has to stop two items existing *at once*, and
+        without the count it did much more than that: ``work_items.dedup_key``
+        is a permanent unique index and ``enqueue`` is ``on conflict do
+        nothing``, so the first terminal failure of a pair spent its key for
+        good. The allocator kept choosing that stage and the queue kept
+        silently refusing it -- an hour of the first dogfood's ticks each
+        deciding the same eight things and enqueueing none of them. Worse, it
+        was unrecoverable: fixing the defect that caused the failures did not
+        help, because the keys were still spent.
+
+        A count and not a timestamp, because two ticks racing must compute the
+        same key. ``Bounds.max_stage_failures`` is what stops it being an
+        unbounded retry.
         """
 
         if self.kind == ADVANCE_IDEA:
-            return f"{self.kind}:{self.idea_id}:{self.stage}"
+            return f"{self.kind}:{self.idea_id}:{self.stage}:{self.failed_attempts}"
         return f"{self.kind}:{self.explorer or ''}:{self.payload.get('bucket', '')}"
 
 
@@ -120,6 +139,11 @@ class Candidate:
     open_objections: int
     spent: Decimal
     lineage_spent: Decimal
+    #: How many times this idea's next stage has already failed terminally.
+    #: Carried into the allocation so the dedup key can name the generation;
+    #: the ceiling that stops it growing forever is applied in
+    #: ``tick._candidates``, where the idea can also be marked blocked.
+    failed_attempts: int = 0
 
 
 def diversity_key(
@@ -307,6 +331,7 @@ def plan(
                     utility=score,
                     idea_id=item.idea.idea_id,
                     stage=item.stage,
+                    failed_attempts=item.failed_attempts,
                 )
             )
             break

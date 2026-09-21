@@ -137,11 +137,46 @@ deterministic quality gates, four-layer deduplication, fourteen role contracts,
 the bounded idea track, the deterministic portfolio pass, the Git bank and its
 Curator, the digest, and the human-facing commands. 244 new tests in 14 files.
 
-**Not demonstrated, and the gap is the point of this entry:** no provider was
-called, no project was dogfooded, no soak was run, and no scientific-quality
-audit was performed. The verdict recorded on the branch is
-`AUTONOMOUS_DISCOVERY_BETA` rather than a release candidate, because §43 of the
-mission that authorised it requires all three and none happened.
+**Dogfooded, soaked and audited on 2026-09-21, and still beta.** A real
+provider was called 173 times against two materially different real projects
+(`cg-sparse-regression`, `ccao-covariance-regressivity`), `researchd` ran
+unattended for just under four hours, and the ideas it produced were audited. The verdict
+on the branch remains `AUTONOMOUS_DISCOVERY_BETA`, now for a different reason:
+the three exercises were performed and what they found is the reason.
+
+They found eight defects invisible to a green 4,308-test suite, three of them
+release-blocking. The largest: **twelve of the fourteen agent roles this layer
+added had no entry in the router's adapter table**, so every model call except
+the two explorers raised `KeyError` — the entire pipeline below idea generation
+was unreachable against a real provider. The tests missed it because all 244
+portfolio tests replace `ModelRouter` with a double that never consults that
+table. Also: a terminally failed stage wedged its idea permanently, with no
+recovery even after the cause was fixed, because `work_items.dedup_key` is
+permanently unique; and a routing failure leaked its budget reservation, so a
+portfolio would eventually report exhausted money it had never spent.
+
+What works, now demonstrated rather than asserted: the falsifier kills roughly
+two thirds of ideas at cents apiece and its reasons are sound; the
+failure-mining explorer turns its own rejections into better-posed successors;
+a revision driven by a CRITICAL objection did not launder it away; the Curator
+wrote nothing under `.research/` in just under four hours; and the runtime met a real
+session-limit outage, refused to answer critical work with a weaker model,
+rejected no idea because of it, and recovered by itself.
+
+What is still unproven is the half that matters most: `adjudicate`,
+`literature_audit`, `evidence`, `review_board`, `meta_review` and `replicate`
+have **never executed against a real provider**, and no idea has reached
+`VALIDATED`. The throughput reason is recorded in the build report §Q.4 — the
+daemon claims one work item per pass, so `max_active_tracks` bounds allocation
+and not execution.
+
+Two measurements worth carrying here. `duplicate_similarity: 0.72` is too high:
+across 46 real idea pairs the maximum trigram Jaccard observed was 0.377, and a
+pair that is plainly the same direction scored 0.297, so the semantic duplicate
+adjudicator has never been consulted. And the falsifier rejects research
+questions whose *stated test* is weak, where a researcher would revise — the
+sharpening stage runs only for ideas it has already spared. Neither was changed
+autonomously: both are scientific judgements.
 
 Two of the defects that branch found are worth repeating here, because
 neither was found by a test and both are about the difference between a

@@ -67,6 +67,12 @@ class TickReport:
     blocks_cleared: int = 0
     allocations: tuple[allocation.Allocation, ...] = ()
     work_enqueued: int = 0
+    #: Allocations the queue already had an item for, so nothing was enqueued.
+    #: One or two of these is a tick racing itself and is normal; every
+    #: allocation in a pass refused, pass after pass, is the portfolio
+    #: deciding and not doing -- which is what the first dogfood spent an hour
+    #: doing while reporting RUNNING.
+    work_refused: int = 0
     uncurated: int = 0
     curation_enqueued: bool = False
     digest_enqueued: bool = False
@@ -82,6 +88,7 @@ class TickReport:
             "stale_actions_reclaimed": self.stale_actions_reclaimed,
             "blocks_cleared": self.blocks_cleared,
             "work_enqueued": self.work_enqueued,
+            "work_refused": self.work_refused,
             "uncurated": self.uncurated,
             "curation_enqueued": self.curation_enqueued,
             "digest_enqueued": self.digest_enqueued,
@@ -219,8 +226,24 @@ def tick(
     # condition held. The status it reached for is real; what detects it is
     # `barren_explorations` above, which asks whether generating has *worked*
     # rather than whether it is possible.
+    #
+    # `PAUSED_BLOCKED_EXTERNAL` had the same shape of defect and it survived
+    # the fix above: the condition was `not allocations`, and an explorer is an
+    # allocation. A portfolio whose every live idea is blocked still has a free
+    # slot and a pool under its ceiling, so it still buys an explorer, so
+    # `allocations` was never empty and this branch could not fire either.
+    #
+    # `§4.3` says the condition is "every *allocatable idea* is blocked
+    # externally", which is what this now asks. Exploring past it is not
+    # harmless: the new ideas meet the same blocked stage, and spending $0.60 a
+    # cadence to keep producing them reports the eventual stop as
+    # `PAUSED_BUDGET_EXHAUSTED` -- the wrong cause, which is precisely the
+    # mistake §N.8 was about.
+    idea_allocations = [
+        item for item in allocations if item.kind == allocation.ADVANCE_IDEA
+    ]
     if (
-        not allocations
+        not idea_allocations
         and report.active_tracks == 0
         and live
         and blocked_externally
@@ -231,7 +254,12 @@ def tick(
             report,
             PortfolioStatus.PAUSED_BLOCKED_EXTERNAL,
             f"every one of {len(live)} live idea(s) is waiting on something "
-            f"outside this machine",
+            f"outside this machine: "
+            + ", ".join(
+                sorted({str(item.operational_state) for item in blocked_externally})
+            )
+            + ". `researchctl portfolio status` lists the failures that got "
+            "them there.",
         )
 
     # --- launch ----------------------------------------------------------
@@ -251,6 +279,18 @@ def tick(
         )
         if enqueued.created:
             report.work_enqueued += 1
+        else:
+            report.work_refused += 1
+
+    if report.work_refused and not report.work_enqueued and allocations:
+        # Not a note for the sake of one. A pass that decided on N things and
+        # bought none of them is indistinguishable, in every other field of
+        # this report, from a pass with nothing to do.
+        report.notes.append(
+            f"allocated {len(allocations)} item(s) and enqueued none: the queue "
+            f"already holds an item for each. If this repeats, those items are "
+            f"not being worked -- `researchctl portfolio status` lists failures."
+        )
 
     # --- update the bank -------------------------------------------------
     report.uncurated = store.uncurated_count(project_id)
@@ -307,6 +347,10 @@ def _pause(
     )
     store.touch_tick(report.project_id)
     report.status = status
+    # A paused pass bought nothing, so it must not report allocations. The
+    # blocked-external pause is computed *after* the plan, and leaving the
+    # plan in the report made a pass that enqueued zero items list one.
+    report.allocations = ()
     report.notes.append(detail)
     return report
 
@@ -383,6 +427,7 @@ def _candidates(
     """
 
     found: list[allocation.Candidate] = []
+    failures = store.failed_stage_counts(project_id)
     for idea in store.list_ideas(project_id=project_id, limit=500):
         if not allocation.allocatable(idea):
             continue
@@ -410,6 +455,26 @@ def _candidates(
         stage, reason = select_stage(snapshot, config)
         if stage is None:
             continue
+        failed_attempts = failures.get((idea.idea_id, str(stage)), 0)
+        if failed_attempts >= config.bounds.max_stage_failures:
+            # Retried to its ceiling and still failing, so this is not a
+            # transient. `BLOCKED_EXTERNAL` rather than a status change,
+            # because the same rule that governs an exhausted budget governs
+            # this: an infrastructure failure must not be written down as a
+            # scientific decision about the idea. What is missing is a person
+            # fixing something, which is what that state already means and why
+            # `_clear_blocks` deliberately does not guess when it lifts.
+            #
+            # Silently dropping the candidate instead -- which is what an
+            # early draft of this fix did -- reproduces the defect it is here
+            # to close, one layer up: the idea disappears from the allocator
+            # and nothing anywhere says why.
+            if idea.operational_state is not OperationalState.BLOCKED_EXTERNAL:
+                store.set_operational_state(
+                    idea_id=idea.idea_id,
+                    state=OperationalState.BLOCKED_EXTERNAL,
+                )
+            continue
         found.append(
             allocation.Candidate(
                 idea=idea,
@@ -426,6 +491,7 @@ def _candidates(
                 open_objections=len(snapshot.open_objections),
                 spent=store.spend_for_idea(idea.idea_id),
                 lineage_spent=store.spend_for_lineage(idea.lineage_root),
+                failed_attempts=failed_attempts,
             )
         )
     return tuple(found)

@@ -27,6 +27,7 @@ from research_os.portfolio.store import PortfolioStore
 from research_os.portfolio.tick import ensure_schedule, tick
 from research_os.runtime.budgets import BudgetLedger, Dimension
 from research_os.runtime.db import Database
+from research_os.runtime.failures import FailureClass
 from research_os.runtime.models import BudgetScope
 from research_os.runtime.queue import WorkQueue
 from research_os.runtime.store import RuntimeStore
@@ -680,3 +681,277 @@ def test_an_explorer_in_flight_is_not_an_empty_frontier(
     second = _tick(runtime_db, pg_dsn, tmp_path, runtime_project, now=later)
     assert second.status is PortfolioStatus.RUNNING
     assert not second.allocations
+
+
+# ----------------------------------- the seventh loop, found by the dogfood --
+def _fail_the_queued_advance(
+    runtime_db: Database, project: str, idea_id: str
+) -> str | None:
+    """Fail the advance work item the last tick enqueued, terminally.
+
+    Through the real queue rather than by writing rows, because the thing
+    under test is what the queue's permanent ``dedup_key`` index does to the
+    next tick. The stage is returned so a caller can assert which one died.
+    """
+
+    queue = WorkQueue(runtime_db)
+    owner = "worker-under-test"
+    while True:
+        claimed = queue.claim(owner=owner, lease_seconds=60, limit=1)
+        if not claimed:
+            return None
+        item = claimed[0]
+        if (
+            item.kind == allocation.ADVANCE_IDEA
+            and item.payload.get("idea_id") == idea_id
+        ):
+            queue.fail(
+                item.work_id,
+                owner=owner,
+                failure_class=FailureClass.CODE_EXCEPTION,
+                error="KeyError: <ModelRole.NOVELTY_SCREENER: 'novelty_screener'>",
+                force_terminal=True,
+            )
+            return str(item.payload.get("stage") or "")
+        queue.succeed(item.work_id, owner=owner, result={})
+
+
+def test_a_failed_stage_can_be_bought_again(
+    portfolio: PortfolioStore,
+    runtime_db: Database,
+    pg_dsn: str,
+    tmp_path,
+    runtime_project: str,
+) -> None:
+    """The dedup key must not outlive the work item it deduplicates.
+
+    ``work_items.dedup_key`` is a permanent unique index and ``enqueue`` is
+    ``on conflict do nothing``, so a key naming only the idea and the stage is
+    spent the moment that pair first fails. The first dogfood ran an hour of
+    ticks that each allocated the same eight advances and enqueued none of
+    them, reporting RUNNING the whole time -- and fixing the routing defect
+    underneath did not recover it, because the keys were still spent.
+    """
+
+    idea, _ = seed_idea(portfolio, runtime_project)
+    portfolio.set_status(idea_id=idea.idea_id, status=IdeaStatus.PROMISING)
+
+    first = _tick(runtime_db, pg_dsn, tmp_path, runtime_project)
+    assert first.work_enqueued >= 1
+    stage = _fail_the_queued_advance(runtime_db, runtime_project, idea.idea_id)
+    assert stage, "nothing was enqueued for this idea, so this test proves nothing"
+    portfolio.set_operational_state(idea_id=idea.idea_id, state=OperationalState.IDLE)
+
+    second = _tick(runtime_db, pg_dsn, tmp_path, runtime_project)
+    again = [
+        item
+        for item in second.allocations
+        if item.kind == allocation.ADVANCE_IDEA and item.idea_id == idea.idea_id
+    ]
+    assert again, "the allocator stopped choosing an idea it had not finished"
+    assert second.work_enqueued >= 1, (
+        "the stage was allocated again and the queue refused it: the dedup key "
+        "outlived the failed work item"
+    )
+    # The mechanism, named. The retry is a *different* key from the one the
+    # failed item holds forever, and the generation is what makes it different.
+    retried = next(item for item in again if item.stage is not None)
+    assert retried.failed_attempts == 1
+    assert retried.dedup_key.endswith(":1")
+    with runtime_db.tx() as conn:
+        row = conn.execute(
+            "select status from work_items where dedup_key = %s",
+            (retried.dedup_key,),
+        ).fetchone()
+    assert row is not None, "the generation-1 key bought nothing"
+    assert str(row["status"]) != "FAILED"
+
+
+def test_retrying_a_failing_stage_has_a_ceiling(
+    portfolio: PortfolioStore,
+    runtime_db: Database,
+    pg_dsn: str,
+    tmp_path,
+    runtime_project: str,
+) -> None:
+    """Invariant 14. A retry with no bound is the loop, wearing a new name.
+
+    Past the ceiling the idea is ``BLOCKED_EXTERNAL`` -- what is missing is a
+    person fixing something -- and *not* REJECTED or PARKED, because those
+    would write an infrastructure failure down as a decision about the
+    science. Same rule as an exhausted budget.
+    """
+
+    config = load_config()
+    idea, _ = seed_idea(portfolio, runtime_project)
+    portfolio.set_status(idea_id=idea.idea_id, status=IdeaStatus.PROMISING)
+
+    for _ in range(config.bounds.max_stage_failures):
+        _tick(runtime_db, pg_dsn, tmp_path, runtime_project)
+        assert _fail_the_queued_advance(runtime_db, runtime_project, idea.idea_id)
+        portfolio.set_operational_state(
+            idea_id=idea.idea_id, state=OperationalState.IDLE
+        )
+
+    report = _tick(runtime_db, pg_dsn, tmp_path, runtime_project)
+
+    assert not [
+        item
+        for item in report.allocations
+        if item.kind == allocation.ADVANCE_IDEA and item.idea_id == idea.idea_id
+    ]
+    blocked = portfolio.get_idea(idea.idea_id)
+    assert blocked is not None
+    assert blocked.operational_state is OperationalState.BLOCKED_EXTERNAL
+    assert blocked.status is IdeaStatus.PROMISING, (
+        "a stage that keeps failing is not a scientific verdict on the idea"
+    )
+
+
+def test_a_pass_that_buys_nothing_it_decided_on_says_so(
+    portfolio: PortfolioStore,
+    runtime_db: Database,
+    pg_dsn: str,
+    tmp_path,
+    runtime_project: str,
+) -> None:
+    """Deciding and not doing must not look like having nothing to do.
+
+    Every other field of the tick report is identical between the two.
+    """
+
+    idea, _ = seed_idea(portfolio, runtime_project)
+    portfolio.set_status(idea_id=idea.idea_id, status=IdeaStatus.PROMISING)
+    moment = datetime.now(UTC)
+
+    first = _tick(runtime_db, pg_dsn, tmp_path, runtime_project, now=moment)
+    assert first.work_enqueued >= 1
+    assert first.work_refused == 0
+    assert not any("enqueued none" in note for note in first.notes)
+
+    second = _tick(runtime_db, pg_dsn, tmp_path, runtime_project, now=moment)
+    assert second.work_enqueued == 0
+    assert second.work_refused == len(
+        [item for item in second.allocations if item.kind == allocation.ADVANCE_IDEA]
+    )
+    assert any("enqueued none" in note for note in second.notes)
+
+
+def test_a_portfolio_whose_every_idea_is_blocked_pauses_and_stops_exploring(
+    portfolio: PortfolioStore,
+    runtime_db: Database,
+    pg_dsn: str,
+    tmp_path,
+    runtime_project: str,
+) -> None:
+    """``PAUSED_BLOCKED_EXTERNAL`` had a condition that could not hold.
+
+    The same shape as the dead ``PAUSED_NO_FRONTIER`` branch §N.9 removed: it
+    required ``not allocations``, and a portfolio with a free slot and a pool
+    under its ceiling always allocates an explorer -- so the status was
+    reachable in the enum, the CLI and §4.3, and not in the code.
+
+    It matters more than a tidy enum. Exploring past this spends $0.60 a
+    cadence producing ideas that meet the same blocked stage, and the eventual
+    stop is then reported as ``PAUSED_BUDGET_EXHAUSTED``: the wrong cause,
+    which is the mistake §N.8 is about.
+    """
+
+    idea, _ = seed_idea(portfolio, runtime_project)
+    portfolio.set_status(idea_id=idea.idea_id, status=IdeaStatus.PROMISING)
+    portfolio.set_operational_state(
+        idea_id=idea.idea_id, state=OperationalState.BLOCKED_EXTERNAL
+    )
+
+    report = _tick(runtime_db, pg_dsn, tmp_path, runtime_project)
+
+    assert report.status is PortfolioStatus.PAUSED_BLOCKED_EXTERNAL
+    assert not any(item.kind == allocation.EXPLORE for item in report.allocations)
+    assert report.work_enqueued == 0
+    assert "BLOCKED_EXTERNAL" in (portfolio.get_state(runtime_project).detail or "")
+
+
+def test_a_stage_that_succeeded_on_its_second_attempt_is_not_bought_again(
+    portfolio: PortfolioStore,
+    runtime_db: Database,
+    pg_dsn: str,
+    tmp_path,
+    runtime_project: str,
+) -> None:
+    """A retry *inside* a work item is not a failure of that work item.
+
+    The soak caught this against the first version of the generation counter,
+    which counted FAILED ``idea_actions`` rows. A falsifier call returned
+    ``error_max_structured_output_retries``; the queue retried the same item
+    on its own backoff and the second attempt succeeded -- which is the R5
+    retry machinery working exactly as designed. But the first attempt had
+    already written a FAILED action row, so the generation advanced, the key
+    changed, and the tick bought a *second* work item for a stage that had
+    just succeeded.
+
+    Counting terminally failed work items instead makes the two cases
+    different, which they are: the queue exhausting its attempts is a failure,
+    and the queue succeeding on attempt two is not.
+    """
+
+    idea, _ = seed_idea(portfolio, runtime_project)
+    portfolio.set_status(idea_id=idea.idea_id, status=IdeaStatus.PROMISING)
+
+    first = _tick(runtime_db, pg_dsn, tmp_path, runtime_project)
+    assert first.work_enqueued >= 1
+
+    # One failed attempt, then success -- on the same work item, the way the
+    # queue's own backoff does it.
+    queue = WorkQueue(runtime_db)
+    owner = "worker-under-test"
+    item = next(
+        claimed
+        for claimed in queue.claim(owner=owner, lease_seconds=60, limit=5)
+        if claimed.kind == allocation.ADVANCE_IDEA
+        and claimed.payload.get("idea_id") == idea.idea_id
+    )
+    stage = str(item.payload.get("stage") or "")
+    queue.fail(
+        item.work_id,
+        owner=owner,
+        failure_class=FailureClass.PROVIDER_UNAVAILABLE,
+        error="claude did not answer: error_max_structured_output_retries",
+    )
+    action = portfolio.open_action(
+        idea_id=idea.idea_id,
+        idea_version=1,
+        stage=Stage(stage),
+        basis_digest="attempt-one",
+    )
+    portfolio.complete_action(
+        action_id=action.action_id,
+        status=ActionStatus.FAILED,
+        failure_class="provider_unavailable",
+    )
+    # A retryable failure reschedules rather than failing the item, so the
+    # count must already be zero here -- before the retry has even run.
+    assert (
+        portfolio.failed_stage_counts(runtime_project).get((idea.idea_id, stage), 0)
+        == 0
+    ), "an item that is going to be retried was counted as failed"
+
+    # Now let the retry happen and succeed, as the soak's falsifier did.
+    with runtime_db.tx() as conn:
+        conn.execute(
+            "update work_items set scheduled_at = now() - interval '1 minute' "
+            "where work_id = %s",
+            (item.work_id,),
+        )
+    retried = next(
+        claimed
+        for claimed in queue.claim(owner=owner, lease_seconds=60, limit=5)
+        if claimed.work_id == item.work_id
+    )
+    assert retried.attempts == 2
+    queue.succeed(retried.work_id, owner=owner, result={})
+
+    counts = portfolio.failed_stage_counts(runtime_project)
+    assert counts.get((idea.idea_id, stage), 0) == 0, (
+        "a work item that succeeded on its second attempt was counted as a "
+        "failure, so the next tick will buy the same stage again"
+    )

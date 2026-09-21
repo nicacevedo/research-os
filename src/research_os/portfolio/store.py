@@ -1896,6 +1896,150 @@ class PortfolioStore:
             ).fetchall()
         return {IdeaStatus(str(row["status"])): int(row["n"]) for row in rows}
 
+    def blocked_counts(self, project_id: str) -> dict[str, int]:
+        """Live ideas that are blocked, by operational state.
+
+        ``counts_by_status`` groups by the *scientific* status, which is the
+        right thing for it to do and means a blocked idea is reported as
+        PROMISING with nothing saying it cannot move. That was tolerable while
+        nothing in this layer produced ``BLOCKED_EXTERNAL``; the stage-failure
+        ceiling does, so a dead end would otherwise be counted as a healthy
+        idea.
+        """
+
+        with self._db.tx() as conn:
+            rows = conn.execute(
+                "select operational_state, count(*) as n from ideas "
+                "where project_id = %s "
+                "  and operational_state <> 'IDLE' and operational_state <> 'ACTIVE' "
+                "  and status not in ('REJECTED', 'SUPERSEDED', 'HUMAN_READY') "
+                "group by operational_state",
+                (project_id,),
+            ).fetchall()
+        return {str(row["operational_state"]): int(row["n"]) for row in rows}
+
+    def failed_stage_counts(self, project_id: str) -> dict[tuple[str, str], int]:
+        """How many times each ``(idea, stage)`` advance has failed terminally.
+
+        Two things read this, and they are the two halves of one fix.
+
+        The **dedup key** includes the count, so a failed stage can be bought
+        again. ``work_items.dedup_key`` is a permanent unique index and
+        ``enqueue`` is ``on conflict do nothing``, so a key computed only from
+        the idea and the stage is spent the first time that pair fails: the
+        allocator goes on choosing it and ``enqueue`` goes on silently
+        refusing. The first dogfood ran an hour of ticks each deciding the
+        same eight things and enqueueing none of them, reporting RUNNING
+        throughout -- and after the defect that caused the failures was fixed,
+        the portfolio still could not recover, because the keys were gone.
+
+        The **allocator** reads it as a ceiling, because a count in a dedup key
+        with nothing bounding it is an infinite retry wearing a fresh name.
+
+        **Counted over work items, not over ``idea_actions``.** The first
+        version of this counted failed action rows, and that has a gap the
+        dogfood happened not to land in: ``advance_idea`` reads the idea, the
+        version and the snapshot, selects the stage and opens a run *before*
+        it opens the action row, so a terminal failure in that window leaves
+        no action row at all -- the count would not move, the key would stay
+        spent, and the wedge would be back in exactly the shape this exists to
+        prevent. A work item always exists by the time it can fail.
+
+        The stage read here is the *allocator's*, from the payload, which is
+        the stage the dedup key is built from. ``advance_idea`` may
+        legitimately select a different one; agreeing with the key is what
+        matters.
+
+        A count rather than a timestamp so two concurrent ticks compute the
+        same key. That is the property the key exists for, and it is why this
+        is not "append the current time".
+        """
+
+        with self._db.tx() as conn:
+            rows = conn.execute(
+                "select payload->>'idea_id' as idea_id, "
+                "       payload->>'stage' as stage, "
+                "       count(*) as n "
+                "  from work_items "
+                " where project_id = %s "
+                "   and kind = 'portfolio_advance_idea' "
+                "   and status = 'FAILED' "
+                "   and payload->>'idea_id' is not null "
+                "   and payload->>'stage' is not null "
+                " group by 1, 2",
+                (project_id,),
+            ).fetchall()
+        return {(str(row["idea_id"]), str(row["stage"])): int(row["n"]) for row in rows}
+
+    def failed_work(
+        self, project_id: str, *, limit: int = 5
+    ) -> tuple[tuple[str, str, str], int]:
+        """Portfolio work that failed for this project: samples, and the count.
+
+        `portfolio status` had no notion of this, and the first dogfood is why
+        it does now. A routing defect failed every ``portfolio_advance_idea``
+        item the moment it reached a model, and the command a researcher of
+        this layer would actually type answered
+
+            portfolio  cg-sparse-regression  RUNNING
+            tracks     0 in flight
+              candidate      9
+
+        -- nine ideas, no tracks, nothing wrong. The failures were visible in
+        `researchctl runtime status`, which is the operational view of a
+        different layer; this is the one that is supposed to say what the
+        portfolio is doing.
+
+        The same reasoning as the "not scheduled" line above it: a portfolio
+        that cannot advance an idea is not RUNNING in any sense a researcher
+        means, and a silence there reads as health.
+
+        Returns ``(samples, total, stuck)``. ``stuck`` is whether the newest
+        failure is newer than the newest success, and it exists because the
+        first version of this line was itself misleading within the hour: the
+        soak's first project carried eight failures from a defect fixed long
+        before, kept advancing ideas past them, and was told by this command
+        that "a portfolio that cannot advance an idea is not making progress".
+        It was making progress. A count with no recency is not a diagnosis.
+
+        Scoped to this project and to this layer's work kinds, so a failure
+        belonging to an R5 objective is not reported here as a portfolio
+        problem.
+        """
+
+        with self._db.tx() as conn:
+            rows = conn.execute(
+                """
+                select kind, coalesce(failure_class, 'unknown') as failure_class,
+                       coalesce(last_error, '') as last_error
+                from work_items
+                where project_id = %s and status = 'FAILED'
+                  and kind like 'portfolio\\_%%' escape '\\'
+                order by updated_at desc
+                limit %s
+                """,
+                (project_id, limit),
+            ).fetchall()
+            totals = conn.execute(
+                """
+                select count(*) filter (where status = 'FAILED') as failed,
+                       max(updated_at) filter (where status = 'FAILED') as last_fail,
+                       max(updated_at) filter (where status = 'SUCCEEDED') as last_ok
+                from work_items
+                where project_id = %s
+                  and kind like 'portfolio\\_%%' escape '\\'
+                """,
+                (project_id,),
+            ).fetchone()
+        samples = tuple(
+            (str(row["kind"]), str(row["failure_class"]), str(row["last_error"]))
+            for row in rows
+        )
+        last_fail = totals["last_fail"]
+        last_ok = totals["last_ok"]
+        stuck = last_fail is not None and (last_ok is None or last_ok < last_fail)
+        return samples, int(totals["failed"]), stuck
+
     def active_count(self, project_id: str) -> int:
         """How many idea tracks are in flight.
 

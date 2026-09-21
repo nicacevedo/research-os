@@ -148,8 +148,31 @@ class IndependenceUnavailableError(RoutingError):
 
 #: How the runtime's roles map onto the v1 adapter's five roles. The adapters
 #: were written for the coding pipeline and take one of those; the runtime has
-#: eleven roles and needs them all recorded, so the mapping is here and the
-#: runtime's own role goes into provenance untouched.
+#: more roles than that and needs them all recorded, so the mapping is here and
+#: the runtime's own role goes into provenance untouched.
+#:
+#: **This table must cover every** :class:`ModelRole`, and
+#: ``test_every_model_role_has_an_adapter_role`` asserts that it does rather
+#: than trusting this sentence. It is not documentation: the lookup below is a
+#: bare subscript, so a role with no entry raises ``KeyError`` deep inside
+#: ``complete()`` -- after the budget has been reserved and before any provider
+#: has been asked.
+#:
+#: The first dogfood found exactly that. Twelve of the fourteen roles the
+#: discovery portfolio added were missing here, so every portfolio model call
+#: except the two explorers -- the screen, the falsifier, the discovery pass,
+#: the literature scout, all three reviewers, the replicator, the meta-reviewer,
+#: the duplicate adjudicator and the brancher -- died in the router. The whole
+#: pipeline downstream of generating an idea was unreachable against a real
+#: provider, and 4,308 tests passed, because the test doubles are adapters of
+#: their own and never consult this table. A role added to the enum without a
+#: line here now fails the suite.
+#:
+#: The bucket follows the template's declared ``Capability``: ``CRITIQUE`` is
+#: REVIEWER, generation is ANALYST, and work over retrieved sources is
+#: LITERATURE. It decides which model answers and nothing else -- the router
+#: hard-codes ``read_only=True``, so an invocation's tool set is empty whatever
+#: this says.
 _ADAPTER_ROLE: dict[ModelRole, AutomationRole] = {
     ModelRole.PLANNER: AutomationRole.PLANNER,
     ModelRole.BLIND_EXPLORER: AutomationRole.ANALYST,
@@ -166,6 +189,36 @@ _ADAPTER_ROLE: dict[ModelRole, AutomationRole] = {
     # ANALYST, not REVIEWER: a derivation is produced work, and routing it as
     # review would put it in the pool the *critique* of it must come from.
     ModelRole.DERIVER: AutomationRole.ANALYST,
+    # --- the discovery portfolio's roles ---------------------------------
+    #
+    # Generators, for the same reason DERIVER is one: what they produce is the
+    # thing a reviewer later attacks, so they must not be drawn from the
+    # reviewer pool.
+    ModelRole.FAILURE_MINING_EXPLORER: AutomationRole.ANALYST,
+    ModelRole.SCIENTIFIC_DISCOVERY: AutomationRole.ANALYST,
+    ModelRole.BRANCHER: AutomationRole.ANALYST,
+    # Work over retrieved sources, which is what LITERATURE already means here.
+    # NOVELTY_SCREENER is the cheap "does this look known" pass and
+    # LITERATURE_SCOUT the audit that reads a corpus; both are literature
+    # questions, and keeping them out of ANALYST keeps the generator pool and
+    # the pool that checks a generator's novelty claim distinct.
+    ModelRole.NOVELTY_SCREENER: AutomationRole.LITERATURE,
+    ModelRole.LITERATURE_SCOUT: AutomationRole.LITERATURE,
+    # Critique. The falsifier is here despite its docstring saying it is not a
+    # reviewer: that sentence is about the portfolio's own role taxonomy -- it
+    # is not one of the three board reviewers a gate counts -- and what it does
+    # to an idea is adversarial reading, which is what this bucket selects a
+    # model for.
+    ModelRole.FALSIFIER: AutomationRole.REVIEWER,
+    ModelRole.METHODOLOGY_REVIEWER: AutomationRole.REVIEWER,
+    ModelRole.NOVELTY_REVIEWER: AutomationRole.REVIEWER,
+    ModelRole.SKEPTIC_REVIEWER: AutomationRole.REVIEWER,
+    ModelRole.REPLICATOR: AutomationRole.REVIEWER,
+    ModelRole.META_REVIEWER: AutomationRole.REVIEWER,
+    # ANALYST: deciding whether two candidate directions are the same is a
+    # judgement about text this system produced, not a reading of literature
+    # and not a critique of science.
+    ModelRole.DUPLICATE_ADJUDICATOR: AutomationRole.ANALYST,
 }
 
 
@@ -572,13 +625,28 @@ class ModelRouter:
                 role="prompt",
                 producer=f"{request.role}:{request.prompt_version}",
             )
+            # Inside the guard, and it was outside it until the first dogfood.
+            #
+            # This is the last thing between reserving the budget and asking a
+            # provider, it is pure computation, and it can raise: it subscripts
+            # `_ADAPTER_ROLE`, so a role with no entry there raised `KeyError`
+            # here with both grant sets already HELD and nothing to release
+            # them. Every one of those failures took a stage ceiling out of the
+            # project's budget permanently -- observed as eight HELD rows and
+            # $0.40 of a $15 ceiling gone on a run that spent $0.34.
+            #
+            # The docstring above records this exact bug being fixed once
+            # before for the two reservations themselves. It is the same bug:
+            # anything that can raise between the reservation and the
+            # invocation belongs under the release, and a line added below the
+            # guard is how it comes back.
+            model, effort = self._model_and_effort(request, profile)
         except BaseException:
             self._budgets.release_all(cost_grants)
             self._budgets.release_all(grants)
             raise
 
         started = time.monotonic()
-        model, effort = self._model_and_effort(request, profile)
         try:
             result = adapter.invoke(
                 InvocationRequest(

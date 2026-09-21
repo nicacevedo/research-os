@@ -334,6 +334,8 @@ def _status(args: argparse.Namespace) -> int:
             for row in RuntimeStore(db).list_schedules()
         )
         counts = store.counts_by_status(project)
+        blocked = store.blocked_counts(project)
+        failures, failed_total, failures_are_current = store.failed_work(project)
         payload = {
             "project": project,
             "status": str(state.status),
@@ -346,6 +348,13 @@ def _status(args: argparse.Namespace) -> int:
             if state.last_tick_at
             else None,
             "counts": {str(key): value for key, value in sorted(counts.items())},
+            "blocked": dict(sorted(blocked.items())),
+            "failed_work": failed_total,
+            "failures_are_current": failures_are_current,
+            "failures": [
+                {"kind": kind, "failure_class": failure_class, "error": error}
+                for kind, failure_class, error in failures
+            ],
         }
         if getattr(args, "as_json", False):
             _print(json.dumps(payload, indent=2, sort_keys=True))
@@ -367,6 +376,10 @@ def _status(args: argparse.Namespace) -> int:
         )
         for key, value in sorted(counts.items()):
             _print(f"  {str(key).lower():<14} {value}")
+        for key, value in sorted(blocked.items()):
+            # A blocked idea is counted above under its scientific status, so
+            # without this line a dead end reads as a healthy PROMISING idea.
+            _print(f"blocked    {value} idea(s) {key}")
         _print(
             f"bank       {payload['uncurated']} idea(s) not yet written to Git"
             + (f"; last commit {state.bank_commit[:12]}" if state.bank_commit else "")
@@ -376,6 +389,34 @@ def _status(args: argparse.Namespace) -> int:
                 "           uncurated ideas are the only thing losing the "
                 "operational database would lose"
             )
+        if failed_total:
+            # Not a silence, for the reason the "not scheduled" line above is
+            # not one. A portfolio whose work is failing looks identical to a
+            # healthy quiet one from every other line of this output.
+            #
+            # But a count with no recency is not a diagnosis either, and the
+            # first version of this said so wrongly: the soak's first project
+            # carried eight failures from a defect fixed an hour earlier, was
+            # advancing ideas past them the whole time, and was told it was not
+            # making progress.
+            _print("")
+            _print(
+                f"failed     {failed_total} portfolio work item(s) have failed"
+                + (
+                    ", and nothing has succeeded since the last one. A portfolio "
+                    "that cannot advance an idea is not making progress, whatever "
+                    "the status line says."
+                    if failures_are_current
+                    else "; work has succeeded since the last of them, so these "
+                    "are history rather than a diagnosis."
+                )
+            )
+            for kind, failure_class, error in failures:
+                _print(
+                    f"  {kind:<24} {failure_class:<14} "
+                    f"{terminal_safe(error.splitlines()[0] if error else '')[:90]}"
+                )
+            _print("           `researchctl runtime status` has the full list.")
     return EXIT_OK
 
 
@@ -608,6 +649,30 @@ def _seed_add(args: argparse.Namespace) -> int:
     project = _project(args.project)
     with _database() as db:
         store = PortfolioStore(db)
+        # `portfolio_state` has a foreign key to the operational `projects`
+        # row, and `portfolio enable` is the only thing in this layer that
+        # creates one. Without this check the first command a researcher types
+        # after `register-project` answers with
+        #
+        #     insert or update on table "portfolio_state" violates foreign key
+        #     constraint "portfolio_state_project_id_fkey"
+        #
+        # which is a true statement about PostgreSQL and no help at all. The
+        # first dogfood hit it following this layer's own documented order.
+        #
+        # Deliberately *not* creating the row here. `_enable` says why the two
+        # commands are separate: enabling commits the machine to spending
+        # against a budget and recording a direction does not, so `seed add`
+        # must not quietly do the thing that starts the spending.
+        if RuntimeStore(db).get_project(project) is None:
+            _print(
+                f"{project} has no portfolio yet, so there is nowhere to put a "
+                f"seed. `researchctl portfolio enable {project}` starts one -- "
+                f"it is the command that commits this machine to spending "
+                f"against your budgets, which is why recording a direction "
+                f"does not do it for you."
+            )
+            return EXIT_ERROR
         store.upsert_state(project_id=project)
         seed = store.add_seed(project_id=project, text=args.text, note=args.note)
         scheduled = any(

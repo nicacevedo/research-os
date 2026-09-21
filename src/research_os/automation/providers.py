@@ -320,7 +320,7 @@ class ClaudeCodeProvider:
                 if isinstance(payload.get("session_id"), str)
                 else None
             ),
-            input_tokens=_as_int(usage.get("input_tokens")),
+            input_tokens=_input_tokens(usage),
             output_tokens=_as_int(usage.get("output_tokens")),
             total_cost_usd=_as_float(payload.get("total_cost_usd")),
             permission_denials=len(denials) if isinstance(denials, list) else None,
@@ -468,6 +468,38 @@ def _as_int(value: object) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int):
         return None
     return value
+
+
+#: The three fields an Anthropic usage block splits input tokens across. All
+#: three are input the call consumed; which bucket a token lands in is a
+#: caching fact, not a size fact.
+_INPUT_TOKEN_FIELDS = (
+    "input_tokens",
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+)
+
+
+def _input_tokens(usage: dict[str, Any]) -> int | None:
+    """Total input tokens, cached and uncached.
+
+    Reading ``input_tokens`` alone reports only what was *not* served from
+    cache, which on a long prompt with a warm prefix is close to nothing. The
+    first dogfood recorded ``tokens_in = 4`` against a call that returned
+    13,854 output tokens, in a column ``docs/RUNTIME.md`` §11 says carries the
+    tokens a call used.
+
+    Cost is unaffected and always was -- it comes from the CLI's own
+    ``total_cost_usd``, which prices the cached tokens correctly -- so this is
+    a provenance fix, not a budget one.
+
+    ``None`` only when the block names no input field at all, so "the provider
+    did not say" stays distinguishable from "the provider said zero".
+    """
+
+    present = [_as_int(usage.get(field)) for field in _INPUT_TOKEN_FIELDS]
+    counted = [value for value in present if value is not None]
+    return sum(counted) if counted else None
 
 
 def _as_float(value: object) -> float | None:

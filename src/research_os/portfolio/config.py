@@ -45,11 +45,13 @@ class Bounds(BaseModel):
     """The anti-explosion controls. Every one of them a finite stop condition.
 
     Invariant 14 says no workflow may recurse or retry indefinitely, and a
-    portfolio has six ways to do it that a single objective does not: breadth,
-    lineage depth, branching factor, revision, spend, and generating forever
-    without generating anything. One bound each. The sixth was found by
-    running the tick twice against a real project and watching the queue
-    grow.
+    portfolio has seven ways to do it that a single objective does not:
+    breadth, lineage depth, branching factor, revision, spend, generating
+    forever without generating anything, and retrying a stage that will never
+    succeed. One bound each. The sixth was found by running the tick twice
+    against a real project and watching the queue grow; the seventh by
+    running it against one for an hour and watching it decide the same eight
+    things every pass and do none of them.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -81,6 +83,18 @@ class Bounds(BaseModel):
     candidate_pool_floor: int = Field(default=6, ge=0, le=200)
     #: And the ceiling, so a run of explorers cannot fill the table.
     candidate_pool_ceiling: int = Field(default=40, ge=1, le=1_000)
+    #: How many times one (idea, stage) pair may fail terminally before the
+    #: allocator stops choosing it and the idea is marked BLOCKED_EXTERNAL.
+    #:
+    #: The seventh way a portfolio can loop, and the first dogfood found it by
+    #: fixing something else. A terminally failed stage leaves the idea IDLE,
+    #: so the allocator picks the same stage again every tick -- forever, at
+    #: no cost, producing nothing, while `portfolio status` says RUNNING.
+    #: Retrying is right, because a stage that failed on a defect is an
+    #: infrastructure outcome and this layer's whole doctrine is that
+    #: infrastructure must not decide science; retrying *without a ceiling* is
+    #: invariant 14's forbidden loop.
+    max_stage_failures: int = Field(default=3, ge=1, le=20)
     #: How many explorer runs may succeed without producing a single new idea
     #: before the portfolio stops exploring. The sixth loop, and the one the
     #: other five do not cover: every explorer generating a near-duplicate
