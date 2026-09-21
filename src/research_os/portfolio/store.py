@@ -1921,8 +1921,8 @@ class PortfolioStore:
             ).fetchall()
         return {str(row["operational_state"]): int(row["n"]) for row in rows}
 
-    def failed_stage_counts(self, project_id: str) -> dict[tuple[str, str], int]:
-        """How many times each ``(idea, stage)`` advance has failed terminally.
+    def failed_stage_counts(self, project_id: str) -> dict[tuple[str, str, str], int]:
+        """How many times each ``(idea, stage, version)`` advance failed terminally.
 
         Two things read this, and they are the two halves of one fix.
 
@@ -1948,10 +1948,14 @@ class PortfolioStore:
         spent, and the wedge would be back in exactly the shape this exists to
         prevent. A work item always exists by the time it can fail.
 
-        The stage read here is the *allocator's*, from the payload, which is
-        the stage the dedup key is built from. ``advance_idea`` may
-        legitimately select a different one; agreeing with the key is what
-        matters.
+        The stage and version read here are the *allocator's*, from the
+        payload, which is what the dedup key is built from. ``advance_idea``
+        may legitimately select a different stage; agreeing with the key is
+        what matters.
+
+        Scoped by version because the key is: a stage that failed twice on
+        version 1 starts again with a clean ceiling on version 2, which is
+        the content it actually has to run against.
 
         A count rather than a timestamp so two concurrent ticks compute the
         same key. That is the property the key exists for, and it is why this
@@ -1962,6 +1966,7 @@ class PortfolioStore:
             rows = conn.execute(
                 "select payload->>'idea_id' as idea_id, "
                 "       payload->>'stage' as stage, "
+                "       coalesce(payload->>'idea_version', '') as idea_version, "
                 "       count(*) as n "
                 "  from work_items "
                 " where project_id = %s "
@@ -1969,10 +1974,15 @@ class PortfolioStore:
                 "   and status = 'FAILED' "
                 "   and payload->>'idea_id' is not null "
                 "   and payload->>'stage' is not null "
-                " group by 1, 2",
+                " group by 1, 2, 3",
                 (project_id,),
             ).fetchall()
-        return {(str(row["idea_id"]), str(row["stage"])): int(row["n"]) for row in rows}
+        return {
+            (str(row["idea_id"]), str(row["stage"]), str(row["idea_version"])): int(
+                row["n"]
+            )
+            for row in rows
+        }
 
     def failed_work(
         self, project_id: str, *, limit: int = 5

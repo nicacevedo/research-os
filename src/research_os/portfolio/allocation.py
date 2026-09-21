@@ -88,8 +88,11 @@ class Allocation:
     stage: Stage | None = None
     explorer: str | None = None
     payload: Mapping[str, object] = field(default_factory=dict)
-    #: How many times this ``(idea, stage)`` pair has already failed
-    #: terminally. Part of the dedup key, and nothing else reads it.
+    #: The idea version this work is for. Part of the dedup key, because a
+    #: revision legitimately re-runs the cheap ladder against new content.
+    idea_version: int | None = None
+    #: How many times this ``(idea, stage, version)`` triple has already
+    #: failed terminally. Part of the dedup key, and nothing else reads it.
     failed_attempts: int = 0
 
     @property
@@ -103,6 +106,22 @@ class Allocation:
         explorer and the tick's own bucket, because two blind explorations in
         one tick is a duplicate and two in successive ticks is the system
         working.
+
+        **The version is load-bearing and was missing, and that cost a whole
+        soak.** A revision appends a new ``idea_versions`` row and the cheap
+        ladder must run again against the new content -- ``dedup``,
+        ``novelty_screen`` and ``falsify`` are all version-scoped in
+        ``succeeded_stages_for_version``, so the stage machine correctly asks
+        for them again. Without the version in the key they could not be
+        bought: the key was spent by the *previous* version's run, which had
+        SUCCEEDED, so ``on conflict do nothing`` refused it forever.
+
+        Every idea that reached ``PROMISING`` and was then sharpened was
+        therefore wedged permanently at the bottom of its own re-run ladder.
+        The first soak's report blamed throughput for never reaching the
+        literature audit or the review board; the throughput was real and
+        this was the actual cause. It surfaced the moment ``work_refused``
+        existed to show a tick allocating eight items and buying none.
 
         **The failure count is load-bearing and was missing.** The sentence
         above says this key only has to stop two items existing *at once*, and
@@ -121,7 +140,10 @@ class Allocation:
         """
 
         if self.kind == ADVANCE_IDEA:
-            return f"{self.kind}:{self.idea_id}:{self.stage}:{self.failed_attempts}"
+            return (
+                f"{self.kind}:{self.idea_id}:{self.stage}:"
+                f"v{self.idea_version}:{self.failed_attempts}"
+            )
         return f"{self.kind}:{self.explorer or ''}:{self.payload.get('bucket', '')}"
 
 
@@ -139,9 +161,9 @@ class Candidate:
     open_objections: int
     spent: Decimal
     lineage_spent: Decimal
-    #: How many times this idea's next stage has already failed terminally.
-    #: Carried into the allocation so the dedup key can name the generation;
-    #: the ceiling that stops it growing forever is applied in
+    #: How many times this idea's next stage has already failed terminally,
+    #: on this version. Carried into the allocation so the dedup key can name
+    #: the generation; the ceiling that stops it growing forever is applied in
     #: ``tick._candidates``, where the idea can also be marked blocked.
     failed_attempts: int = 0
 
@@ -331,6 +353,7 @@ def plan(
                     utility=score,
                     idea_id=item.idea.idea_id,
                     stage=item.stage,
+                    idea_version=item.idea.current_version,
                     failed_attempts=item.failed_attempts,
                 )
             )

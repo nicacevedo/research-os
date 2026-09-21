@@ -270,6 +270,12 @@ def tick(
             payload={
                 "idea_id": item.idea_id,
                 "stage": str(item.stage) if item.stage else None,
+                # Provenance, and the key `failed_stage_counts` groups by, so
+                # the count it returns and the key the allocator builds are
+                # derived from the same three things.
+                "idea_version": (
+                    str(item.idea_version) if item.idea_version is not None else None
+                ),
                 "explorer": item.explorer,
                 "reason": item.reason,
                 "utility": str(item.utility),
@@ -455,7 +461,9 @@ def _candidates(
         stage, reason = select_stage(snapshot, config)
         if stage is None:
             continue
-        failed_attempts = failures.get((idea.idea_id, str(stage)), 0)
+        failed_attempts = failures.get(
+            (idea.idea_id, str(stage), str(version.version)), 0
+        )
         if failed_attempts >= config.bounds.max_stage_failures:
             # Retried to its ceiling and still failing, so this is not a
             # transient. `BLOCKED_EXTERNAL` rather than a status change,

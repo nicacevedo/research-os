@@ -955,3 +955,88 @@ def test_a_stage_that_succeeded_on_its_second_attempt_is_not_bought_again(
         "a work item that succeeded on its second attempt was counted as a "
         "failure, so the next tick will buy the same stage again"
     )
+
+
+def test_a_revision_can_re_run_the_cheap_ladder(
+    portfolio: PortfolioStore,
+    runtime_db: Database,
+    pg_dsn: str,
+    tmp_path,
+    runtime_project: str,
+) -> None:
+    """The defect that actually cost the first soak its deep stages.
+
+    `succeeded_stages_for_version` is version-scoped, so after a revision the
+    stage machine correctly asks for dedup, the novelty screen and the
+    falsifier again -- against content that is now different. The dedup key
+    named only the idea and the stage, so those keys had been spent by the
+    *previous* version's runs, which SUCCEEDED, and `on conflict do nothing`
+    refused them forever.
+
+    Every idea that reached PROMISING and was then sharpened was therefore
+    wedged permanently at the bottom of its own re-run ladder. The first
+    soak's report blamed throughput for never reaching the literature audit
+    or the review board. Throughput was real; this was the cause. It became
+    visible the moment `work_refused` existed to show a tick allocating eight
+    items and buying none of them.
+    """
+
+    idea, _ = seed_idea(portfolio, runtime_project)
+    portfolio.set_status(idea_id=idea.idea_id, status=IdeaStatus.PROMISING)
+
+    first = _tick(runtime_db, pg_dsn, tmp_path, runtime_project)
+    v1 = [
+        item
+        for item in first.allocations
+        if item.kind == allocation.ADVANCE_IDEA and item.idea_id == idea.idea_id
+    ]
+    assert v1, "nothing was allocated, so this test proves nothing"
+    stage = v1[0].stage
+    assert v1[0].dedup_key.endswith(":v1:0")
+
+    # Run it to success on version 1, exactly as the real ladder does.
+    queue = WorkQueue(runtime_db)
+    owner = "worker-under-test"
+    for item in queue.claim(owner=owner, lease_seconds=60, limit=5):
+        queue.succeed(item.work_id, owner=owner, result={})
+    action = portfolio.open_action(
+        idea_id=idea.idea_id,
+        idea_version=1,
+        stage=stage,
+        basis_digest="v1",
+    )
+    portfolio.complete_action(action_id=action.action_id, status=ActionStatus.SUCCEEDED)
+
+    # Now sharpen it. A new version, and the cheap ladder is owed again.
+    portfolio.append_version(
+        idea_id=idea.idea_id,
+        fields=idea_fields(research_question="a sharper question entirely"),
+        origin_call_id=None,
+        origin_role="scientific_discovery",
+        origin_stage=str(Stage.DISCOVER),
+    )
+    portfolio.set_operational_state(idea_id=idea.idea_id, state=OperationalState.IDLE)
+
+    second = _tick(runtime_db, pg_dsn, tmp_path, runtime_project)
+    v2 = [
+        item
+        for item in second.allocations
+        if item.kind == allocation.ADVANCE_IDEA and item.idea_id == idea.idea_id
+    ]
+    assert v2, "the stage machine stopped asking for the re-run"
+    assert v2[0].stage is stage
+    assert v2[0].dedup_key.endswith(":v2:0"), (
+        f"the key does not name the version: {v2[0].dedup_key}"
+    )
+    assert second.work_enqueued >= 1, (
+        "the cheap ladder was owed again for version 2 and the queue refused "
+        "it: the dedup key outlived the version it was built for"
+    )
+    # Any refusal left is the explorer sharing this tick's minute bucket,
+    # which is the key doing its job. The advance is what must get through.
+    with runtime_db.tx() as conn:
+        row = conn.execute(
+            "select count(*) as n from work_items where dedup_key = %s",
+            (v2[0].dedup_key,),
+        ).fetchone()
+    assert int(row["n"]) == 1

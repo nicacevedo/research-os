@@ -401,15 +401,33 @@ def run_dedup(context: TrackContext, snapshot: stages.TrackSnapshot) -> StageOut
             cost_usd=_cost(response),
             model_calls=1,
         )
+    # `DUPLICATE_OF` for both verdicts, and the verdict word kept in the
+    # detail so the nuance survives.
+    #
+    # The `merge` branch used to write `MERGED_FROM`, which could never work
+    # and had never run. `is_lineage` is `kind not in
+    # ('CONTRADICTS','DUPLICATE_OF')`, so `MERGED_FROM` is a lineage edge and
+    # `idea_edges_acyclic_ck` requires `child_depth > parent_depth`. Dedup
+    # compares *siblings* -- two ideas two explorers produced independently,
+    # both at depth 0 -- so every merge it recorded violated the constraint.
+    #
+    # It was unreachable until the similarity threshold was recalibrated, and
+    # it failed on the first real merge afterwards. The architecture is
+    # unambiguous about which edge belongs here: §7 says a semantic duplicate
+    # is "given a `DUPLICATE_OF` edge to the survivor", and §4.1's
+    # disposition table says the same. The code disagreed with both.
+    #
+    # `MERGED_FROM` stays in the enum, unwritten. It means an idea *formed by*
+    # merging parents, which is genuinely deeper than either and would satisfy
+    # the constraint -- and nothing in this build creates one.
     result = _record_duplicate(
         context,
         survivor=verdict.of_idea_id,
-        detail=verdict.rationale or f"adjudicated {verdict.verdict}",
-        kind=(
-            EdgeKind.MERGED_FROM
-            if verdict.verdict == "merge"
-            else EdgeKind.DUPLICATE_OF
+        detail=(
+            f"adjudicated {verdict.verdict}"
+            + (f": {verdict.rationale}" if verdict.rationale else "")
         ),
+        kind=EdgeKind.DUPLICATE_OF,
     )
     return StageOutcome.succeeded(
         result.detail,

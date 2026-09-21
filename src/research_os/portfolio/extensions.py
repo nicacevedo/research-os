@@ -61,6 +61,62 @@ def run_tick(context: WorkContext) -> dict[str, Any]:
     return report.payload()
 
 
+class _IndexedLiterature:
+    """A :class:`runner.LiteratureSource` over the shared literature index.
+
+    The portfolio declares its need for retrieval as a one-method protocol and
+    takes it by injection, so that a deployment with no literature access is a
+    *missing capability the gate reports* rather than a crash. That design is
+    right and it had nothing plugged into it: the composition root passed
+    ``literature=None``, every deep novelty audit failed with
+    ``capability_denied``, and since ``novelty_or_literature`` is the only
+    route that can execute on this build, **no idea could reach VALIDATED in
+    production at all**.
+
+    Found by the 2026-09-21 dogfood, one stage after the version-scoped dedup
+    key unblocked the ladder far enough to attempt an audit. It is the same
+    shape as the twelve unroutable roles: a capability the system has, wired
+    to nothing, behind a seam no test crossed because every test injects its
+    own double.
+
+    The store is opened per search and closed again. Searches are occasional,
+    SQLite open is cheap, and holding a connection across a stage that makes
+    provider calls would keep a file handle open for minutes to save
+    microseconds.
+    """
+
+    def search(self, query: str, *, limit: int = 12) -> Any:
+        from research_os.literature.packet import build_packet
+        from research_os.literature.search import SearchOptions
+        from research_os.literature.search import search as lit_search
+        from research_os.literature.store import open_store
+
+        with open_store() as store:
+            results = lit_search(store, query, SearchOptions(limit=limit))
+        return build_packet(query, results, max_works=limit)
+
+
+def _literature() -> Any | None:
+    """The shared index, or ``None`` when this deployment has none.
+
+    ``None`` is a supported answer and must stay one. An index that does not
+    exist yet, or cannot be opened, has to leave the audit reporting
+    ``capability_denied`` -- which says "novelty cannot be established here"
+    and stops the idea below VALIDATED -- rather than failing the stage with a
+    stack trace or, far worse, letting novelty rest on model recall.
+    """
+
+    from research_os.literature.store import database_path
+
+    try:
+        if not database_path().exists():
+            LOG.info("no literature index; deep novelty audits will report that")
+            return None
+    except OSError:
+        return None
+    return _IndexedLiterature()
+
+
 def run_advance_idea(context: WorkContext) -> dict[str, Any]:
     """Advance one idea by one stage.
 
@@ -90,7 +146,7 @@ def run_advance_idea(context: WorkContext) -> dict[str, Any]:
             run_id, context.item.project_id, context.item.work_id
         ),
         repo_path=context.repo_path,
-        literature=None,
+        literature=_literature(),
         can_execute=False,
     )
     payload = {

@@ -1106,3 +1106,81 @@ def test_every_call_a_track_makes_is_attributed_to_its_own_run(
 
     runtime = RuntimeStore(runtime_db)
     assert runtime.get_run(result.run_id) is not None
+
+
+@pytest.mark.parametrize("verdict", ["duplicate", "merge"])
+def test_an_adjudicated_duplicate_is_recorded_without_violating_the_schema(
+    portfolio: PortfolioStore,
+    runtime_db: Database,
+    pg_dsn: str,
+    checkpoint_tables: str,
+    tmp_path: Path,
+    runtime_project: str,
+    verdict: str,
+) -> None:
+    """Both adjudicator verdicts must be storable. `merge` was not.
+
+    `is_lineage` is `kind not in ('CONTRADICTS','DUPLICATE_OF')`, so
+    `MERGED_FROM` is a lineage edge and `idea_edges_acyclic_ck` demands
+    `child_depth > parent_depth`. Deduplication compares *siblings* -- two
+    ideas two explorers produced independently, both at depth 0 -- so every
+    merge it tried to record violated the constraint with
+
+        new row for relation "idea_edges" violates check constraint
+        "idea_edges_acyclic_ck"
+
+    Nobody found out because the branch was unreachable: the similarity
+    threshold was set so high that layer four had never once been consulted.
+    Recalibrating it on measured data made the branch live, and it failed on
+    the first real merge.
+
+    §7 of the architecture says a semantic duplicate is "given a
+    `DUPLICATE_OF` edge to the survivor" and §4.1's disposition table says the
+    same; the code disagreed with both.
+    """
+
+    survivor, _ = seed_idea(portfolio, runtime_project)
+    candidate, _ = seed_idea(
+        portfolio,
+        runtime_project,
+        research_question="a near-identical question about the same thing",
+    )
+    assert survivor.depth == candidate.depth == 0, (
+        "the point of this test is two ideas at the same depth"
+    )
+
+    router = _router(
+        runtime_db,
+        answers={
+            "duplicate_adjudicator": {
+                "verdict": verdict,
+                "of_idea_id": survivor.idea_id,
+                "rationale": "the same direction in different words",
+            }
+        },
+    )
+    # Force layer four: identical-enough text that the screen escalates.
+    outcome = _advance(
+        portfolio,
+        runtime_db,
+        pg_dsn,
+        tmp_path,
+        runtime_project,
+        candidate.idea_id,
+        router,
+    )
+    assert outcome.ok, outcome.detail
+
+    stored = portfolio.get_idea(candidate.idea_id)
+    assert stored is not None
+    # Strict, not conditional: a test that silently skips its own subject is
+    # the failure mode §H of the build report is about.
+    assert stored.status is IdeaStatus.SUPERSEDED, (
+        "the adjudicator was never reached, so this test proves nothing; "
+        f"the candidate is {stored.status}"
+    )
+    kinds = {edge.kind for edge in portfolio.edges_of(candidate.idea_id)}
+    assert EdgeKind.MERGED_FROM not in kinds, (
+        "a sibling merge cannot be a lineage edge; it violates idea_edges_acyclic_ck"
+    )
+    assert EdgeKind.DUPLICATE_OF in kinds

@@ -104,6 +104,24 @@ Type=simple
 #      in a checkout. An independent security review found this in the first
 #      version of these instructions.)
 #
+#      PUT IT OUTSIDE ~/.config/research-os, which this example does not.
+#      `tests/conftest.py` walks the four real Research OS directories before
+#      and after every test session and reports anything that appeared, so
+#      that a test which escapes its temporary root is caught. The provider
+#      CLI writes session files, key files and `.claude.json` backups into its
+#      config directory constantly -- so a provider home *inside* one of those
+#      four roots makes that guard fire on every suite run that overlaps with
+#      a live `researchd`, with entries like
+#
+#        .config/research-os/<home>/sessions/972.json
+#        .config/research-os/<home>/backups/.claude.json.backup.<stamp>
+#
+#      Found by running the suite alongside the daemon during the 2026-09-21
+#      dogfood. Nothing was actually contaminated and the guard was right to
+#      say so: provider session churn is not Research OS state and does not
+#      belong under the Research OS config home. Somewhere like
+#      `~/.local/state/provider-homes/research-os` keeps both true.
+#
 #   2. a long-lived token from `claude setup-token`, written into the
 #      EnvironmentFile under the variable that command tells you to use;
 #
