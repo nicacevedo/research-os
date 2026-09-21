@@ -53,6 +53,7 @@ tests/
     test_portfolio_cli.py            the commands a researcher types
     test_portfolio_daemon.py         schedule -> event -> work -> handler
     test_portfolio_authority.py      what this layer structurally cannot do
+    test_portfolio_promotion.py      the whole ladder, written by production
 ```
 
 **What is implemented and what is proven are different claims**, and this
@@ -714,6 +715,12 @@ version's current evidence set; its prompt version is the one this build would
 use; and it is younger than `review_max_age_seconds` when one is configured. A
 review of a superseded version never counts, for any tier, ever.
 
+All four are **on by default**, through a sentinel rather than a `bool`, so a
+caller that wants a looser reading has to ask for it in writing at the call
+site. An earlier build made two of the four opt-in, which meant the sentence
+above was true of the gate and false of the six other callers -- defined once,
+but read six ways.
+
 ### The severity scale, defined once
 
 ```text
@@ -854,6 +861,22 @@ bearing, and the existing guard could not have caught it -- the AST test that
 checks for a model call parses `daemon.py` only. That test is extended to the
 portfolio package for the same reason.
 
+**One explorer is in flight at a time.** The allocator buys at most one per
+tick, which bounds a tick and bounds nothing across them: the leftover-capacity
+branch fires whenever a slot is free and the pool is under its *ceiling*, which
+on a quiet portfolio is every tick, so it bought an explorer every cadence
+whether or not the previous one had started. `PortfolioStore.explorations_in_flight`
+is the bound, and it costs nothing in the ordinary case, because an explorer
+that finishes inside one cadence never blocks the next.
+
+**And exploration that produces nothing stops.** `barren_explorations` counts
+successful explorer runs since the newest idea; past `max_barren_explorations`
+the portfolio pauses as `PAUSED_NO_FRONTIER` and says the idea space looks
+exhausted to the explorers available here. A new seed clears it, because a
+seed is exactly the information the count says is missing. Before this the
+budget ceiling was the only thing that stopped the loop, which is true, and
+"you have spent your ceiling" is the wrong diagnosis for it.
+
 A scheduling utility `U` is computed per candidate action. It is an
 **operational number**: stored on `idea_actions`, never in the scientific
 record, and the digest ranks by Pareto layer and diversity rather than by `U`.
@@ -880,6 +903,14 @@ Each candidate's utility carries a configurable penalty proportional to how
 much of the active set already shares its coordinates, and a hard cap bounds
 active descendants per lineage root. The digest's top-ideas selection is a
 Pareto front with a diversity constraint rather than `order by U`.
+
+The front's dimensions are `novelty`, `evidence_strength` and
+`literature_confidence`, and `evidence_strength` is **computed from the
+evidence and review rows**, never taken from a model's own score. An earlier
+build ranked the front on five dimensions, three of them self-assessed, which
+let an idea reach the researcher's attention by rating itself highly. Model
+self-assessment is still stored and still shown; it no longer orders
+anything.
 
 ### The tick reaches the daemon through the existing schedule machinery
 
@@ -1107,6 +1138,7 @@ properties that must survive.
 | Curator meets an unexpected tip | committing on top of something it did not write | refuses, and names the sha |
 | experiment crash | a refutation retried until it stops refuting | unchanged: `FailureClass` has no member for "the science came out negative", by construction |
 | budget exhausted | a scientific rejection | `BLOCKED_BUDGET`, status untouched |
+| every explorer returns a near-duplicate | an explorer bought every cadence until the budget is gone, reported as `PAUSED_BUDGET_EXHAUSTED` | one explorer in flight at a time, and `PAUSED_NO_FRONTIER` after `max_barren_explorations` fruitless runs |
 | one idea waits for a human | the portfolio stops | capacity counts ACTIVE tracks only; there is no portfolio `WAIT_HUMAN` to reach |
 
 ---
@@ -1114,6 +1146,7 @@ properties that must survive.
 ## 17. Human interaction
 
 ```text
+researchctl portfolio enable <project>
 researchctl seed add <project> --text ...
 researchctl portfolio status [project]
 researchctl portfolio top [project]
@@ -1121,6 +1154,14 @@ researchctl portfolio pause | resume <project>
 researchctl portfolio digest [show <id> | list]
 researchctl ideas list | show | lineage | rejected | validated | human-ready
 ```
+
+`portfolio enable` is the only command that starts anything, and it is
+separate from `seed add` on purpose: recording a direction costs nothing and
+putting a project on the tick commits the machine to spending against the
+researcher's budgets. It prints what that commitment is before it is made.
+Enabling is *not* the undo for `pause`; a paused portfolio says so and names
+`resume`, because the obvious command to type after finding a quiet portfolio
+should not silently restart the thing the researcher stopped.
 
 `researchctl portfolio digest` rather than `researchctl digest show`: the
 kernel already owns `researchctl digest <OBJECT-ID>`, which prints a capsule

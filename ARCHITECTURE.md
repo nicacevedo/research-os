@@ -517,6 +517,13 @@ idea_objections standing objections that survive the revision claiming to
                 answer them
 ```
 
+A project joins it with one command, `researchctl portfolio enable <path>`,
+which is what puts the tick on the runtime's schedule table; it also creates
+the operational `projects` row, because the portfolio is the thing that runs
+when *no* objective is running and requiring `runtime start` first would
+invert that. `researchctl portfolio pause` is the off switch, and `enable` is
+deliberately not its undo.
+
 **A portfolio Idea is not a capsule Idea.** `docs/CAPSULE.md` already defines
 one, at `.research/ideas/IDEA-0001.yaml`, and it is scientific state the
 researcher owns. This layer's is a candidate direction with no scientific

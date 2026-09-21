@@ -135,13 +135,23 @@ is **not merged and not released**; the branch carries
 Implemented and integration-tested: the Idea object and its nine tables, the
 deterministic quality gates, four-layer deduplication, fourteen role contracts,
 the bounded idea track, the deterministic portfolio pass, the Git bank and its
-Curator, the digest, and the human-facing commands. 211 new tests.
+Curator, the digest, and the human-facing commands. 244 new tests in 14 files.
 
 **Not demonstrated, and the gap is the point of this entry:** no provider was
 called, no project was dogfooded, no soak was run, and no scientific-quality
 audit was performed. The verdict recorded on the branch is
 `AUTONOMOUS_DISCOVERY_BETA` rather than a release candidate, because §43 of the
 mission that authorised it requires all three and none happened.
+
+Two of the defects that branch found are worth repeating here, because
+neither was found by a test and both are about the difference between a
+system that passes and a system that runs. There was no command that started
+a portfolio -- `ensure_schedule` had no caller outside the tests, so a seeded
+project reported `RUNNING` and nothing ever ticked it. And the allocator
+bought an explorer every cadence whether or not the last one had started,
+bounded only by the project budget, which reports the wrong cause. Both are
+fixed, both have tests, and both were found by typing the commands in the
+order a researcher would.
 
 Two evidence routes are deliberately unwired on that branch: a mathematical
 idea needs an executed counterexample search and an empirical one needs the
