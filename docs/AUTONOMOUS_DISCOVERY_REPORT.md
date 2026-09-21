@@ -667,16 +667,36 @@ the advisory lock held, printed what was happening, exited zero, and left the
 running one untouched — the property `deploy/researchd.service` documents,
 confirmed against a real race rather than a test.
 
-### Q.4 What the soak did not reach
+### Q.4 What the soak did not reach, and why -- corrected
 
-At one work item per pass (`Daemon._claim_and_run` claims `limit=1` and runs it
-inline), throughput is one model call at a time — roughly one stage per minute.
-`max_active_tracks: 8` bounds *allocation*, not *execution*, so "eight tracks in
-flight" means eight tracks queued and run serially. `WorkQueue.claim` takes a
-`limit` and uses `for update skip locked` precisely so several workers can run
-concurrently; the daemon does not use it.
+**This section said throughput, and throughput was not the cause.** The
+correction is kept rather than rewritten away, because the wrong explanation
+is instructive: it was plausible, it was partly true, and it would have sent
+the next person to optimise the wrong thing.
 
-That is why §O.6's last line is zero, and §R is about what it means.
+What was true: at one work item per pass (`Daemon._claim_and_run` claims
+`limit=1` and runs it inline) the control plane executes one model call at a
+time, so `max_active_tracks: 8` bounds *allocation* and not *execution*.
+`WorkQueue.claim` takes a `limit` and uses `for update skip locked` precisely
+so several workers can run concurrently; the daemon does not use it. That is
+real, and it is slow.
+
+What was actually stopping the deep stages was a wedge. **The dedup key was
+blind to the idea version.** After a revision the cheap ladder is owed again
+-- `succeeded_stages_for_version` is version-scoped, so the stage machine
+correctly asks for dedup, the screen and the falsifier against content that
+is now different -- and those keys had been spent by the previous version's
+runs, which had SUCCEEDED. `on conflict do nothing` refused them forever.
+Every idea that reached `PROMISING` and was then sharpened was wedged
+permanently at the bottom of its own re-run ladder, and being sharpened is
+what happens to every idea that survives.
+
+The evidence was in the tick reports the whole time and nothing was reading
+it: eight allocations, zero enqueued, pass after pass. It became visible the
+moment `work_refused` existed to print it.
+
+§W records the fix and the two further defects that fixing it exposed.
+
 
 ## R. Scientific-quality audit
 
@@ -899,12 +919,31 @@ rc/thesis-pilot  unchanged
 The gates at the final commit:
 
 ```text
-full suite            4335 passed, 8 skipped, exit 0   (forward)
-full suite            4335 passed, 8 skipped, exit 0   (--reverse)
+full suite            4349 passed, 8 skipped, exit 0   (forward)
+full suite            4349 passed, 8 skipped, exit 0   (--reverse)
 ruff check .          all checks passed
 ruff format --check   370 files already formatted
-migrations            24 applied on a fresh cluster, head 0024
+migrations            25 applied on a fresh cluster, head 0025
 ```
+
+The figures before the second pass were 4,335 and head 0024. One caveat is
+worth recording about how a green run was nearly mis-read: an earlier gate
+run reported
+
+```text
+===== Research OS real-state contamination =====
+7 entries appeared in the researcher's real Research OS directories
+  .config/research-os/claude/sessions/972.json
+  .config/research-os/claude/backups/.claude.json.backup....
+```
+
+with 4,347 tests passing. Nothing was contaminated by the tests. The dogfood
+daemon was running *alongside* the suite, and the isolated provider home the
+deployment uses sits at `~/.config/research-os/claude` -- inside one of the
+four roots `tests/conftest.py` inventories. The guard was right to report new
+entries; the location is the problem, and `deploy/researchd.service` now says
+so where it recommends the path. The gate figures above are from a run with
+the daemon stopped.
 
 Against the 4,308-test figure this branch carried before the dogfood, that is
 27 new tests in six files. **One existing test was changed**, and it is
@@ -952,12 +991,16 @@ safety/authority   met, and now dogfood-proven rather than asserted. Across
                    authored, and a revision that claimed to answer five
                    objections did not resolve one of them
 bank               met, dogfood-proven against two real repositories
-portfolio          NOT met.  six of eleven stages -- adjudicate, literature
-                   audit, evidence, review board, meta-review, replicate --
-                   have never executed against a real provider. No idea has
-                   reached VALIDATED. The half of the ladder that decides
-                   whether an idea is any good is exactly as unproven as it
-                   was before this exercise
+portfolio          NOT met, and §W changes why.  Three of those six now run:
+                   adjudicate, the literature audit (4 and 5 retrieved
+                   sources against a floor of 3) and the evidence stage,
+                   which correctly refuses. The review board, the
+                   meta-review and replication have still never executed --
+                   and §W.5 establishes that they *cannot* on real ideas
+                   from these projects, because all five adjudicated ideas
+                   need measurement and the experiment pipeline is unwired.
+                   No idea has reached VALIDATED. What changed is that this
+                   is now a known architectural gap rather than an unknown
 scientific work    partially met.  Ideas were generated, screened, falsified,
                    killed and sharpened by a real model on two materially
                    different real projects, and §O and §R say the output is
@@ -995,6 +1038,29 @@ not be described as production-ready until the live harness has run against a
 real cluster". This host has one provider family and no scheduler. Every review
 board it can produce is one model three times, which the system correctly
 refuses to call independent.
+
+### What the second pass changed
+
+The verdict is unchanged for the third time, and the reason has moved again.
+
+The first revision said beta because the dogfood, soak and audit had not
+happened. The second said beta because they had, and found the layer's cheap
+half working and its expensive half unproven. This one says beta because the
+expensive half is now *understood*: it is unreachable for real science on this
+build, and §W.5 says exactly why -- five of five adjudicated ideas need
+something run, and nothing here can run anything.
+
+That is worth more than another green line. "We do not know whether the review
+board works" and "the review board cannot be reached, because real falsifiers
+demand execution and the experiment pipeline is unwired" are different
+statements, and only the second tells anyone what to build next.
+
+Eight of fourteen roles have now met a real model, and the three defects §W.3
+records were each found by fixing the one before it -- a version-blind dedup
+key, an edge kind that violated its own schema, and a retrieval capability
+connected to nothing. All three were invisible to a suite that was green, and
+all three sat behind seams no test crossed because every test injects its own
+double. That is the same lesson as §V and it has now repeated twice.
 
 ### What changed, honestly
 
@@ -1201,3 +1267,182 @@ that order: only `portfolio enable` creates the operational `projects` row that
 the other two need. A document written so that running the dogfood would be "a
 decision and twenty minutes rather than a project" failed on its second command.
 Corrected, and run in the corrected order for the second project.
+
+## W. The second pass: the two delegated findings, and what closing them found
+
+§R.2 and §O.5 were left for a person because both were scientific judgements.
+Both were delegated back. Closing them exposed three more defects, each
+uncovered by fixing the one before it, and then a finding that changes what
+this layer needs next more than any of them.
+
+### W.1 The duplicate threshold, recalibrated on measurement
+
+0.72 → 0.25. Before changing it, the prior question: can character-trigram
+Jaccard separate duplicates at all? A cut point on a noisy ranking is
+worthless. It can. Across **1,081 real pairs from two real projects** the top
+of the distribution is dominated by genuine duplicates -- this portfolio asked
+*"is the pricing rule just safe screening in disguise?"* four separate times
+and *"is instance-size independence an artifact?"* twice, screening and
+falsifying each as a new idea.
+
+```text
+p50 0.160   p90 0.231   p95 0.253   p99 0.315   max 0.381
+lowest pair confirmed by reading as the same direction: 0.297
+```
+
+0.25 is p95. Lowering it costs less than it appears: the screen makes **one**
+adjudicator call carrying up to six neighbours, not one per pair. The real
+constraint is input quality -- two neighbours is a focused question, six is
+noise.
+
+**Result, measured:** the duplicate adjudicator went from *never having been
+consulted in the system's existence* to 26 calls, all well-formed, and six
+ideas are now `SUPERSEDED` rather than occupying tracks.
+
+Two limits recorded rather than smoothed over. It is calibrated on two
+projects and trigram overlap depends on the writing style of the model that
+produced the text. And it does not catch everything: a *short* paraphrase of
+the same question measures 0.239 and still passes. Character overlap cannot
+see meaning and no cut point on it will.
+
+### W.2 The falsifier no longer kills a question because its test is broken
+
+Severity was the only axis, so "this idea is wrong" and "this idea's test is
+wrong" were one decision. Objections now carry `target: CLAIM | TEST`
+(migration 0025). The model reports a *fact about its own objection*; ordinary
+Python routes on it, the way the adjudication type is read out of the
+falsifier rather than chosen by it. `CLAIM` is the default, so silence still
+kills.
+
+Three bounds, and the third is the one that matters: every fatal objection
+must be about the test, the revision ceiling applies, and **the gate did not
+move** -- a fatal test objection still blocks promotion until a different role
+agrees a later version answered it. Not killing an idea is not the same as
+letting it through.
+
+**Result, measured over 390 real objections:**
+
+```text
+CLAIM  61 FATAL   68 CRITICAL   138 MAJOR   54 MINOR
+TEST    6 FATAL   21 CRITICAL    30 MAJOR   12 MINOR
+```
+
+The model is not using `TEST` to spare everything: it is 18% of objections and
+9% of fatal ones. The `TEST` ones are the right kind -- *"the falsifier gives
+no account of how many folds/seeds are needed"*, *"the design doesn't specify
+which correction model is under scrutiny; it would trivially pass this check
+by construction"*.
+
+Writing the controls found a hazard worth its own test. With only half the
+change -- test objections excluded from the track-ending guard, nothing
+routing them to sharpening -- such an objection becomes *invisible* and the
+idea proceeds to the expensive stages, which is worse than either the old
+behaviour or the new. A partial revert produced exactly that.
+
+### W.3 Three defects, each found by fixing the last
+
+**The dedup key was blind to the idea version**, so every sharpened idea was
+wedged. See §Q.4, which this corrects.
+
+**Recording an adjudicated duplicate crashed.** `is_lineage` is
+`kind not in ('CONTRADICTS','DUPLICATE_OF')`, so `MERGED_FROM` is a lineage
+edge and `idea_edges_acyclic_ck` demands `child_depth > parent_depth`. Dedup
+compares *siblings*, both at depth 0, so every merge violated it. §7 says a
+semantic duplicate gets a `DUPLICATE_OF` edge and §4.1 agrees; the code
+disagreed with both and was the only writer of `MERGED_FROM` anywhere.
+Unreachable until W.1 made it reachable, then it failed on the first merge.
+
+**And the shared literature index was wired to nothing.** The portfolio takes
+retrieval by injection so a corpus-less deployment reports a missing
+capability instead of crashing. Nothing was injected: `run_advance_idea`
+passed `literature=None`, every deep audit failed `capability_denied`, and
+since `novelty_or_literature` is the only route that can execute on this
+build, **`VALIDATED` was unreachable in production.** The same shape as the
+twelve unroutable roles -- a capability the system has, connected to nothing,
+behind a seam no test crossed because every test injects its own double.
+
+The first test for that wiring asserted `_literature()` returns a source,
+which passes whether or not anything *calls* it -- which is how a capability
+ends up wired to nothing. It now spies on the handler.
+
+### W.4 Three more stages proven, and three that cannot be
+
+```text
+adjudicate         5 runs, no model call, reads the falsifier
+literature_audit   3 runs; 5 and 4 distinct retrieved sources against a
+                   floor of 3, with real source keys
+evidence           3 runs, every one correctly capability_denied
+review_board       never run
+meta_review        never run
+replicate          never run
+```
+
+Roles that have now met a real model: **8 of 14**, up from 6. New this pass:
+`duplicate_adjudicator` (26 calls) and `literature_scout` (3).
+
+The literature audit's success also answers the dogfood procedure's fourth
+question, which had been open: `novelty_min_sources: 3` does **not** stop
+everything. Retrieval reaches 4 and 5 distinct sources on real questions.
+
+### W.5 And the finding that matters more than any defect here
+
+**Every adjudicated idea is empirical. All five, across both projects. Not one
+is literature-only.**
+
+```text
+{empirical}                        3
+{empirical, mathematical}          1
+{empirical, novelty_or_literature} 1
+```
+
+This was checked for a classifier defect and is not one. The falsifiers
+genuinely demand execution:
+
+```text
+"run CG on a fine grid of λ/λ_max ... Record rounds/time(λ/λ_max)"
+"compute within-cell Cov(e,y) with a bootstrap 95% CI (>=1000 resamples),
+ Benjamini-Hochberg FDR at q=0.05"
+"Execute the four-arm comparison ... recording wall-clock time and peak memory"
+```
+
+`runtime.adjudication.classify` is reading those correctly. Real research
+questions, written by competent explorers against real projects, need things
+run.
+
+`select_stage` puts `evidence` before `review_board`, and the board is reached
+only once `_evidence_sufficient` holds. For an empirical idea on a host that
+cannot execute, that never becomes true. So the review board, the meta-review
+and the replication stage are **not reachable on real ideas from these
+projects** -- not because of a defect, and not for want of budget.
+
+§S said the literature route "is the weakest of the four". The measurement
+says something stronger and more actionable: **it is the route real falsifiers
+almost never imply.** Five of five needed execution. On this evidence the only
+wired route is close to a null path for genuine research, which makes wiring
+the experiment pipeline the gating item for this layer producing validated
+science -- not an enhancement.
+
+They could have been reached by contriving a literature-only idea. That is
+manufacturing coverage, it was explicitly forbidden, and it would have proved
+nothing except that the code runs.
+
+### W.6 What the system got right under all of this
+
+Worth recording, because the list above is all defects.
+
+The evidence stage, meeting an idea it cannot settle, said:
+
+> this idea is settled by measurement and nothing on this host can execute
+> anything. It stops here rather than being concluded from reasoning about
+> what the measurement would have shown.
+
+That is the single most important safety property in the layer -- §S's "an
+idea that cannot be settled here must not be validated on prose" -- observed
+declining in production rather than asserted in a docstring.
+
+The literature failure before it was equally honest: *"no literature source is
+configured, so novelty cannot be established. This idea will not reach
+VALIDATED, which is the correct outcome rather than a failure of the idea."*
+An infrastructure gap that refuses to read as a scientific verdict.
+
+And across 285 reservations: 259 settled, 26 released, **0 held**.

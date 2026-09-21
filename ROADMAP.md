@@ -163,20 +163,45 @@ wrote nothing under `.research/` in just under four hours; and the runtime met a
 session-limit outage, refused to answer critical work with a weaker model,
 rejected no idea because of it, and recovered by itself.
 
-What is still unproven is the half that matters most: `adjudicate`,
+What that pass left unproven was the half that matters most: `adjudicate`,
 `literature_audit`, `evidence`, `review_board`, `meta_review` and `replicate`
-have **never executed against a real provider**, and no idea has reached
-`VALIDATED`. The throughput reason is recorded in the build report §Q.4 — the
-daemon claims one work item per pass, so `max_active_tracks` bounds allocation
-and not execution.
+had **never executed against a real provider**, and no idea had reached
+`VALIDATED`. It was attributed to throughput -- the daemon claims one work
+item per pass, so `max_active_tracks` bounds allocation and not execution --
+and that was true but was not the cause. The cause was a version-blind dedup
+key, found in the pass below and corrected in the build report §Q.4.
 
-Two measurements worth carrying here. `duplicate_similarity: 0.72` is too high:
-across 46 real idea pairs the maximum trigram Jaccard observed was 0.377, and a
-pair that is plainly the same direction scored 0.297, so the semantic duplicate
-adjudicator has never been consulted. And the falsifier rejects research
-questions whose *stated test* is weak, where a researcher would revise — the
-sharpening stage runs only for ideas it has already spared. Neither was changed
-autonomously: both are scientific judgements.
+Both scientific-workflow findings were subsequently delegated and closed.
+`duplicate_similarity` is recalibrated 0.72 -> 0.25 on 1,081 real pairs (p95;
+the lowest confirmed duplicate scores 0.297), and the duplicate adjudicator has
+gone from never once consulted to 26 calls with six ideas superseded.
+Objections now carry `target: CLAIM | TEST` (migration 0025) so a fatal
+objection to an idea's *test* sends it to be sharpened instead of killing the
+question, while the promotion gate is unchanged -- across 390 real objections
+the model used TEST for 18% of them and 9% of fatal ones, so it is not sparing
+everything.
+
+Closing those exposed three more defects, each found by fixing the one before:
+a dedup key blind to the idea version, which wedged every sharpened idea at the
+bottom of its re-run ladder and was the *actual* reason the first soak never
+reached the deep stages; a `MERGED_FROM` edge that violated
+`idea_edges_acyclic_ck` on every sibling merge and was unreachable until the
+threshold moved; and a shared literature index wired to nothing, which made
+`VALIDATED` unreachable in production.
+
+Three more stages now run against a real provider -- `adjudicate`, the
+literature audit (4 and 5 distinct retrieved sources against a floor of 3) and
+`evidence`, which correctly refuses -- taking roles that have met a real model
+to 8 of 14.
+
+**And the finding that should drive what happens next:** all five adjudicated
+ideas across both projects are `empirical`. Not a classifier error -- the
+falsifiers ask for grids to be run, bootstraps to be resampled and wall-clock
+to be recorded. Since `evidence` gates `review_board`, the review board, the
+meta-review and replication are *unreachable* on real ideas here. The
+literature route is not merely the weakest of the four; it is the one real
+falsifiers almost never imply. Wiring the experiment pipeline is the gating
+item for this layer producing validated science.
 
 Two of the defects that branch found are worth repeating here, because
 neither was found by a test and both are about the difference between a
