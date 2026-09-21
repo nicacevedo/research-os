@@ -131,6 +131,19 @@ DIGEST_COLUMNS = (
 )
 
 
+class _Unset:
+    """ "Not supplied", distinct from ``None``, which means "do not check".
+
+    A sentinel rather than ``None`` because both are meaningful for the
+    liveness filters: the default applies this build's prompt versions and
+    configured maximum age, and an explicit ``None`` turns one check off for a
+    test that is about a different one.
+    """
+
+
+UNSET = _Unset()
+
+
 class PortfolioStateError(ResearchOSError):
     """Raised when a portfolio record is missing or a transition is refused."""
 
@@ -982,8 +995,8 @@ class PortfolioStore:
         self,
         *,
         idea_id: str,
-        current_prompt_versions: Mapping[str, str] | None = None,
-        max_age_seconds: int | None = None,
+        current_prompt_versions: Mapping[str, str] | None | _Unset = UNSET,
+        max_age_seconds: int | None | _Unset = UNSET,
     ) -> tuple[IdeaReview, ...]:
         """The reviews a gate may count. Defined once, in SQL.
 
@@ -999,10 +1012,28 @@ class PortfolioStore:
         - its prompt version is the one this build would use now -- a review
           produced by a superseded prompt answered a question no longer being
           asked;
-        - it is not older than ``max_age_seconds``, when one is configured. A
-          parked idea unparked six months later has reviews that were never
-          revisited and literature that has moved.
+        - it is not older than ``max_age_seconds``. A parked idea unparked six
+          months later has reviews nobody revisited and literature that has
+          moved.
+
+        **The last two default to this build's values, and that is deliberate.**
+        They were optional once, with ``None`` meaning "skip this check", and
+        six of the nine callers took the default -- so the architecture's claim
+        that liveness "is defined once" was false, and the most consequential
+        divergence was a livelock: ``track._basis_for`` counted a stale review
+        in the basis while ``select_stage`` counted it missing, so the track
+        demanded a review board it then refused as a duplicate basis, forever.
+        An independent test audit found it. Passing ``None`` explicitly still
+        disables a check, for a test that is about one of the others.
         """
+
+        from research_os.portfolio.config import load_config
+        from research_os.portfolio.prompts import CURRENT_REVIEW_PROMPTS
+
+        if isinstance(current_prompt_versions, _Unset):
+            current_prompt_versions = CURRENT_REVIEW_PROMPTS
+        if isinstance(max_age_seconds, _Unset):
+            max_age_seconds = load_config().thresholds.review_max_age_seconds
 
         evidence = None
         with self._db.tx() as conn:
@@ -1541,6 +1572,55 @@ class PortfolioStore:
             return 0
         grounded = int(row["grounded"])
         return 0 if grounded < 0 else max(0, int(row["here"]) - grounded)
+
+    def barren_explorations(self, *, project_id: str) -> int:
+        """Explorer runs that succeeded and left the portfolio no new idea.
+
+        Counted from the newest idea rather than from a stored counter, so it
+        needs no column and cannot drift from the thing it describes: if the
+        last idea is older than the last six successful explorations, then six
+        explorations produced nothing, whatever any counter says.
+        """
+
+        with self._db.tx() as conn:
+            row = conn.execute(
+                """
+                select count(*) as n
+                  from work_items w
+                 where w.project_id = %(project_id)s
+                   and w.kind = 'portfolio_explore'
+                   and w.status = 'SUCCEEDED'
+                   and w.created_at > coalesce(
+                         (select max(created_at) from ideas
+                           where project_id = %(project_id)s),
+                         '-infinity'::timestamptz)
+                """,
+                {"project_id": project_id},
+            ).fetchone()
+        return int(row["n"]) if row else 0
+
+    def explorations_in_flight(self, *, project_id: str) -> int:
+        """Explorer work that is queued or running for this project.
+
+        The allocator buys one explorer per tick, which bounds a single tick
+        and bounds nothing across ticks: with a 120 s cadence and an explorer
+        that takes longer, every tick adds another. One in flight at a time is
+        the bound, and it costs nothing in the ordinary case because an
+        explorer that finishes inside one cadence never blocks the next.
+        """
+
+        with self._db.tx() as conn:
+            row = conn.execute(
+                """
+                select count(*) as n
+                  from work_items w
+                 where w.project_id = %(project_id)s
+                   and w.kind = 'portfolio_explore'
+                   and w.status in ('PENDING', 'LEASED', 'WAITING')
+                """,
+                {"project_id": project_id},
+            ).fetchone()
+        return int(row["n"]) if row else 0
 
     def stale_actions(
         self, *, project_id: str, older_than_seconds: float, limit: int = 50

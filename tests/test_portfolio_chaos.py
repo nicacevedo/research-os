@@ -190,9 +190,12 @@ def test_a_model_that_returns_prose_writes_no_idea_content(
 
     assert not result.ok
     assert "contract" in result.detail or "JSON" in result.detail
+    assert len(portfolio.list_versions(idea.idea_id)) == 1, (
+        "no version may be appended from output that did not validate"
+    )
     assert portfolio.require_version(idea.idea_id).content_digest == (
         version.content_digest
-    ), "no version may be appended from output that did not validate"
+    )
     assert portfolio.list_reviews(idea_id=idea.idea_id) == ()
     assert portfolio.list_evidence(idea_id=idea.idea_id) == ()
 
@@ -239,32 +242,71 @@ def test_a_reclaimed_track_does_not_consume_a_revision(
     portfolio: PortfolioStore,
     runtime_db: Database,
     pg_dsn: str,
-    tmp_path,
+    checkpoint_tables: str,
+    tmp_path: Path,
     runtime_project: str,
 ) -> None:
     """ "Consume lineage incorrectly", in the form this layer can produce it.
 
-    The revision bound exists to stop a revise/review loop. A crash that spent
-    one would let a handful of outages exhaust an idea's ability to be
+    The revision bound exists to stop a revise/review loop. A failure that
+    spent one would let a handful of outages exhaust an idea's ability to be
     sharpened at all.
+
+    Driven through the production path with a *positive control*: the first
+    half kills the discover stage and asserts nothing was spent; the second
+    lets it succeed and asserts one was. The first version asserted only the
+    first half against a reclaimer that touches no version table, so it was
+    structurally incapable of failing.
     """
 
-    idea, _ = seed_idea(portfolio, runtime_project)
+    idea, _ = seed_idea(portfolio, runtime_project, mechanism="", falsifier="")
+    _past_dedup(portfolio, runtime_db, pg_dsn, tmp_path, runtime_project, idea.idea_id)
     before = portfolio.revision_count(idea.idea_id)
-    action = portfolio.open_action(
-        idea_id=idea.idea_id,
-        idea_version=1,
-        stage=Stage.DISCOVER,
-        basis_digest="died-here",
+
+    broken = ScriptedRouter(
+        # Everything on the way answers; only discovery does not.
+        answers={
+            "duplicate_adjudicator": {"verdict": "distinct"},
+            "novelty_screener": {"likely_known": False},
+            "falsifier": {"summary": "nothing fatal", "objections": []},
+        },
+        unavailable_roles={"scientific_discovery"},
+        store=RuntimeStore(runtime_db),
     )
-    with runtime_db.tx() as conn:
-        conn.execute(
-            "update idea_actions set updated_at = now() - interval '3 hours' "
-            "where action_id = %s",
-            (action.action_id,),
+    for _ in range(4):
+        result = _advance(
+            runtime_db, pg_dsn, tmp_path, runtime_project, idea.idea_id, broken
         )
-    _tick(runtime_db, pg_dsn, tmp_path, runtime_project)
+        portfolio.set_operational_state(
+            idea_id=idea.idea_id, state=OperationalState.IDLE
+        )
+        if result.stage is Stage.DISCOVER:
+            break
+    assert result.stage is Stage.DISCOVER and not result.ok, result.detail
     assert portfolio.revision_count(idea.idea_id) == before
+
+    working = ScriptedRouter(
+        answers={
+            "duplicate_adjudicator": {"verdict": "distinct"},
+            "novelty_screener": {"likely_known": False},
+            "falsifier": {"summary": "nothing fatal", "objections": []},
+            "scientific_discovery": {
+                "can_be_made_precise": True,
+                "refined": {
+                    "title": "sharpened",
+                    "research_question": "Does the bound hold under ties?",
+                    "core_idea": "Ties break the monotonicity the bound needs.",
+                    "mechanism": "Selection by bound is not monotone under ties.",
+                    "falsifier": "Exhibit a tied instance where it still holds.",
+                },
+            },
+        },
+        store=RuntimeStore(runtime_db),
+    )
+    _advance(runtime_db, pg_dsn, tmp_path, runtime_project, idea.idea_id, working)
+    assert portfolio.revision_count(idea.idea_id) == before + 1, (
+        "a discover that succeeded must spend one, or the test above proves nothing"
+    )
 
 
 # ------------------------------------------------------------ replays --
@@ -370,6 +412,12 @@ def test_a_curator_crash_leaves_nothing_half_written(
         text=True,
     ).stdout.split()
     assert not any("HALF-WRITTEN" in name for name in listing)
+    # The control. Without it this passes against a second curation that did
+    # nothing at all, which is indistinguishable from "the reset worked".
+    ideas = portfolio.list_ideas(project_id=runtime_project)
+    assert len(ideas) == 2
+    for idea in ideas:
+        assert f"{BANK_ROOT}/ideas/{idea.idea_id}.md" in listing
 
 
 # ------------------------------------------------------------- budgets --

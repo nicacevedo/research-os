@@ -265,6 +265,14 @@ def classify_independence(
             f"reviewed it. That is not a weak review; it is a defect in whatever "
             f"assembled the review request."
         )
+    if origin_provider_family is None and origin_model is None:
+        # The origin call could not be found, so nothing about the separation
+        # is known. ``NONE`` rather than ``DIFFERENT_CONTEXT``: an unknown
+        # origin is not a weaker separation, it is no evidence of one -- and
+        # this value is printed into the researcher's repository next to the
+        # word VALIDATED. `routing.py` records what false independence
+        # provenance cost the last time it happened.
+        return Independence.NONE
     if origin_provider_family and review_provider_family != origin_provider_family:
         return Independence.DIFFERENT_FAMILY
     if origin_model and review_model and review_model != origin_model:
@@ -498,6 +506,32 @@ def _replication_met(
     evidence: Sequence[IdeaEvidence],
     origin_calls: set[str | None],
 ) -> bool:
+    """Whether the second-line verification this type requires actually exists.
+
+    Two shapes, because "a second time" means different things:
+
+    **A second execution or an independent reconstruction.** A ``REPLICATION``
+    row from a call that is not among the calls that produced the original
+    work, with a job when the type demands one.
+
+    **A second terminology path**, for a literature-adjudicated idea. A
+    novelty claim is a claim about absence, and the way to verify an absence is
+    to look again with different words. So the test is over the *literature*
+    rows: at least two distinct retrieval calls, and the later ones finding
+    keys the first did not.
+
+    The first version of this function applied the execution shape to both, and
+    the literature case was unsatisfiable by construction: every literature
+    row's own call went into ``origin_calls``, so every literature row was
+    filtered out of the candidates, so a second audit could never count. An
+    independent test audit found it -- and found that no test could have,
+    because the suite's only passing gate control used an adjudication type
+    this build cannot produce evidence for.
+    """
+
+    if rule.new_literature_keys:
+        return _second_terminology_path(evidence, rule.new_literature_keys)
+
     candidates = [item for item in evidence if item.kind in rule.kinds]
     if rule.requires_distinct_source:
         # A replication with no recorded call cannot demonstrate that it is
@@ -512,21 +546,43 @@ def _replication_met(
         ]
     if rule.requires_execution:
         candidates = [item for item in candidates if item.job_id]
-    if rule.new_literature_keys:
-        original = {
-            item.literature_key
+    return bool(candidates)
+
+
+def _second_terminology_path(
+    evidence: Sequence[IdeaEvidence], minimum_new_keys: int
+) -> bool:
+    """Whether a later retrieval found sources the first one did not.
+
+    Grouped by the call that produced each row and ordered by when it was
+    written, so "the first search" is a fact about the record rather than a
+    label somebody applied.
+    """
+
+    literature = sorted(
+        (
+            item
             for item in evidence
             if item.kind is EvidenceKind.LITERATURE
-            and item.source_call_id in origin_calls
             and item.literature_key
-        }
-        fresh = {
-            item.literature_key
-            for item in candidates
-            if item.literature_key and item.literature_key not in original
-        }
-        return len(fresh) >= rule.new_literature_keys
-    return bool(candidates)
+            and item.source_call_id
+        ),
+        key=lambda item: (item.created_at, item.evidence_id),
+    )
+    if not literature:
+        return False
+    calls: list[str] = []
+    for item in literature:
+        if item.source_call_id not in calls:
+            calls.append(str(item.source_call_id))
+    if len(calls) < 2:
+        return False
+    first = calls[0]
+    original = {
+        item.literature_key for item in literature if item.source_call_id == first
+    }
+    later = {item.literature_key for item in literature if item.source_call_id != first}
+    return len(later - original) >= minimum_new_keys
 
 
 def evaluate(

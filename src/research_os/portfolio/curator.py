@@ -44,13 +44,15 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import shutil
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from research_os.automation import gitutil
 from research_os.errors import ResearchOSError
+from research_os.ids import validate_project_id
 from research_os.paths import state_home
 from research_os.portfolio.gates import board_independence
 from research_os.portfolio.models import (
@@ -130,10 +132,32 @@ def worktree_root() -> Path:
 
 
 def _safe(relative: str) -> str:
+    """Refuse anything that is not a path inside the bank.
+
+    Two rules, and the second one was missing. ``.research/`` is the capsule
+    and is the researcher's. And a path that is not *under* ``BANK_ROOT`` --
+    absolute, containing ``..``, or simply somewhere else -- is not a bank
+    file, whatever it is called.
+
+    Nothing reaches this with a model-supplied segment today: every variable
+    part is an internally minted id. The guard is here because the module
+    docstring promises one, and because one future filename derived from
+    something else turns the absence into traversal.
+    """
+
     if relative.startswith(".research/") or relative == ".research":
         raise CuratorError(
             f"the Curator refuses to write {relative!r}: `.research/` is the "
             f"capsule and is the researcher's"
+        )
+    path = PurePosixPath(relative)
+    if path.is_absolute() or "\\" in relative:
+        raise CuratorError(f"the Curator refuses an absolute path: {relative!r}")
+    if any(part in {"..", "."} for part in path.parts):
+        raise CuratorError(f"the Curator refuses a traversing path: {relative!r}")
+    if not relative.startswith(BANK_ROOT + "/"):
+        raise CuratorError(
+            f"the Curator writes only under {BANK_ROOT}/, not {relative!r}"
         )
     return relative
 
@@ -474,19 +498,29 @@ def curate(
     digest = snapshot_digest(files)
     ideas = store.list_ideas(project_id=project_id, limit=2_000)
 
-    if state.bank_digest == digest:
-        return CurationResult(
-            project_id=project_id,
-            branch=AUTONOMOUS_BANK_BRANCH,
-            commit=state.bank_commit,
-            digest=digest,
-            ideas=len(ideas),
-            changed=False,
-            detail="the bank already matches this state; nothing was committed",
-        )
-
     try:
         with repository_lock(db, str(repository)):
+            # The tip is verified *before* the "nothing changed" shortcut, not
+            # after it. The shortcut is the common case on an idle portfolio,
+            # and the first version returned from it without reading the
+            # branch at all -- so a bank somebody else had written to sat
+            # undetected for as long as nothing changed, while the researcher
+            # was being told to read it. An independent security review found
+            # it; this is the compensating control for the ref-namespace
+            # exemption and it has to run.
+            _verify_tip(repository, expected_tip=state.bank_commit)
+            if state.bank_digest == digest:
+                return CurationResult(
+                    project_id=project_id,
+                    branch=AUTONOMOUS_BANK_BRANCH,
+                    commit=state.bank_commit,
+                    digest=digest,
+                    ideas=len(ideas),
+                    changed=False,
+                    detail=(
+                        "the bank already matches this state; nothing was committed"
+                    ),
+                )
             commit = _write(
                 repository=repository,
                 project_id=project_id,
@@ -532,17 +566,18 @@ def _write(
     repository, so their ``git status`` never mentions it.
     """
 
+    # Validated before it is joined into a path. `ids.validate_project_id`
+    # enforces the same pattern the capsule does; it was enforced at capsule
+    # init and not at this boundary, and this boundary is the one that makes a
+    # directory.
+    validate_project_id(project_id)
     target = worktree_root() / project_id
+    # Verified *before* the branch is created, because `_ensure_branch` would
+    # otherwise make the branch exist and the check would then refuse the
+    # Curator's own first write.
+    _verify_tip(repository, expected_tip=expected_tip)
     base = _ensure_branch(repository)
     _ensure_worktree(repository=repository, target=target, base=base)
-
-    tip = gitutil.head_commit(target)
-    if expected_tip and tip != expected_tip:
-        raise UnexpectedBankTipError(
-            f"{AUTONOMOUS_BANK_BRANCH} is at {tip}, and the Curator last wrote "
-            f"{expected_tip}. Something else has written to this system's "
-            f"reserved ref namespace. Refusing to commit on top of it."
-        )
 
     # Reset to the tip before rendering, so a crash mid-write leaves nothing
     # for the next pass to commit.
@@ -577,6 +612,41 @@ def _write(
 #: The empty tree, which every Git repository has whether or not anything
 #: references it. Used to root the bank's first commit.
 EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+
+
+def _verify_tip(repository: Path, *, expected_tip: str | None) -> None:
+    """Refuse a bank branch the Curator did not write.
+
+    Two refusals, and the second one was missing:
+
+    - the branch is at a commit that is not the one recorded. Something else
+      wrote to this system's reserved ref namespace.
+    - the branch **exists and there is no record at all**. That is the state
+      after an operational-database reset -- and it is also the state an
+      attacker arranges by creating the branch before the first curation,
+      because creating a reserved ref is deliberately permitted by the coding
+      pipeline's escape check. Adopting it silently would let the Curator's own
+      history be rooted on somebody else's commit.
+    """
+
+    if not gitutil.branch_exists(repository, AUTONOMOUS_BANK_BRANCH):
+        return
+    tip = gitutil.git(
+        ["rev-parse", AUTONOMOUS_BANK_BRANCH], cwd=repository
+    ).stdout.strip()
+    if expected_tip is None:
+        raise UnexpectedBankTipError(
+            f"{AUTONOMOUS_BANK_BRANCH} already exists at {tip} and this system "
+            f"has no record of writing it. Refusing to build on it. If the "
+            f"operational database was reset, delete the branch or re-point the "
+            f"watermark deliberately; if it was not, something else created it."
+        )
+    if tip != expected_tip:
+        raise UnexpectedBankTipError(
+            f"{AUTONOMOUS_BANK_BRANCH} is at {tip}, and the Curator last wrote "
+            f"{expected_tip}. Something else has written to this system's "
+            f"reserved ref namespace. Refusing to commit on top of it."
+        )
 
 
 def _ensure_branch(repository: Path) -> str:
@@ -622,16 +692,49 @@ def _ensure_branch(repository: Path) -> str:
 
 
 def _ensure_worktree(*, repository: Path, target: Path, base: str) -> None:
-    if (target / ".git").exists():
+    """Adopt the Curator's worktree, or replace it if it is not the right one.
+
+    An existing directory with a ``.git`` entry used to be adopted on sight,
+    and the path is keyed on the project id alone. So a project re-pointed at a
+    different repository -- a re-clone, a moved checkout, a restored backup --
+    left a stale worktree of the *old* repository, which the Curator would then
+    hard-reset and commit into. The repository lock was taken on the new path,
+    so the write was serialised against nothing. An independent security review
+    found it.
+
+    Both halves are checked: that the worktree belongs to this repository, and
+    that it is on the bank branch. A sha-only check could not tell "the right
+    branch" from "a different branch that happens to be at the same commit".
+    """
+
+    if (target / ".git").exists() and _is_worktree_of(target, repository, base):
         gitutil.git(["fetch", "--all", "--quiet"], cwd=target, check=False)
         return
     if target.exists():
         gitutil.remove_worktree(repository=repository, target=target, force=True)
+        if target.exists():
+            shutil.rmtree(target, ignore_errors=True)
     target.parent.mkdir(parents=True, exist_ok=True)
     gitutil.git(
         ["worktree", "add", str(target), base],
         cwd=repository,
     )
+
+
+def _is_worktree_of(target: Path, repository: Path, branch: str) -> bool:
+    try:
+        common = gitutil.git(
+            ["rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=target
+        ).stdout.strip()
+        current = gitutil.current_branch(target)
+    except ResearchOSError:
+        return False
+    if current != branch:
+        return False
+    try:
+        return Path(common).resolve().is_relative_to(repository.resolve())
+    except (OSError, ValueError):  # pragma: no cover - unreadable path
+        return False
 
 
 __all__ = [

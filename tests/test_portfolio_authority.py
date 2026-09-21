@@ -97,6 +97,13 @@ def test_no_portfolio_module_promotes_anything() -> None:
         or name in {"promote_proposal", "promote_insight"}
     ]
     assert offenders == [], "; ".join(offenders)
+    # Call names as well as imports, matching the human-Review test above. The
+    # asymmetry ran the wrong way: `import research_os.proposal as p` followed
+    # by `p.promote.promote_proposal(...)` passed the import check, and this is
+    # the more consequential of the two prohibitions.
+    called = {name for path in _sources() for name in _calls(path)}
+    forbidden = {"promote_proposal", "promote_insight", "promote"}
+    assert not (called & forbidden), sorted(called & forbidden)
 
 
 def test_no_portfolio_module_reimplements_the_acceptance_rule() -> None:

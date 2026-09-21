@@ -73,6 +73,16 @@ class TrackSnapshot:
     version: IdeaVersion
     #: Stages that have succeeded against this *version*, at any basis.
     succeeded_stages: frozenset[Stage] = frozenset()
+    #: Stages that have succeeded against the version's *current basis* --
+    #: this content, this evidence set, these live reviews.
+    #:
+    #: Both are needed and they answer different questions. "Has the falsifier
+    #: run on this version" decides whether to run it at all; "has the
+    #: meta-review run on *this* basis" decides whether the synthesis is still
+    #: a synthesis of what exists. Without the second, replication satisfied
+    #: the last HUMAN_READY requirement and nothing ever re-evaluated the gate,
+    #: so an idea that had earned the top tier sat at VALIDATED forever.
+    basis_stages: frozenset[Stage] = frozenset()
     evidence: tuple[IdeaEvidence, ...] = ()
     live_reviews: tuple[IdeaReview, ...] = ()
     open_objections: tuple[IdeaObjection, ...] = ()
@@ -272,14 +282,25 @@ def select_stage(
     # another name or refuse. For every other type the audit is required for
     # VALIDATED anyway, and doing the $1.50 stage before the $2.50 one is the
     # same cheapest-first rule the rest of this function follows.
-    if (
-        Stage.LITERATURE_AUDIT not in snapshot.succeeded_stages
-        or len(snapshot.literature_keys()) < config.thresholds.novelty_min_sources
-    ) and _permits(snapshot.status, Stage.LITERATURE_AUDIT):
-        return Stage.LITERATURE_AUDIT, (
-            "establish what is already known, from retrieved sources rather than "
-            "from recollection"
-        )
+    if _permits(snapshot.status, Stage.LITERATURE_AUDIT):
+        keys = len(snapshot.literature_keys())
+        needed = config.thresholds.novelty_min_sources
+        if Stage.LITERATURE_AUDIT not in snapshot.succeeded_stages:
+            return Stage.LITERATURE_AUDIT, (
+                "establish what is already known, from retrieved sources rather "
+                "than from recollection"
+            )
+        if keys < needed:
+            # The audit ran and the corpus did not have enough in it. Running
+            # it again asks the same question of the same index and gets the
+            # same answer, so this stops -- at $1.50 a time, unattended, the
+            # first version would have asked forever. Found by the first test
+            # that drove an idea all the way through.
+            return None, (
+                f"the novelty case rests on {keys} retrieved source(s) and "
+                f"{needed} are required; this index does not have them. The idea "
+                f"is not refuted -- its novelty cannot be established here."
+            )
 
     if not _evidence_sufficient(snapshot) and _permits(snapshot.status, Stage.EVIDENCE):
         if snapshot.depth_without_evidence > config.bounds.max_depth_without_evidence:
@@ -310,10 +331,19 @@ def select_stage(
             f"{snapshot.blocking_objections[0].summary[:120]}"
         )
 
-    if Stage.META_REVIEW not in snapshot.succeeded_stages and _permits(
+    if Stage.META_REVIEW not in snapshot.basis_stages and _permits(
         snapshot.status, Stage.META_REVIEW
     ):
-        return Stage.META_REVIEW, "synthesise the reviews into a disposition"
+        if snapshot.review_count >= config.bounds.max_reviews_per_idea:
+            return None, (
+                f"this idea has attracted {snapshot.review_count} reviews, which "
+                f"is the ceiling"
+            )
+        return Stage.META_REVIEW, (
+            "synthesise what is now on the record into a disposition"
+            if Stage.META_REVIEW in snapshot.succeeded_stages
+            else "synthesise the reviews into a disposition"
+        )
 
     # --- replicate consequentially ---------------------------------------
     if Stage.REPLICATE not in snapshot.succeeded_stages and _permits(
@@ -353,27 +383,60 @@ STAGE_ORDER: tuple[Stage, ...] = (
 )
 
 
-def classify_from_falsifier(version: IdeaVersion) -> tuple[AdjudicationType, ...]:
-    """What kind of work would settle this idea, read from its own falsifier.
+def classify_adjudication(version: IdeaVersion) -> tuple[AdjudicationType, ...]:
+    """What kind of work would settle this idea. Read, not asked.
 
     Delegates to :func:`research_os.runtime.adjudication.classify`, which
     weights the falsification clause above the statement because *the falsifier
     is the sentence in which someone already wrote down what would settle the
-    thing*. Reading it is not inference.
+    thing*.
 
-    This is deliberately not a model call and deliberately not a field an
-    explorer fills in. Every quality gate is parameterised by the adjudication
-    type, so a generator that could declare its own would be choosing its own
-    evidentiary bar.
+    **And it is read twice, from two different fields, and the answers are
+    unioned.** That is the part an independent security review argued for, and
+    it is worth being precise about what it does and does not buy.
+
+    It does not make the type un-steerable. The falsifier is written by a
+    model, the classifier is keyword scoring, and the ``scientific_discovery``
+    prompt tells the model outright that what kind of work would settle the
+    idea is read from that sentence. A generator that wants a cheaper bar can
+    phrase its falsifier as a literature question, and an earlier version of
+    this function -- which read the falsifier alone and returned a
+    single-element tuple -- would have given it one.
+
+    What the union buys is that steering can only ever *add* requirements. The
+    gates take the union of the evidence rules over every declared type
+    (:func:`research_os.portfolio.gates._rules_for`), so an idea whose question
+    reads as empirical and whose falsifier reads as a literature search must
+    satisfy both -- it needs an execution *and* retrieved sources. Making the
+    falsifier cheaper no longer removes what the question demands.
+
+    ``UNDETERMINED`` is dropped when anything concrete survives, and kept when
+    nothing does: a target this module does not understand behaves exactly as
+    it did before the module existed, which is what
+    ``runtime/adjudication.py`` means by conservative.
     """
 
     from research_os.runtime.adjudication import classify
 
-    verdict = classify(
-        statement=f"{version.research_question}\n{version.core_idea}",
-        falsification=version.falsifier,
-    )
-    return (AdjudicationType(verdict.kind.value),)
+    from_falsifier = classify(falsification=version.falsifier).kind
+    from_statement = classify(
+        statement=f"{version.research_question}\n{version.core_idea}"
+    ).kind
+    declared = {
+        AdjudicationType(item.value) for item in (from_falsifier, from_statement)
+    }
+    concrete = declared - {AdjudicationType.UNDETERMINED}
+    if not concrete:
+        return (AdjudicationType.UNDETERMINED,)
+    # MIXED alongside a concrete type says nothing the concrete one does not.
+    if len(concrete) > 1:
+        concrete -= {AdjudicationType.MIXED}
+    return tuple(sorted(concrete, key=lambda item: item.value))
+
+
+#: The old name, kept for one release because the report and two documents
+#: cite it. It reads only the falsifier, which is what made the type steerable.
+classify_from_falsifier = classify_adjudication
 
 
 def stage_reason_lines(

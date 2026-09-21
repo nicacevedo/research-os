@@ -78,7 +78,7 @@ from research_os.runtime.context import CycleContext
 from research_os.runtime.failures import FailureClass
 from research_os.runtime.idempotency import idempotency_key
 from research_os.runtime.locks import RepositoryBusyError, repository_lock
-from research_os.runtime.refs import is_reserved_ref
+from research_os.runtime.refs import RESERVED_REF_VALUE, is_reserved_ref
 from research_os.runtime.spend import DelegatedSpendAuthority
 from research_os.sandbox import SandboxError, SandboxMode
 
@@ -138,7 +138,9 @@ def canonical_fingerprint(
     makes the coding cycle report an escape that did not happen. That is the
     identical failure recorded two paragraphs above, with a different writer.
     ``runtime/refs.py`` records what the blind spot costs and what covers it
-    instead.
+    instead. The exemption is narrower than it first was: a reserved ref is
+    recorded under its own marker with a constant value, so only a *move* is
+    invisible -- one appearing or disappearing is still an escape.
 
     One deliberate blind spot: ``.research/runtime/`` is excluded. It is
     gitignored scratch space that the capsule specification reserves and nothing
@@ -196,6 +198,11 @@ def canonical_fingerprint(
             continue
         sha, ref = parts[0].strip(), parts[1].strip()
         if is_reserved_ref(ref):
+            # Recorded, not dropped, and with a constant value. A reserved ref
+            # *moving* is what the exemption is for; a reserved ref appearing
+            # or vanishing is still a change, and is caught in every
+            # repository -- including the ones with no Curator to notice.
+            found[f"<reserved-ref> {ref}"] = RESERVED_REF_VALUE
             continue
         if any(ref.startswith(prefix) for prefix in owned_ref_prefixes):
             # **Recorded, not dropped.** An exempt ref is allowed to come into
@@ -267,9 +274,20 @@ def branch_drift(repo: Path, run: Any) -> str:
 def escaped(before: dict[str, str], after: dict[str, str]) -> bool:
     """Whether the difference between two fingerprints is an escape.
 
-    One thing is permitted and exactly one: an ``<owned-ref>`` key that did not
-    exist before and does now. That is the pipeline creating its own worktree
-    branch, which is what worktree isolation *is*.
+    Two things are permitted, and both are a key that did not exist before and
+    does now.
+
+    An ``<owned-ref>``: the pipeline creating its own worktree branch, which is
+    what worktree isolation *is*.
+
+    A ``<reserved-ref>``: the Curator creating this system's bank branch for
+    the first time. Its *value* is a constant, so a reserved ref moving changes
+    nothing here and is the exemption `runtime/refs.py` describes; its
+    appearance is permitted because a first curation during a coding run is an
+    ordinary event; and its **deletion** is not permitted, because that removes
+    a key. What guards a reserved ref that somebody else created is the
+    Curator, which refuses to build on a branch whose tip it does not
+    recognise.
 
     Everything else fails -- a capsule file changed, any other ref created,
     moved or deleted, and an owned ref that existed before and now points
@@ -280,7 +298,7 @@ def escaped(before: dict[str, str], after: dict[str, str]) -> bool:
     for key in set(before) | set(after):
         if before.get(key) == after.get(key):
             continue
-        if key.startswith("<owned-ref> ") and key not in before:
+        if key.startswith(("<owned-ref> ", "<reserved-ref> ")) and key not in before:
             continue
         return True
     return False
@@ -293,7 +311,9 @@ def _describe_drift(before: dict[str, str], after: dict[str, str]) -> str:
         key
         for key in set(before) | set(after)
         if before.get(key) != after.get(key)
-        and not (key.startswith("<owned-ref> ") and key not in before)
+        and not (
+            key.startswith(("<owned-ref> ", "<reserved-ref> ")) and key not in before
+        )
     )
     return ", ".join(changed[:12]) + ("..." if len(changed) > 12 else "")
 

@@ -262,6 +262,15 @@ class FalsifierOutput(_Contract):
             raise ValueError(f"at most {MAX_OBJECTIONS} objections")
         return value
 
+    @field_validator("attempted")
+    @classmethod
+    def _bounded_attempts(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(value) > MAX_LIST_ITEMS:
+            raise ValueError(f"at most {MAX_LIST_ITEMS} attempts")
+        return tuple(
+            _bounded(item, MAX_STATEMENT_CHARS, "an attempt") for item in value
+        )
+
     @property
     def worst(self) -> Severity:
         from research_os.portfolio.models import SEVERITY_ORDER
@@ -317,6 +326,19 @@ class NoveltyRow(_Contract):
     def _required(cls, value: str) -> str:
         return _bounded(value, MAX_STATEMENT_CHARS, "this field")
 
+    @field_validator("precise_difference")
+    @classmethod
+    def _bounded_difference(cls, value: str) -> str:
+        # Bounded because it is interpolated into an evidence row's summary,
+        # which the Curator commits into the researcher's repository. An
+        # independent security review found six fields this module's own
+        # "every string has a maximum size" did not cover; this is the one
+        # that reaches Git.
+        stripped = value.strip()
+        if len(stripped) > MAX_STATEMENT_CHARS:
+            raise ValueError(f"at most {MAX_STATEMENT_CHARS} characters")
+        return stripped
+
 
 class NoveltyAuditOutput(_Contract):
     """The deep audit: a structured matrix, and the queries that produced it.
@@ -331,6 +353,24 @@ class NoveltyAuditOutput(_Contract):
     rows: tuple[NoveltyRow, ...] = ()
     queries: tuple[str, ...] = ()
     summary: str = ""
+
+    @field_validator("queries")
+    @classmethod
+    def _bounded_queries(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        # The queries travel in `StageOutcome.data` into the LangGraph
+        # checkpoint, whose own docstring says state carrying bytes is a table
+        # that grows by megabytes.
+        if len(value) > MAX_LIST_ITEMS:
+            raise ValueError(f"at most {MAX_LIST_ITEMS} queries")
+        return tuple(_bounded(item, MAX_TITLE_CHARS, "a query") for item in value)
+
+    @field_validator("summary")
+    @classmethod
+    def _bounded_summary(cls, value: str) -> str:
+        stripped = value.strip()
+        if len(stripped) > MAX_SUMMARY_CHARS:
+            raise ValueError(f"at most {MAX_SUMMARY_CHARS} characters")
+        return stripped
 
     @field_validator("rows")
     @classmethod
@@ -413,7 +453,11 @@ class MetaReviewOutput(_Contract):
     def _bounded(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         if len(value) > MAX_LIST_ITEMS:
             raise ValueError(f"at most {MAX_LIST_ITEMS} disagreements")
-        return value
+        # Each becomes an objection summary row, so the per-item bound matters
+        # as much as the list length.
+        return tuple(
+            _bounded(item, MAX_SUMMARY_CHARS, "a disagreement") for item in value
+        )
 
 
 class DuplicateAdjudication(_Contract):
@@ -461,9 +505,22 @@ class BranchOutput(_Contract):
     children: tuple[CandidateIdea, ...] = ()
     relations: tuple[str, ...] = ()
 
+    @field_validator("children")
+    @classmethod
+    def _bounded_children(
+        cls, value: tuple[CandidateIdea, ...]
+    ) -> tuple[CandidateIdea, ...]:
+        # A schema bound as well as `check(maximum=...)`, so the ceiling is a
+        # property of the type rather than something a caller must remember.
+        if len(value) > MAX_CANDIDATES:
+            raise ValueError(f"at most {MAX_CANDIDATES} children")
+        return value
+
     @field_validator("relations")
     @classmethod
     def _lineage_only(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(value) > MAX_CANDIDATES:
+            raise ValueError(f"at most {MAX_CANDIDATES} relations")
         allowed = {"DERIVED_FROM", "GENERALIZES", "SPECIALIZES"}
         bad = [item for item in value if item not in allowed]
         if bad:

@@ -30,7 +30,7 @@ from research_os.portfolio.models import (
 from research_os.portfolio.stages import (
     STAGE_ORDER,
     TrackSnapshot,
-    classify_from_falsifier,
+    classify_adjudication,
     select_stage,
 )
 from research_os.runtime.interfaces import Independence
@@ -260,6 +260,7 @@ def test_replication_is_not_reachable_before_validated() -> None:
         snapshot(
             status=IdeaStatus.REVIEW,
             succeeded_stages=everything,
+            basis_stages=everything,
             evidence=_complete_evidence(),
             live_reviews=_complete_reviews(),
             revision_count=1,
@@ -272,6 +273,7 @@ def test_replication_is_not_reachable_before_validated() -> None:
         snapshot(
             status=IdeaStatus.VALIDATED,
             succeeded_stages=everything,
+            basis_stages=everything,
             evidence=_complete_evidence(),
             live_reviews=_complete_reviews(),
             revision_count=1,
@@ -330,6 +332,7 @@ def test_the_review_loop_has_a_stop_condition() -> None:
         snapshot(
             status=IdeaStatus.INVESTIGATING,
             succeeded_stages=frozenset(STAGE_ORDER) - {Stage.REVIEW_BOARD},
+            basis_stages=frozenset(STAGE_ORDER) - {Stage.REVIEW_BOARD},
             evidence=_complete_evidence(),
             revision_count=1,
             review_count=CONFIG.bounds.max_reviews_per_idea,
@@ -373,6 +376,7 @@ def test_branching_stops_at_the_lineage_ceiling() -> None:
         snapshot(
             status=IdeaStatus.VALIDATED,
             succeeded_stages=frozenset(STAGE_ORDER) - {Stage.BRANCH},
+            basis_stages=frozenset(STAGE_ORDER) - {Stage.BRANCH},
             evidence=_complete_evidence(),
             live_reviews=_complete_reviews(),
             revision_count=1,
@@ -403,95 +407,106 @@ def test_a_closed_or_parked_idea_gets_no_work(status: IdeaStatus) -> None:
     assert str(status) in why
 
 
-def test_the_machine_terminates_from_any_starting_point() -> None:
+@pytest.mark.parametrize(
+    "start",
+    [
+        IdeaStatus.CANDIDATE,
+        IdeaStatus.PROMISING,
+        IdeaStatus.INVESTIGATING,
+        IdeaStatus.REVIEW,
+        IdeaStatus.VALIDATED,
+    ],
+)
+@pytest.mark.parametrize(
+    "declared",
+    [
+        (AdjudicationType.MATHEMATICAL,),
+        (AdjudicationType.EMPIRICAL,),
+        (AdjudicationType.NOVELTY_OR_LITERATURE,),
+        (AdjudicationType.MIXED,),
+        (AdjudicationType.UNDETERMINED,),
+        (),
+    ],
+)
+def test_the_machine_terminates_from_any_starting_point(
+    start: IdeaStatus, declared: tuple[AdjudicationType, ...]
+) -> None:
     """Drive it to a fixed point and assert it reaches one.
 
-    The bound is the stage count plus one. A machine that needed more passes
-    than it has stages would be revisiting one, which is the shape of a loop
-    even when each individual rule looks like progress.
+    Parametrised over every status and every adjudication type, because both
+    loops this property has actually caught were type- and version-dependent
+    and a single fixed starting point would have missed either.
+
+    The harness models what each stage *does*, not only that it ran. A
+    ``DISCOVER`` appends a version, so it spends a revision and may legitimately
+    be selected again; an ``ADJUDICATE`` writes the type. Marking either done
+    and moving on -- which the first version did -- made a genuine repeat look
+    like a loop, and would equally have hidden one.
     """
 
     done: set[Stage] = set()
-    for _ in range(len(STAGE_ORDER) + 1):
+    revisions = 1
+    types = declared
+    bound = len(STAGE_ORDER) + CONFIG.bounds.max_revisions_per_idea + 2
+    for _ in range(bound):
         stage, _why = select_stage(
             snapshot(
-                status=IdeaStatus.VALIDATED,
+                status=start,
+                version=version(adjudication_types=types),
                 succeeded_stages=frozenset(done),
+                basis_stages=frozenset(done),
                 evidence=_complete_evidence(),
                 live_reviews=_complete_reviews(),
-                revision_count=1,
+                revision_count=revisions,
             ),
             CONFIG,
         )
         if stage is None:
             break
+        if stage is Stage.DISCOVER:
+            # What discover does: append a version, spending a revision. The
+            # bound on that is what makes an idea nobody can sharpen stop.
+            revisions += 1
+            done.add(stage)
+            continue
+        if stage is Stage.ADJUDICATE:
+            # What adjudicate does: write the type read from the idea's own
+            # text. A harness that only marked it done would see the machine
+            # ask for it forever, which is a loop in the harness rather than
+            # in the machine.
+            types = (AdjudicationType.NOVELTY_OR_LITERATURE,)
+            done.add(stage)
+            continue
         assert stage not in done, f"{stage} was selected twice"
         done.add(stage)
     else:  # pragma: no cover - a loop would land here
-        pytest.fail("the stage machine did not reach a fixed point")
+        pytest.fail(
+            f"the stage machine did not reach a fixed point from {start} "
+            f"with {declared}; it ran {sorted(done)}"
+        )
 
 
-def test_a_mixed_idea_is_split_rather_than_investigated() -> None:
-    """The loop the termination property found.
+def test_an_idea_nobody_can_sharpen_stops_rather_than_revising_forever() -> None:
+    """The stop condition the parametrised property above depends on.
 
-    MIXED and UNDETERMINED carry no evidence rule, so no amount of evidence
-    satisfies one. An earlier version let both fall through to the evidence
-    stage, where the sufficiency test was permanently false and the stage would
-    have been selected forever -- at two and a half dollars a time, unattended.
+    An idea whose falsifier says nothing about how it would be settled is sent
+    back to be sharpened. If sharpening never helps, the revision bound is what
+    ends it -- and a bound that was never reached would make the property above
+    pass for the wrong reason.
     """
 
-    for declared in (
-        (AdjudicationType.MIXED,),
-        (AdjudicationType.UNDETERMINED,),
-        (AdjudicationType.MIXED, AdjudicationType.UNDETERMINED),
-    ):
-        stage, why = select_stage(
-            snapshot(
-                status=IdeaStatus.PROMISING,
-                version=version(adjudication_types=declared),
-                succeeded_stages=frozenset(
-                    {Stage.DEDUP, Stage.NOVELTY_SCREEN, Stage.FALSIFY, Stage.DISCOVER}
-                ),
-                revision_count=1,
-            ),
-            CONFIG,
-        )
-        assert stage is Stage.DISCOVER, f"{declared} reached {stage}"
-        assert "split" in why or "sharpen" in why
-
-
-def test_a_mixed_idea_with_a_concrete_component_does_proceed() -> None:
-    """MIXED alongside a real type is a route, not a dead end."""
-
-    stage, _why = select_stage(
+    stage, why = select_stage(
         snapshot(
-            status=IdeaStatus.PROMISING,
-            version=version(
-                adjudication_types=(
-                    AdjudicationType.MIXED,
-                    AdjudicationType.MATHEMATICAL,
-                )
-            ),
+            version=version(adjudication_types=(AdjudicationType.UNDETERMINED,)),
             succeeded_stages=frozenset(
-                {
-                    Stage.DEDUP,
-                    Stage.NOVELTY_SCREEN,
-                    Stage.FALSIFY,
-                    Stage.DISCOVER,
-                    Stage.LITERATURE_AUDIT,
-                }
+                {Stage.DEDUP, Stage.NOVELTY_SCREEN, Stage.FALSIFY, Stage.DISCOVER}
             ),
-            evidence=tuple(
-                evidence(
-                    EvidenceKind.LITERATURE, literature_key=f"openalex:W{i}", index=i
-                )
-                for i in range(3)
-            ),
-            revision_count=1,
+            revision_count=CONFIG.bounds.max_revisions_per_idea + 1,
         ),
         CONFIG,
     )
-    assert stage is Stage.EVIDENCE
+    assert stage is None
+    assert "revision bound is spent" in why
 
 
 def test_the_selector_consults_no_model_and_no_clock() -> None:
@@ -529,23 +544,60 @@ def test_the_selector_consults_no_model_and_no_clock() -> None:
             ),
             AdjudicationType.NOVELTY_OR_LITERATURE,
         ),
-        # Balanced signals, so neither dominates and the classifier says MIXED
-        # rather than picking one. `adjudication.py`'s DOMINANCE_RATIO is what
-        # makes that conservative by construction.
-        (
-            "Prove the inequality; measure whether it is tight.",
-            AdjudicationType.MIXED,
-        ),
         ("It would feel wrong.", AdjudicationType.UNDETERMINED),
     ],
 )
-def test_the_adjudication_type_is_read_from_the_falsifier(
+def test_the_adjudication_type_is_read_from_the_idea(
     falsifier: str, expected: AdjudicationType
 ) -> None:
-    """Not inferred, and certainly not asked of the generator.
+    """Not asked of the generator, and read from two fields rather than one.
 
-    Every quality gate is parameterised by this, so a role that could declare
-    its own type would be choosing its own evidentiary bar.
+    With a neutral question, the falsifier decides -- which is right, because
+    the falsifier is the sentence that says what would settle the thing.
     """
 
-    assert classify_from_falsifier(version(falsifier=falsifier)) == (expected,)
+    neutral = version(
+        research_question="Is the stated relationship the one that holds?",
+        core_idea="The stated relationship is the one that holds.",
+        falsifier=falsifier,
+    )
+    assert classify_adjudication(neutral) == (expected,)
+
+
+def test_a_cheaper_falsifier_adds_a_requirement_rather_than_removing_one() -> None:
+    """The steering mitigation, and the honest limit around it.
+
+    The type *is* derived from model-authored text and *is* steerable: a
+    generator that wants a cheaper bar can phrase its falsifier as a literature
+    question, and the `scientific_discovery` prompt tells it the sentence is
+    read downstream. Reading the question as well, and unioning, means that
+    steering can only add. The gate takes the union of the evidence rules, so
+    this idea needs an execution *and* retrieved sources.
+    """
+
+    steered = version(
+        research_question=(
+            "Which solver is faster in wall-clock time over 30 repetitions?"
+        ),
+        core_idea="We measure runtime across seeds and report the median.",
+        falsifier=("Find a prior publication reporting this; search the literature."),
+    )
+    declared = classify_adjudication(steered)
+    assert AdjudicationType.EMPIRICAL in declared
+    assert AdjudicationType.NOVELTY_OR_LITERATURE in declared
+
+    from research_os.portfolio.gates import EVIDENCE_RULES
+
+    assert EVIDENCE_RULES[AdjudicationType.EMPIRICAL].requires_execution
+
+
+def test_an_idea_that_says_nothing_about_how_it_would_be_settled_is_undetermined() -> (
+    None
+):
+    assert classify_adjudication(
+        version(
+            research_question="Is it interesting?",
+            core_idea="It might be interesting.",
+            falsifier="It would feel wrong.",
+        )
+    ) == (AdjudicationType.UNDETERMINED,)

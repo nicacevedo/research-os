@@ -178,12 +178,14 @@ def test_the_duplicate_is_kept_as_a_reference_rather_than_dropped(
 
 # ------------------------------------------------ determinism, five ways --
 def test_the_canonical_identity_does_not_depend_on_anything_that_can_vary() -> None:
-    """Restart, reconnect, replay and model nondeterminism, in one assertion.
+    """The identity is a pure function of the text, computed twice.
 
-    All four reduce to the same question -- does the identity depend on
-    anything that could differ between two runs? -- and the answer is that it
-    is a pure function of the text. Computing it twice, from separately
-    constructed inputs, is the whole test.
+    Restart, reconnect, replay and model nondeterminism all reduce to one
+    question -- does the identity depend on anything that could differ between
+    two runs? -- and the answer here is an argument plus this: the function
+    reads only its arguments, and two separately constructed inputs with the
+    same text give the same digest. That is not the same as having restarted a
+    process, and the docstring said it was.
     """
 
     fields = idea_fields()

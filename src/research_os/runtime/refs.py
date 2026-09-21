@@ -22,13 +22,24 @@ fingerprint's own docstring records having had once before, when it flagged the
 pipeline's own worktree branch.
 
 **What the reservation costs, stated rather than hidden.** A reserved ref is
-excluded from the fingerprint entirely, so an acceptance command that wrote to
-``refs/heads/research-os/*`` would not be detected *there*. That blind spot is
-the same shape as the existing one for ``.research/runtime/`` and it is covered
-somewhere else rather than left open: the Curator records the commit it last
-wrote and refuses to commit onto a tip it does not recognise, naming the
-unexpected sha. So the fingerprint guards the refs nothing in this system
-writes, and the one namespace this system does write guards itself, loudly.
+recorded under a marker whose *value* is a constant, so:
+
+- **creating** one is a new key and is still an escape;
+- **deleting** one removes a key and is still an escape;
+- **moving** one is invisible, and that is the whole exemption.
+
+Movement is what the Curator does, and movement is what the Curator guards: it
+records the commit it last wrote and refuses to commit onto a tip it does not
+recognise, naming the unexpected sha. The first version of this dropped
+reserved refs from the fingerprint entirely, which made creation and deletion
+invisible too -- in *every* repository the coding pipeline touches, including
+the ones that have no portfolio and therefore no Curator to notice. An
+independent security review found that the cost was being carried by a
+component that may not exist.
+
+So: the fingerprint guards the refs nothing in this system writes; it still
+notices a reserved ref appearing or vanishing anywhere; and the one namespace
+this system moves guards itself.
 
 The alternative -- a bare repository under the state home -- was rejected
 because the whole value of the bank being Git is that the researcher can run
@@ -42,13 +53,32 @@ from __future__ import annotations
 #: system, and never checked out in the researcher's own working tree.
 AUTONOMOUS_BANK_BRANCH = "research-os/autonomous"
 
-#: Ref prefixes written by this system's own serialized writers, excluded from
-#: the coding pipeline's escape fingerprint. Deliberately short: every entry is
-#: a namespace somebody has to be shown to guard by another mechanism.
+#: Ref prefixes written by this system's own serialized writers, whose
+#: *movement* the coding pipeline's escape fingerprint ignores. Deliberately
+#: short: every entry is a namespace somebody has to be shown to guard by
+#: another mechanism.
+#:
+#: The marker the fingerprint records them under. Present so that a reserved
+#: ref appearing or disappearing is still a change, while moving one is not.
 RESERVED_REF_PREFIXES: tuple[str, ...] = (f"refs/heads/{AUTONOMOUS_BANK_BRANCH}",)
+
+#: What a reserved ref's value is recorded as. A constant, so a move is
+#: invisible and an appearance or a disappearance is not.
+RESERVED_REF_VALUE = "reserved"
 
 
 def is_reserved_ref(ref: str) -> bool:
-    """Whether ``ref`` belongs to a namespace this system reserves."""
+    """Whether ``ref`` belongs to a namespace this system reserves.
 
-    return any(ref.startswith(prefix) for prefix in RESERVED_REF_PREFIXES)
+    Anchored: the ref must *be* a reserved prefix or live under it as a path
+    component. A bare ``startswith`` also matched
+    ``refs/heads/research-os/autonomous-anything``, which an acceptance command
+    could create -- so the one namespace the escape check ignores would have
+    been a whole family of names the Curator never looks at. An independent
+    security review found it.
+    """
+
+    return any(
+        ref == prefix or ref.startswith(prefix + "/")
+        for prefix in RESERVED_REF_PREFIXES
+    )

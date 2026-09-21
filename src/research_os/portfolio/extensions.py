@@ -177,16 +177,34 @@ def run_explore(context: WorkContext) -> dict[str, Any]:
 def run_curate(context: WorkContext) -> dict[str, Any]:
     """Write the bank to the project's autonomous branch."""
 
-    from research_os.portfolio.curator import curate
+    from research_os.portfolio.curator import UnexpectedBankTipError, curate
 
     if context.repo_path is None:
         return {"skipped": "this project has no resolvable repository"}
-    result = curate(
-        db=context.db,
-        project_id=context.item.project_id,
-        repository=Path(context.repo_path),
-        artifacts_root=context.config.artifacts_root,
-    )
+    try:
+        result = curate(
+            db=context.db,
+            project_id=context.item.project_id,
+            repository=Path(context.repo_path),
+            artifacts_root=context.config.artifacts_root,
+        )
+    except UnexpectedBankTipError as exc:
+        # Recorded and *not* retried. This is the compensating control for the
+        # reserved ref namespace the coding pipeline's escape check ignores, so
+        # it is the one refusal in this layer a person has to see -- and
+        # letting it fail three times and disappear into a work item's last
+        # error is not seeing it.
+        context.store.record_event(
+            project_id=context.item.project_id,
+            kind="PORTFOLIO_BANK_TIP_UNEXPECTED",
+            payload={
+                "work_id": context.item.work_id,
+                "repository": str(context.repo_path),
+                "detail": str(exc),
+            },
+        )
+        LOG.error("%s", exc)
+        return {"refused": True, "detail": str(exc)}
     return result.payload()
 
 

@@ -40,16 +40,26 @@ from research_os.runtime.db import Database
 
 LOG = logging.getLogger("research_os.portfolio.digest")
 
-#: The dimensions the Pareto front is computed over. Not every dimension: the
-#: three a system can assess about itself without evidence -- plausibility,
-#: tractability, reviewer confidence -- are excluded from *selection* and still
-#: reported, because otherwise the front would rank confident prose highly.
+#: The dimensions the Pareto front is computed over.
+#:
+#: **Only the ones something deterministic writes.** An earlier version kept
+#: six, of which four -- ``potential_impact``, ``falsifiability``,
+#: ``evidence_strength``, ``reproducibility`` -- came only from model output.
+#: An explorer returning 1.0 on all four would Pareto-dominate everything, take
+#: the top of ``researchctl portfolio top`` and of the digest's "worth your
+#: attention", and raise its own scheduling utility. This module's docstring
+#: claimed the front excluded the self-assessable dimensions "because otherwise
+#: the front would rank confident prose highly"; it excluded three and kept
+#: four. An independent security review found it.
+#:
+#: ``novelty`` is written by the screen and the audit, ``literature_confidence``
+#: by the audit, and ``evidence_strength`` is computed in :func:`_top_ideas`
+#: from the evidence rows rather than taken from anybody's opinion. The
+#: remaining dimensions are still *reported*; they just do not decide what a
+#: researcher is shown first.
 FRONT_DIMENSIONS: tuple[str, ...] = (
     "novelty",
-    "potential_impact",
-    "falsifiability",
     "evidence_strength",
-    "reproducibility",
     "literature_confidence",
 )
 
@@ -286,7 +296,24 @@ def _top_ideas(
         version = store.get_version(idea.idea_id)
         if version is None:
             continue
-        scored.append((idea, version.dimensions))
+        # `evidence_strength` is replaced with a computed value. What a
+        # reviewer said about how strong the evidence was is that reviewer's
+        # opinion; how much evidence exists, and how much of it was executed or
+        # retrieved, is a fact about rows.
+        scored.append(
+            (
+                idea,
+                version.dimensions.model_copy(
+                    update={
+                        "evidence_strength": _evidence_strength(
+                            store.list_evidence(
+                                idea_id=idea.idea_id, idea_version=version.version
+                            )
+                        )
+                    }
+                ),
+            )
+        )
 
     front = pareto_front(scored)
     # HUMAN_READY first, then VALIDATED, then the rest: the front is about
@@ -311,6 +338,30 @@ def _top_ideas(
         )
     chosen = diversify(with_keys, limit=MAX_TOP_IDEAS)
     return [_build_top(store, idea) for idea, _dimensions, _key in chosen]
+
+
+def _evidence_strength(evidence: Sequence[Any]) -> float:
+    """How much an idea actually rests on, as a number nobody asserted.
+
+    Counts what a gate would count: rows that bear on the proposition --
+    ``SUPPORTS`` or ``CONTRADICTS``, never ``CONSISTENT_WITH`` -- weighted up
+    when something was executed and when a retrieved source is named.
+    Saturates at five, because the difference between five such rows and fifty
+    is not a difference in how hard a researcher should look.
+    """
+
+    from research_os.portfolio.models import EvidenceStrength as _Strength
+
+    score = 0.0
+    for item in evidence:
+        if item.strength not in {_Strength.SUPPORTS, _Strength.CONTRADICTS}:
+            continue
+        score += 1.0
+        if item.job_id:
+            score += 1.0
+        if item.literature_key or item.artifact_id:
+            score += 0.5
+    return min(1.0, score / 5.0)
 
 
 def _build_top(store: PortfolioStore, idea: PortfolioIdea) -> TopIdea:

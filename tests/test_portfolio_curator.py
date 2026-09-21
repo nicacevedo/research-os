@@ -26,7 +26,7 @@ from research_os.portfolio.models import EvidenceKind, EvidenceStrength, IdeaSta
 from research_os.portfolio.store import PortfolioStore
 from research_os.runtime.actions.coding import canonical_fingerprint, escaped
 from research_os.runtime.db import Database
-from research_os.runtime.refs import AUTONOMOUS_BANK_BRANCH
+from research_os.runtime.refs import AUTONOMOUS_BANK_BRANCH, RESERVED_REF_VALUE
 from tests.fs_helpers import make_git_repo
 from tests.portfolio_helpers import portfolio, record_review, seed_idea
 from tests.runtime_helpers import pg_dsn, runtime_db, runtime_project, runtime_xdg
@@ -264,7 +264,123 @@ def test_curating_does_not_make_a_concurrent_coding_run_report_an_escape(
         f"the Curator moved a ref the escape check watches: "
         f"{sorted(set(before.items()) ^ set(after.items()))}"
     )
-    assert not any("research-os/autonomous" in key for key in after)
+    # Recorded rather than dropped, and with a constant value: the ref's
+    # *movement* is what the exemption covers, so a second curation changes
+    # nothing here, while the ref appearing or vanishing still would.
+    marker = f"<reserved-ref> refs/heads/{AUTONOMOUS_BANK_BRANCH}"
+    assert marker in after
+    assert after[marker] == RESERVED_REF_VALUE
+    assert not any(key.startswith("<git-ref> refs/heads/research-os/") for key in after)
+
+
+def test_a_ref_that_only_looks_reserved_is_not_exempt(repository: Path) -> None:
+    """The prefix is anchored, and an unanchored one was a whole family.
+
+    ``startswith("refs/heads/research-os/autonomous")`` also matched
+    ``...autonomous-anything`` -- names an acceptance command could create and
+    that no Curator would ever look at. An independent security review found
+    it.
+    """
+
+    before = canonical_fingerprint(repository)
+    subprocess.run(
+        ["git", "branch", "research-os/autonomous-evil"],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+    )
+    assert escaped(before, canonical_fingerprint(repository))
+
+
+def test_deleting_the_bank_branch_is_still_an_escape(
+    portfolio: PortfolioStore,
+    runtime_db: Database,
+    runtime_project: str,
+    repository: Path,
+) -> None:
+    """Only *movement* is exempt. Appearance is permitted; removal is not."""
+
+    seed_idea(portfolio, runtime_project)
+    _curate(runtime_db, runtime_project, repository)
+    before = canonical_fingerprint(repository)
+    # Through `update-ref` rather than `branch -D`, because the branch is
+    # checked out in the Curator's worktree and git refuses to delete it --
+    # which is exactly the shape a deletion would take if something wanted the
+    # bank gone without asking git's permission.
+    subprocess.run(
+        ["git", "update-ref", "-d", f"refs/heads/{AUTONOMOUS_BANK_BRANCH}"],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+    )
+    assert escaped(before, canonical_fingerprint(repository))
+
+
+def test_a_bank_branch_this_system_did_not_write_is_refused(
+    portfolio: PortfolioStore,
+    runtime_db: Database,
+    runtime_project: str,
+    repository: Path,
+) -> None:
+    """Creating a reserved ref is permitted by the escape check, so the
+    Curator has to be the thing that notices.
+
+    This is the state after an operational-database reset, and it is also the
+    state an attacker arranges by creating the branch before the first
+    curation. Adopting it silently would root the Curator's own history on
+    somebody else's commit.
+    """
+
+    subprocess.run(
+        ["git", "branch", AUTONOMOUS_BANK_BRANCH],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+    )
+    seed_idea(portfolio, runtime_project)
+    with pytest.raises(UnexpectedBankTipError, match="no record of writing it"):
+        _curate(runtime_db, runtime_project, repository)
+
+
+def test_a_tampered_bank_is_caught_even_when_nothing_changed(
+    portfolio: PortfolioStore,
+    runtime_db: Database,
+    runtime_project: str,
+    repository: Path,
+) -> None:
+    """The check runs before the "nothing to do" shortcut, not after it.
+
+    The shortcut is the common case on an idle portfolio, and returning from
+    it without reading the branch meant a bank somebody else had written to
+    sat undetected for as long as nothing changed -- while the researcher was
+    being told to read it.
+    """
+
+    seed_idea(portfolio, runtime_project)
+    _curate(runtime_db, runtime_project, repository)
+
+    target = worktree_root() / runtime_project
+    (target / "planted.txt").write_text("not the curator\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=target, check=True, capture_output=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.email=x@y.invalid",
+            "-c",
+            "user.name=X",
+            "commit",
+            "-m",
+            "planted",
+        ],
+        cwd=target,
+        check=True,
+        capture_output=True,
+    )
+
+    # Nothing about the portfolio changed, so the snapshot digest is identical.
+    with pytest.raises(UnexpectedBankTipError, match="Refusing to commit"):
+        _curate(runtime_db, runtime_project, repository)
 
 
 def test_a_real_escape_is_still_detected(

@@ -445,7 +445,10 @@ def test_every_template_has_a_spending_ceiling() -> None:
         if name in explorer_templates:
             assert config.explorer_cost_usd > 0
             continue
-        assert config.cost_for(_stage_for(name)) >= 0, name
+        stage = _stage_for(name)
+        # A real ceiling, not merely a non-negative one. Only `adjudicate`
+        # costs nothing, and it has no template -- it consults no model.
+        assert config.cost_for(stage) > 0, name
 
 
 def test_an_unmapped_template_raises_rather_than_taking_a_default() -> None:

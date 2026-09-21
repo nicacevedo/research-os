@@ -31,6 +31,7 @@ from decimal import Decimal
 from typing import Any, Protocol
 
 from research_os.portfolio import dedup as pdedup
+from research_os.portfolio import digests as pdigests
 from research_os.portfolio import gates, packets, stages
 from research_os.portfolio.config import PortfolioConfig
 from research_os.portfolio.contracts import (
@@ -65,6 +66,7 @@ from research_os.portfolio.models import (
 from research_os.portfolio.prompts import CURRENT_REVIEW_PROMPTS
 from research_os.portfolio.prompts import TEMPLATES as PORTFOLIO_TEMPLATES
 from research_os.portfolio.store import PortfolioStore
+from research_os.runtime.db import jsonb
 from research_os.runtime.failures import FailureClass
 from research_os.runtime.interfaces import (
     ArtifactStore,
@@ -193,11 +195,26 @@ def build_snapshot(context: TrackContext) -> stages.TrackSnapshot:
     store = context.portfolio
     idea = store.require_idea(context.idea_id)
     version = store.require_version(context.idea_id)
+    evidence = store.list_evidence(
+        idea_id=context.idea_id, idea_version=version.version
+    )
+    live = store.live_reviews(idea_id=context.idea_id)
+    basis = pdigests.basis_digest(
+        content=version.content_digest,
+        evidence_ids=[item.evidence_id for item in evidence],
+        review_ids=[item.review_id for item in live],
+        stage_inputs={"stage": str(Stage.META_REVIEW)},
+    )
     return stages.TrackSnapshot(
         status=idea.status,
         version=version,
         succeeded_stages=store.succeeded_stages_for_version(
             idea_id=context.idea_id, idea_version=version.version
+        ),
+        basis_stages=store.completed_stages(
+            idea_id=context.idea_id,
+            idea_version=version.version,
+            basis_digest=basis,
         ),
         evidence=store.list_evidence(
             idea_id=context.idea_id, idea_version=version.version
@@ -603,8 +620,7 @@ def run_discover(context: TrackContext, snapshot: stages.TrackSnapshot) -> Stage
         response = _ask(
             context,
             PORTFOLIO_TEMPLATES["scientific_discovery"],
-            fields={"charter": context.charter},
-            blocks=blocks,
+            blocks={**blocks, "charter": [context.charter] if context.charter else []},
         )
     except ProviderCallFailedError as exc:
         return StageOutcome.failed(
@@ -678,15 +694,17 @@ def run_discover(context: TrackContext, snapshot: stages.TrackSnapshot) -> Stage
 def run_adjudicate(
     context: TrackContext, snapshot: stages.TrackSnapshot
 ) -> StageOutcome:
-    """Read the falsifier and record what kind of work would settle this.
+    """Record what kind of work would settle this idea.
 
-    No model, no cost, and that is the point. Every quality gate is
-    parameterised by the adjudication type, so it is computed by
-    ``runtime.adjudication.classify`` from the sentence in which somebody
-    already wrote down what would settle the thing.
+    No model, no cost. The type is read from the idea's own text by
+    ``runtime.adjudication.classify`` -- from the falsifier *and* from the
+    question, with the answers unioned, so a falsifier phrased to attract a
+    cheaper bar adds a requirement rather than removing one. See
+    :func:`research_os.portfolio.stages.classify_adjudication`, which is
+    explicit about what that does and does not buy.
     """
 
-    declared = stages.classify_from_falsifier(snapshot.version)
+    declared = stages.classify_adjudication(snapshot.version)
     context.portfolio.set_adjudication_types(
         idea_id=context.idea_id,
         version=snapshot.version.version,
@@ -701,9 +719,20 @@ def run_adjudicate(
 
 
 def run_literature_audit(
-    context: TrackContext, snapshot: stages.TrackSnapshot
+    context: TrackContext,
+    snapshot: stages.TrackSnapshot,
+    *,
+    second_path: bool = False,
 ) -> StageOutcome:
-    """The deep audit. Every row cites a work that was actually retrieved."""
+    """The deep audit. Every row cites a work that was actually retrieved.
+
+    ``second_path`` is how a literature-adjudicated idea is *replicated*. A
+    novelty claim is a claim about absence, and the way to verify an absence is
+    to look again with different words -- so the second pass searches on the
+    core idea and the claimed difference rather than on the research question,
+    and records its rows under its own call. The gate then asks whether the
+    later search found anything the first did not.
+    """
 
     if context.literature is None:
         return StageOutcome.failed(
@@ -712,7 +741,12 @@ def run_literature_audit(
             "correct outcome rather than a failure of the idea.",
             failure_class=FailureClass.CAPABILITY_DENIED,
         )
-    packet = context.literature.search(snapshot.version.research_question, limit=12)
+    query = (
+        f"{snapshot.version.core_idea} {snapshot.version.claimed_difference}".strip()
+        if second_path
+        else snapshot.version.research_question
+    )
+    packet = context.literature.search(query, limit=12)
     supplied = tuple(getattr(packet, "work_keys", ()))
     if not supplied:
         return StageOutcome.failed(
@@ -823,9 +857,11 @@ def run_literature_audit(
             novelty=0.1 if any(row.relation == "same" for row in audit.rows) else 0.8,
         ),
     )
-    _begin_investigating(context)
+    if not second_path:
+        _begin_investigating(context)
     return StageOutcome.succeeded(
-        f"{recorded} matrix row(s) from {len(set(audit.source_keys))} retrieved "
+        ("second terminology path: " if second_path else "")
+        + f"{recorded} matrix row(s) from {len(set(audit.source_keys))} retrieved "
         f"source(s), over {len(audit.queries)} query(ies)",
         disposition=Disposition.CONTINUE,
         cost_usd=_cost(response),
@@ -1157,6 +1193,16 @@ def run_replicate(
 ) -> StageOutcome:
     """Second-line verification along the line the adjudication type fixes."""
 
+    # A literature-adjudicated idea is replicated by searching again with
+    # different words, not by asking a model to agree. Dispatching here rather
+    # than in `select_stage` keeps the stage machine's vocabulary the same for
+    # every type: `replicate` means "verify this a second way", and what that
+    # is depends on how the idea would be settled.
+    if AdjudicationType.NOVELTY_OR_LITERATURE in set(
+        snapshot.version.adjudication_types
+    ):
+        return run_literature_audit(context, snapshot, second_path=True)
+
     packet = packets.build_packet(
         version=snapshot.version,
         evidence=snapshot.evidence,
@@ -1468,14 +1514,17 @@ def _explorer_inputs(
     """
 
     store = context.portfolio
-    fields = {"charter": context.charter}
-    if "problem" in template.fields:
-        fields["problem"] = context.problem
+    declared = {name for name, _fence in template.blocks}
+    fields: dict[str, str] = {}
     blocks: dict[str, Sequence[str]] = {}
-    if "established_facts" in {name for name, _fence in template.blocks}:
-        blocks["established_facts"] = list(context.established_facts)
-    if "constraints" in {name for name, _fence in template.blocks}:
-        blocks["constraints"] = list(context.constraints)
+    for name, value in (
+        ("charter", [context.charter] if context.charter else []),
+        ("problem", [context.problem] if context.problem else []),
+        ("established_facts", list(context.established_facts)),
+        ("constraints", list(context.constraints)),
+    ):
+        if name in declared:
+            blocks[name] = value
 
     if explorer == "seeded_explorer":
         blocks["researcher_seeds"] = [
@@ -1579,16 +1628,11 @@ def _record_review(
 
     from research_os.automation.providers import provider_family
 
-    origin_call = None
-    if snapshot.version.origin_call_id:
-        origin_call = next(
-            (
-                item
-                for item in context.runtime.list_model_calls(run_id=None, limit=500)
-                if item.call_id == snapshot.version.origin_call_id
-            ),
-            None,
-        )
+    origin_call = (
+        context.runtime.get_model_call(snapshot.version.origin_call_id)
+        if snapshot.version.origin_call_id
+        else None
+    )
     independence = gates.classify_independence(
         origin_call_id=snapshot.version.origin_call_id,
         review_call_id=response.call_id,
@@ -1696,6 +1740,33 @@ def _try_resolve_objections(
     return resolved
 
 
+def promote_if_earned(context: TrackContext) -> str | None:
+    """Grant ``PROMISING`` when the rows already support it.
+
+    The one tier a gate can grant on its own. Its requirements -- a question, a
+    mechanism, a falsifier, the cheap screen run, no standing fatal objection
+    -- involve no reviewer, so there is nothing for a meta-review to
+    synthesise. ``VALIDATED`` and ``HUMAN_READY`` stay behind the meta-review,
+    because that is where unresolved disagreement is preserved.
+
+    Called after every successful stage. Without it nothing performed the
+    ``CANDIDATE -> PROMISING`` transition at all -- and the literature audit,
+    the evidence stage and the review board all require ``PROMISING`` or
+    better, so an idea that survived the falsifier simply stopped. An
+    independent test audit found that no test drove a promotion through the
+    production path; trying to write one is how this surfaced.
+    """
+
+    idea = context.portfolio.require_idea(context.idea_id)
+    if idea.status is not IdeaStatus.CANDIDATE:
+        return None
+    result = _evaluate(context)
+    if not result.at_least(QualityTier.PROMISING):
+        return None
+    context.portfolio.set_status(idea_id=context.idea_id, status=IdeaStatus.PROMISING)
+    return str(IdeaStatus.PROMISING)
+
+
 def _begin_investigating(context: TrackContext) -> None:
     """Move PROMISING to INVESTIGATING once evidence has actually been gathered.
 
@@ -1735,13 +1806,7 @@ def _merge_dimensions(
         conn.execute(
             "update idea_versions set dimensions = %s "
             "where idea_id = %s and version = %s",
-            (
-                __import__("research_os.runtime.db", fromlist=["jsonb"]).jsonb(
-                    merged.model_dump()
-                ),
-                context.idea_id,
-                snapshot.version.version,
-            ),
+            (jsonb(merged.model_dump()), context.idea_id, snapshot.version.version),
         )
 
 

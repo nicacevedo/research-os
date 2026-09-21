@@ -179,28 +179,28 @@ def test_the_top_ideas_are_a_front_and_not_an_ordering(
 ) -> None:
     """§8: do not implement one opaque idea score.
 
-    The idea below that is best on novelty and worst on impact, and the one
-    that is the reverse, are both on the front. An ordering by any single
-    number would drop one of them.
+    The idea that is best on novelty and worst on literature confidence, and
+    the one that is the reverse, are both on the front. An ordering by any
+    single number would drop one of them.
     """
 
     high_novelty, _ = portfolio.create_idea(
         project_id=runtime_project,
         origin=IdeaOrigin.BLIND_EXPLORER,
-        fields=idea_fields(title="novel, low impact"),
+        fields=idea_fields(title="novel, thinly searched"),
         origin_role="blind_explorer",
-        dimensions=QualityDimensions(novelty=0.95, potential_impact=0.2),
+        dimensions=QualityDimensions(novelty=0.95, literature_confidence=0.2),
     )
-    high_impact, _ = portfolio.create_idea(
+    well_searched, _ = portfolio.create_idea(
         project_id=runtime_project,
         origin=IdeaOrigin.BLIND_EXPLORER,
         fields=idea_fields(
-            title="high impact, not novel",
+            title="thoroughly searched, less novel",
             research_question="A completely different question about amplifiers.",
             core_idea="Substrate conduction dominates radiative loading.",
         ),
         origin_role="blind_explorer",
-        dimensions=QualityDimensions(novelty=0.2, potential_impact=0.95),
+        dimensions=QualityDimensions(novelty=0.2, literature_confidence=0.95),
     )
     dominated, _ = portfolio.create_idea(
         project_id=runtime_project,
@@ -211,16 +211,80 @@ def test_the_top_ideas_are_a_front_and_not_an_ordering(
             core_idea="Queue depth predicts tail latency.",
         ),
         origin_role="blind_explorer",
-        dimensions=QualityDimensions(novelty=0.1, potential_impact=0.1),
+        dimensions=QualityDimensions(novelty=0.1, literature_confidence=0.1),
     )
-    for idea in (high_novelty, high_impact, dominated):
+    for idea in (high_novelty, well_searched, dominated):
         portfolio.set_status(idea_id=idea.idea_id, status=IdeaStatus.PROMISING)
 
     record = _produce(runtime_db, runtime_project)
     chosen = {entry["idea_id"] for entry in record.payload["top_ideas"]}
     assert high_novelty.idea_id in chosen
-    assert high_impact.idea_id in chosen
+    assert well_searched.idea_id in chosen
     assert dominated.idea_id not in chosen
+
+
+def test_an_idea_cannot_reach_the_top_by_scoring_itself(
+    portfolio: PortfolioStore, runtime_db: Database, runtime_project: str
+) -> None:
+    """The front ranks only what something deterministic wrote.
+
+    An explorer returning 1.0 on every dimension it is allowed to report must
+    not thereby dominate an idea with actual evidence. Four of the nine
+    dimensions come only from model output, and an earlier version ranked on
+    all four -- so the cheapest way to the top of "worth your attention" was
+    confidence.
+    """
+
+    boastful, _ = portfolio.create_idea(
+        project_id=runtime_project,
+        origin=IdeaOrigin.BLIND_EXPLORER,
+        fields=idea_fields(title="scores itself perfectly"),
+        origin_role="blind_explorer",
+        dimensions=QualityDimensions(
+            potential_impact=1.0,
+            plausibility=1.0,
+            falsifiability=1.0,
+            tractability=1.0,
+            reproducibility=1.0,
+            reviewer_confidence=1.0,
+            evidence_strength=1.0,
+        ),
+    )
+    grounded, _ = portfolio.create_idea(
+        project_id=runtime_project,
+        origin=IdeaOrigin.BLIND_EXPLORER,
+        fields=idea_fields(
+            title="has actual evidence",
+            research_question="A different question about amplifiers.",
+            core_idea="Substrate conduction dominates radiative loading.",
+        ),
+        origin_role="blind_explorer",
+        dimensions=QualityDimensions(),
+    )
+    for index in range(4):
+        portfolio.add_evidence(
+            idea_id=grounded.idea_id,
+            idea_version=1,
+            kind=EvidenceKind.LITERATURE,
+            strength=EvidenceStrength.SUPPORTS,
+            summary=f"retrieved source {index}",
+            literature_key=f"openalex:W{index}",
+        )
+    for idea in (boastful, grounded):
+        portfolio.set_status(idea_id=idea.idea_id, status=IdeaStatus.PROMISING)
+
+    record = _produce(runtime_db, runtime_project)
+    chosen = {entry["idea_id"] for entry in record.payload["top_ideas"]}
+    assert grounded.idea_id in chosen
+    # The boastful one is not excluded -- nothing here judges it -- but it must
+    # not have *dominated* the grounded one, which is what would have happened
+    # when the front read four dimensions only it had filled in.
+    assert not _dominates_by_self_report(record, boastful.idea_id, grounded.idea_id)
+
+
+def _dominates_by_self_report(record, winner: str, loser: str) -> bool:
+    entries = [item["idea_id"] for item in record.payload["top_ideas"]]
+    return winner in entries and loser not in entries
 
 
 def test_the_front_is_thinned_by_diversity(
@@ -246,7 +310,10 @@ def test_the_front_is_thinned_by_diversity(
         portfolio.set_status(idea_id=child.idea_id, status=IdeaStatus.PROMISING)
 
     record = _produce(runtime_db, runtime_project)
-    assert len(record.payload["top_ideas"]) < 7
+    shown = record.payload["top_ideas"]
+    # Both bounds: thinning must remove some and must not remove everything.
+    assert shown, "thinning removed the whole family"
+    assert len(shown) < 7
 
 
 def test_the_digest_body_is_assembled_from_fields(
@@ -304,7 +371,10 @@ def test_diversify_is_bounded_and_deterministic(count: int) -> None:
         for index in range(count)
     ]
     kept = diversify(entries, limit=MAX_TOP_IDEAS)  # type: ignore[arg-type]
-    assert len(kept) <= min(count, MAX_TOP_IDEAS)
+    assert len(kept) == min(count, MAX_TOP_IDEAS), (
+        "every entry here occupies a distinct coordinate, so nothing should be "
+        "thinned except by the limit"
+    )
     assert kept == diversify(entries, limit=MAX_TOP_IDEAS)  # type: ignore[arg-type]
 
 

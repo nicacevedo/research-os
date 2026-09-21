@@ -844,6 +844,25 @@ class RuntimeStore:
             ).fetchone()
         return ModelCall.model_validate(row)
 
+    def get_model_call(self, call_id: str) -> ModelCall | None:
+        """One call by id.
+
+        Added for the discovery portfolio's independence check, which compares
+        a review's call against the call that produced the work. It was doing
+        that by scanning the 500 most recent calls -- so past five hundred
+        calls system-wide the origin was simply not found, the comparison fell
+        through to its weakest answer, and every review afterwards recorded a
+        weaker independence than it had. Silently, and invisibly to any test
+        whose fixture makes ten calls.
+        """
+
+        with self._db.tx() as conn:
+            row = conn.execute(
+                f"select {MODEL_CALL_COLUMNS} from model_calls where call_id = %s",
+                (call_id,),
+            ).fetchone()
+        return ModelCall.model_validate(row) if row else None
+
     def list_model_calls(
         self, *, run_id: str | None = None, limit: int = 200
     ) -> tuple[ModelCall, ...]:

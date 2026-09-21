@@ -206,14 +206,27 @@ def finish_board(
 def conclude(
     state: TrackState, runtime: Runtime[runner.TrackContext]
 ) -> dict[str, Any]:
-    """Record nothing new. The stage handlers already wrote what they found.
+    """Grant the one tier a gate can grant alone, and stop.
 
-    A node anyway, because a graph whose terminal behaviour lives in the
-    caller is a graph whose behaviour changes when somebody writes a second
-    caller.
+    The stage handlers already wrote what they found. What happens here is the
+    ``CANDIDATE -> PROMISING`` transition, evaluated from rows: its
+    requirements involve no reviewer, so there is nothing for a meta-review to
+    synthesise, and every stage past the falsifier is gated on the idea having
+    reached it. Nothing performed that transition before, so an idea that
+    survived the falsifier simply stopped -- which is what trying to write a
+    test that drives a promotion end to end surfaced.
+
+    A node rather than something in the caller, because a graph whose terminal
+    behaviour lives outside it is a graph whose behaviour changes when somebody
+    writes a second caller.
     """
 
-    return {"notes": [state.get("detail", "")]}
+    notes = [state.get("detail", "")]
+    if not state.get("failure_class"):
+        promoted = runner.promote_if_earned(runtime.context)
+        if promoted:
+            notes.append(f"the rows now support {promoted}")
+    return {"notes": notes}
 
 
 def _after_hydrate(state: TrackState) -> str:
