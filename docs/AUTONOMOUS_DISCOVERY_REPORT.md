@@ -1446,3 +1446,49 @@ VALIDATED, which is the correct outcome rather than a failure of the idea."*
 An infrastructure gap that refuses to read as a scientific verdict.
 
 And across 285 reservations: 259 settled, 26 released, **0 held**.
+
+### W.7 The final soak, and both terminal pauses observed
+
+A last unattended run at the shipped breadth, to budget exhaustion. Both of
+the portfolio's terminal pause states fired, and both are correct:
+
+```text
+cg-sparse-regression    PAUSED_BLOCKED_EXTERNAL
+  every one of 3 live idea(s) is waiting on something outside this machine
+
+ccao-covariance-regressivity  PAUSED_BUDGET_EXHAUSTED
+  project budget for model_cost_usd is spent. Raise it with
+  `researchctl runtime budget --max-cost-usd` and the next tick resumes;
+  nothing here converts that into a scientific rejection.
+```
+
+`PAUSED_BLOCKED_EXTERNAL` is the branch §V.4 records as having been
+unreachable -- the same dead-condition shape as `PAUSED_NO_FRONTIER` before
+it. It has now fired in production, for precisely the right reason: all three
+live ideas are empirical, all three are blocked on an execution capability
+this host does not have, and the portfolio said so instead of spending.
+
+The budget pause overshot its ceiling by $0.12 on $15.00, which is the
+documented behaviour and not a leak: §K states the overshoot is bounded by one
+stage's own `max_cost_usd` rather than hidden.
+
+**Raising the budget would not buy the three unproven stages.** They are
+gated on evidence sufficiency, which is gated on execution, which is not a
+money problem. That is why this run was allowed to end at the ceiling rather
+than asking for more.
+
+### W.8 Final figures
+
+```text
+ideas               83   60 rejected, 9 superseded, 5 promising,
+                         3 investigating, 6 candidate
+model calls        298   $27.76 across two projects
+roles exercised   8/14   + duplicate_adjudicator, literature_scout
+stages exercised  7/11   + adjudicate, literature_audit, evidence
+reservations       280 settled, 26 released, 0 held
+capsules          both unchanged; registry and shared index untouched
+```
+
+Nine ideas are `SUPERSEDED` rather than occupying tracks, which is the
+recalibrated duplicate screen and the corrected edge kind working together;
+before this pass that number was one.
