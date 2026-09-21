@@ -156,13 +156,9 @@ def test_a_schedule_becomes_an_event_becomes_work_becomes_a_tick(
         seen.append(str(report.payload()))
         if not report.did_something:
             break
-    work = plane["queue"]
-    kinds_run = {
-        item.kind
-        for item in store.list_events(limit=200)
-        if item.kind.startswith("WORK_")
-    }
-    assert work.counts_by_status() or kinds_run, seen
+    assert any("portfolio" in item.kind for item in store.list_events(limit=200)) or (
+        plane["queue"].counts_by_status()
+    ), seen
 
     # And the portfolio's own state records that it ticked.
     state = portfolio.get_state(project)
@@ -189,8 +185,6 @@ def test_an_unknown_work_kind_is_failed_rather_than_left_claimable(
         payload={},
     )
     plane["daemon"].tick()
-    items = queue.list_for_run(run_id=None) if False else None
-    del items
     counts = queue.counts_by_status()
     assert counts.get(WorkStatus.FAILED, 0) >= 1
 
@@ -233,18 +227,34 @@ def test_a_tick_work_item_runs_the_deterministic_pipeline(
 
 
 def test_the_daemon_still_runs_with_no_portfolio_composed(
-    runtime_db: Database, pg_dsn: str, tmp_path: Path, runtime_project: str
+    runtime_db: Database,
+    pg_dsn: str,
+    tmp_path: Path,
+    runtime_project: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Deleting this layer leaves a runtime that still works.
 
-    The property the whole extension arrangement exists for, and the reason
-    the daemon consults a registry rather than importing anything: a
-    researcher who does not want autonomous discovery is not carrying it.
+    The property the whole extension arrangement exists for. The registry is a
+    module-level dict with no reset, and an earlier version of this test
+    asserted ``report is not None`` against a registry another test in the
+    same file had already filled -- so it tested neither half of its name.
+
+    Emptied deliberately here. The daemon must still tick, and a portfolio
+    work item must be *refused*, not left claimable: work nobody can run must
+    not sit in the queue forever, which is what ``daemon._run_item`` already
+    guarantees for its own unknown kinds.
     """
+
+    from research_os.runtime.models import WorkStatus
+
+    monkeypatch.setattr(runtime_extensions, "WORK_EXTENSIONS", {})
+    monkeypatch.setattr(runtime_extensions, "EVENT_EXTENSIONS", {})
 
     store = RuntimeStore(runtime_db)
     repo = make_capsule(tmp_path / "project")
     store.upsert_project(project_id=runtime_project, repo_path=str(repo))
+    queue = WorkQueue(runtime_db)
     daemon = Daemon(
         config=make_config(pg_dsn, tmp_path / "artifacts"),
         db=runtime_db,
@@ -253,5 +263,71 @@ def test_the_daemon_still_runs_with_no_portfolio_composed(
         clock=FrozenClock(),
         owner="bare-worker",
     )
+    queue.enqueue(project_id=runtime_project, kind="portfolio_tick", payload={})
+
     report = daemon.tick()
-    assert report is not None
+    assert report.work_claimed >= 1
+    assert queue.counts_by_status().get(WorkStatus.FAILED, 0) == 1
+    assert queue.counts_by_status().get(WorkStatus.PENDING, 0) == 0
+
+    # And the runtime's own machinery is untouched: a second tick with nothing
+    # to do is a clean pass, not an error.
+    assert daemon.tick() is not None
+
+
+def test_a_composed_daemon_does_run_the_same_item(
+    plane, portfolio: PortfolioStore
+) -> None:
+    """The control for the test above.
+
+    Without it, "the daemon refuses portfolio work when the layer is absent"
+    would pass equally against a daemon that refuses it always.
+    """
+
+    from research_os.runtime.models import WorkStatus
+
+    queue: WorkQueue = plane["queue"]
+    seed_idea(portfolio, plane["project"])
+    queue.enqueue(project_id=plane["project"], kind="portfolio_tick", payload={})
+    for _ in range(4):
+        report = plane["daemon"].tick()
+        if report.work_succeeded or report.work_failed:
+            break
+    assert report.work_succeeded >= 1
+    assert queue.counts_by_status().get(WorkStatus.FAILED, 0) == 0
+
+
+def test_the_end_to_end_chain_actually_ran_the_tick(
+    plane, portfolio: PortfolioStore
+) -> None:
+    """What `test_a_schedule_becomes_an_event_becomes_work_becomes_a_tick`
+    should have asserted.
+
+    Its middle assertion was `queue.counts_by_status() or kinds_run`, true if
+    any work item exists in any status including FAILED. The evidence that the
+    chain worked is that the *portfolio* recorded a tick and that nothing
+    failed.
+    """
+
+    daemon: Daemon = plane["daemon"]
+    project = plane["project"]
+    seed_idea(portfolio, project)
+    ensure_schedule(db=plane["db"], project_id=project, config=load_config())
+
+    for _ in range(8):
+        report = daemon.tick()
+        if not report.did_something:
+            break
+    state = portfolio.get_state(project)
+    assert state is not None and state.last_tick_at is not None
+
+    # The tick itself succeeded. Something downstream may not have -- the
+    # curator has no repository here and the idea track needs stages this
+    # fixture does not script -- and that is the portfolio working, not the
+    # chain failing. What must not happen is the tick being the failure.
+    failed = [
+        item.payload.get("kind")
+        for item in plane["store"].list_events(limit=200)
+        if item.kind == "WORK_FAILED"
+    ]
+    assert "portfolio_tick" not in failed, failed

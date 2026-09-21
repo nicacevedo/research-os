@@ -294,3 +294,117 @@ def test_the_portfolio_command_set_has_no_verb_that_accepts_science(
     _collect(subparsers)
     forbidden = {"promote", "accept", "approve", "review", "merge", "publish", "push"}
     assert not (verbs & forbidden), sorted(verbs & forbidden)
+
+
+# ------------------------------------------------- starting a portfolio --
+def test_enabling_a_portfolio_puts_it_on_the_tick(
+    cli: str,
+    runtime_db: Database,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The one command without which none of this layer ever runs.
+
+    `ensure_schedule` existed from the first commit and had no production
+    caller: every test reached it directly, so a seeded project acquired state
+    and no cadence, and `researchd` never ticked it. The headline property --
+    the portfolio continues without the researcher advancing cycles -- was
+    unreachable from the command line.
+    """
+
+    schedules = RuntimeStore(runtime_db).list_schedules()
+    assert not [row for row in schedules if row.kind == "PORTFOLIO_TICK_DUE"]
+
+    assert run_cli(monkeypatch, "portfolio", "enable", cli) == 0
+
+    rows = [
+        row
+        for row in RuntimeStore(runtime_db).list_schedules()
+        if row.kind == "PORTFOLIO_TICK_DUE" and row.project_id == cli
+    ]
+    assert len(rows) == 1
+    assert rows[0].payload["project_id"] == cli
+    out = capsys.readouterr().out
+    assert rows[0].schedule_id in out
+    # It says what it is about to spend before it spends it.
+    assert "budget" in out
+
+
+def test_enabling_twice_is_one_schedule(
+    cli: str,
+    runtime_db: Database,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Idempotent, because a researcher will type it again to check."""
+
+    assert run_cli(monkeypatch, "portfolio", "enable", cli) == 0
+    assert run_cli(monkeypatch, "portfolio", "enable", cli) == 0
+    rows = [
+        row
+        for row in RuntimeStore(runtime_db).list_schedules()
+        if row.kind == "PORTFOLIO_TICK_DUE" and row.project_id == cli
+    ]
+    assert len(rows) == 1
+
+
+def test_enable_does_not_reverse_a_pause(
+    cli: str,
+    runtime_db: Database,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A pause is the researcher's decision; `enable` is not its undo.
+
+    Otherwise the obvious command to type after coming back to a quiet
+    portfolio would silently restart the thing they stopped.
+    """
+
+    assert (
+        run_cli(monkeypatch, "portfolio", "pause", cli, "--reason", "thesis week") == 0
+    )
+    capsys.readouterr()
+    assert run_cli(monkeypatch, "portfolio", "enable", cli) == 0
+    out = capsys.readouterr().out
+    assert "thesis week" in out
+    assert "resume" in out
+    state = PortfolioStore(runtime_db).get_state(cli)
+    assert state is not None
+    assert str(state.status) == "PAUSED_BY_RESEARCHER"
+
+
+def test_status_says_when_nothing_will_ever_tick_it(
+    cli: str,
+    runtime_db: Database,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A RUNNING portfolio with no schedule looks healthy and is not."""
+
+    seed_idea(PortfolioStore(runtime_db), cli)
+    assert run_cli(monkeypatch, "portfolio", "status", cli) == 0
+    before = capsys.readouterr().out
+    assert "not scheduled" in before
+
+    assert run_cli(monkeypatch, "portfolio", "enable", cli) == 0
+    capsys.readouterr()
+    assert run_cli(monkeypatch, "portfolio", "status", cli) == 0
+    after = capsys.readouterr().out
+    assert "not scheduled" not in after
+
+
+def test_a_seed_on_a_portfolio_nothing_ticks_says_so(
+    cli: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`seed add` used to promise a "next pass" that was never coming."""
+
+    assert run_cli(monkeypatch, "seed", "add", cli, "--text", "try a warm start") == 0
+    out = capsys.readouterr().out
+    assert "no next pass yet" in out
+    assert "portfolio enable" in out
+
+    assert run_cli(monkeypatch, "portfolio", "enable", cli) == 0
+    capsys.readouterr()
+    assert run_cli(monkeypatch, "seed", "add", cli, "--text", "and a cold one") == 0
+    assert "no next pass yet" not in capsys.readouterr().out

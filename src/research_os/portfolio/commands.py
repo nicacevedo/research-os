@@ -45,9 +45,11 @@ from research_os.portfolio.models import (
 )
 from research_os.portfolio.stages import TrackSnapshot, select_stage
 from research_os.portfolio.store import PortfolioStore
+from research_os.portfolio.tick import ensure_schedule
 from research_os.registry import list_projects
 from research_os.runtime.config import load_config as load_runtime_config
 from research_os.runtime.db import Database
+from research_os.runtime.store import RuntimeStore
 from research_os.textsafe import terminal_safe
 
 #: Printed above every list of portfolio ideas.
@@ -65,6 +67,12 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     )
     actions = portfolio.add_subparsers(dest="portfolio_command")
     portfolio.set_defaults(portfolio_parser=portfolio)
+
+    enable = actions.add_parser(
+        "enable",
+        help="Start running a portfolio for a project. Idempotent.",
+    )
+    enable.add_argument("project", nargs="?", default=None)
 
     status = actions.add_parser("status", help="What the portfolio is doing.")
     status.add_argument("project", nargs="?", default=None)
@@ -135,6 +143,7 @@ def dispatch_portfolio(args: argparse.Namespace) -> int:
         args.portfolio_parser.print_help()
         return EXIT_OK
     return {
+        "enable": _enable,
         "status": _status,
         "top": _top,
         "pause": _pause,
@@ -195,6 +204,38 @@ def _project(value: str | None) -> str:
     return value
 
 
+def _project_and_repo(value: str | None, db: Database) -> tuple[str, Path]:
+    """Resolve to ``(project_id, repo_path)``, from whichever source knows.
+
+    Three sources, in the order that a researcher would expect them to be
+    consulted: a path they typed, the operational table, and the global
+    registry. The registry is last because `ARCHITECTURE.md` calls it
+    disposable; it is consulted at all because deleting it must never stop a
+    project working, and a researcher who ran `register-project` reasonably
+    expects the id it printed to be usable.
+    """
+
+    from research_os.runtime.kernel import ScientificKernelAdapter
+
+    if value is not None:
+        candidate = Path(value).expanduser()
+        if candidate.exists():
+            git_root, project = ScientificKernelAdapter(candidate).identity()
+            return str(project.id), Path(git_root)
+
+    project = _project(value)
+    stored = RuntimeStore(db).get_project(project)
+    if stored is not None:
+        return stored.project_id, Path(stored.repo_path)
+    for entry in list_projects():
+        if entry.project_id == project:
+            return project, Path(entry.path)
+    raise ResearchOSError(
+        f"{project!r} is neither a path nor a project this machine knows. "
+        f"Give the path instead: `researchctl portfolio enable <path>`."
+    )
+
+
 def _print(text: str) -> None:
     print(terminal_safe(text))
 
@@ -225,6 +266,58 @@ def _provenance_line(store: PortfolioStore, idea: PortfolioIdea) -> str:
 
 
 # ------------------------------------------------------------- handlers --
+def _enable(args: argparse.Namespace) -> int:
+    """Put this project's tick on the runtime's schedule, and say so.
+
+    Without this there is no production path that creates a
+    ``PORTFOLIO_TICK_DUE`` schedule, and a seeded project sits with state and
+    no cadence forever -- which is precisely the property this whole layer
+    exists to provide. Separate from `seed add` because enabling a portfolio
+    is a decision about how the machine spends money, and recording an idea is
+    not; a researcher may reasonably want to leave seeds for later.
+
+    Idempotent in both halves: `upsert_state` is, and `ensure_schedule`
+    returns the existing schedule rather than creating a second one.
+    """
+
+    config = load_config()
+    with _database() as db:
+        project, repo_path = _project_and_repo(args.project, db)
+        # The operational `projects` row, which `portfolio_state` has a foreign
+        # key to, is created by `runtime start` and by nothing else -- so
+        # enabling a portfolio on a project that has never had an R5 objective
+        # failed on that constraint. Creating it here is the fix, and it is the
+        # right one: the portfolio exists precisely to run when no objective
+        # is running, so requiring one first inverts the dependency.
+        RuntimeStore(db).upsert_project(project_id=project, repo_path=str(repo_path))
+        store = PortfolioStore(db)
+        store.upsert_state(project_id=project)
+        state = store.get_state(project)
+        if state is not None and state.status is PortfolioStatus.PAUSED_BY_RESEARCHER:
+            # A pause is a researcher's decision and enabling is not the verb
+            # that reverses it. Saying so beats silently un-pausing.
+            _print(
+                f"{project} is paused by you: {state.detail or 'no reason recorded'}. "
+                f"`researchctl portfolio resume {project}` restarts allocation."
+            )
+        elif state is None or state.status is not PortfolioStatus.RUNNING:
+            store.set_portfolio_status(
+                project_id=project,
+                status=PortfolioStatus.RUNNING,
+                detail="enabled by the researcher",
+            )
+        schedule_id = ensure_schedule(db=db, project_id=project, config=config)
+    minutes = config.cadence.tick_seconds / 60
+    _print(f"portfolio enabled for {project} ({schedule_id})")
+    _print(
+        f"`researchd` will tick it every {minutes:.0f} min and spend up to "
+        f"{config.bounds.max_active_tracks} tracks' worth of model calls "
+        f"against your budgets. Ceilings are `researchctl runtime budget`; "
+        f"`researchctl portfolio pause {project}` stops allocation."
+    )
+    return EXIT_OK
+
+
 def _status(args: argparse.Namespace) -> int:
     project = _project(args.project)
     with _database() as db:
@@ -232,9 +325,14 @@ def _status(args: argparse.Namespace) -> int:
         state = store.get_state(project)
         if state is None:
             _print(
-                f"{project} has no portfolio yet. Seed one with `researchctl seed add`."
+                f"{project} has no portfolio yet. "
+                f"`researchctl portfolio enable {project}` starts one."
             )
             return EXIT_OK
+        scheduled = any(
+            row.project_id == project and row.kind == "PORTFOLIO_TICK_DUE"
+            for row in RuntimeStore(db).list_schedules()
+        )
         counts = store.counts_by_status(project)
         payload = {
             "project": project,
@@ -242,6 +340,7 @@ def _status(args: argparse.Namespace) -> int:
             "detail": state.detail,
             "active_tracks": store.active_count(project),
             "uncurated": store.uncurated_count(project),
+            "scheduled": scheduled,
             "bank_commit": state.bank_commit,
             "last_tick_at": state.last_tick_at.isoformat()
             if state.last_tick_at
@@ -254,6 +353,14 @@ def _status(args: argparse.Namespace) -> int:
         _print(f"portfolio  {project}  {state.status}")
         if state.detail:
             _print(f"           {state.detail}")
+        if not scheduled:
+            # A RUNNING portfolio with no schedule advances only when somebody
+            # types a command, which is the state this whole layer exists to
+            # avoid. It is worth a line rather than a silence.
+            _print(
+                f"           not scheduled: nothing ticks it. "
+                f"`researchctl portfolio enable {project}`"
+            )
         _print(
             f"tracks     {payload['active_tracks']} in flight"
             f"   (a HUMAN_READY idea holds no slot)"
@@ -503,12 +610,21 @@ def _seed_add(args: argparse.Namespace) -> int:
         store = PortfolioStore(db)
         store.upsert_state(project_id=project)
         seed = store.add_seed(project_id=project, text=args.text, note=args.note)
+        scheduled = any(
+            row.project_id == project and row.kind == "PORTFOLIO_TICK_DUE"
+            for row in RuntimeStore(db).list_schedules()
+        )
     _print(f"recorded {seed.seed_id}")
     _print(
         "The seeded explorer will take it on the portfolio's next pass. It is a "
         "direction to push, not a claim: the system may well conclude it is "
         "already known or not worth pursuing, and that is a result."
     )
+    if not scheduled:
+        _print(
+            f"There is no next pass yet: `researchctl portfolio enable {project}` "
+            f"puts this project on the tick."
+        )
     return EXIT_OK
 
 
