@@ -22,6 +22,7 @@ from research_os.portfolio.models import (
     IdeaReview,
     IdeaStatus,
     IdeaVersion,
+    ObjectionTarget,
     ReviewerRole,
     ReviewVerdict,
     Severity,
@@ -100,15 +101,18 @@ def evidence(
     )
 
 
-def objection(severity: Severity) -> IdeaObjection:
+def objection(
+    severity: Severity, target: ObjectionTarget = ObjectionTarget.CLAIM
+) -> IdeaObjection:
     return IdeaObjection(
-        objection_id=f"IOBJ-{severity}",
+        objection_id=f"IOBJ-{severity}-{target}",
         idea_id="PIDEA-20260101T000000Z-00000000",
         raised_in_review="IREV-1",
         raised_at_version=1,
-        objection_key=f"key-{severity}",
+        objection_key=f"key-{severity}-{target}",
         severity=severity,
-        summary=f"a {severity} problem",
+        target=target,
+        summary=f"a {severity} problem with the {target}",
         created_at=NOW,
     )
 
@@ -601,3 +605,143 @@ def test_an_idea_that_says_nothing_about_how_it_would_be_settled_is_undetermined
             falsifier="It would feel wrong.",
         )
     ) == (AdjudicationType.UNDETERMINED,)
+
+
+# --------------------------- killing the idea vs fixing its test --------
+def test_a_fatal_objection_to_the_test_sharpens_instead_of_killing() -> None:
+    """The first dogfood's §R.2, as a routing property.
+
+    Three of the seven rejections read in full were fatal to the idea's
+    *stated falsifier* -- "the test can only confirm what correctness already
+    requires", "no control variable is included" -- and a researcher meeting
+    those rewrites the test. The stage that rewrites tests is DISCOVER, and it
+    ran only for ideas the falsifier had already spared, so the question died
+    with its test.
+    """
+
+    stage, why = select_stage(
+        snapshot(
+            status=IdeaStatus.PROMISING,
+            succeeded_stages=frozenset(
+                {Stage.DEDUP, Stage.NOVELTY_SCREEN, Stage.FALSIFY}
+            ),
+            open_objections=(objection(Severity.FATAL, ObjectionTarget.TEST),),
+            revision_count=1,
+        ),
+        CONFIG,
+    )
+    assert stage is Stage.DISCOVER
+    assert "test" in why
+
+
+def test_a_fatal_objection_to_the_claim_still_ends_the_track() -> None:
+    """The control. Softening the test case must not soften the other one.
+
+    CLAIM is also the default, so an objection that says nothing about what it
+    targets keeps killing -- which is the direction to err in.
+    """
+
+    for target in (ObjectionTarget.CLAIM, None):
+        obj = (
+            objection(Severity.FATAL)
+            if target is None
+            else objection(Severity.FATAL, target)
+        )
+        stage, why = select_stage(
+            snapshot(
+                succeeded_stages=frozenset(
+                    {Stage.DEDUP, Stage.NOVELTY_SCREEN, Stage.FALSIFY}
+                ),
+                open_objections=(obj,),
+            ),
+            CONFIG,
+        )
+        assert stage is None
+        assert "fatal objection" in why
+
+
+def test_sharpening_a_broken_test_is_bounded_like_everything_else() -> None:
+    """Invariant 14. "Sharpen until the falsifier gives up" is a loop.
+
+    Past the revision ceiling an idea whose test nobody can fix stops, and
+    says that is why -- rather than being sharpened forever at $0.50 a time.
+    """
+
+    stage, why = select_stage(
+        snapshot(
+            status=IdeaStatus.PROMISING,
+            succeeded_stages=frozenset(
+                {Stage.DEDUP, Stage.NOVELTY_SCREEN, Stage.FALSIFY}
+            ),
+            open_objections=(objection(Severity.FATAL, ObjectionTarget.TEST),),
+            revision_count=CONFIG.bounds.max_revisions_per_idea,
+        ),
+        CONFIG,
+    )
+    assert stage is None
+    assert "revision bound" in why
+
+
+def test_a_mixed_fatal_verdict_kills() -> None:
+    """One fatal objection to the claim is enough, whatever else is alongside.
+
+    The softer route requires that *every* fatal objection be about the test.
+    A reviewer who finds both a broken test and a fatal flaw in the question
+    has found a dead idea.
+    """
+
+    stage, why = select_stage(
+        snapshot(
+            succeeded_stages=frozenset(
+                {Stage.DEDUP, Stage.NOVELTY_SCREEN, Stage.FALSIFY}
+            ),
+            open_objections=(
+                objection(Severity.FATAL, ObjectionTarget.TEST),
+                objection(Severity.FATAL, ObjectionTarget.CLAIM),
+            ),
+            revision_count=0,
+        ),
+        CONFIG,
+    )
+    assert stage is None
+    assert "fatal objection" in why
+
+
+def test_a_fatal_test_objection_never_reaches_an_expensive_stage() -> None:
+    """The dangerous middle, and the reason this is its own test.
+
+    Excluding TEST-targeted objections from `fatal_objections` is half the
+    change; routing them to DISCOVER is the other half. With only the first
+    half in place a fatal objection to an idea's test becomes *invisible* and
+    the idea sails on to the literature audit and the evidence stage -- worse
+    than either the old behaviour or the new one, and it is what a partial
+    revert of this change actually produced.
+
+    So: whatever else is true, a standing fatal objection to the test may
+    select sharpening or nothing, and never anything that costs dollars.
+    """
+
+    expensive = {
+        Stage.LITERATURE_AUDIT,
+        Stage.EVIDENCE,
+        Stage.REVIEW_BOARD,
+        Stage.META_REVIEW,
+        Stage.REPLICATE,
+    }
+    for revisions in range(CONFIG.bounds.max_revisions_per_idea + 2):
+        for status in (IdeaStatus.PROMISING, IdeaStatus.INVESTIGATING):
+            stage, _why = select_stage(
+                snapshot(
+                    status=status,
+                    succeeded_stages=frozenset(
+                        {Stage.DEDUP, Stage.NOVELTY_SCREEN, Stage.FALSIFY}
+                    ),
+                    open_objections=(objection(Severity.FATAL, ObjectionTarget.TEST),),
+                    revision_count=revisions,
+                ),
+                CONFIG,
+            )
+            assert stage not in expensive, (
+                f"a fatal objection to the test reached {stage} at "
+                f"revision_count={revisions}, status={status}"
+            )

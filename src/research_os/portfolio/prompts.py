@@ -271,7 +271,21 @@ LITERATURE_SCOUT = PromptTemplate(
 
 FALSIFIER = PromptTemplate(
     name="falsifier",
-    version=1,
+    # Version 2: `target` on every objection.
+    #
+    # The first dogfood's scientific-quality audit found that this role's two
+    # outcomes -- kill or continue -- collapsed two different findings into
+    # one. Three of seven rejections read in full were fatal to the idea's
+    # *test*, not to its question, and a researcher meeting those rewrites the
+    # test. Asking for one more fact per objection is what lets ordinary
+    # Python tell them apart; the disposition is still not the model's to
+    # choose.
+    #
+    # A version bump, not an edit, because `prompt_version` is what makes a
+    # review live: every verdict recorded by falsifier@1 is now superseded,
+    # which is correct -- they were produced by a role that could not express
+    # the distinction.
+    version=2,
     role=ModelRole.FALSIFIER,
     capability=Capability.CRITIQUE,
     criticality=Criticality.CRITICAL,
@@ -292,6 +306,22 @@ FALSIFIER = PromptTemplate(
         "Rate each objection FATAL, CRITICAL, MAJOR or MINOR. FATAL means the idea "
         "as stated does not survive it. Do not inflate: an objection you cannot "
         "defend costs the portfolio a direction.\n"
+        "Then set `target` on each objection, and read this twice, because it is "
+        "the field most likely to be got wrong:\n"
+        "  CLAIM -- the research question itself does not survive. It is wrong, "
+        "already answered, subsumed by a known result, or not worth the work "
+        "whatever method were used.\n"
+        "  TEST  -- the question may well stand; what does not survive is the "
+        "specific falsifier or design proposed for settling it. A different "
+        "experiment, derivation or control could still settle the question.\n"
+        "'this test cannot distinguish the hypothesis from its rival', 'this "
+        "check is guaranteed by construction so it can only find a bug', and "
+        "'no control variable is included' are TEST. 'a known theorem already "
+        "answers this' and 'the mechanism misattributes a prediction the theory "
+        "does not make' are CLAIM.\n"
+        "Do not use TEST to spare an idea you think is wrong. A TEST objection "
+        "says you believe the question is still worth asking; if you do not "
+        "believe that, say CLAIM and let it die.\n"
         "Say in `attempted` what you looked for and did not find. 'I searched for "
         "a two-variable counterexample and did not find one' is worth recording; "
         "silence is indistinguishable from not looking."

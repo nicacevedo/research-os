@@ -59,6 +59,7 @@ from research_os.portfolio.models import (
     IdeaReview,
     IdeaStatus,
     IdeaVersion,
+    ObjectionTarget,
     OperationalState,
     PortfolioDigestRecord,
     PortfolioIdea,
@@ -105,7 +106,7 @@ REVIEW_COLUMNS = (
 )
 OBJECTION_COLUMNS = (
     "objection_id, idea_id, raised_in_review, raised_at_version, objection_key, "
-    "severity, summary, addressed_at_version, response, resolved_by_review, "
+    "severity, target, summary, addressed_at_version, response, resolved_by_review, "
     "resolved_at, created_at"
 )
 ACTION_COLUMNS = (
@@ -1098,6 +1099,7 @@ class PortfolioStore:
         raised_at_version: int,
         severity: Severity,
         summary: str,
+        target: ObjectionTarget = ObjectionTarget.CLAIM,
     ) -> tuple[IdeaObjection, bool]:
         """Record one objection against an idea. Returns ``(objection, created)``.
 
@@ -1117,9 +1119,9 @@ class PortfolioStore:
                 f"""
                 insert into idea_objections
                     (objection_id, idea_id, raised_in_review, raised_at_version,
-                     objection_key, severity, summary)
+                     objection_key, severity, target, summary)
                 values (%(objection_id)s, %(idea_id)s, %(review_id)s, %(version)s,
-                        %(key)s, %(severity)s, %(summary)s)
+                        %(key)s, %(severity)s, %(target)s, %(summary)s)
                 on conflict (idea_id, objection_key, raised_at_version) do nothing
                 returning {OBJECTION_COLUMNS}
                 """,
@@ -1130,6 +1132,7 @@ class PortfolioStore:
                     "version": raised_at_version,
                     "key": key,
                     "severity": str(severity),
+                    "target": str(target),
                     "summary": summary,
                 },
             ).fetchone()

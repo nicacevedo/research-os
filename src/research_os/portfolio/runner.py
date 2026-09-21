@@ -56,6 +56,7 @@ from research_os.portfolio.models import (
     EvidenceStrength,
     IdeaOrigin,
     IdeaStatus,
+    ObjectionTarget,
     QualityDimensions,
     QualityTier,
     ReviewerRole,
@@ -580,16 +581,59 @@ def run_falsify(context: TrackContext, snapshot: stages.TrackSnapshot) -> StageO
         verdict=verdict,
         severity=result.worst,
         summary=result.summary,
-        objections=[(item.severity, item.summary) for item in result.objections],
+        objections=[
+            (item.severity, item.target, item.summary) for item in result.objections
+        ],
     )
     if result.worst is Severity.FATAL:
+        fatal = [item for item in result.objections if item.severity is Severity.FATAL]
+        # **Killing the idea and fixing its test are different decisions.**
+        #
+        # The first dogfood's audit found this. At least three of the seven
+        # rejections read in full objected to the *stated falsifier*, not to
+        # the *research question* -- "the test can only confirm what
+        # correctness already requires", "no control variable is included" --
+        # and a researcher meeting those rewrites the test. This stage
+        # rejected the question and wrote the test's flaw into
+        # `retire_reason`, recording "we ruled this out" for something that
+        # had not been ruled out.
+        #
+        # The routing is ordinary Python over a typed field, not a
+        # disposition the model chose: the model says what its objection is
+        # *about*, exactly as `runtime.adjudication.classify` reads the
+        # adjudication type out of the falsifier rather than letting the
+        # generator pick its own bar. `ObjectionTarget.CLAIM` is the default,
+        # so silence still kills.
+        #
+        # Bounded three ways, because "sharpen until the falsifier gives up"
+        # is invariant 14's loop: every fatal objection must be about the
+        # test, the idea must have revisions left, and the objections stay
+        # standing so the sharpened version has to answer them to a different
+        # role's satisfaction.
+        only_the_test = all(item.target is ObjectionTarget.TEST for item in fatal)
+        revisions_left = (
+            snapshot.revision_count < context.config.bounds.max_revisions_per_idea
+        )
+        if only_the_test and revisions_left:
+            return StageOutcome.succeeded(
+                "the question survives its own falsifier and the falsifier does "
+                f"not: {fatal[0].summary[:160]}",
+                disposition=Disposition.CONTINUE,
+                cost_usd=_cost(response),
+                model_calls=1,
+                data={"review_id": review},
+            )
         context.portfolio.set_status(
             idea_id=context.idea_id,
             status=IdeaStatus.REJECTED,
-            retire_reason=result.objections[0].summary,
+            retire_reason=(
+                fatal[0].summary
+                if only_the_test is False
+                else f"{fatal[0].summary} (and the revision bound is spent)"
+            ),
         )
         return StageOutcome.succeeded(
-            f"killed by the falsifier: {result.objections[0].summary[:160]}",
+            f"killed by the falsifier: {fatal[0].summary[:160]}",
             disposition=Disposition.REJECT,
             cost_usd=_cost(response),
             model_calls=1,
@@ -1001,7 +1045,9 @@ def run_one_review(
         verdict=review.verdict,
         severity=review.severity,
         summary=review.summary,
-        objections=[(item.severity, item.summary) for item in review.objections],
+        objections=[
+            (item.severity, item.target, item.summary) for item in review.objections
+        ],
         packet_digest=packet.digest,
     )
     _merge_dimensions(context, snapshot, review.dimensions)
@@ -1162,7 +1208,9 @@ def run_meta_review(
         severity=Severity.NONE if not meta.unresolved_disagreements else Severity.MINOR,
         summary=meta.summary,
         objections=[
-            (Severity.MINOR, f"unresolved disagreement: {item}")
+            # A disagreement between reviewers is about the idea's standing,
+            # not about its test, so CLAIM.
+            (Severity.MINOR, ObjectionTarget.CLAIM, f"unresolved disagreement: {item}")
             for item in meta.unresolved_disagreements
         ],
         recommendation=meta.recommendation,
@@ -1265,7 +1313,9 @@ def run_replicate(
         verdict=review.verdict,
         severity=review.severity,
         summary=review.summary,
-        objections=[(item.severity, item.summary) for item in review.objections],
+        objections=[
+            (item.severity, item.target, item.summary) for item in review.objections
+        ],
         packet_digest=packet.digest,
     )
     agreed = review.verdict in {ReviewVerdict.PASS, ReviewVerdict.PASS_WITH_OBJECTIONS}
@@ -1614,7 +1664,7 @@ def _record_review(
     verdict: ReviewVerdict,
     severity: Severity,
     summary: str,
-    objections: Sequence[tuple[Severity, str]],
+    objections: Sequence[tuple[Severity, ObjectionTarget, str]],
     recommendation: Disposition | None = None,
     packet_digest: str | None = None,
 ) -> str:
@@ -1674,12 +1724,13 @@ def _record_review(
         independence_note=response.independence_note,
         call_id=response.call_id,
     )
-    for objection_severity, objection_summary in objections:
+    for objection_severity, objection_target, objection_summary in objections:
         context.portfolio.raise_objection(
             idea_id=context.idea_id,
             review_id=review.review_id,
             raised_at_version=snapshot.version.version,
             severity=objection_severity,
+            target=objection_target,
             summary=objection_summary,
         )
     return review.review_id

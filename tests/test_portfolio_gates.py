@@ -27,6 +27,7 @@ from research_os.portfolio.models import (
     EvidenceStrength,
     IdeaOrigin,
     IdeaVersion,
+    ObjectionTarget,
     QualityTier,
     ReviewerRole,
     ReviewVerdict,
@@ -735,3 +736,47 @@ def test_a_gate_evaluated_on_a_version_object_needs_no_database(
     assert result.passed
     assert result.tier is QualityTier.PROMISING
     del runtime_project
+
+
+def test_a_fatal_objection_to_the_test_still_blocks_promotion(
+    portfolio: PortfolioStore, runtime_db: Database, runtime_project: str
+) -> None:
+    """Not killing the idea is not the same as letting it through.
+
+    The falsify stage no longer rejects an idea whose *test* is fatally
+    broken -- it sends it to be sharpened, because a researcher meeting
+    "this check is guaranteed by construction" rewrites the check rather than
+    abandoning the question. That would be a loophole if the gate softened
+    too: an idea could reach PROMISING carrying a standing fatal objection
+    nobody had answered.
+
+    It does not. The gate reads severity and ignores target, so the objection
+    blocks promotion until a *different* role agrees a later version answered
+    it. Killing and gating are separate decisions and only the first moved.
+    """
+
+    built = _build(portfolio, runtime_db, runtime_project)
+    assert built.gate(requested=QualityTier.PROMISING).passed
+
+    killer = record_review(
+        portfolio,
+        idea_id=built.idea_id,
+        version=1,
+        role=ReviewerRole.FALSIFIER,
+        verdict=ReviewVerdict.REJECT,
+        severity=Severity.FATAL,
+        summary="the proposed check is guaranteed by construction",
+    )
+    objection, _created = portfolio.raise_objection(
+        idea_id=built.idea_id,
+        review_id=killer.review_id,
+        raised_at_version=1,
+        severity=Severity.FATAL,
+        target=ObjectionTarget.TEST,
+        summary="the proposed check is guaranteed by construction",
+    )
+    assert objection.target is ObjectionTarget.TEST
+
+    result = built.gate(requested=QualityTier.PROMISING)
+    assert not result.passed
+    assert any("fatal objection" in item for item in result.unmet)

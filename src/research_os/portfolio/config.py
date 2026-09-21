@@ -113,11 +113,50 @@ class Thresholds(BaseModel):
     #: Trigram Jaccard above which a candidate is put to the semantic duplicate
     #: adjudicator. Below it, no model is asked and the candidate proceeds.
     #:
-    #: 0.72 is a starting value, not a measurement. It is high enough that two
-    #: genuinely different directions in one subfield -- which share most of
-    #: their vocabulary -- do not collide, and low enough that a rephrasing
-    #: does. The dogfood is what would calibrate it.
-    duplicate_similarity: float = Field(default=0.72, ge=0.0, le=1.0)
+    #: **0.28 is a measurement.** The previous value, 0.72, was a starting
+    #: guess and the dogfood of 2026-09-21 is the calibration it asked for.
+    #: Over 1,081 real pairs from two real projects:
+    #:
+    #: ```text
+    #: p50   0.160     p95   0.253     p99    0.315
+    #: p75   0.192     p97   0.275     max    0.381
+    #: ```
+    #:
+    #: Nothing reached 0.72, or 0.40, so the semantic adjudicator -- layer 4,
+    #: the one that exists precisely for differently-worded duplicates -- was
+    #: never once consulted. Meanwhile the portfolio asked "is the pricing rule
+    #: just safe screening in disguise?" four separate times and "is
+    #: instance-size independence an artifact?" twice, and screened and
+    #: falsified each of them as a new idea.
+    #:
+    #: The ranking was never the problem. Every pair confirmed by reading as
+    #: the same research direction scores at or above 0.297, and the top of the
+    #: distribution is dominated by them; the bulk of unrelated pairs sits near
+    #: 0.16. Only the cut point was wrong.
+    #:
+    #: 0.25 sits at p95: below the lowest confirmed duplicate (0.297) with
+    #: margin, above the p90 bulk of unrelated work (0.231). The cost of
+    #: lowering it is small and not what it looks like: the screen makes
+    #: **one** call carrying up to ``MAX_NEIGHBOURS`` neighbours, not one call
+    #: per pair, so the price is about one extra $0.10 call per new idea. The
+    #: real constraint on going lower is the adjudicator's *input quality* --
+    #: at p95 a new idea arrives with roughly two neighbours to compare, which
+    #: is a focused question; at p87 it arrives with six, which is noise.
+    #:
+    #: Two honest limits. This is calibrated on two projects, and trigram
+    #: overlap depends on the writing style of the model that produced the
+    #: text, so it is a measurement of this corpus rather than a constant.
+    #: And it does not catch everything: a *short* paraphrase of the same
+    #: question scores lower than a long one -- the same pair rewritten
+    #: tersely measures 0.239 and would still pass. Character overlap cannot
+    #: see meaning, and no cut point on it will. Closing that gap needs a
+    #: different signal, not a different number, and this release does not
+    #: add one.
+    #:
+    #: Layer 3 is a **recall filter, not a decision.** Being above this number
+    #: means "a model should look", never "this is a duplicate". That is what
+    #: makes erring low the cheap direction.
+    duplicate_similarity: float = Field(default=0.25, ge=0.0, le=1.0)
     #: Distinct retrieved literature keys a deep novelty audit must produce
     #: before VALIDATED. A floor of 1 so configuration can only make the
     #: literature requirement stricter.

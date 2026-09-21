@@ -308,3 +308,115 @@ def test_the_first_idea_in_a_portfolio_has_no_nearest_neighbour(
     assert outcome.verdict is DedupVerdict.DISTINCT
     assert outcome.similarity == 0.0
     assert "first idea" in outcome.detail
+
+
+def test_the_screen_asks_a_model_about_a_real_near_duplicate(
+    portfolio: PortfolioStore, runtime_project: str
+) -> None:
+    """The calibration, as a property rather than a number in a comment.
+
+    Both texts below are verbatim from the first dogfood: two ideas produced
+    by two different explorers, asking the same research question -- is the
+    column-generation pricing rule a re-derivation of known safe-screening
+    theory -- in different words. They score 0.297.
+
+    Under the previous threshold of 0.72 the screen said "nothing close", and
+    across 1,081 real pairs from two projects the semantic adjudicator was
+    never consulted once.
+    """
+
+    config = load_config()
+    seed_idea(
+        portfolio,
+        runtime_project,
+        research_question=(
+            "Is the bounded-pricing reduced-cost test in the conic "
+            "column-generation decomposition algebraically identical to the LASSO "
+            "dual-feasibility condition |X_j^T r| \u2264 \u03bb, and does its "
+            "most-violated-column selection rule coincide index-for-index with an "
+            "existing working-set construction rule such as Blitz's Gauss-Southwell "
+            "rule or GAP Safe screening?"
+        ),
+        core_idea=(
+            "Derive the KKT stationarity conditions for the conic reformulation "
+            "identified in docs/2026/TIMELINE.md \u00a7T0 (exact LASSO reformulation, "
+            "not an \u21130 relaxation) and show the pricing subproblem's reduced cost "
+            "for column j reduces to \u03bb \u2212 |X_j^T r| up to a constant, i.e. "
+            "exactly the standard LASSO dual residual. Then run the column-generation "
+            "algorithm and Celer/Blitz on identical instances from identical warm "
+            "starts and compare the exact sequence of entering columns, not just "
+            "runtime, to test rule-level identity rather than just performance "
+            "identity."
+        ),
+    )
+    outcome = screen(
+        portfolio,
+        project_id=runtime_project,
+        fields={
+            "research_question": (
+                "Given that the conic model is an exact LASSO reformulation, does the "
+                "column-generation decomposition offer any computational advantage "
+                "over established safe-screening and working-set LASSO solvers (e.g., "
+                "celer/Gap-Safe rules, blitz), or is it structurally equivalent to "
+                "them?"
+            ),
+            "core_idea": (
+                "Benchmark the column-generation solver against celer and blitz on "
+                "identical instances, tolerances, and lambda grids, and separately "
+                "check whether the pricing step's optimality certificate is "
+                "mathematically the same test as a Gap-Safe/dynamic screening rule."
+            ),
+        },
+        config=config,
+    )
+
+    assert outcome.verdict is DedupVerdict.NEEDS_ADJUDICATION, (
+        "the screen must hand a real near-duplicate to the adjudicator; at the "
+        "old threshold of 0.72 it said 'nothing close'"
+    )
+    assert outcome.similarity >= config.thresholds.duplicate_similarity
+    assert outcome.match_idea_id is not None
+
+
+def test_two_unrelated_directions_in_one_subfield_still_do_not_collide(
+    portfolio: PortfolioStore, runtime_project: str
+) -> None:
+    """The control, and the reason the threshold was high in the first place.
+
+    Ideas in one subfield share most of their vocabulary. Lowering the cut
+    point is only correct if the bulk of unrelated work stays below it --
+    measured at p50 0.160 and p90 0.231 over the same 1,081 pairs.
+    """
+
+    config = load_config()
+    seed_idea(
+        portfolio,
+        runtime_project,
+        research_question=(
+            "Does the historical speed regime survive a fair modern comparison at "
+            "matched objectives, matched tolerances and controlled threads?"
+        ),
+        core_idea=(
+            "Force every solver to stop at the same duality gap and pin the thread "
+            "count, removing the convergence-criterion and BLAS-parallelism confounds."
+        ),
+    )
+    outcome = screen(
+        portfolio,
+        project_id=runtime_project,
+        fields={
+            "research_question": (
+                "Is the numerical instability recorded in the historical material a "
+                "solver-era artifact or structural to the second-order cone "
+                "formulation itself?"
+            ),
+            "core_idea": (
+                "Re-run the recorded failures on a current interior-point solver and "
+                "compare conditioning of the master problem's internal solves."
+            ),
+        },
+        config=config,
+    )
+
+    assert outcome.verdict is DedupVerdict.DISTINCT
+    assert outcome.similarity < config.thresholds.duplicate_similarity

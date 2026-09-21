@@ -229,6 +229,35 @@ class Severity(StrEnum):
     FATAL = "FATAL"
 
 
+class ObjectionTarget(StrEnum):
+    """What an objection is about: the idea, or the way it proposes to settle it.
+
+    The axis the first dogfood found missing. Severity says how bad an
+    objection is; this says what it is bad *about*, and the two together are
+    what make "this question is wrong" and "this question's test is wrong"
+    different decisions. Before it they were the same one, and a fatal
+    objection to a falsifier rejected the research question that falsifier was
+    attached to.
+
+    Reported by the model as a fact about its own objection; never a
+    disposition the model chooses. ``runner.run_falsify`` routes on it in
+    ordinary Python, the way ``runtime.adjudication.classify`` reads the
+    adjudication type out of the falsifier rather than letting a generator
+    pick its own evidentiary bar.
+    """
+
+    CLAIM = "CLAIM"
+    """The idea itself does not survive: wrong, already known, or not worth it."""
+
+    TEST = "TEST"
+    """The idea may stand; what it proposes as a way to settle it does not.
+
+    A researcher meeting this rewrites the test. So does the portfolio now --
+    once, bounded by ``max_revisions_per_idea``, and with the objection left
+    standing so the sharpened version has to answer it.
+    """
+
+
 SEVERITY_ORDER: dict[Severity, int] = {
     Severity.NONE: 0,
     Severity.MINOR: 1,
@@ -522,6 +551,10 @@ class IdeaObjection(_Record):
     raised_at_version: int
     objection_key: str
     severity: Severity
+    #: Whether the objection is to the idea or to the way it proposes to
+    #: settle itself. Stored, because `stages.select_stage` and
+    #: `runner.run_falsify` both route on it and both read stored rows.
+    target: ObjectionTarget = ObjectionTarget.CLAIM
     summary: str
     addressed_at_version: int | None = None
     response: str | None = None
@@ -629,6 +662,7 @@ ENUM_CONSTRAINTS: dict[str, frozenset[str]] = {
     "idea_objections_severity_ck": frozenset(
         s.value for s in Severity if s is not Severity.NONE
     ),
+    "idea_objections_target_ck": frozenset(s.value for s in ObjectionTarget),
     "idea_actions_status_ck": frozenset(s.value for s in ActionStatus),
     "idea_actions_stage_ck": frozenset(s.value for s in Stage),
     "idea_actions_disposition_ck": frozenset(s.value for s in Disposition),

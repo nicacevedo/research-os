@@ -37,6 +37,7 @@ from research_os.portfolio.models import (
     IdeaReview,
     IdeaStatus,
     IdeaVersion,
+    ObjectionTarget,
     ReviewerRole,
     Severity,
     Stage,
@@ -108,8 +109,33 @@ class TrackSnapshot:
 
     @property
     def fatal_objections(self) -> tuple[IdeaObjection, ...]:
+        """Standing FATAL objections **to the idea**, which end a track.
+
+        A FATAL objection targeting the *test* is deliberately not here. It is
+        fatal to the way the idea proposes to settle itself, and the answer to
+        that is to sharpen the idea, not to bury it -- see
+        :attr:`fatal_test_objections` and the first dogfood's §R.2.
+        """
+
         return tuple(
-            item for item in self.open_objections if item.severity is Severity.FATAL
+            item
+            for item in self.open_objections
+            if item.severity is Severity.FATAL and item.target is ObjectionTarget.CLAIM
+        )
+
+    @property
+    def fatal_test_objections(self) -> tuple[IdeaObjection, ...]:
+        """Standing FATAL objections to the idea's *test* rather than its claim.
+
+        These do not end a track; they make sharpening the next thing that
+        has to happen, and they stay standing until a role other than the one
+        that raised them agrees the sharpened version answers them.
+        """
+
+        return tuple(
+            item
+            for item in self.open_objections
+            if item.severity is Severity.FATAL and item.target is ObjectionTarget.TEST
         )
 
     @property
@@ -226,6 +252,23 @@ def select_stage(
     if snapshot.fatal_objections:
         return None, (
             f"a fatal objection stands: {snapshot.fatal_objections[0].summary[:120]}"
+        )
+
+    # A fatal objection to the *test* is the one kind that does not end the
+    # track. It makes sharpening the next thing that must happen, and it is
+    # bounded by the same revision ceiling everything else is -- past it, an
+    # idea whose test nobody can fix has no route left and stops here rather
+    # than being sharpened forever.
+    if snapshot.fatal_test_objections:
+        if snapshot.revision_count >= config.bounds.max_revisions_per_idea:
+            return None, (
+                "the falsifier is fatal to this idea's test, and the revision "
+                f"bound of {config.bounds.max_revisions_per_idea} is spent: "
+                f"{snapshot.fatal_test_objections[0].summary[:120]}"
+            )
+        return Stage.DISCOVER, (
+            "the question survives but its test does not; rewrite the test: "
+            f"{snapshot.fatal_test_objections[0].summary[:120]}"
         )
 
     # --- sharpen ----------------------------------------------------------

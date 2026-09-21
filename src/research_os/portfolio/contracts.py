@@ -40,6 +40,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from research_os.errors import ResearchOSError
 from research_os.portfolio.models import (
     Disposition,
+    ObjectionTarget,
     QualityDimensions,
     ReviewVerdict,
     Severity,
@@ -219,6 +220,15 @@ class Objection(_Contract):
 
     severity: Severity
     summary: str
+    #: Whether this is wrong with the *idea* or with the way the idea proposes
+    #: to settle itself. See :class:`ObjectionTarget`.
+    #:
+    #: Defaults to ``CLAIM``, which is today's behaviour, so the softer route
+    #: is reachable only when a model states plainly that the question
+    #: survives its own objection. A reviewer that says nothing is read as
+    #: objecting to the idea, which is the reading that kills -- erring
+    #: towards the cheap outcome rather than towards keeping work alive.
+    target: ObjectionTarget = ObjectionTarget.CLAIM
 
     @field_validator("summary")
     @classmethod
