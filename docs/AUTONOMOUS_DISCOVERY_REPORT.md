@@ -24,7 +24,7 @@ produced. §O–§R record what happened and §V records the eight defects that
 running it found. The sentence is kept rather than deleted because the gap it
 described is the reason the rest of this document is worth reading.
 
-What is still **not** dogfood-proven is named precisely in §R and §U: five of
+What is still **not** dogfood-proven is named precisely in §R and §U: six of
 the eleven stages — adjudicate, literature audit, evidence, review board,
 meta-review and replicate — have still never run against a real model, and no
 idea has reached `VALIDATED`.
@@ -747,7 +747,7 @@ explicit that this number decides what to spend on next and never what an idea
 
 **No idea reached `VALIDATED`. No review board has ever met a real model.**
 
-Five of the eleven stages — `adjudicate`, `literature_audit`, `evidence`,
+Six of the eleven stages — `adjudicate`, `literature_audit`, `evidence`,
 `review_board`, `meta_review`, `replicate` — have still never executed against a
 real provider, on either project, in just under four hours and 173 calls. The literature
 index was given the researcher's own 1,128 indexed works specifically so the
@@ -946,13 +946,13 @@ engineering        met.  4,335 tests forward and reverse, migrations green,
                    real provider failure survived unattended, zero reservation
                    leaks across 181 reservations, real-state contamination zero
 safety/authority   met, and now dogfood-proven rather than asserted. Across
-                   just under four hours the Curator wrote 0 paths under .research/, the
-                   bank stayed an orphan branch, both researchers' branches
+                   four hours the Curator wrote 0 paths under .research/, the
+                   bank stayed an orphan branch, both projects' own branches
                    were untouched, no proposal was promoted, no Review was
                    authored, and a revision that claimed to answer five
                    objections did not resolve one of them
 bank               met, dogfood-proven against two real repositories
-portfolio          NOT met.  five of eleven stages -- adjudicate, literature
+portfolio          NOT met.  six of eleven stages -- adjudicate, literature
                    audit, evidence, review board, meta-review, replicate --
                    have never executed against a real provider. No idea has
                    reached VALIDATED. The half of the ladder that decides
