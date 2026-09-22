@@ -2164,3 +2164,117 @@ One thing checked and found correct rather than fixed: no rejected idea
 carries a `revisit_if`, and none should. The schema requires it on `PARKED`
 and a rejection is revived as a *new* idea with a `REVIVES` edge, so the
 record of what was rejected stays what it was.
+
+### Y.4 The scientific-quality audit: 12 rejections and 11 survivors, read in full
+
+109 ideas across two projects, none VALIDATED, none HUMAN_READY, so the
+audit is of what the portfolio *killed* and what it is still carrying. The
+funnel first, because it says where the quality comes from:
+
+```text
+dedup            109 CONTINUE   25 DUPLICATE      $1.88
+novelty_screen   108 CONTINUE    0 rejections     $3.00
+falsify           41 CONTINUE   63 REJECT        $17.06
+adjudicate         6 CONTINUE                     $0.00
+```
+
+**The falsifier does all of the killing**, at 61% of what it sees and 71% of
+what the portfolio spends. The novelty screen rejects nothing by design --
+"a screen that could demote an idea would be a novelty judgement made
+without a retrieved source" -- and dedup removes one idea in five.
+
+Twelve rejections sampled at random from 63 and read in full. All twelve are
+defensible. Ten are strong. The two best are not the kind of thing a
+keyword rule produces:
+
+> The cited bootstrap-inconsistency theory (Bickel & Freedman 1981; Athreya
+> 1987) requires the statistic's asymptotic distribution to be a
+> non-Gaussian stable limit, i.e. infinite variance ... The proposal's own
+> stated assumption (upper tail regular enough for EVT/GPD modeling) is
+> fully compatible with finite variance (shape parameter < 0.5), a regime in
+> which the ordinary case-resampling bootstrap ... is consistent.
+
+> Solving Sherman-Morrison independently within each leaf's index set
+> discards the cross-leaf terms induced by the shared rank-one vector u
+> (since u generally has nonzero mass in multiple leaves) ... the method
+> computes a different, still-approximate quantity while advertising it as
+> the ground truth.
+
+The first catches a citation used for a condition it does not establish.
+The second catches an error in the precise step the proposal offered as its
+contribution. Four more are identification failures stated exactly: a
+ρ-sweep where correlation is a common cause of both rival mechanisms; a
+design whose outcome is "analytically forced before any code runs"; a
+contrast that "conflat[es] solver-generation/implementation quality with
+formulation choice". One rejects a proposal for smuggling a normative
+premise into a technical frame -- that between-neighborhood reallocation is
+"laundering" -- and says the property-tax literature treats it as the
+central litigated harm.
+
+Two reservations, recorded because an audit that finds nothing is not an
+audit:
+
+1. `dd0e8118` was killed as pre-answered by Blitz/Celer, and the killer
+   itself says the objection is *"FATAL only insofar as the thesis's pricing
+   step is a standard Lasso-type dual"* -- a condition nothing then checked.
+   The kill is probably right and is not *shown* to be right.
+2. `4bee1ae8` was killed for insignificance rather than invalidity: its
+   `why_it_matters` was blank and its question explicitly excluded the only
+   consequence anyone had named. Defensible, and it is the one rejection in
+   the sample that a person might reverse.
+
+Neither is a threshold to tune. One is a missing verification step inside an
+objection, one is a judgement call at the boundary, and §9 of the brief is
+explicit that policy changes follow repeated measured failure modes rather
+than single unattractive examples. Twelve of twelve defensible is not a
+repeated failure mode.
+
+The eleven live ideas were read the same way. What they show:
+
+- **Pre-registered three-way decision rules, with a named null.** *"R > 3 →
+  supported ... R < 1/3 → falsified ... 1/3 ≤ R ≤ 3 → both shift comparably;
+  treat as a null result."* The third bucket is what stops a binary from
+  manufacturing a verdict, and it was written unprompted.
+- **Scope limits the idea imposes on itself.** *"Neither outcome by itself
+  licenses a verdict on whether historical CG-vs-Celer/Blitz timing
+  comparisons were fair, since no analogous single-factor toggle exists."*
+- **Method that the falsifier did not ask for**: HAC-corrected inference,
+  unit-root tests, Benjamini-Hochberg at q=0.05, bootstrap CIs at ≥1000
+  resamples, sales-weighted materiality bars tied to IAAO conventions.
+- **Revision that is actually responsive.** One idea is on version 5. Its
+  `closest_prior_work` cites *its own two prior rejected versions* -- "n=3
+  correlation; then the df/circularity fix without an autocorrelation
+  control" -- and then cites Yule 1926 and Granger & Newbold 1974 for the
+  control it added in response.
+
+And the single clearest piece of evidence that the portfolio discriminates:
+`7c527766` was **rejected** for conflating solver generation with
+formulation choice, while `e9e1551d`, which asks a neighbouring question
+with an explicit four-arm software-versus-hardware ablation, **survived**.
+The same confound, caught in one design and controlled in the other, with
+opposite outcomes.
+
+### Y.5 Portfolio diversity, and the one structural thing it is missing
+
+Three generators are actually running, not one: 69 ideas from the blind
+explorer, 32 from failure mining, 8 from researcher seeds. 23 ideas carry
+more than one version and the revision loop reaches version 5. Subject
+matter is genuinely spread -- on `ccao` alone: leaf-level Hessian curvature,
+stratified covariance under pooled nulling, tail materiality of a weighted
+objective, feature-attribution equifinality, and autocorrelated moment
+drift. These are not one idea in five costumes.
+
+The missing structure is branching. **`max_depth` is 0 and
+`count(distinct lineage_root)` equals the idea count in both projects: in
+109 ideas, no idea has ever had a child.** This is not a defect in the
+brancher, and it needs no change. `STAGE_MINIMUM_STATUS[BRANCH]` is
+PROMISING, and `select_stage` reaches BRANCH only after EVIDENCE,
+LITERATURE_AUDIT, REVIEW_BOARD, META_REVIEW and REPLICATE have been
+considered. Every PROMISING idea in this portfolio stops at EVIDENCE,
+because of §Y.2. So the portfolio is broad and completely flat, and it will
+stay flat for exactly as long as the empirical route stays closed.
+
+That is worth stating plainly as a release consideration: the depth of this
+portfolio has never been exercised on real ideas, by anything. It is
+covered by tests, and it has no production-path evidence whatsoever.
+
