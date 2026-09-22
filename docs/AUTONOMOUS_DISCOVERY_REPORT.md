@@ -2506,3 +2506,43 @@ The columns that would carry a finding -- numerical evidence, executed
 evidence, experiments concluded, VALIDATED, HUMAN_READY -- are all zero,
 and §Y.2 says why in seven items, none of which an agent may supply.
 
+### Y.11 Recovery, tested by killing it
+
+The daemon was sent `SIGTERM` mid-flight, with work in progress and no
+graceful drain. What it left:
+
+```text
+1  work item LEASED, lease already expired
+3  budget reservations HELD, $0.05 each, oldest ~50 min
+0  ACTIVE actions with no live work item
+0  experiments in SUBMITTED or RUNNING
+0  ideas marked ACTIVE with no active action
+```
+
+That list is the point. A hard kill left exactly two kinds of debris, both
+of which the runtime already knows how to collect, and **no scientific
+state in an inconsistent condition** -- no idea stranded mid-track, no
+experiment claiming to be running, no action orphaned from its work item.
+
+On restart the daemon's first reconciliation pass logged:
+
+```text
+reclaimed 1 expired lease(s)
+```
+
+and earlier in the run, the same reconciler:
+
+```text
+released 3 stale budget reservation(s)
+```
+
+Across the whole run it released 34 reservations totalling $7.40 against
+$22.05 settled -- reservations for work that was claimed, paid for in
+advance, and then interrupted. The held balance fell 12 -> 9 -> 6 -> 4
+under observation without intervention.
+
+**No SQL was run against scientific state, at any point, for any reason.**
+The only direct database writes this session made were reads, plus creating
+and dropping one throwaway database (`gate_fresh`) to prove migrations
+apply from empty.
+
