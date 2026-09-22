@@ -1950,7 +1950,7 @@ justify. Six defects were found on the production path, none of them
 reachable from a suite that was green at 4,402 tests. Four were found in the
 first twenty minutes.
 
-### Y.1 Ten defects, and what each one was
+### Y.1 Fifteen defects: the first ten, which this author found
 
 **An explicit project cost ceiling was silently raised.** The operator set
 `--max-cost-usd 50.00`; a *reconciler-rescheduled* objective cycle -- one
@@ -2060,10 +2060,23 @@ before reaching the stage it would choose. The aggregate was never missing;
 `portfolio status` has counted blocked ideas all along. It was missing from
 the view someone opens to ask about one idea.
 
-Of the ten, **four were found by auditing rather than by running**: the
+Of these ten, **four were found by auditing rather than by running**: the
 two above, the CLAIM/TEST calibration, and the truncation -- which was
 found by trying to obey Phase 1 and discovering the record did not contain
 what Phase 1 asked to be recorded.
+
+Five more follow, and this author found none of them. §Y.13 has the four
+an independent architecture review turned up in a single read-only pass --
+every one of them a place where the permanent record stated something
+untrue -- and the fifteenth, the reporting half of that review's second
+finding, is in `650ec5e`: the bank pages printed how much executed
+evidence an idea had and never which way it pointed.
+
+**That is the number that should decide the verdict.** A reviewer given
+the branch for one afternoon found four record-integrity defects in code
+that had 4,402 green tests and had already been audited twice this
+session. The defect surface is not exhausted, and nothing here establishes
+where its edge is.
 
 ### Y.2 Phase 1, answered: the missing capability is human-owned
 
