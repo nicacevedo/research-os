@@ -2054,24 +2054,45 @@ path addresses. A preregistered decision rule names one number in one JSON
 document, and no declared command in this project produces one for the
 questions the portfolio is asking.
 
-What would close it, precisely, and all of it the researcher's:
+That is one entry on the list, and the shortest. The full list came from
+reading all six refusals of the night in full, which was only possible after
+fixing the defect in §Y.1 that was discarding 83% of each of them. Every
+item is the researcher's, and every item is named by a refusal rather than
+inferred by this author:
 
 ```text
-1. analyse_benchmark.py takes --out and writes its verdict as JSON
-2. analyse-benchmark declares that path in `outputs`
-3. (or) a declared command whose parameters span a question the portfolio
-   asks -- the refusals name exactly which parameter each one lacks
+1. analyse_benchmark.py takes --out and writes its verdict as JSON, and
+   analyse-benchmark declares that path in `outputs`
+2. `benchmark` and `adjudicate-pricing` declare output schemas at all --
+   both declare none, so no metric path can be preregistered against
+   either, which four of the six refusals raise independently
+3. a tracked benchmark plan enumerating correlation structures x a
+   lambda/lambda_max grid -- or `correlation_structure`, `rho` and
+   `lambda_ratio` as parameters on a command
+4. achieved cardinality s in some output schema; no command reports
+   support size, and two hypotheses are defined by it
+5. a warm-start on/off toggle, or any solver-configuration parameter
+6. a parameter selecting a hardware or solver generation; `resources`
+   carries scheduler keys only
+7. peak memory recorded anywhere at all
 ```
 
-Declaring an experiment command for someone's project is the act
-`experiments.yaml` lives outside every worktree to prevent an agent from
-performing, and none was performed.
+Items 3 through 7 are not flags. They are measurements this project has not
+built, and no amount of prompting produces them. Declaring an experiment
+command for someone's project is the act `experiments.yaml` lives outside
+every worktree to prevent an agent from performing, and none was performed.
 
-One correction to the above, which the third idea produced after the
-catalogue was corrected and which is worth more than the guess it replaces.
-The missing capability is not only the output file. Asked again, with the
-declared inputs and the output schemas in front of it, the designer refused
-the wall-clock/memory ablation twice, on two grounds neither of which a
+Three of the refusals go further and order their own remediation by least
+change -- *"(a) a benchmark plan checked into the tree that enumerates the
+correlation structures and a lambda/lambda_max grid, plus a declared output
+schema exposing rounds, time, s and lambda/lambda_max per cell ... or (b)
+correlation_structure, rho, and lambda_ratio parameters on
+adjudicate-pricing"* -- and then say why neither is theirs to do: *"Either
+is a change to experiments.yaml or to the tracked plan set, not something I
+can supply as a parameter value."*
+
+Items 6 and 7 come from the third idea, the wall-clock/memory ablation,
+which was refused twice after the catalogue was corrected -- on grounds no
 `--out` flag would answer:
 
 > (1) No handle on hardware. Arms (a) and (b) are defined by running on
@@ -2085,13 +2106,28 @@ the wall-clock/memory ablation twice, on two grounds neither of which a
 > schema is `profile`, and its committed numeric paths are purely a timing
 > decomposition.
 
-So the list of missing human-owned capability has three entries, not one: a
-written verdict file, a parameter that selects a hardware or solver
-generation, and an instrument that records peak memory. The system is not
-confused about what it lacks. It is unusually precise about it, and it said
-so three times without once proposing to measure something adjacent and call
-it the answer -- which is the behaviour these refusals should be read as
-evidence *for*.
+The system is not confused about what it lacks. It is unusually precise
+about it, and in six attempts it never once proposed to measure something
+adjacent and call it the answer. Each refusal ends by saying so in its own
+words, and these are the sentences that matter most in this document:
+
+> Specifying `profile` and reading a first/last ratio would spend a run on a
+> number the falsifier does not reference, which is why I am declining
+> rather than substituting it.
+
+> Running it and calling it a test of this idea would manufacture a verdict
+> the measurement does not support, so I am declining to name a command
+> instead.
+
+> That control is explicitly labelled secondary in the proposal and cannot
+> decide the portability claim, so running it and calling it a test of this
+> hypothesis would misreport what was measured.
+
+An autonomous system that will not spend a real budget to produce a number
+it knows cannot answer the question is the property this architecture exists
+to have. It is worth more than a traversal would have been, and it is the
+one result of the overnight run that could not have been obtained by writing
+a test.
 
 ### Y.3 The scientific-quality audit found a calibration error
 
