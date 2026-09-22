@@ -534,9 +534,13 @@ another. The Python class is `PortfolioIdea`, never `Idea`.
 The authority boundary is unchanged and is enforced structurally. Nothing under
 `research_os/portfolio` writes a capsule file, authors a Review, accepts a
 Claim, promotes a proposal or an insight, merges, or pushes;
-`tests/test_portfolio_authority.py` asserts it by parsing the package. The one
-edge into science is the one that already exists: a `HUMAN_READY` idea becomes
-a `Proposal`, and a person promotes it.
+`tests/test_portfolio_authority.py` asserts it by parsing the package. There
+is **no edge into science at all**: nothing in `research_os/portfolio` builds
+a `Proposal`, and no command converts a `HUMAN_READY` idea into one. An
+earlier version of this paragraph described that conversion as existing. It
+does not, and a reader checking the authority boundary should not go looking
+for it. A `HUMAN_READY` idea is a page a person reads; carrying it into the
+capsule is, today, entirely manual.
 
 **The empirical route.** An idea whose falsifier asks for a measurement gets
 one: `portfolio/empirical.py` bridges an idea version to the experiment
