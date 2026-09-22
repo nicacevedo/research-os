@@ -3148,8 +3148,11 @@ is not established by having a good reason for not being exercised.
 **And the defect surface is not exhausted. This is the deciding fact.**
 Twenty-seven defects this session. Ten found by this author. Then three
 independent reviewers, each given one afternoon and read-only access to
-code carrying 4,437 green tests that had already been audited twice, found
-**seventeen more between them** -- and they barely overlapped.
+code carrying a green suite -- 4,402 tests at the last clean measurement
+before they began, and more by the time they finished -- that had already
+been audited twice, found **seventeen more between them**, and they
+barely overlapped. (The figure is the pre-review baseline deliberately:
+§Y.20 voids every count taken while two gate runs overlapped.)
 
 The first found four, every one of them the permanent record asserting
 something untrue: every analysis artifact in the store said
