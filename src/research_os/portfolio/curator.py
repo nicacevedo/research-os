@@ -65,6 +65,7 @@ from research_os.portfolio.store import PortfolioStore
 from research_os.runtime.db import Database
 from research_os.runtime.locks import RepositoryBusyError, repository_lock
 from research_os.runtime.refs import AUTONOMOUS_BANK_BRANCH
+from research_os.textsafe import terminal_safe
 
 LOG = logging.getLogger("research_os.portfolio.curator")
 
@@ -244,6 +245,26 @@ def _direction(counts: dict[str, int]) -> str:
     return f"> executed evidence: {supporting} supporting, none refuting"
 
 
+def _one_line(text: str) -> str:
+    """A model-authored string rendered where one line is expected.
+
+    The bank is committed Markdown and it is the document a person reads
+    before deciding whether to promote an idea. `_bounded` strips and
+    length-checks and permits newlines, so a title or a summary could
+    carry `\n## Reviews` and forge a heading, or a line shaped like the
+    computed provenance header, in the page whose whole purpose is to be
+    trusted. A security review of this branch found it.
+
+    Newlines become a visible marker rather than disappearing: a reader
+    should be able to tell that the text contained one. `terminal_safe`
+    then handles the rest, so `cat` of a bank page cannot move the
+    researcher's cursor either.
+    """
+
+    collapsed = " ".join(text.replace("\r\n", "\n").split("\n"))
+    return terminal_safe(collapsed, keep=frozenset())
+
+
 def _indented(detail: str) -> str:
     """Keep a multi-paragraph explanation inside the bullet that owns it.
 
@@ -284,13 +305,15 @@ def render_idea(store: PortfolioStore, idea: PortfolioIdea) -> str:
         current = version.version == idea.current_version
         lines.append(f"## Version {version.version}{' (current)' if current else ''}")
         lines.append("")
-        lines.append(f"**{version.title}**")
+        lines.append(f"**{_one_line(version.title)}**")
         lines.append("")
-        lines.append(f"- research question: {version.research_question}")
-        lines.append(f"- core idea: {version.core_idea}")
-        lines.append(f"- mechanism: {version.mechanism or '(none stated)'}")
-        lines.append(f"- why it matters: {version.why_it_matters or '(none stated)'}")
-        lines.append(f"- falsifier: {version.falsifier or '(none stated)'}")
+        lines.append(f"- research question: {_one_line(version.research_question)}")
+        lines.append(f"- core idea: {_one_line(version.core_idea)}")
+        lines.append(f"- mechanism: {_one_line(version.mechanism) or '(none stated)'}")
+        lines.append(
+            f"- why it matters: {_one_line(version.why_it_matters) or '(none stated)'}"
+        )
+        lines.append(f"- falsifier: {_one_line(version.falsifier) or '(none stated)'}")
         lines.append(
             "- settled by: "
             + (
@@ -339,8 +362,8 @@ def render_idea(store: PortfolioStore, idea: PortfolioIdea) -> str:
             if part
         )
         lines.append(
-            f"- v{item.idea_version} [{item.kind}/{item.strength}] {item.summary}"
-            + (f"  ({refs})" if refs else "")
+            f"- v{item.idea_version} [{item.kind}/{item.strength}] "
+            f"{_one_line(item.summary)}" + (f"  ({refs})" if refs else "")
         )
     lines.append("")
 
@@ -359,7 +382,7 @@ def render_idea(store: PortfolioStore, idea: PortfolioIdea) -> str:
             f"independence vs origin: `{item.independence_vs_origin}`, "
             f"prompt `{item.prompt_version}`"
         )
-        lines.append(f"  - {item.summary}")
+        lines.append(f"  - {_one_line(item.summary)}")
     lines.append("")
 
     lines.append("## Standing objections")
@@ -369,7 +392,8 @@ def render_idea(store: PortfolioStore, idea: PortfolioIdea) -> str:
         lines.append("(none unanswered)")
     for item in sorted(objections, key=lambda row: row.objection_id):
         lines.append(
-            f"- [{item.severity}] raised at v{item.raised_at_version}: {item.summary}"
+            f"- [{item.severity}] raised at v{item.raised_at_version}: "
+            f"{_one_line(item.summary)}"
         )
     lines.append("")
 
@@ -401,7 +425,7 @@ def render_index(store: PortfolioStore, ideas: Sequence[PortfolioIdea]) -> str:
     ]
     for idea in ideas:
         version = store.get_version(idea.idea_id)
-        title = version.title if version else ""
+        title = _one_line(version.title) if version else ""
         lines.append(
             f"| `{idea.idea_id}` | {idea.status} | {idea.quality_tier} | "
             f"{idea.origin} | {title} |"
@@ -446,21 +470,27 @@ def render_bank(
     for idea in ideas:
         version = store.get_version(idea.idea_id)
         counts = _provenance(store, idea)
-        lines.append(f"## `{idea.idea_id}` — {version.title if version else ''}")
+        lines.append(
+            f"## `{idea.idea_id}` — {_one_line(version.title) if version else ''}"
+        )
         lines.append("")
         lines.extend(_header(counts)[1:])
         if version is not None:
             lines.append(f"- research question: {version.research_question}")
             lines.append(
-                f"- why it matters: {version.why_it_matters or '(not stated)'}"
+                f"- why it matters: {_one_line(version.why_it_matters) or '(not stated)'}"
             )
-            lines.append(f"- falsifier: {version.falsifier or '(not stated)'}")
             lines.append(
-                f"- closest prior work: {version.closest_prior_work or '(not stated)'}"
+                f"- falsifier: {_one_line(version.falsifier) or '(not stated)'}"
+            )
+            lines.append(
+                f"- closest prior work: {_one_line(version.closest_prior_work) or '(not stated)'}"
             )
             for item in version.open_uncertainties:
-                lines.append(f"- limitation: {item}")
-            lines.append(f"- next: {version.next_best_action or '(none recorded)'}")
+                lines.append(f"- limitation: {_one_line(item)}")
+            lines.append(
+                f"- next: {_one_line(version.next_best_action) or '(none recorded)'}"
+            )
         lines.append(f"- full record: `{BANK_ROOT}/ideas/{idea.idea_id}.md`")
         lines.append("")
     return "\n".join(lines) + "\n"

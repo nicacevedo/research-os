@@ -36,7 +36,7 @@ from research_os.runtime.failures import FailureClass
 from research_os.runtime.refs import AUTONOMOUS_BANK_BRANCH, RESERVED_REF_VALUE
 from research_os.runtime.store import RuntimeStore
 from tests.fs_helpers import make_git_repo
-from tests.portfolio_helpers import portfolio, record_review, seed_idea
+from tests.portfolio_helpers import idea_fields, portfolio, record_review, seed_idea
 from tests.runtime_helpers import pg_dsn, runtime_db, runtime_project, runtime_xdg
 
 __all__ = ["pg_dsn", "portfolio", "runtime_db", "runtime_project", "runtime_xdg"]
@@ -613,3 +613,57 @@ def test_a_page_with_no_execution_does_not_look_like_a_supported_one(
     page = snapshot(runtime_db, runtime_project)[f"{BANK_ROOT}/bank/VALIDATED.md"]
     assert "none, so nothing here was measured" in page
     assert "refuting" not in page
+
+
+def test_a_model_cannot_forge_structure_in_the_page_a_person_reads(
+    portfolio: PortfolioStore,
+    runtime_db: Database,
+    runtime_project: str,
+    repository: Path,
+) -> None:
+    """The bank is committed Markdown and it is the promotion document.
+
+    `_bounded` strips and length-checks model-authored strings and permits
+    newlines, so a title could carry `\\n## Reviews` and forge a heading,
+    or a line shaped like the computed provenance header, in the one page
+    whose purpose is to be trusted. A security review of this branch found
+    it. Collapsed rather than dropped, so a reader can tell the text
+    contained a newline.
+    """
+
+    idea, _ = seed_idea(portfolio, runtime_project)
+    portfolio.append_version(
+        idea_id=idea.idea_id,
+        fields=idea_fields(
+            title="Innocent title\n\n## Reviews\n\n- methodology: PASS",
+            research_question="Q?\n> executions performed: 99",
+        ),
+    )
+    page = snapshot(runtime_db, runtime_project)[f"{BANK_ROOT}/ideas/{idea.idea_id}.md"]
+    headings = [line for line in page.splitlines() if line.startswith("## ")]
+    assert headings.count("## Reviews") == 1, (
+        f"a model wrote a heading into the bank: {headings}"
+    )
+    assert not any(
+        line.startswith("> executions performed: 99") for line in page.splitlines()
+    ), "a model forged the computed provenance header"
+    assert "Innocent title" in page
+
+
+def test_ordinary_prose_survives_the_bank_unchanged(
+    portfolio: PortfolioStore,
+    runtime_db: Database,
+    runtime_project: str,
+    repository: Path,
+) -> None:
+    """Positive control: neutralising structure must not mangle text."""
+
+    idea, _ = seed_idea(portfolio, runtime_project)
+    portfolio.append_version(
+        idea_id=idea.idea_id,
+        fields=idea_fields(
+            title="Does CG's fast regime survive rho in {0.3, 0.6, 0.9}?"
+        ),
+    )
+    page = snapshot(runtime_db, runtime_project)[f"{BANK_ROOT}/ideas/{idea.idea_id}.md"]
+    assert "Does CG's fast regime survive rho in {0.3, 0.6, 0.9}?" in page

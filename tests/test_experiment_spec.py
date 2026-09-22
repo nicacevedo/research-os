@@ -356,3 +356,23 @@ def test_a_finite_number_inside_its_bounds_is_accepted() -> None:
         ],
     )
     assert "-0.5" in resolve_command(command, {"shift": -0.5}).argv
+
+
+def test_the_program_to_run_may_not_be_a_parameter() -> None:
+    """`argv[0]` is the researcher's choice, not a value supplied per run.
+
+    A placeholder contains no `/` and does not begin with `-`, so the
+    bare-program-name rule admitted `argv: ["{tool}", ...]`. With `tool`
+    declared as a token, a model could name `bash`, `env` or `curl`, and
+    this layer would resolve it on PATH and bind its execution closure
+    into the sandbox. Found by a security review of this branch.
+    """
+
+    with pytest.raises(ValidationError, match="may not be a parameter"):
+        spec(
+            argv=["{tool}", "run", "--seed", "{seed}"],
+            parameters=[
+                {"name": "tool", "type": "token", "required": True},
+                {"name": "seed", "type": "integer", "required": True},
+            ],
+        )

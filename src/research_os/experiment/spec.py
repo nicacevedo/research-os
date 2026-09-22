@@ -102,6 +102,20 @@ class CommandSpec(BaseModel):
                 "what runs is resolved on PATH rather than by a path in a "
                 "configuration file"
             )
+        if PLACEHOLDER_RE.fullmatch(program) is not None:
+            # A placeholder contains no `/` and does not start with `-`, so
+            # the rule above admits `argv: ["{tool}", ...]`. With `tool`
+            # declared as a token, a model could then name `bash`, `env` or
+            # `curl` and this layer would resolve it on PATH and bind its
+            # execution closure into the sandbox. A security review of this
+            # branch found it. The researcher chooses the program; a
+            # parameter chooses its arguments.
+            raise ValueError(
+                f"the program to run may not be a parameter: {program!r}. A "
+                f"declared command names its own program, because choosing "
+                f"what executes is the researcher's decision and not a value "
+                f"supplied per run"
+            )
         for token in value:
             if TOKEN_RE.fullmatch(token) is None:
                 raise ValueError(
