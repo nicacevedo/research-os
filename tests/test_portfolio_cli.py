@@ -582,3 +582,99 @@ def test_show_stays_quiet_about_an_idea_that_is_simply_working(
     out = capsys.readouterr().out
     assert "state:" not in out
     assert "last attempt" not in out
+
+
+def test_show_drops_a_failure_the_stage_has_since_overcome(
+    cli: str, portfolio: PortfolioStore, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """A refusal that has been answered is history, not the current state.
+
+    The idea whose evidence stage this reproduces was refused five times
+    for a capability the project had not declared. The researcher declared
+    it, `portfolio resume` lifted the block, and the stage then ran a
+    contained measurement and wrote an interpreted experiment. `ideas show`
+    went on opening with "last attempt at evidence failed
+    (capability_denied); tried 5 times" and the whole stale refusal --
+    directly under a `next:` line that had moved on to the review board.
+
+    `portfolio status` already draws this distinction in words; this view
+    did not draw it at all.
+    """
+
+    idea, _ = seed_idea(portfolio, cli)
+    portfolio.set_status(idea_id=idea.idea_id, status=IdeaStatus.PROMISING)
+    for attempt in range(2):
+        refused = portfolio.open_action(
+            idea_id=idea.idea_id,
+            idea_version=1,
+            stage=Stage.EVIDENCE,
+            basis_digest=f"basis-refused-{attempt}",
+        )
+        portfolio.complete_action(
+            action_id=refused.action_id,
+            status=ActionStatus.FAILED,
+            detail="no declared command can run this sweep",
+            failure_class=str(FailureClass.CAPABILITY_DENIED),
+            operational_state=OperationalState.IDLE,
+        )
+    measured = portfolio.open_action(
+        idea_id=idea.idea_id,
+        idea_version=1,
+        stage=Stage.EVIDENCE,
+        basis_digest="basis-measured",
+    )
+    portfolio.complete_action(
+        action_id=measured.action_id,
+        status=ActionStatus.SUCCEEDED,
+        detail="the measurement ran and was read",
+        operational_state=OperationalState.IDLE,
+    )
+
+    assert run_cli(monkeypatch, "ideas", "show", idea.idea_id) == 0
+    out = capsys.readouterr().out
+    assert "last attempt" not in out
+    assert "capability_denied" not in out
+
+
+def test_show_still_reports_a_stage_that_is_still_failing(
+    cli: str, portfolio: PortfolioStore, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """Negative control, and the reason the filter is per stage.
+
+    A cheap stage succeeding must not silence an expensive one that is
+    still refusing -- which is what an aggregate "has anything succeeded
+    since" test would have done, and is the defect in the other direction.
+    """
+
+    idea, _ = seed_idea(portfolio, cli)
+    portfolio.set_status(idea_id=idea.idea_id, status=IdeaStatus.PROMISING)
+    measured = portfolio.open_action(
+        idea_id=idea.idea_id,
+        idea_version=1,
+        stage=Stage.EVIDENCE,
+        basis_digest="basis-measured",
+    )
+    portfolio.complete_action(
+        action_id=measured.action_id,
+        status=ActionStatus.SUCCEEDED,
+        detail="the measurement ran and was read",
+        operational_state=OperationalState.IDLE,
+    )
+    stuck = portfolio.open_action(
+        idea_id=idea.idea_id,
+        idea_version=1,
+        stage=Stage.DISCOVER,
+        basis_digest="basis-stuck",
+    )
+    portfolio.complete_action(
+        action_id=stuck.action_id,
+        status=ActionStatus.FAILED,
+        detail="the sharpened title was 201 characters",
+        failure_class=str(FailureClass.MODEL_OUTPUT_INVALID),
+        operational_state=OperationalState.IDLE,
+    )
+
+    assert run_cli(monkeypatch, "ideas", "show", idea.idea_id) == 0
+    out = capsys.readouterr().out
+    assert "last attempt at discover failed" in out
+    assert "the sharpened title was 201 characters" in out

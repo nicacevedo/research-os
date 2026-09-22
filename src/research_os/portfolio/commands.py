@@ -245,15 +245,40 @@ def _print(text: str) -> None:
 
 
 def _last_failure(store: PortfolioStore, idea_id: str) -> tuple[IdeaAction, str] | None:
-    """The most recent failed attempt, and how many times that stage has failed.
+    """The most recent unresolved failed attempt, and how often that stage failed.
 
     Not filtered to the stage ``next`` names: the two differ whenever the
     machine gave up before reaching the stage it would choose, and the
     attempt that failed is the one worth reading either way.
+
+    It **is** filtered to failures the stage has not since overcome, which is
+    a different question and was the defect. On 2026-09-22 an idea whose
+    evidence stage had been refused five times for a missing capability got
+    the capability, ran a contained measurement, and wrote an interpreted
+    experiment -- and this view still opened with "last attempt at evidence
+    failed (capability_denied); tried 5 times" followed by the whole stale
+    refusal, while the line above it said the next stage was the review
+    board. A record that asserts something untrue about the present is worse
+    than no record: ``portfolio status`` already separates the two cases in
+    so many words -- "work has succeeded since the last of them, so these are
+    history rather than a diagnosis" -- and this surface did not.
+
+    Per stage rather than in aggregate, because a stage that is still failing
+    must keep reporting even when a cheaper one has succeeded since.
     """
 
     actions = store.list_actions(idea_id=idea_id)
-    failed = [item for item in actions if item.status is ActionStatus.FAILED]
+    latest_success: dict[object, int] = {
+        item.stage: index
+        for index, item in enumerate(actions)
+        if item.status is ActionStatus.SUCCEEDED
+    }
+    failed = [
+        item
+        for index, item in enumerate(actions)
+        if item.status is ActionStatus.FAILED
+        and index > latest_success.get(item.stage, -1)
+    ]
     if not failed:
         return None
     latest = failed[-1]
