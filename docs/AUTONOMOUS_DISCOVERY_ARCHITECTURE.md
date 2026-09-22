@@ -20,7 +20,7 @@ This document states what the system does, and every enforcement claim names
 the test that holds it. As of this revision the following exist and pass:
 
 ```text
-sql/0019 .. 0027                     the schema, head 0027
+sql/0019 .. 0029                     the schema, head 0029
 research_os/portfolio/
     ids, digests, models, config     identity, the three digests, the bounds
     empirical                        the bridge to the experiment machinery
@@ -1188,6 +1188,26 @@ it a portfolio whose blocker had been fixed stayed stopped with no command
 that started it, which is exactly what happened to the three ideas the
 empirical route unblocked.
 
+**Forgiving the ceiling is a watermark, not a reset**, and the distinction
+is load-bearing. `Bounds.max_stage_failures` counts failed work items and
+never decays, so unblocking alone was undone by the next tick. But the
+count also feeds `work_items.dedup_key` against a permanently unique index:
+reset it and the retry re-uses a spent key, which `enqueue` refuses
+silently -- the wedge the count exists to close.
+`portfolio_state.failures_forgiven_at` (`0029`) moves instead, and
+`stage_failures` returns three numbers for three readers: all-time for the
+key, recent for the ceiling, and recent *refusals* for the rule below.
+
+**A refusal counts once.** The ceiling is right for a transient and wrong
+for an answer: "no declared command can test this idea" does not become
+true on the third attempt, and each attempt is a paid frontier call. So one
+failure whose class is `CAPABILITY_DENIED`, `POLICY_REFUSED` or
+`MISSING_SCIENTIFIC_AUTHORITY` -- the classes the failure taxonomy already
+calls terminal -- blocks the idea, and `resume` is what reconsiders it.
+This was unimplementable until stage failures stopped reaching the queue as
+`UNKNOWN`: `_as_error` raised a bare `ResearchOSError` for anything that
+was not a provider failure, so twenty-seven were recorded with no class.
+
 `researchctl portfolio digest` rather than `researchctl digest show`: the
 kernel already owns `researchctl digest <OBJECT-ID>`, which prints a capsule
 object's semantic digest, and overloading it would make an object id named
@@ -1407,6 +1427,30 @@ argv, seeds, resources, expected outputs, with the workspace path removed.
 An identical rerun is refused before it runs. A reproducibility check is a
 useful thing and is not a replication, and this layer will not record one as
 the other.
+
+### 19.6a What the designer is shown about a command
+
+Three things, and each was added because its absence was measured rather
+than anticipated:
+
+```text
+parameters      type, required, bounds, and for a `path` the in-tree rule
+inputs          the checkout's tracked data and configuration files
+outputs         the numeric paths of a declared output the project has
+                committed from an earlier run -- keys and types only
+```
+
+The third has a scientific edge on it. **The values are never shown.** A
+threshold chosen to fit a result that already exists is a rule fixed after
+the fact wearing the clothes of one fixed before, and the whole point of a
+decision rule is that it precedes the number. A designer that wants to know
+what value to expect has to reason about the science.
+
+Only *declared* outputs and only *tracked* files: the researcher declares
+what a command writes, and a leftover in somebody's working tree does not
+get to describe it. A command whose output nobody has committed gets no
+listing, which is the truth -- and the designer then refuses rather than
+guessing a metric path, which is the behaviour observed and is correct.
 
 ### 19.7a A design has liveness, the way a review does
 

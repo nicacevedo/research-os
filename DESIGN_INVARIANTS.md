@@ -252,3 +252,38 @@ the executor crashed  !=  the idea is wrong
 `EmpiricalConclusion.OPERATIONALLY_BLOCKED` exists so that the first has
 somewhere to go, and `EVIDENCE_STRENGTH_FOR_CONCLUSION` has no entry for it,
 so it cannot become the second by accident.
+
+## Change control record: budget authority
+
+Per the change-control section above, a dedicated record. **No invariant
+changed and nothing was added to the permitted-technology list.** Invariant
+12 is *strengthened*, and the record exists because the change is about
+authority rather than about accounting.
+
+The defect, measured on 2026-09-22 rather than reasoned about: an operator
+set a project's standing cost ceiling with `researchctl runtime budget
+--max-cost-usd 50.00`, and minutes later a **reconciler-rescheduled**
+objective cycle -- one nobody started -- raised it to 300.00, that being
+`max_model_cost_usd * max_cycles_per_objective` from the shipped
+configuration. Nothing reported it.
+
+`cycles.apply_default_budgets` raises a project ceiling and never lowers
+one, and that rule is correct: deriving the ceiling from a single
+objective's `--max-cost-usd` is what once let a 0.50 USD smoke run write a
+lifetime ceiling that bricked a project. What it left open was the opposite
+direction.
+
+| # | invariant | what changed |
+|---|---|---|
+| 12 | paid use has budgets | strengthened. `budgets.explicit` (`0028`) distinguishes a ceiling a *person* typed from one the runtime derived. A derived ceiling is still raised when an objective needs more; an explicit one is left alone and the shortfall logged, and an objective that needs more than it stops on `BUDGET_EXHAUSTED` -- terminal, honest, and already what happens when a person's number runs out. The flag is sticky, so a derived write cannot demote it |
+| 13 | human versus agent authority | unchanged, and now enforced where it was previously only stated. `ARCHITECTURE.md` §13 and `docs/AUTONOMOUS_DISCOVERY_ARCHITECTURE.md` §13's A2 list put *unbounded budget changes* among the acts a human performs. A machine that can multiply a human's number by six has performed one, whatever the number is afterwards |
+| 14 | finite stop conditions | unchanged in bound, corrected in decay. `max_stage_failures` never decayed, so an idea whose stage failed while a capability was missing could not be retried once it arrived -- `portfolio resume` unblocked it and the next tick re-blocked it. `failures_forgiven_at` (`0029`) is a watermark and deliberately not a reset: the count also feeds `work_items.dedup_key` against a permanently unique index, and resetting it would make the retry re-use a spent key that `enqueue` refuses silently. And a *refusal* now counts once rather than three times, using only the classes the failure taxonomy already calls terminal |
+
+The property worth stating as new rather than preserved:
+
+```text
+a number a person typed  !=  a number the configuration implies
+```
+
+Both are budgets. Only one of them is an authorisation, and until this
+release the system could not tell them apart.

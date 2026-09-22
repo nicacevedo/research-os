@@ -1935,3 +1935,147 @@ review board on an experiment.
 The two things standing in the way are declarations in the researcher's
 `experiments.yaml` (§X.8) and a budget ceiling that is theirs to raise. None
 of the three is a defect in this layer, and none is an agent's to decide.
+
+---
+
+## Y. The overnight run
+
+Starting point: `75b8e8f`, the empirical bridge, with the human-owned
+experiment catalogue corrected to expose four commands rather than three --
+`benchmark`, `analyse-benchmark`, `adjudicate-pricing`, `profile`.
+
+The purpose was to finish the real empirical traversal §X.7 could not, and
+to push the layer as far toward release as the science and the machinery
+justify. Six defects were found on the production path, none of them
+reachable from a suite that was green at 4,402 tests. Four were found in the
+first twenty minutes.
+
+### Y.1 Six defects, and what each one was
+
+**An explicit project cost ceiling was silently raised.** The operator set
+`--max-cost-usd 50.00`; a *reconciler-rescheduled* objective cycle -- one
+nobody started -- raised it to 300.00, being `25 x 12` from the shipped
+configuration. `cycles.apply_default_budgets` raises a project ceiling and
+never lowers it, which is right and exists because deriving it from one
+objective's cap once bricked a project. What it left open is the other
+direction, and §13 puts unbounded budget changes among the acts a human
+performs. `budgets.explicit` (`0028`) tells a number a person typed from one
+the runtime derived; the first is left alone, and an objective that needs
+more stops on `BUDGET_EXHAUSTED`.
+
+**`portfolio resume` could not undo what it said it undid.** The
+stage-failure ceiling counts failed work items and never decays, so `resume`
+returned three ideas to IDLE and the next tick re-blocked them on the same
+historical count. Their evidence stage had failed three times *while the
+experiment route did not exist*, so the route arriving could never reach
+them. The fix is a watermark (`0029`) and not a reset, and that distinction
+is load-bearing: `work_items.dedup_key` is built from the failure count
+against a permanently unique index, so resetting it would make the retry
+re-use a spent key and `enqueue`'s `on conflict do nothing` would refuse it
+silently -- the wedge the count exists to close.
+
+**The designer refused every command because none declared what it writes.**
+Its own words, refusing an idea: *"its output schema is not declared
+(declared outputs: none), so any metric_path I named inside the file I
+create would be a guess rather than a preregistration."* The catalogue now
+reads the declared output the project has *committed* from an earlier run
+and lists its numeric paths -- keys and types only, never values, because a
+threshold chosen to fit a result that already exists is a rule fixed after
+the fact wearing the clothes of one fixed before.
+
+**Every portfolio stage failure reached the queue as `unknown`.**
+Twenty-seven of them. `_as_error` raised a bare `ResearchOSError` for
+everything that was not a provider failure, and `Daemon._classify` falls
+through to `UNKNOWN`. Three losses at once: `portfolio status` could not say
+why anything failed, the retry policy could not tell an outage from a policy
+answer, and the allocator could not tell a stable refusal from a transient.
+
+**So the allocator bought the same refusal three times.** `max_stage_
+failures` is a ceiling on *retries*, right for a transient and wrong for an
+answer: "no declared command can test this idea" does not become true on the
+third attempt, and each attempt is a paid frontier call. Six identical
+refusals were bought across two sessions. One refusal now blocks, using the
+classes the taxonomy already calls terminal, and `portfolio resume`
+reconsiders.
+
+**The falsifier reached for CLAIM when its objection named the test.** See
+§Y.3; it is the one change here driven by the scientific-quality audit
+rather than by the machinery.
+
+### Y.2 Phase 1, answered: the missing capability is human-owned
+
+No declared command can settle any of the three real empirical questions,
+and the refusals are detailed, stable, and reproduced across two sessions
+and three prompt versions. They are correct. The clearest is the one that
+reasoned *against* the new output-schema listing rather than being helped by
+it:
+
+> Its committed numeric paths confirm this: `cases.0.first_master_ms`,
+> `cases.0.last_master_ms`, `cases.0.master_solve_seconds` all describe a
+> single solve path. The nearest proxy, first_master_ms/last_master_ms, is
+> not S: the first master solve is cold only because it is simultaneously
+> the smallest (fewest generated columns/cones), so that ratio mixes
+> warm-start amortization with column-set growth -- and the growth direction
+> is precisely the open uncertainty the design was meant to resolve. **It
+> would answer a different question under the same name.**
+
+That is a better judgement than the one this session's author made when
+guessing that `profile` could answer that idea.
+
+The chain the corrected catalogue was clearly meant to enable is
+`benchmark -> analyse-benchmark`. It cannot close, and the reason is one
+sentence: **`scripts/analyse_benchmark.py` prints its verdict and writes no
+file.** At `ad4d66c` it has no `write_text`, no `json.dump` and no `--out`;
+`benchmark` itself writes JSON *Lines*, which is not a document a metric
+path addresses. A preregistered decision rule names one number in one JSON
+document, and no declared command in this project produces one for the
+questions the portfolio is asking.
+
+What would close it, precisely, and all of it the researcher's:
+
+```text
+1. analyse_benchmark.py takes --out and writes its verdict as JSON
+2. analyse-benchmark declares that path in `outputs`
+3. (or) a declared command whose parameters span a question the portfolio
+   asks -- the refusals name exactly which parameter each one lacks
+```
+
+Declaring an experiment command for someone's project is the act
+`experiments.yaml` lives outside every worktree to prevent an agent from
+performing, and none was performed.
+
+### Y.3 The scientific-quality audit found a calibration error
+
+Fourteen rejections read in full. Twelve well judged, and several better
+than well judged: one refuted a proposal algebraically from
+`Cov(e,y) = [Var(y)+Var(e)-Var(yhat)]/2`, showing the falsifier's own
+trigger condition self-contradictory; one caught that the cited
+bootstrap-inconsistency theory (Bickel & Freedman 1981; Athreya 1987) needs
+infinite variance while the proposal's own assumption implies finite; one
+refused a false dichotomy with a LARS counterexample; one showed a
+motivating example already subsumed by Xu, Caramanis & Mannor 2010.
+
+Two were objections to the *test*, recorded as fatal to the *claim*:
+
+```text
+"The falsifier's causal attribution is algebraically backwards..."   FATAL/CLAIM
+"...The falsifier as specified produces a pattern consistent with
+ either explanation"                                                FATAL/CLAIM
+```
+
+The second is an identification failure, which is the falsifier prompt's own
+canonical `TEST` example. So the guidance was not missing and was not
+unread: it was **unbalanced**. It warned against over-using `TEST` and never
+against over-using `CLAIM`, and never said the two mistakes cost different
+things. A wrong `CLAIM` at `FATAL` ends a question permanently; a wrong
+`TEST` costs one bounded sharpening cycle with the objection still standing.
+`falsifier@3` names the asymmetry.
+
+Measured rather than anecdotal: across **425 real objections** from two
+projects the split is 79% `CLAIM` / 21% `TEST`, and among fatal ones 63
+`CLAIM` against 10 `TEST`.
+
+One thing checked and found correct rather than fixed: no rejected idea
+carries a `revisit_if`, and none should. The schema requires it on `PARKED`
+and a rejection is revived as a *new* idea with a `REVIVES` edge, so the
+record of what was rejected stays what it was.
