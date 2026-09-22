@@ -287,3 +287,52 @@ a number a person typed  !=  a number the configuration implies
 
 Both are budgets. Only one of them is an authorisation, and until this
 release the system could not tell them apart.
+
+## Change control record: composed experiment inputs
+
+Per the change-control section above, a dedicated record. **No invariant
+changed, no technology was added and no dependency was added.** This uses
+the experiment declarations, the parameter contract, the content-addressed
+artifact store, the preregistration, the disposable worktree, the sandbox
+and the invocation ledger that `ARCHITECTURE.md` §12 and §12a–§12b already
+permit.
+
+The defect, measured on 2026-09-22 rather than reasoned about: a real
+portfolio was blocked on a *file*. The `(n, p) x difficulty` question needed
+no new executable capability -- the declared `sweep-lambda-support` can run
+it -- and what was missing was one committed JSON plan. A `path` parameter
+may only name a **tracked** file, which is the correct rule, and its
+unintended consequence was that every genuinely new design inside an
+already-approved capability required a person to author and commit a plan.
+
+```text
+human governed  !=  human operated
+```
+
+| # | invariant | what changed |
+|---|---|---|
+| 1 | local before LLM | unchanged. The model composes a document; validating it against the researcher's declared schema, canonicalising it, bounding it, hashing it, choosing its path, writing it and rehashing it are all ordinary Python |
+| 11 | experiments traceable | **strengthened.** A composed document is part of the specification, not a side channel: its `(path, sha256)` enters `ExecutionSpec.inputs`, and therefore the specification digest, the variation digest and the preregistration. Two runs differing only in a composed plan cannot share a digest, an idempotency key or a preregistration, and the bytes are written from the content-addressed store and rehashed before the run, so a replay is the same measurement rather than a similar one |
+| 13 | human versus agent authority | unchanged, and the boundary is now *narrower and explicit*. Composing is not something a plan may elect to do: it is a property of a parameter, declared with `type: generated` in `experiments.yaml`, which lives outside every worktree. The declaration still decides the program, the argv, which parameters exist, which may be composed, what a composed one may contain, and how large it may be. What moved across the line is which individual measurement is taken inside that family |
+| 14 | finite stop conditions | unchanged. A composed document is bounded by the declaration's `max_bytes` against canonical bytes, by a declaration-independent ceiling, and by whatever bounds the schema itself states on grids, repetitions and timeouts |
+
+Two properties are worth stating as new rather than preserved.
+
+```text
+a system that can run an approved experiment  !=  one that can ask a new question with it
+```
+
+And the one that keeps the first from being an escape: **the caller never
+supplies a destination.** It composes content. Research OS decides where
+that content lands, checks the path it chose against the same worktree
+containment rule an untrusted value faces, writes the file `0o444`, and
+refuses a caller that tries to name the location itself. A model may not
+revise a plan after seeing a result, and at the file level it may not
+rewrite the plan it is being measured against either.
+
+One thing this deliberately did **not** do: move any digest already written.
+`spec_digest` and `variation_digest` omit the new key entirely when there
+are no composed inputs, so every preregistration and every idempotency key
+written before this release rebuilds to the same hash. An unconditional
+empty list would have been a migration wearing the clothes of a field
+addition.

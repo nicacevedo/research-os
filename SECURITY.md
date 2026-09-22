@@ -156,6 +156,19 @@ than a program name. That stops a *plan* from naming an arbitrary command. It
 does not stop a program the researcher already trusts from doing what programs
 do.
 
+**A declared experiment may also accept a document the caller composes**, and
+the boundary there is worth stating precisely because it is the one place a
+model's output becomes a file on disk. A parameter declared `type: generated`
+in `experiments.yaml` -- the researcher's file, outside every worktree -- takes
+a JSON document rather than a path. Research OS validates it against the
+`input_schema` that declaration carries, refuses any key the schema does not
+list, bounds its canonical bytes, hashes it, and **chooses where it lands**
+inside the disposable workspace; the file is written `0o444` and rehashed
+against the preregistered digest on the way in. The caller never supplies a
+destination, and one that tries to is refused. What a composed document can do
+is be read by a program the researcher already declared; what it cannot do is
+become an argument, a flag, a second command, or a file anywhere else.
+
 The practical consequence: **do not point Research OS at a repository you would
 not run `pytest` in.** Cloning an untrusted project and starting a run on it is
 equivalent to executing that project's code.

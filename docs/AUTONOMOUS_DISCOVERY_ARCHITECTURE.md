@@ -1493,3 +1493,69 @@ the reason `TrackSnapshot.experiments` exists.
 The stop is not a refutation. An `INCONCLUSIVE` or `INSUFFICIENT`
 measurement leaves the question open, and the reason the researcher reads
 says so.
+
+### 19.9 Composed inputs: the measurement a plan may instantiate
+
+§19.6a says the designer is shown a command's parameters, the checkout's
+tracked inputs, and the numeric paths of a declared output. It did not say
+what happens when the question the falsifier asks is *inside* a declared
+command's reach and no tracked file expresses it. What happened is that the
+portfolio stopped and a person wrote a file.
+
+`ParameterType.GENERATED` is the parameter kind whose value is **content**
+rather than a choice among what the repository already holds.
+
+```text
+type: generated        the researcher declares this, in experiments.yaml
+input_schema:          the shape a composed document may have. Required.
+max_bytes:             its ceiling, against canonical bytes. Finite.
+```
+
+The route:
+
+```text
+design          the model returns the document itself under the parameter's
+                name -- a JSON object, never a path, never a string of JSON
+freeze          checked against `input_schema`; canonicalised (sorted keys,
+                compact separators, no NaN); bounded; hashed
+place           Research OS chooses
+                `.research-os/experiment-inputs/<param>-<sha16>.json`
+preregister     `(path, sha256)` enters `ExecutionSpec.inputs`, and so the
+                specification digest and the variation digest; the record
+                names the digest, the store holds the bytes
+materialise     written from the store into the disposable workspace,
+                rehashed on the way in, `chmod 0444`
+```
+
+**The schema subset is closed and unknown keywords are refused, at
+configuration time.** `type`, `enum`, `const`, `properties`, `required`,
+`additionalProperties: false`, `items`, `minItems`, `maxItems`, `minimum`,
+`maximum`, `minLength`, `maxLength`. A researcher who writes `pattern:` is
+told it is not honoured rather than being left to believe it is -- the same
+defect as a bound that is enforced and never stated, which this codebase
+paid for five times before §AA.4.1.
+
+**Objects are closed by default**, which is the opposite of JSON Schema's
+own default and is deliberate: a composed document reaches a program the
+researcher trusts, and a key nobody declared is exactly the one that should
+not pass.
+
+What this does not move:
+
+- the program and the argv. A composed document is a *file the command
+  reads*, and can never become an argument, a flag, or a second command;
+- the destination. The caller supplies content and nothing else; a caller
+  that names a path is refused, and the path Research OS chose is put
+  through the same worktree-containment rule an untrusted value faces;
+- the conclusion. The decision rule is still fixed before the result exists
+  and still applied by ordinary code.
+
+**Replication.** `variation_digest` includes the composed inputs, so a
+replication that varies the plan varies by *content* rather than by a
+filename that happens to carry a digest. `assert_varies` is unchanged and
+now has something real to compare.
+
+**Compatibility.** Both digests omit the key when there are no composed
+inputs, so every preregistration written before this route existed rebuilds
+to its original hash. `tests/test_experiment_generated_input.py` pins the
+real stored specification of `PEXP-20260922T195752Z-4331c06a` to prove it.
