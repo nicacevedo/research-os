@@ -2623,3 +2623,99 @@ Two things for the researcher, both small and both theirs:
    entry, not just the declaration
 ```
 
+### Y.13 The independent architecture review, and the four things it was right about
+
+An independent reviewer was given the branch, the six authority documents
+and read-only access, and asked to break the four hard prohibitions. It
+could not: it traced the call graph and found no path to a human `Review`
+(`idea_reviews` has no `reviewer_kind` column at all), none to `propose
+promote` or `insight promote` (no `subprocess` import in the package;
+`automation.gitutil` is argv-only with `core.hooksPath=/dev/null`), none to
+a write under `.research/` (one `write_text` in the package, guarded by
+`_safe`), and none to the researcher's branch (the bank is rooted on the
+empty tree via `commit-tree`).
+
+It then found four things wrong that this author had not, all of them
+places where **the record said something that was not so**. All four are
+fixed in `9f3bf6c`; §Y.1's ten become fourteen.
+
+**The containment claim was unfalsifiable from the record it points at.**
+`DESIGN_INVARIANTS.md` leans on containment, `SandboxMode.PREFERRED` runs
+uncontained on a host with no backend, so both cases exist -- and the
+permanent analysis artifact recorded `job.detail` under the key
+`containment`. For a local run `handle.detail` is the literal string
+`"completed"`. Every analysis document in the store therefore says
+`"containment": "completed"` and `"wall_clock": "completed"`, and the
+monotonic duration `submit` actually measures was computed, put in the
+ledger result, and dropped. The comment above it asserted that `job.detail`
+*"carries what the submission recorded, which includes the duration"*,
+which was false when written. Migration 0030 adds the three columns; NULL
+means unrecorded and is deliberately not `False`, because inventing the
+more alarming of two answers is still inventing one.
+
+**The autonomy dial's premise does not hold for this layer.**
+`build_executors` requires containment only at `autonomy: high`, and its
+docstring gives the reason: *"Lower settings use the researcher's
+configured mode, because there a person is at the keyboard."* That is true
+of an objective cycle, which a person starts. It is false of the portfolio
+daemon, which runs unattended by construction. So a researcher who lowered
+autonomy *to be more careful* got model-parameterised project commands
+running uncontained with the full `os.environ`. The portfolio now asks for
+`REQUIRED` at every setting.
+
+**A file the run wrote was reported as a file it did not.** `_collect`
+hashes at most 32 declared outputs and skips anything over 256MB;
+`analyse` derived *"declared outputs were not produced"* from what came
+back. The workspace still exists at that point, so the two facts are now
+told apart.
+
+**And the Curator fetched from the network while holding the repository
+lock.** `git fetch --all` against a bank branch that is an orphan with no
+upstream -- and it moves `refs/remotes/*`, which `canonical_fingerprint`
+reads. A curate pass picking up an upstream commit during a coding run
+failed that run as an escape: precisely the false positive
+`runtime/refs.py` was written to prevent, reintroduced by a line that did
+nothing.
+
+It also found two documents claiming more than the code does, both
+corrected rather than implemented:
+
+- Invariant 12 said *"portfolio, project and run ceilings through the
+  existing ledger"*. `apply_default_budgets` is called by `runtime start`
+  and `open_cycle` and by nothing in the portfolio, so a project that has
+  only ever run the portfolio -- the case §13a calls intended -- has
+  neither, and `budgets.reserve` treats an absent budget as unlimited. The
+  idea ($8) and lineage ($40) ceilings are real and always apply.
+- `ARCHITECTURE.md` said a `HUMAN_READY` idea *"becomes a `Proposal`, and a
+  person promotes it"*. Nothing builds a `Proposal`. The error was in the
+  safe direction, but a reader auditing the boundary should not be sent
+  looking for an edge that is not there.
+
+**Neither budget behaviour nor the missing edge was changed.** Creating
+default ceilings changes what a deployment spends and refuses, and that
+belongs to the person whose money it is.
+
+Three findings were reported and deliberately not acted on, and they are
+the most important ones for a release decision:
+
+1. **The authority table does not govern this layer.**
+   `research_os/portfolio/` contains no reference to `ActionKind`,
+   `policy_for` or `authorize`. The objective cycle calls
+   `authorize(action, autonomy=...)` and raises `ScientificGateError` on
+   A2; the portfolio's fifteen `ActionKind` entries are read by `runtime
+   doctor` and by a test, and by nothing on the execution path. Being
+   listed in the table is not being governed by it. Wiring it is an
+   architecture change and belongs to a person.
+2. **The gates are blind to evidence direction.** `_substantive` and
+   `_replication_met` count a row as qualifying if its strength is
+   SUPPORTS *or* CONTRADICTS, and no gate reads which. An idea whose
+   experiment and replication both refuted it can reach HUMAN_READY on
+   three model verdicts, and `render_bank` prints the counts without the
+   direction. This has never fired, because no idea has reached the board.
+3. **The empirical route bypasses `experiment_interpretations`.** `sql/0006`
+   and `sql/0010` exist to make "which experiment this interpretation is
+   of" durable, with a uniqueness constraint so two workers resolve to one
+   interpretation. `empirical.interpret` guards with a read-then-write
+   instead. In practice the active-track index serialises it; it is a
+   second answer to a question the schema already answered once.
+
