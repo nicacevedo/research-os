@@ -2368,3 +2368,34 @@ one of the ten fixes. The second reason is not the machine's failure, but
 it is not the eight hours either, and a run in which the code changed ten
 times is not the run the brief asked for.
 
+### Y.8 Two structural limits, neither of which is a defect
+
+**Independence is surfaced, not gated.** `_validated_unmet` requires a live
+non-negative review from each of the three `INDEPENDENT_REVIEW_ROLES`. It
+requires three *roles*. It does not require three *models*.
+`board_independence` counts distinct `(provider_family, model)` pairs, and
+the gate attaches its result as a **note** -- *"every review of this idea
+was produced by one model. That is not independent review, and nothing
+rendered from this may call it so"* -- rather than as an unmet requirement.
+
+The code does exactly what §10 of the architecture says it does, the note
+reaches `ideas show`, `portfolio top` and `runtime doctor`, and
+`gates.py:225` states the intent in as many words. So this is not a defect
+and it has not been changed: nothing measured it failing, because no idea
+has ever reached VALIDATED. It is recorded because it bounds the meaning of
+a word. On this host `runtime doctor` reports
+`DEGRADED_SAME_PROVIDER_FAMILY` -- *"no second model family is
+installed"* -- so an idea that reached the board here would be validated by
+three samples from one model, and the only thing standing between that and
+the word "independent" is a note that renderers are trusted to print. It is
+a policy question about what VALIDATED should mean, and it belongs to a
+person.
+
+**The empirical route is closed by a missing capability, and everything
+downstream of it is therefore unexercised on real work.** Not the review
+board, not the meta-review, not replication, not branching. All four have
+test coverage, including an end-to-end drive that reaches HUMAN_READY; none
+has production-path evidence. §Y.2 and §Y.5 give the two chains. They
+reduce to the same sentence: nothing real got past EVIDENCE, so nothing real
+reached anything after it.
+
