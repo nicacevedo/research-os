@@ -2767,3 +2767,105 @@ Seven refusals now, across two sessions, three prompt versions and a
 restart on new code. Not one of them has proposed to measure something
 adjacent and call it the answer.
 
+## Z. Final release assessment
+
+### Z.1 What each verdict would require
+
+**`FULL_AUTONOMOUS_RESEARCH_OS_READY`** would mean the loop this system
+exists to close has closed on real science: an idea generated, sharpened,
+survived falsification, measured by a real experiment, read by arithmetic
+against a rule fixed beforehand, reviewed by genuinely independent
+reviewers, replicated a second way, and handed to a researcher as
+something they could act on -- more than once, on more than one project,
+without a person in the loop.
+
+**`AUTONOMOUS_DISCOVERY_RELEASE_CANDIDATE`** would mean that path has run
+end to end at least once on real work, that the defects being found are
+getting smaller and rarer, and that a reviewer looking hard finds
+refinements rather than false records.
+
+**`AUTONOMOUS_DISCOVERY_BETA`** means what the accepted checkpoint already
+meant: the machinery is real, it runs unattended, its boundaries hold, and
+it has not yet done the thing.
+
+### Z.2 What is true
+
+The case *for* advancing is not nothing, and it is stronger than it was:
+
+- The system ran unattended in eight segments, longest 5h 06m, and cost
+  $23.45 against ceilings it never exceeded and a human ceiling it never
+  raised.
+- **The authority boundary held under adversarial audit.** An independent
+  reviewer with the branch and six hours of context could not construct a
+  path to a human `Review`, to a promotion, to a write under `.research/`,
+  or to the researcher's branch. After 120 ideas and a thousand work
+  items, both human branches still show exactly one reflog entry --
+  `clone:` -- both capsules validate, and the explicit $50 ceiling is
+  untouched.
+- **The science criticism is good.** Twelve rejections read in full, twelve
+  defensible, two of them catching errors -- a citation used for a
+  condition it does not establish, a Sherman-Morrison step that drops
+  cross-leaf terms -- that a careful referee might miss.
+- **It refuses rather than substitutes.** Seven times, across two sessions,
+  three prompt versions and a restart, asked to measure something it could
+  not, it declined to measure something adjacent and call it the answer.
+  That is the single most valuable behaviour observed, and it is worth
+  more than a traversal would have been.
+- It recovers from a hard kill by ordinary reconciliation, and it upgraded
+  its own schema six times under load.
+
+### Z.3 The verdict
+
+**`AUTONOMOUS_DISCOVERY_BETA`.**
+
+Unchanged from the accepted checkpoint, and the reasons are not close.
+
+**Nothing completed.** Zero experiments concluded, zero board reviews,
+zero replications, zero branches, zero VALIDATED, zero HUMAN_READY. The
+review board, the meta-review, replication and branching have test
+coverage including a drive that reaches HUMAN_READY, and **no
+production-path evidence whatsoever**. A release candidate cannot be
+declared for a path that has never run.
+
+**The blocker is real but it is not an excuse.** It is human-owned --
+seven named capabilities in §Y.2, five of them measurements this project
+has not built -- and no agent may supply them. But the system's readiness
+is not established by having a good reason for not being exercised.
+
+**And the defect surface is not exhausted.** Fifteen defects this session.
+Ten found by this author; then an independent reviewer, given one
+afternoon and read-only access to code carrying 4,402 green tests that had
+already been audited twice tonight, found four more -- and every one of
+those four was **the permanent record asserting something untrue**. Every
+analysis artifact in the store said `"containment": "completed"`. The
+containment invariant that `DESIGN_INVARIANTS.md` leans on was
+unfalsifiable from the record it points at. A researcher lowering autonomy
+to be more careful got uncontained execution. Those are not refinements.
+Nothing in this run locates the edge of that surface, and a fourth audit
+finding a fifth class is the expectation, not the surprise.
+
+**Three known gaps are recorded and unfixed**, each because it is a
+person's decision rather than a defect: the authority table does not
+govern this layer, the promotion gates do not read evidence direction, and
+independence is surfaced rather than required -- which on this host, with
+one provider family installed, means a board would be three samples from
+one model.
+
+### Z.4 What would move it
+
+In order, and the first is the only one that is not this system's to do:
+
+```text
+1. the seven capabilities of §Y.2 -- above all a declared command that
+   writes a JSON document with a declared output schema
+2. one real idea through experiment -> evidence -> board -> meta-review
+   -> replication, on the production path, start to finish
+3. a second provider family, so "independent review" can be true
+4. one full unattended run, eight hours or more, on code that does not
+   change during it
+5. an audit that finds only refinements
+```
+
+Items 2 through 5 are all reachable once item 1 exists, and none of them
+is reachable before it.
+
