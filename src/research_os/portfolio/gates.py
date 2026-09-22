@@ -655,6 +655,37 @@ def evaluate(
             "a numerical witness is recorded. It is consistent with the "
             "proposition; it does not establish it."
         )
+    # Direction, which no requirement above reads. `_substantive` and
+    # `_replication_met` both count SUPPORTS and CONTRADICTS, and that is
+    # deliberate -- a refutation is evidence, and HUMAN_READY means "merits
+    # your attention", which a good refutation does. What was missing is
+    # that a caller could not tell. An independent review put the case: an
+    # idea whose experiment and replication both refuted it reaches the top
+    # tier on three model verdicts and nothing says so. These are notes and
+    # not `unmet`, because what VALIDATED should mean on refuting evidence
+    # is a policy question and belongs to a person.
+    executed = [item for item in evidence if item.job_id]
+    refuting = [
+        item for item in executed if item.strength is EvidenceStrength.CONTRADICTS
+    ]
+    if refuting:
+        notes.append(
+            f"{len(refuting)} of {len(executed)} executed measurement(s) "
+            f"refuted this idea. No requirement above reads the direction of "
+            f"evidence, so a tier here is not a claim that the measurement "
+            f"supported it."
+        )
+    primary = {
+        item.strength for item in executed if item.kind is EvidenceKind.EXPERIMENT
+    }
+    replicated = {
+        item.strength for item in executed if item.kind is EvidenceKind.REPLICATION
+    }
+    if primary and replicated and primary != replicated:
+        notes.append(
+            "the replication did not agree with the primary measurement. The "
+            "replication requirement counts it as met either way."
+        )
     return GateResult(
         tier=tier,
         requested=requested,

@@ -112,6 +112,7 @@ def _build(
     literature_keys: int = 3,
     review_verdict: ReviewVerdict = ReviewVerdict.PASS,
     families: tuple[str, ...] = ("openai", "google", "anthropic"),
+    primary_strength: EvidenceStrength = EvidenceStrength.SUPPORTS,
 ) -> Built:
     """Assemble an idea that passes every gate, then let a test remove one thing."""
 
@@ -156,7 +157,7 @@ def _build(
             idea_id=idea.idea_id,
             idea_version=1,
             kind=EvidenceKind.EXPERIMENT,
-            strength=EvidenceStrength.SUPPORTS,
+            strength=primary_strength,
             summary="an executed search exhibited the divergent instance",
             job_id=job.job_id,
         )
@@ -780,3 +781,72 @@ def test_a_fatal_objection_to_the_test_still_blocks_promotion(
     result = built.gate(requested=QualityTier.PROMISING)
     assert not result.passed
     assert any("fatal objection" in item for item in result.unmet)
+
+
+def test_a_complete_empirical_idea_reaches_human_ready(
+    portfolio: PortfolioStore, runtime_db: Database, runtime_project: str
+) -> None:
+    """The positive control this suite was missing.
+
+    `_build`'s default type is MATHEMATICAL, and `run_evidence` returns
+    CAPABILITY_DENIED for MATHEMATICAL -- §18 says so -- so the control
+    above exercises `EVIDENCE_RULES[MATHEMATICAL]` and
+    `REPLICATION_RULES[MATHEMATICAL]` and nothing else. The EMPIRICAL
+    rules, which are the ones every real adjudicated idea in the dogfood
+    has, had only refusal tests in this file. An independent review noted
+    that this is a recurrence of the shape `gates.py:526` already records
+    an earlier audit finding: the code was fixed and the control was not
+    generalised.
+    """
+
+    built = _build(
+        portfolio,
+        runtime_db,
+        runtime_project,
+        adjudication=[AdjudicationType.EMPIRICAL],
+    )
+    result = built.gate()
+    assert result.unmet == (), result.unmet
+    assert result.tier is QualityTier.HUMAN_READY
+
+
+def test_a_refuted_measurement_is_disclosed_even_though_it_gates_the_same(
+    portfolio: PortfolioStore, runtime_db: Database, runtime_project: str
+) -> None:
+    """No requirement reads direction, so the result must say so out loud.
+
+    A refutation is evidence and HUMAN_READY means "merits your
+    attention", which a good refutation does -- so this is deliberately a
+    note and not an `unmet`. What was missing is that a caller could not
+    tell the difference at all.
+    """
+
+    built = _build(
+        portfolio,
+        runtime_db,
+        runtime_project,
+        adjudication=[AdjudicationType.EMPIRICAL],
+        primary_strength=EvidenceStrength.CONTRADICTS,
+    )
+    result = built.gate()
+    assert result.tier is QualityTier.HUMAN_READY, "still a note, not a bar"
+    assert any("refuted this idea" in note for note in result.notes), result.notes
+    assert any("did not agree with the primary" in n for n in result.notes), (
+        result.notes
+    )
+
+
+def test_an_agreeing_replication_says_nothing_about_disagreement(
+    portfolio: PortfolioStore, runtime_db: Database, runtime_project: str
+) -> None:
+    """Positive control for both notes: they fire on the condition, not always."""
+
+    built = _build(
+        portfolio,
+        runtime_db,
+        runtime_project,
+        adjudication=[AdjudicationType.EMPIRICAL],
+    )
+    result = built.gate()
+    assert not any("refuted this idea" in note for note in result.notes)
+    assert not any("did not agree" in note for note in result.notes)

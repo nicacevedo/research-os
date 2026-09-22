@@ -40,6 +40,7 @@ from research_os.portfolio.gates import board_independence
 from research_os.portfolio.models import (
     ActionStatus,
     EvidenceKind,
+    EvidenceStrength,
     IdeaAction,
     IdeaStatus,
     OperationalState,
@@ -273,13 +274,27 @@ def _provenance_line(store: PortfolioStore, idea: PortfolioIdea) -> str:
         }
     )
     executions = sum(1 for item in evidence if item.job_id)
+    # `executions N` alone is the failure the curator's own comment names:
+    # it tells a reader how much was measured and not what the measurement
+    # said. The bank pages carry the direction; this line is the other
+    # surface a researcher reads, and it did not.
+    refuting = sum(
+        1
+        for item in evidence
+        if item.job_id and item.strength is EvidenceStrength.CONTRADICTS
+    )
+    measured = (
+        f"executions {executions}"
+        if not refuting
+        else f"executions {executions} ({refuting} refuting)"
+    )
     independence = (
         "one model reviewed this; that is not independent review"
         if models <= 1
         else f"{models} distinct reviewer models"
     )
     return (
-        f"    executions {executions} | sources {sources} | {independence} | "
+        f"    {measured} | sources {sources} | {independence} | "
         f"objections {len(objections)} "
         f"({sum(1 for item in objections if item.blocking)} blocking)"
     )
