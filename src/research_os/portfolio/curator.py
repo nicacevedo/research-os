@@ -57,6 +57,7 @@ from research_os.paths import state_home
 from research_os.portfolio.gates import board_independence
 from research_os.portfolio.models import (
     EvidenceKind,
+    EvidenceStrength,
     IdeaStatus,
     PortfolioIdea,
 )
@@ -181,6 +182,24 @@ def _provenance(store: PortfolioStore, idea: PortfolioIdea) -> dict[str, int]:
         "reviewer_models": board_independence(reviews),
         "objections": len(objections),
         "blocking": sum(1 for item in objections if item.blocking),
+        # Which way the measurements pointed. No gate reads this -- both
+        # count as substantive evidence, and a refutation is evidence --
+        # but a reader opening VALIDATED.md and seeing "executions
+        # performed: 2" with no direction can only assume they supported
+        # the idea. An independent review of this branch put the case
+        # plainly: an idea whose experiment and replication both refuted it
+        # can reach the top tier on three model verdicts, and the page
+        # would not say so.
+        "supporting": sum(
+            1
+            for item in evidence
+            if item.job_id and item.strength is EvidenceStrength.SUPPORTS
+        ),
+        "refuting": sum(
+            1
+            for item in evidence
+            if item.job_id and item.strength is EvidenceStrength.CONTRADICTS
+        ),
     }
 
 
@@ -196,8 +215,33 @@ def _header(counts: dict[str, int]) -> list[str]:
             f"> standing objections: {counts['objections']} "
             f"({counts['blocking']} blocking)"
         ),
+        _direction(counts),
         "",
     ]
+
+
+def _direction(counts: dict[str, int]) -> str:
+    """Which way the executed evidence pointed, beside how much of it there is.
+
+    Printed even when it is zero and zero, because "no measurement was
+    executed" and "the measurements supported it" must not look alike on a
+    page headed VALIDATED.
+    """
+
+    supporting, refuting = counts["supporting"], counts["refuting"]
+    if not supporting and not refuting:
+        return "> executed evidence: none, so nothing here was measured"
+    if refuting and not supporting:
+        return (
+            f"> executed evidence: {refuting} refuting and none supporting. "
+            f"The measurement did not support this idea."
+        )
+    if supporting and refuting:
+        return (
+            f"> executed evidence: {supporting} supporting, {refuting} refuting "
+            f"-- they disagree, and neither is the answer"
+        )
+    return f"> executed evidence: {supporting} supporting, none refuting"
 
 
 def _indented(detail: str) -> str:

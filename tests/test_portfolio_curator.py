@@ -34,6 +34,7 @@ from research_os.runtime.actions.coding import canonical_fingerprint, escaped
 from research_os.runtime.db import Database
 from research_os.runtime.failures import FailureClass
 from research_os.runtime.refs import AUTONOMOUS_BANK_BRANCH, RESERVED_REF_VALUE
+from research_os.runtime.store import RuntimeStore
 from tests.fs_helpers import make_git_repo
 from tests.portfolio_helpers import portfolio, record_review, seed_idea
 from tests.runtime_helpers import pg_dsn, runtime_db, runtime_project, runtime_xdg
@@ -557,3 +558,58 @@ def test_a_multi_line_refusal_stays_inside_its_own_bullet(
         if not line.strip():
             continue
         assert line.startswith(("- ", "  ")), f"{line!r} escaped its bullet"
+
+
+def test_a_page_says_which_way_the_measurement_pointed(
+    portfolio: PortfolioStore,
+    runtime_db: Database,
+    runtime_project: str,
+    repository: Path,
+) -> None:
+    """An idea its own experiment refuted must not read like one it supported.
+
+    No gate reads the direction, and that is defensible: a refutation is
+    evidence, and HUMAN_READY means "merits your attention", which a good
+    refutation does. What is not defensible is the page. An independent
+    review of this branch put the case concretely -- experiment CONTRADICTS,
+    replication CONTRADICTS, three reviewers endorse it as an important
+    negative result, and `VALIDATED.md` said "executions performed: 2" and
+    nothing else. The reader is not told the measurement refuted it.
+    """
+
+    idea, _ = seed_idea(portfolio, runtime_project)
+    job = RuntimeStore(runtime_db).create_external_job(
+        project_id=runtime_project,
+        executor="local",
+        spec_digest="d" * 64,
+        run_dir="/tmp/refuting",
+    )
+    portfolio.add_evidence(
+        idea_id=idea.idea_id,
+        idea_version=1,
+        kind=EvidenceKind.EXPERIMENT,
+        strength=EvidenceStrength.CONTRADICTS,
+        summary="the measurement refuted it",
+        job_id=job.job_id,
+    )
+    portfolio.set_status(idea_id=idea.idea_id, status=IdeaStatus.VALIDATED)
+
+    files = snapshot(runtime_db, runtime_project)
+    page = files[f"{BANK_ROOT}/bank/VALIDATED.md"]
+    assert "1 refuting and none supporting" in page
+    assert "did not support this idea" in page
+
+
+def test_a_page_with_no_execution_does_not_look_like_a_supported_one(
+    portfolio: PortfolioStore,
+    runtime_db: Database,
+    runtime_project: str,
+    repository: Path,
+) -> None:
+    """Positive control, and the reason the line prints when both are zero."""
+
+    idea, _ = seed_idea(portfolio, runtime_project)
+    portfolio.set_status(idea_id=idea.idea_id, status=IdeaStatus.VALIDATED)
+    page = snapshot(runtime_db, runtime_project)[f"{BANK_ROOT}/bank/VALIDATED.md"]
+    assert "none, so nothing here was measured" in page
+    assert "refuting" not in page
