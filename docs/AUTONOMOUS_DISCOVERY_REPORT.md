@@ -2413,11 +2413,13 @@ gives five unattended segments:
 ```text
 longest single run     5h 06m   (2026-09-21 00:33 -> 05:38)
 second                 3h 01m
-total daemon-active   10h 42m   across 5 segments
+total daemon-active   11h 31m   across 6 segments
 ```
 
 The brief asked for a minimum of eight hours unattended if available. The
-longest single stretch was 5h 06m. Two things ended segments: the provider
+longest single stretch was 5h 06m. (Segment boundaries are derived from the
+work-item record -- any gap over ten minutes -- rather than from this
+author's count of restarts, which was higher and wrong.) Two things ended segments: the provider
 session limit -- visible in the bank as *"You've hit your session limit ·
 resets 5:10am"* -- and, more often, this author stopping the daemon to apply
 one of the ten fixes. The second reason is not the machine's failure, but
