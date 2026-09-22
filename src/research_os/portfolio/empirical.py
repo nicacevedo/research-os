@@ -45,6 +45,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -350,7 +351,9 @@ def output_schema_lines(
             try:
                 if not target.is_file() or target.stat().st_size > MAX_SCHEMA_BYTES:
                     continue
-                document = json.loads(target.read_text(encoding="utf-8"))
+                document = json.loads(
+                    target.read_text(encoding="utf-8"), parse_constant=_not_a_number
+                )
             except (OSError, ValueError, UnicodeDecodeError):
                 continue
             paths = numeric_paths(document)[:MAX_SCHEMA_PATHS]
@@ -625,6 +628,19 @@ class Analysis:
         }
 
 
+class NotANumberError(ValueError):
+    """A document used ``NaN``, ``Infinity`` or ``-Infinity``.
+
+    Python's `json` accepts all three by default and no other JSON reader
+    does. Refusing them where the document is parsed is what keeps them out
+    of the arithmetic and out of the stored record at the same time.
+    """
+
+
+def _not_a_number(literal: str) -> float:
+    raise NotANumberError(literal)
+
+
 def metric_from(document: Any, path: str) -> float | None:
     """Read one number out of a parsed JSON document by dotted path.
 
@@ -653,7 +669,18 @@ def metric_from(document: Any, path: str) -> float | None:
         return None
     if isinstance(current, bool) or not isinstance(current, int | float):
         return None
-    return float(current)
+    value = float(current)
+    if not math.isfinite(value):
+        # NaN and the infinities are floats to Python and not numbers to a
+        # decision rule. An independent review found what that costs: with
+        # the common "not exactly zero" rule shape, `NaN != 0` is True and
+        # `NaN == 0` is False, so a run whose solver diverged and wrote NaN
+        # -- a run that produced no number at all -- returned SUPPORTS. An
+        # overflowed ratio reported the strongest possible confirmation.
+        # §19.5 already says the answer: a metric that is not a number is
+        # INSUFFICIENT.
+        return None
+    return value
 
 
 def analyse(
@@ -736,7 +763,9 @@ def analyse(
                 outputs=outputs,
                 notes=tuple(notes),
             )
-        document = json.loads(target.read_text(encoding="utf-8"))
+        document = json.loads(
+            target.read_text(encoding="utf-8"), parse_constant=_not_a_number
+        )
     except (OSError, ValueError, UnicodeDecodeError) as exc:
         return Analysis(
             conclusion=EmpiricalConclusion.INSUFFICIENT,
@@ -992,7 +1021,9 @@ def design(
         "spec": _spec_record(spec),
     }
     ref = context.artifacts.put_text(
-        json.dumps(record, indent=2, sort_keys=True, ensure_ascii=False),
+        json.dumps(
+            record, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False
+        ),
         media_type="application/json",
         role=f"idea_preregistration:{digest}",
         producer=f"{response.provider}:{template.identity}",
@@ -1824,7 +1855,9 @@ def interpret(context: Any, experiment: IdeaExperiment) -> ExperimentStep:
     # is the commit the disposable worktree was cut from.
     document["base_commit"] = _workspace_commit(workspace)
     ref = context.artifacts.put_text(
-        json.dumps(document, indent=2, sort_keys=True, ensure_ascii=False),
+        json.dumps(
+            document, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False
+        ),
         media_type="application/json",
         role=f"idea_experiment_analysis:{experiment.experiment_id}",
         producer="portfolio.empirical.analyse@1",

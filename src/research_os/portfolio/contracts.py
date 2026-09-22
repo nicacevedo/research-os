@@ -421,7 +421,14 @@ class DecisionPredicate(_Contract):
     """One half of a frozen decision rule: a comparison against a threshold."""
 
     comparator: str = Field(pattern=r"^(<=|>=|==|!=|<|>)$")
-    threshold: float
+    #: Finite, because a model writes it. A NaN threshold makes every
+    #: comparison false forever -- a rule that can never be met and never be
+    #: refuted, reported as a permanent INCONCLUSIVE with nothing saying
+    #: why -- and an infinite one is a rule that is always met or never.
+    #: `allow_inf_nan=False` also keeps the token out of the preregistration
+    #: artifact, which is written before the row and must be readable by
+    #: something other than Python.
+    threshold: float = Field(allow_inf_nan=False)
 
     def holds(self, value: float) -> bool:
         """Apply the comparison. Ordinary Python, and the only thing that is.

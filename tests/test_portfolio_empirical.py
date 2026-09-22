@@ -33,10 +33,13 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 
 from research_os.portfolio import empirical
 from research_os.portfolio.config import load_config
+from research_os.portfolio.contracts import DecisionPredicate, DecisionRule
 from research_os.portfolio.models import (
+    EVIDENCE_STRENGTH_FOR_CONCLUSION,
     AdjudicationType,
     EmpiricalConclusion,
     EvidenceKind,
@@ -2544,3 +2547,148 @@ def test_an_output_too_large_to_hash_is_not_called_unproduced(
     assert "never-written.json" in absent
     assert "made.json" not in absent, "a file on disk was called unproduced"
     assert "made.json" in dropped
+
+
+@pytest.mark.parametrize(
+    ("literal", "comparator", "threshold", "why"),
+    [
+        ("NaN", "!=", 0.0, "the shape the `holds` docstring defends as intended"),
+        ("NaN", ">", 0.5, "an ordinary two-sided threshold"),
+        ("Infinity", ">", 0.5, "an overflowed ratio"),
+        ("-Infinity", "<", 0.5, "the same, downward"),
+        ("1e400", ">", 0.5, "an overflow with no NaN token in the file at all"),
+    ],
+)
+def test_a_metric_that_is_not_a_number_never_settles_anything(
+    tmp_path: Path, literal: str, comparator: str, threshold: float, why: str
+) -> None:
+    """The worst defect found in this effort, and the one that had to be found.
+
+    Python's `json` accepts `NaN`, `Infinity` and `-Infinity`, which no
+    other JSON reader does, and `isinstance(float("nan"), float)` is True --
+    so a diverged solver that wrote `{"overlap": NaN}` and exited 0 reached
+    the arithmetic. Under the common "not exactly zero" rule, `NaN != 0` is
+    True and `NaN == 0` is False: **SUPPORTS**. Under an ordinary upper
+    threshold an infinity is the strongest confirmation the rule can
+    express. A run that produced no number manufactured a positive result,
+    which is the one thing this whole arrangement exists to prevent.
+
+    `1e400` is here because it is the case a `parse_constant` guard alone
+    misses: it overflows to infinity with no NaN token in the file, so
+    `metric_from` has to reject it on its own.
+    """
+
+    from research_os.portfolio import empirical as bridge
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    (workspace / "r.json").write_text(f'{{"summary": {{"overlap": {literal}}}}}')
+    rule = DecisionRule(
+        metric_path="summary.overlap",
+        output_path="r.json",
+        success=DecisionPredicate(comparator=comparator, threshold=threshold),
+        failure=DecisionPredicate(comparator="==", threshold=0.0),
+    )
+    analysis = bridge.analyse(
+        experiment=SimpleNamespace(no_rule_reason=""),
+        rule=rule,
+        workspace=workspace,
+        spec=SimpleNamespace(outputs=("r.json",)),
+        exit_code=0,
+    )
+    assert analysis.conclusion is EmpiricalConclusion.INSUFFICIENT, why
+    assert analysis.conclusion not in EVIDENCE_STRENGTH_FOR_CONCLUSION or (
+        EVIDENCE_STRENGTH_FOR_CONCLUSION[analysis.conclusion]
+        is not EvidenceStrength.SUPPORTS
+    )
+
+
+def test_a_finite_metric_still_settles_it(tmp_path: Path) -> None:
+    """Positive control: the guard rejects non-numbers, not numbers."""
+
+    from research_os.portfolio import empirical as bridge
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    (workspace / "r.json").write_text('{"summary": {"overlap": 0.9}}')
+    rule = DecisionRule(
+        metric_path="summary.overlap",
+        output_path="r.json",
+        success=DecisionPredicate(comparator=">", threshold=0.5),
+        failure=DecisionPredicate(comparator="<=", threshold=0.5),
+    )
+    analysis = bridge.analyse(
+        experiment=SimpleNamespace(no_rule_reason=""),
+        rule=rule,
+        workspace=workspace,
+        spec=SimpleNamespace(outputs=("r.json",)),
+        exit_code=0,
+    )
+    assert analysis.conclusion is EmpiricalConclusion.SUPPORTS
+    assert analysis.observed == pytest.approx(0.9)
+
+
+def test_a_threshold_a_model_wrote_must_be_finite() -> None:
+    """A NaN threshold is a rule that can never be met and never refuted.
+
+    It would report a permanent INCONCLUSIVE with nothing saying why, and
+    it would put a token into the preregistration artifact that only Python
+    can read.
+    """
+
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValidationError):
+            DecisionPredicate(comparator=">", threshold=bad)
+
+
+def test_an_analysis_document_is_json_anything_can_read(tmp_path: Path) -> None:
+    """The stored record must not contain a token only Python accepts.
+
+    `json.dumps({"v": float("nan")})` emits a bare `NaN`, which `jq` and
+    every strict reader reject -- and that artifact is the permanent record
+    of the measurement, referenced by the evidence row.
+    """
+
+    with pytest.raises(ValueError):
+        json.dumps({"observed": float("nan")}, allow_nan=False)
+
+
+def test_a_document_with_a_nan_token_anywhere_is_not_a_json_document(
+    tmp_path: Path,
+) -> None:
+    """Stricter than the metric guard, and deliberately so.
+
+    `metric_from`'s finiteness check already covers a non-finite value *at
+    the metric path* -- a mutation control showed that, by leaving this
+    case as the only one the parse guard uniquely catches. The question it
+    forced is whether a run that writes `{"overlap": 0.4, "diag": NaN}`
+    should be read.
+
+    It should not. The preregistered rule says to read a number out of a
+    JSON document, and a bare `NaN` token is not JSON: `jq` rejects the
+    file, and so does every reader that is not Python. Refusing is the
+    conservative direction -- INSUFFICIENT, never a conclusion -- and it
+    keeps the stored record from citing a source file nothing else can
+    parse.
+    """
+
+    from research_os.portfolio import empirical as bridge
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    (workspace / "r.json").write_text('{"summary": {"overlap": 0.9, "diag": NaN}}')
+    rule = DecisionRule(
+        metric_path="summary.overlap",
+        output_path="r.json",
+        success=DecisionPredicate(comparator=">", threshold=0.5),
+        failure=DecisionPredicate(comparator="<=", threshold=0.5),
+    )
+    analysis = bridge.analyse(
+        experiment=SimpleNamespace(no_rule_reason=""),
+        rule=rule,
+        workspace=workspace,
+        spec=SimpleNamespace(outputs=("r.json",)),
+        exit_code=0,
+    )
+    assert analysis.conclusion is EmpiricalConclusion.INSUFFICIENT
+    assert "could not be read as JSON" in analysis.summary
