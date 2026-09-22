@@ -2388,6 +2388,28 @@ live path.
 
 ### Y.7 The engineering gates, and what the soak actually was
 
+**The authoritative gate run.** One process, its own output directory, the
+daemon stopped, at `4346b69`; the only change between it and the final
+commit is this document, with `src/`, `tests/`, `pyproject.toml` and
+`uv.lock` byte-identical:
+
+```text
+ruff check .              pass
+ruff format --check .     pass, 372 files
+pytest -q                 4452 passed, 8 skipped, 870s, exit 0
+pytest -q --reverse       4452 passed, 8 skipped, 868s, exit 0
+real-state contamination  clean, both directions
+```
+
+The contamination result settles a question left open earlier in the run:
+entries kept appearing in the researcher's real Research OS directories
+during test runs, and with the daemon stopped they do not. They were the
+daemon's own provider calls, which is correct behaviour for a dogfood that
+runs there deliberately, and not the suite writing where it should not.
+
+Every earlier gate figure in this session is void; §Y.20 says why. This is
+the only one that counts.
+
 Migrations were exercised twice, and the second is the stronger evidence.
 A fresh database applies all 29 and reports head 0029; running `migrate`
 again answers *"the operational schema is up to date"*. But the dogfood
