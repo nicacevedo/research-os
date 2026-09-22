@@ -2505,25 +2505,26 @@ earlier numbers quoted elsewhere in §Y are smaller and were correct when
 written.
 
 ```text
-ideas                    110      (cg 65, ccao 45)
-versions                 142      one idea reached v5
-actions                  439
-reviews                  105      all from the falsifier; the board never ran
-evidence rows             26      all literature; 0 numerical, 0 executed
-model calls              377
-work items              1062      1009 succeeded, 43 failed, 9 pending, 1 leased
-spend                 $22.05 settled, $7.40 released, $0.15 held
+ideas                    133      (cg and ccao)
+versions                 168      one idea reached v5
+actions                  490
+reviews                  114      all from the falsifier; the board never ran
+evidence rows             31      all literature; 0 numerical, 0 executed
+model calls              431
+work items              1160      1111 succeeded (95.8%)
+spend                 $24.75 settled, $7.55 released, $0.10 held
 ceilings               cg $50.00 (explicit, human-set, never raised)
                        ccao $15.00 (derived)
 experiments                1      superseded; none ever ran to a conclusion
 VALIDATED                  0
 HUMAN_READY                0
-schema                  0029      upgraded under load five times during the run
+schema                  0030      upgraded under load six times during the run
 capsules                  OK      both validate after the entire run
 human branches      unmoved      one reflog entry each, `clone:`
+soak               6 segments, longest 5h 06m, 11h 31m total
 ```
 
-Work-item success rate is 95.0%. Of the 43 failures, 29 carry the
+Work-item success rate is 95.8%. Of the failures, 29 carry the
 pre-fix `unknown` class, 7 are `provider_unavailable`, 4
 `budget_exhausted` and 3 `capability_denied` -- and not one is a
 scientific rejection, because the taxonomy has no member for one.
