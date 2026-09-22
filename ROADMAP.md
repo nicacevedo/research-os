@@ -262,6 +262,46 @@ and `experiments.yaml` lives outside every worktree precisely so that an
 agent cannot write them. `docs/AUTONOMOUS_DISCOVERY_REPORT.md` §X is the
 record.
 
+### The overnight run — fifteen defects, seven refusals, still beta
+
+An overnight finalisation pass on 2026-09-22 pushed the layer as far as the
+evidence allows and left the verdict where it was. 120 ideas across both
+projects, 1,000+ work items at 95% success, $23.45 spent against ceilings
+it never exceeded and a human ceiling it never raised, eight unattended
+segments with the longest at 5h 06m.
+
+**Fifteen defects.** Ten found by this author, including an explicit cost
+ceiling a reconciler-rescheduled cycle raised six-fold, a stage's own
+account of itself cut mid-word at 500 characters by call sites that had
+each picked a literal, and `ideas show` reporting `next: evidence` for
+ideas blocked at that stage after five failed attempts. Then an
+independent architecture review, given one read-only afternoon on code
+carrying 4,402 green tests, found **four more, every one of them the
+permanent record asserting something untrue** -- most seriously that every
+analysis artifact recorded `"containment": "completed"`, so the record
+could not distinguish a contained measurement from an uncontained one,
+which is the condition invariant 11 relies on. Migration 0030 makes it
+checkable. That review also found that a researcher *lowering* autonomy to
+be more careful got uncontained execution, because the portfolio inherited
+a rule whose premise -- "a person is at the keyboard" -- is false for a
+daemon that runs unattended by construction.
+
+**Seven refusals and no traversal.** No declared command can settle any of
+the real empirical questions, and the system said so seven times across
+two sessions, three prompt versions and a restart, without once proposing
+to measure something adjacent and calling it the answer. The missing
+human-owned capability is seven items, not the two named above: two
+declarations and five measurements this project has not built --
+a written verdict file, output schemas on `benchmark` and
+`adjudicate-pricing`, achieved cardinality, a warm-start toggle, a
+hardware-generation selector, and peak memory. §Y.2 has them.
+
+So `review_board`, `meta_review`, `replicate` and `branch` remain
+unexercised on real work -- `max_depth` is 0 across 120 ideas -- and
+nothing reached `VALIDATED`. The verdict stays
+`AUTONOMOUS_DISCOVERY_BETA`; `docs/AUTONOMOUS_DISCOVERY_REPORT.md` §Y is
+the record and §Z is the assessment.
+
 ## Two external prerequisites, and the policy on each
 
 Neither is a defect. Both are things this workstation cannot establish, and
