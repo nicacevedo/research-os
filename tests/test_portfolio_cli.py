@@ -20,14 +20,18 @@ import pytest
 
 from research_os.cli import main
 from research_os.portfolio.models import (
+    ActionStatus,
     EvidenceKind,
     EvidenceStrength,
     IdeaStatus,
+    OperationalState,
     ReviewerRole,
+    Stage,
 )
 from research_os.portfolio.store import PortfolioStore
 from research_os.runtime.config import DSN_ENV
 from research_os.runtime.db import Database
+from research_os.runtime.failures import FailureClass
 from research_os.runtime.store import RuntimeStore
 from tests.portfolio_helpers import portfolio, record_review, seed_idea
 from tests.runtime_graph_helpers import make_capsule
@@ -524,3 +528,57 @@ def test_status_json_carries_the_failures_too(
 
     assert payload["failed_work"] == 0
     assert payload["failures"] == []
+
+
+def test_show_says_the_idea_is_blocked_and_what_refused_it(
+    cli: str, portfolio: PortfolioStore, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """The one command for reading one idea did not mention either.
+
+    Five real ideas sat at `BLOCKED_EXTERNAL` overnight, one of them after
+    five failed attempts at the same stage and two careful refusals naming
+    the capability the project would have to add. `ideas show` printed
+    `next: evidence -- get the evidence this kind of idea would be settled
+    by`, which is what `select_stage` would choose and not what happened.
+    A researcher reading it would wait for work that has already been tried
+    and has already reported why it cannot be done.
+    """
+
+    idea, _ = seed_idea(portfolio, cli)
+    portfolio.set_status(idea_id=idea.idea_id, status=IdeaStatus.PROMISING)
+    action = portfolio.open_action(
+        idea_id=idea.idea_id,
+        idea_version=1,
+        stage=Stage.EVIDENCE,
+        basis_digest="basis-blocked",
+    )
+    portfolio.complete_action(
+        action_id=action.action_id,
+        status=ActionStatus.FAILED,
+        detail="no declared command can measure peak memory",
+        failure_class=str(FailureClass.CAPABILITY_DENIED),
+        operational_state=OperationalState.BLOCKED_EXTERNAL,
+    )
+
+    assert run_cli(monkeypatch, "ideas", "show", idea.idea_id) == 0
+    out = capsys.readouterr().out
+    assert "BLOCKED_EXTERNAL" in out
+    assert "capability_denied" in out
+    assert "no declared command can measure peak memory" in out
+
+
+def test_show_stays_quiet_about_an_idea_that_is_simply_working(
+    cli: str, portfolio: PortfolioStore, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """Positive control: an idle idea gains neither section.
+
+    Asserting the *absence of the line*, not the absence of the word: a
+    first draft of this checked only that "BLOCKED" was missing, which a
+    view printing "state: IDLE" on every idea would have passed.
+    """
+
+    idea, _ = seed_idea(portfolio, cli)
+    assert run_cli(monkeypatch, "ideas", "show", idea.idea_id) == 0
+    out = capsys.readouterr().out
+    assert "state:" not in out
+    assert "last attempt" not in out

@@ -38,8 +38,11 @@ from research_os.portfolio import digest as digest_module
 from research_os.portfolio.config import load_config
 from research_os.portfolio.gates import board_independence
 from research_os.portfolio.models import (
+    ActionStatus,
     EvidenceKind,
+    IdeaAction,
     IdeaStatus,
+    OperationalState,
     PortfolioIdea,
     PortfolioStatus,
 )
@@ -238,6 +241,23 @@ def _project_and_repo(value: str | None, db: Database) -> tuple[str, Path]:
 
 def _print(text: str) -> None:
     print(terminal_safe(text))
+
+
+def _last_failure(store: PortfolioStore, idea_id: str) -> tuple[IdeaAction, str] | None:
+    """The most recent failed attempt, and how many times that stage has failed.
+
+    Not filtered to the stage ``next`` names: the two differ whenever the
+    machine gave up before reaching the stage it would choose, and the
+    attempt that failed is the one worth reading either way.
+    """
+
+    actions = store.list_actions(idea_id=idea_id)
+    failed = [item for item in actions if item.status is ActionStatus.FAILED]
+    if not failed:
+        return None
+    latest = failed[-1]
+    n = sum(1 for item in failed if item.stage == latest.stage)
+    return latest, ("once" if n == 1 else f"{n} times")
 
 
 def _provenance_line(store: PortfolioStore, idea: PortfolioIdea) -> str:
@@ -613,6 +633,25 @@ def _show(args: argparse.Namespace) -> int:
         )
         _print("")
         _print(f"  next: {stage or 'nothing'} -- {why}")
+        # `next` is what `select_stage` would choose, which is not the same
+        # thing as what happened. Five real ideas sat at BLOCKED_EXTERNAL
+        # overnight, one after five failed attempts at the stage named on
+        # that line, and this view mentioned neither -- so it read as work
+        # about to start rather than work already refused. The refusal is
+        # the most useful sentence the system has about such an idea.
+        if idea.operational_state is not OperationalState.IDLE:
+            _print(f"  state: {idea.operational_state}")
+        failure = _last_failure(store, idea.idea_id)
+        if failure is not None:
+            last, tried = failure
+            _print("")
+            _print(
+                f"  last attempt at {last.stage} failed "
+                f"({last.failure_class or 'no class recorded'}); "
+                f"tried {tried}:"
+            )
+            for line in (last.detail or "(nothing recorded)").splitlines():
+                _print(f"    {line}")
         if reviews:
             _print("")
             _print("  live reviews")
