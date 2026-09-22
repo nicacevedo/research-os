@@ -2067,6 +2067,12 @@ what Phase 1 asked to be recorded.
 
 ### Y.2 Phase 1, answered: the missing capability is human-owned
 
+> **Read §Y.12 first.** The catalogue this run loaded declares three
+> commands, not the four the brief describes: the correction landed in the
+> researcher's real config and the dogfood reads its own. Everything below
+> was produced against three. §Y.12 also shows, from the fourth command's
+> own declaration, that having it would not have changed the answer.
+
 No declared command can settle any of the three real empirical questions,
 and the refusals are detailed, stable, and reproduced across two sessions
 and three prompt versions. They are correct. The clearest is the one that
