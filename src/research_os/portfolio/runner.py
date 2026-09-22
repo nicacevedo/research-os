@@ -225,7 +225,20 @@ def build_snapshot(context: TrackContext) -> stages.TrackSnapshot:
     evidence = store.list_evidence(
         idea_id=context.idea_id, idea_version=version.version
     )
-    live = store.live_reviews(idea_id=context.idea_id)
+    # One definition of "live", used by both the basis digest and the stage
+    # selector. This call took the sentinel defaults, which resolve
+    # `max_age_seconds` from the process-global `load_config()`, while the
+    # one below passes `context.config`. Two definitions of liveness in one
+    # function is the exact livelock `live_reviews`' docstring records an
+    # independent test audit finding: the basis counted a stale review that
+    # `select_stage` counted missing, so the track re-ran a stage whose
+    # result it then refused to see. The sentinel fix closed it for six
+    # callers; this call site had quietly reintroduced it.
+    live = store.live_reviews(
+        idea_id=context.idea_id,
+        current_prompt_versions=CURRENT_REVIEW_PROMPTS,
+        max_age_seconds=context.config.thresholds.review_max_age_seconds,
+    )
     basis = pdigests.basis_digest(
         content=version.content_digest,
         evidence_ids=[item.evidence_id for item in evidence],
@@ -243,14 +256,8 @@ def build_snapshot(context: TrackContext) -> stages.TrackSnapshot:
             idea_version=version.version,
             basis_digest=basis,
         ),
-        evidence=store.list_evidence(
-            idea_id=context.idea_id, idea_version=version.version
-        ),
-        live_reviews=store.live_reviews(
-            idea_id=context.idea_id,
-            current_prompt_versions=CURRENT_REVIEW_PROMPTS,
-            max_age_seconds=context.config.thresholds.review_max_age_seconds,
-        ),
+        evidence=evidence,
+        live_reviews=live,
         open_objections=store.open_objections(idea_id=context.idea_id),
         revision_count=store.revision_count(context.idea_id),
         review_count=store.review_count(context.idea_id),
