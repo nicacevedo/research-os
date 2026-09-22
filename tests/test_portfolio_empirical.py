@@ -2793,3 +2793,60 @@ def test_a_threshold_that_moved_after_the_run_cannot_read_the_result(
     assert result.failure_class is FailureClass.MISSING_SCIENTIFIC_AUTHORITY
     assert "fixed after the fact" in result.detail
     assert portfolio.list_evidence(idea_id=idea_id, idea_version=1) == ()
+
+
+def test_a_revision_does_not_leave_a_worktree_in_the_repository(
+    portfolio: PortfolioStore,
+    runtime_db: Database,
+    runtime_project: str,
+    project_repo: Path,
+    tmp_path: Path,
+) -> None:
+    """§19.6 says byte-identical afterwards, and said it unconditionally.
+
+    `append_version` supersedes open experiments of older versions inside
+    one transaction, and `supersede_experiments_below` is pure SQL with no
+    repository in hand. `ensure_workspace` runs inside `submit`'s
+    `perform`, *before* the row leaves PROPOSED -- so a process killed in
+    that window leaves a worktree and an `automation/...` branch that the
+    prompt-staleness path never sees, because that path only fires for a
+    row it is itself replacing. An independent review found it and called
+    it the fourth instance of the surviving-branch family §19.7a says was
+    already paid for three times.
+    """
+
+    from research_os.runtime.actions.coding import canonical_fingerprint
+
+    idea_id = _idea(portfolio, runtime_project)
+    context = _context(
+        portfolio=portfolio,
+        runtime_db=runtime_db,
+        tmp_path=tmp_path,
+        project_id=runtime_project,
+        idea_id=idea_id,
+        router=_router(runtime_db, design=design_answer(seed=5)),
+        repo=project_repo,
+    )
+    before = canonical_fingerprint(project_repo)
+
+    step = empirical.design(
+        context, portfolio.require_version(idea_id), role=ExperimentRole.PRIMARY
+    )
+    assert step.ok, step.detail
+    # The window: a workspace exists while the row is still PROPOSED.
+    empirical.ensure_workspace(step.experiment, repository=project_repo)
+    assert Path(step.experiment.workspace_path).is_dir()
+
+    # A revision arrives and supersedes it, in SQL, with no repository.
+    portfolio.append_version(idea_id=idea_id, fields=idea_fields(title="sharpened"))
+    assert (
+        portfolio.require_experiment(step.experiment.experiment_id).state
+        is ExperimentState.SUPERSEDED
+    )
+
+    empirical.advance(context, portfolio.require_version(idea_id))
+
+    assert not Path(step.experiment.workspace_path).exists()
+    assert canonical_fingerprint(project_repo) == before, (
+        "a superseded measurement left a ref in the researcher's repository"
+    )

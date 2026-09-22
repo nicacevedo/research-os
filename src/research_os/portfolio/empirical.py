@@ -2133,6 +2133,38 @@ def designer_for(role: ExperimentRole) -> Any:
     ]
 
 
+def _release_superseded(context: Any) -> None:
+    """Throw away worktrees left by experiments a *revision* superseded.
+
+    The prompt-staleness path above releases its own. This one has no
+    owner: `append_version` supersedes open experiments of older versions
+    in the same transaction, and `supersede_experiments_below` is pure SQL
+    with no repository in hand -- so a row that reached `PROPOSED` and
+    created a workspace before the process died leaves a worktree and an
+    `automation/...` branch in the researcher's repository that nothing
+    ever collects. §19.6 says the canonical repository is byte-identical
+    afterwards, unconditionally, and an independent review found the
+    condition under which it was not.
+
+    Swept here because this is the next moment that has both the
+    repository and a reason to look. Idempotent: `release_workspace`
+    tolerates a path that is already gone.
+    """
+
+    if context.repo_path is None:
+        return
+    repository = Path(context.repo_path)
+    for item in context.portfolio.list_experiments(idea_id=context.idea_id):
+        if item.state is not ExperimentState.SUPERSEDED:
+            continue
+        if not item.workspace_path or not Path(item.workspace_path).exists():
+            continue
+        LOG.info(
+            "releasing the workspace a revision left behind: %s", item.experiment_id
+        )
+        release_workspace(item, repository=repository)
+
+
 def _is_stale(experiment: IdeaExperiment, *, role: ExperimentRole) -> bool:
     """Whether this design was made by a prompt this build no longer uses.
 
@@ -2194,6 +2226,9 @@ def advance(
         )
     design_cost, design_calls = "0", 0
     if existing is None:
+        # Before designing a replacement, collect anything a revision
+        # superseded and left on disk.
+        _release_superseded(context)
         step = design(context, version, role=role, previous=previous)
         if not step.ok or step.experiment is None:
             return step
