@@ -3095,10 +3095,10 @@ has not built -- and no agent may supply them. But the system's readiness
 is not established by having a good reason for not being exercised.
 
 **And the defect surface is not exhausted. This is the deciding fact.**
-Twenty-one defects this session. Ten found by this author. Then two
+Twenty-seven defects this session. Ten found by this author. Then three
 independent reviewers, each given one afternoon and read-only access to
-code carrying 4,402 green tests that had already been audited twice, found
-**eleven more between them** -- and they did not overlap.
+code carrying 4,437 green tests that had already been audited twice, found
+**seventeen more between them** -- and they barely overlapped.
 
 The first found four, every one of them the permanent record asserting
 something untrue: every analysis artifact in the store said
@@ -3117,12 +3117,27 @@ The same review found that the preregistered *rule* -- the entire content
 of §19.4's claim -- was never checked against its artifact while the
 specification was checked twice.
 
-None of these is a refinement. Two independent passes, no overlap, and
-both found record-integrity defects at the centre of the system's
-scientific claims. **Nothing in this run locates the edge of that
-surface.** A third review finding a seventh class is the expectation, not
-the surprise, and a system whose measurements can be trusted is precisely
-what has not been demonstrated.
+The third was a security review, and it found five more -- among them the
+one true code-execution class in the system (a newline in a `#SBATCH`
+directive turns a comment into script body), a `path` parameter that
+accepted `--config=/home/u/.ssh/id_rsa`, and `nan` clearing every
+declared numeric bound, which is the *same hazard* as the critical defect
+above arriving through a second door in the same week.
+
+None of these is a refinement. **Three independent passes, barely
+overlapping, each finding integrity defects at the centre of a different
+one of the system's claims** -- what the record says, what a measurement
+means, and what a model may cause to execute. That is not a defect count
+converging. **Nothing in this run locates the edge of that surface**, and
+a fourth review finding an eighth class is the expectation rather than
+the surprise.
+
+What the reviews also establish, and it belongs here: the *architecture*
+held every time. No path to a human Review, to a promotion, to a write
+under `.research/`, to the researcher's branch, to an uncontained
+portfolio experiment, or to a shell. The defects were in the record and
+in the arithmetic, never in the boundary. A system can have a sound
+boundary and still not be ready, and that is the position this is in.
 
 **Three known gaps are recorded and unfixed**, each because it is a
 person's decision rather than a defect: the authority table does not
