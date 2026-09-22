@@ -3249,3 +3249,193 @@ Items 2 through 4 are reachable only once item 1 exists. Item 5 is
 reachable today, costs an afternoon, and is the one thing on this list
 that would have caught the worst defect of the run.
 
+
+## AA. The instrumentation traversal: one measurement, one board, one rejection
+
+2026-09-22, after §Z. The researcher declared the capability §Z.4 item 1 names
+-- a command that writes a JSON document with a declared output schema -- and
+one idea was driven through the production path against it. This section is
+what that produced. It does not move the verdict, and §AA.6 says why.
+
+### AA.0 The digest in the prior packet was mislabelled, not wrong
+
+The previous human packet reported EXP-0002 as
+`4d45354b1e23614148edc45b7a3a2c2a98c532d11127942056c140bb400519c7` and that
+was recorded here as an incorrect digest. It is not incorrect. It is the
+plan's **canonical content digest** -- `Plan.digest`, computed by the
+project's own `bench.Plan` from the parsed design -- and the run's output
+document carries it as `plan_digest`. The **file** digest is
+`sha256(experiments/EXP-0002-lambda-support-sweep-plan.json) =
+7aa26e4f5c4fb07c4de062079b1df0d4b746ca35a841146bab511fc7563910ce`, 880
+bytes, introduced by `396f048` and untouched by `efceadf`, identical in the
+instrumentation worktree, the dogfood checkout and both Git objects.
+
+Two digests, both correct, naming the same frozen plan by different rules.
+The error was attaching one to the other's name, which is worse than a wrong
+number: a wrong number fails a comparison, and a mislabelled one passes the
+wrong comparison. Recorded as a **reporting/provenance error**, not as a
+plan defect. Nothing was regenerated.
+
+### AA.1 The declaration had to be where the run reads it
+
+`sweep-lambda-support` was declared in `~/.config/research-os/experiments.yaml`.
+The portfolio runs under `RESEARCH_OS_CONFIG_HOME=.../research-os-dogfood/xdg/config`,
+whose copy was the 2026-09-21 19:55 version, so `researchctl experiment
+commands` listed three commands and the evidence stage went on refusing
+correctly. The researcher's file was copied in byte-for-byte
+(`cd99d69329adf86d...` on both sides; the prior version kept as
+`experiments.yaml.bak-before-sweep-capability`, `34c248dfc94b5ef3...`).
+
+Worth stating plainly because the boundary is real: **no capability was
+authored here.** The text is the researcher's, unmodified, and the copy is
+recorded by digest so that claim is checkable rather than asserted.
+
+### AA.2 What ran
+
+`PIDEA-20260921T054529Z-7c68ed14` v2, `portfolio resume` lifting a
+five-attempt `capability_denied` block, then `researchd` on the ordinary
+schedule.
+
+```text
+experiment      PEXP-20260922T195752Z-4331c06a  PRIMARY  INTERPRETED
+command         sweep-lambda-support
+plan            experiments/EXP-0002-lambda-support-sweep-plan.json
+spec digest     6b0e069ed57e9bf9ab1a92f4f736a5818f867459e033fec25e17443744ca84f5
+variation       e3aaca6a1f3985c6e4684b630c723b141b7487b188eb980bd062cea330d6d118
+prereg artifact 22d44b40530ff0228b92982454c16dca92fa9a3ece56af3d2c3faa9f1649ae5a
+analysis        a730d86cc8d241c47c76d418d13a2c544d2cbbdc557fd25137f986c48b836107
+base commit     efceadf52fcc71b51a092b915fa6ec6ea61e3722
+containment     bubblewrap; network denied; nested user namespaces disabled
+exit / wall     0 / 321.136 s
+designer        experiment_designer@5
+```
+
+The preregistered rule, fixed before any result existed:
+`portability.R > 3.0` supports, `< 0.3333333333` refutes, between them
+`INCONCLUSIVE`. Measured `portability.R = 3.8888888888888884`. Conclusion
+`SUPPORTS`, reached by `DecisionPredicate.holds` and no model.
+
+Then `review_board`: `methodology_reviewer PASS_WITH_OBJECTIONS`,
+`novelty_reviewer REVISE`, `skeptic_reviewer REVISE`, all three
+`anthropic/claude-sonnet-5`, `board_independence` **1** and labelled as not
+independent. Two CRITICAL objections stood, so `select_stage` chose
+`discover` over `meta_review` -- correctly: the machine will not synthesise
+over an unanswered CRITICAL. The sharpened v3 moved the statistic from
+window *width* to argmin *location* and made cold-start explicit, naming 15
+addressed objections. The falsifier then killed it **FATAL / CLAIM**:
+
+> Cold-start pricing rounds from an empty active set are a path-length
+> quantity that should be approximately monotone in λ ... so the 'argmin of
+> R(λ)' this question is built around is expected to sit at the grid
+> boundary for every design -- a construction artifact of the cold-start
+> protocol, not a discoverable phenomenon.
+
+Final state **REJECTED**, tier reached PROMISING, `retire_reason` recorded.
+
+### AA.3 The system got a supporting number and refused it
+
+This is the part worth keeping. The falsifier's diagnosis is corroborated by
+the raw document, which it was not shown: all six designs put their fast
+window at λ/λ_max ∈ [0.7, 0.9] against a grid whose **maximum is 0.9**, at
+best costs of 2--4 iterations and support sizes of 1--5 out of k=25. Every
+window was pinned to the grid edge. The `R = 3.889` that cleared a `> 3.0`
+threshold is a ratio of small integers (support boundaries 5 over 1) taken
+at that edge, and the skeptic had already said so in different words --
+"clears the threshold by only ~30%, with no replication, seeds, or
+variance/CI reported" and "if any design's boundary lands near a small
+integer ... the ratio can blow up purely from discretization".
+
+A `SUPPORTS` that the review layer declined to promote and the falsifier
+then rejected is the strongest evidence in this document that the gates are
+not decorative. It is also the reason `meta_review` and `replicate` are
+still unexercised: they sit *behind* the objection check, and on real ideas
+the CRITICALs do not clear.
+
+### AA.4 Two defects, both of shapes already named here
+
+**AA.4.1 Every contract bound was enforced and none was stated.** Every
+string limit in `portfolio/contracts.py` lives in a `field_validator`, which
+contributes nothing to `model_json_schema()` -- the schema a role is
+actually given. 119 string fields, zero advertising a maximum. It cost this
+traversal directly: `scientific_discovery` returned a 201-character
+`refined.title` and the whole response was discarded as
+`MODEL_OUTPUT_INVALID`; on a sibling idea the same role lost four responses
+to a 2 000-character `obstacle`, and three of those wedge an idea at
+`BLOCKED_EXTERNAL`. `ExperimentDesign._explanation` already records this
+accident in these words -- "a limit nothing had told it about" -- and
+answered it by clipping three fields on one contract. This is the **fifth**
+instance of the shape and the general form of that answer: `_shown()` puts
+the bound in the emitted schema for all 35 validator-covered string fields.
+Schema-only on purpose -- the validators measure the *stripped* value, so a
+real `max_length` would begin refusing padded strings the contract has
+always accepted. `test_every_length_checked_string_says_so_in_the_schema`
+is the general guard; both new tests fail on the unfixed tree.
+
+**AA.4.2 `ideas show` reported a failure the stage had already overcome.**
+After the evidence stage succeeded and wrote an interpreted experiment, the
+view still opened with `last attempt at evidence failed (capability_denied);
+tried 5 times` and the entire stale refusal, directly under a `next:` line
+that had moved on to the review board. The §Y.13 class again -- the
+permanent record asserting something untrue -- and `portfolio status`
+already drew the distinction in words this surface did not draw at all.
+`_last_failure` now ignores failures a stage has since overcome, per stage,
+with a control test asserting that a stage still failing still reports.
+
+**One limitation found and deliberately not fixed.** The experiment designer
+may name a tracked file for a `path` parameter but is never shown its
+*contents*, so it could not tell whether the frozen plan matched the
+falsifier's design. It handled that correctly -- `dataset_identity` records
+"the committed sweep.json lists window keys for only two designs ... The
+plan's digest decides this, not this design" -- and it happened to be wrong
+about the plan, which holds six designs at n=2000. The output-schema listing
+it reasoned from came from a *different* plan's committed run. Showing plan
+contents is a design change with a preregistration hazard beside it, so it
+is recorded rather than made.
+
+### AA.5 What no declared command can still settle
+
+Five refusals were measured after the new capability was in place, each
+naming a human-owned gap and none proposing to measure something adjacent:
+a warm-start on/off toggle (twice), a hardware-generation selector, a
+factorial over (n, p) crossed with difficulty, and a document search of the
+thesis. So six of §Y.2's seven remain.
+
+One of them is smaller than it was recorded as being. The (n, p) factorial
+does **not** need a new command: `sweep-lambda-support` takes any plan file,
+and what blocks it is that a designer may only name a *tracked* file and no
+such plan is committed. That gap closes with a committed plan, not with code.
+
+Also observed, and a tuning property rather than a defect: `evidence` is the
+most expensive stage in the utility function (0.4 × $2.50), so an idea
+needing a measurement is reliably the marginal candidate. With
+`max_active_tracks` 8 and an explorer holding the candidate pool at its
+floor, the ninth-ranked idea is always the one that wants a measurement.
+The target idea got its slot only during the lull `portfolio resume`
+created; a second empirical idea sat at rank 9 of 9 for three daemon
+batches and never ran.
+
+### AA.6 Reassessment: `AUTONOMOUS_DISCOVERY_RELEASE_CANDIDATE` is not justified
+
+Two of §Z.3's zeroes are no longer zero. One experiment concluded on the
+production path -- designed, preregistered, executed contained, read by
+arithmetic -- and one review board sat, three roles, on real work. §Z.4
+item 1 is partly done: one of seven capabilities is declared, and it is the
+one that section singled out.
+
+Everything else in §Z.3 stands. Zero replications, zero branches, zero
+`VALIDATED`, zero `HUMAN_READY`, `max_depth` still 0. `meta_review` and
+`replicate` remain unexercised, and this run showed *why* rather than
+merely that: they sit behind a standing-CRITICAL check that real falsifiers
+and real reviewers keep re-arming. Item 2 -- one idea end to end through
+meta-review and replication -- did not happen. Item 3 is unchanged: a board
+of three samples from one model, correctly labelled as not independent.
+Item 5 was not attempted.
+
+And item 6 is the deciding one, unchanged in force. A single short traversal
+on a path already audited three times produced **two more defects**, both of
+shapes this document had already named and neither caught by 4,457 tests.
+That is not a defect surface converging. The verdict stays
+**`AUTONOMOUS_DISCOVERY_BETA`**.
+
+What this run adds to §Z.4 rather than subtracts: the cheapest remaining
+item is now a committed plan file, not a new command.
