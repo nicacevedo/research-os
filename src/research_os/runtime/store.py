@@ -100,7 +100,8 @@ APPROVAL_COLUMNS = (
 )
 JOB_COLUMNS = (
     "job_id, run_id, work_id, project_id, executor, scheduler_job_id, spec_digest, "
-    "run_dir, status, failure_class, exit_code, detail, submitted_at, last_polled_at, finished_at"
+    "run_dir, status, failure_class, exit_code, detail, contained, containment, "
+    "wall_clock_seconds, submitted_at, last_polled_at, finished_at"
 )
 MODEL_CALL_COLUMNS = (
     "call_id, run_id, project_id, work_id, invocation_id, provider, model, role, "
@@ -927,6 +928,9 @@ class RuntimeStore:
         failure_class: str | None = None,
         exit_code: int | None = None,
         detail: str | None = None,
+        contained: bool | None = None,
+        containment: str | None = None,
+        wall_clock_seconds: Decimal | float | None = None,
         polled: bool = False,
         allow_terminal_override: bool = False,
     ) -> ExternalJob:
@@ -956,6 +960,11 @@ class RuntimeStore:
                     failure_class = coalesce(%(failure_class)s, failure_class),
                     exit_code = coalesce(%(exit_code)s, exit_code),
                     detail = coalesce(%(detail)s, detail),
+                    contained = coalesce(%(contained)s, contained),
+                    containment = coalesce(%(containment)s, containment),
+                    wall_clock_seconds = coalesce(
+                        %(wall_clock_seconds)s, wall_clock_seconds
+                    ),
                     last_polled_at = case when %(polled)s then now() else last_polled_at end,
                     finished_at = case when %(terminal)s then coalesce(finished_at, now()) else finished_at end
                 where job_id = %(job_id)s
@@ -970,6 +979,13 @@ class RuntimeStore:
                     "failure_class": failure_class,
                     "exit_code": exit_code,
                     "detail": detail,
+                    "contained": contained,
+                    "containment": containment,
+                    "wall_clock_seconds": (
+                        None
+                        if wall_clock_seconds is None
+                        else Decimal(str(wall_clock_seconds))
+                    ),
                     "polled": polled,
                     "terminal": terminal,
                     "override": allow_terminal_override,

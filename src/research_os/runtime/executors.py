@@ -636,6 +636,7 @@ def build_executors(
     *,
     project_id: str | None = None,
     autonomy: str | None = None,
+    sandbox_mode: SandboxMode | None = None,
 ) -> dict[str, object]:
     """Whatever this machine can actually run work on.
 
@@ -643,6 +644,12 @@ def build_executors(
     *and* the probe finds the commands. An executor that is configured but
     unreachable is left out, so a graph that asks for it is refused explicitly
     rather than discovering it at submission.
+
+    ``sandbox_mode`` overrides the autonomy-derived choice below, for a caller
+    that knows something the dial does not. The portfolio is the one: its
+    reasoning -- lower autonomy means a person is at the keyboard -- is true
+    of an objective cycle, which a person starts, and false of the portfolio
+    daemon, which by construction runs when nobody is watching.
     """
 
     from research_os.experiment.config import load_config as load_experiment_config
@@ -651,7 +658,9 @@ def build_executors(
     # High autonomy means nobody is watching, so a local experiment runs
     # contained or does not run. Lower settings use the researcher's configured
     # mode, because there a person is at the keyboard.
-    mode = SandboxMode.REQUIRED if autonomy == "high" else _configured_sandbox_mode()
+    mode = sandbox_mode or (
+        SandboxMode.REQUIRED if autonomy == "high" else _configured_sandbox_mode()
+    )
     executors: dict[str, object] = {LOCAL: LocalExecutor(sandbox_mode=mode)}
     # The same mode reaches the Slurm executor, which honours it by refusing.
     # Passing only the local one is how `required` became optional.

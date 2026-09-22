@@ -82,7 +82,7 @@ from research_os.runtime.failures import FailureClass
 from research_os.runtime.idempotency import IdempotencyError, idempotency_key
 from research_os.runtime.ids import new_external_job_id
 from research_os.runtime.interfaces import ExecutionSpec
-from research_os.runtime.models import ExternalJobStatus
+from research_os.runtime.models import ExternalJob, ExternalJobStatus
 from research_os.runtime.routing import ProviderCallFailedError
 
 LOG = logging.getLogger("research_os.portfolio.empirical")
@@ -682,10 +682,24 @@ def analyse(
 
     outputs = _collect(workspace, spec.outputs)
     produced = {path for path, _digest, _size in outputs}
-    missing = [item for item in spec.outputs if item not in produced]
+    absent = [item for item in spec.outputs if item not in produced]
+    # `_collect` bounds what it hashes -- the first `MAX_COLLECTED_OUTPUTS`
+    # declared paths, and nothing over `MAX_COLLECTED_BYTES`. A file dropped
+    # by either bound is not in `produced`, and reporting it as not produced
+    # is a false statement about a run that did produce it. Checked against
+    # the workspace, which still exists here, so the two cases are told apart
+    # rather than merged into the more damning one.
+    missing = [item for item in absent if not (workspace / item).exists()]
+    unrecorded = [item for item in absent if (workspace / item).exists()]
     notes: list[str] = []
     if missing:
         notes.append("declared outputs were not produced: " + ", ".join(missing))
+    if unrecorded:
+        notes.append(
+            "declared outputs were produced but not recorded, being past this "
+            f"run's limit of {MAX_COLLECTED_OUTPUTS} files or "
+            f"{MAX_COLLECTED_BYTES // (1024 * 1024)}MB each: " + ", ".join(unrecorded)
+        )
 
     if rule is None:
         return Analysis(
@@ -1457,6 +1471,15 @@ def submit(context: Any, experiment: IdeaExperiment) -> ExperimentStep:
             scheduler_job_id=handle.scheduler_job_id,
             exit_code=handle.exit_code,
             detail=handle.detail,
+            # Persisted, because the analysis document is written by a later
+            # stage that has only this row to read. Before migration 0030
+            # there was nowhere to put them, so `interpret` wrote
+            # `job.detail` under the key `containment` -- the literal string
+            # "completed" -- and the record could not tell a contained
+            # measurement from an uncontained one.
+            contained=handle.contained,
+            containment=str(handle.containment),
+            wall_clock_seconds=wall_clock_seconds,
         )
         after = canonical_fingerprint(repository, owned_ref_prefixes=owned)
         if escaped(before, after):
@@ -1776,17 +1799,21 @@ def interpret(context: Any, experiment: IdeaExperiment) -> ExperimentStep:
         spec=spec,
         job_id=job.job_id,
         exit_code=job.exit_code,
-        contained=str(job.detail or ""),
+        contained=_containment(job),
     )
     document["stored_outputs"] = stored
     document["stored_logs"] = _store_logs(
         context, experiment, run_dir=Path(job.run_dir)
     )
     # Every resource except wall clock is unobserved here, and it says so
-    # rather than being estimated. `job.detail` carries what the submission
-    # recorded, which includes the duration.
+    # rather than being estimated. Wall clock is the monotonic duration
+    # `submit` measured around the executor call, persisted on the job row;
+    # an earlier version read `job.detail`, which for a local run is the
+    # string "completed".
     document["resource_usage"] = {
-        "wall_clock": job.detail or "unknown",
+        "wall_clock_seconds": (
+            "unknown" if job.wall_clock_seconds is None else str(job.wall_clock_seconds)
+        ),
         "cpu_seconds": "unknown",
         "max_rss_kb": "unknown",
         "observed_by": "LocalExecutor (wall clock only)",
@@ -1954,6 +1981,23 @@ def _store_logs(
         )
         stored.append({"path": relative, "artifact_id": ref.artifact_id})
     return stored
+
+
+def _containment(job: ExternalJob) -> str:
+    """What the record may say about whether this run was contained.
+
+    Three answers and not two. ``None`` means the row predates migration
+    0030 and genuinely does not know, which is not the same as knowing it
+    ran uncontained -- and writing "uncontained" for it would be inventing
+    the more alarming of two answers rather than reporting the absence of
+    one.
+    """
+
+    if job.contained is None:
+        return "unrecorded (this job predates the containment columns)"
+    if job.contained:
+        return str(job.containment or "contained")
+    return f"UNCONTAINED: {job.containment or 'no backend'}"
 
 
 def _store_outputs(

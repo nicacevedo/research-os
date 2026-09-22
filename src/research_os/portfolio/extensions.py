@@ -187,12 +187,24 @@ def _executors(context: WorkContext) -> dict[str, Any]:
     """
 
     from research_os.runtime.executors import build_executors
+    from research_os.sandbox import SandboxMode
 
     return dict(
         build_executors(
             context.config,
             project_id=context.item.project_id,
             autonomy=context.config.autonomy,
+            # Contained or it does not run, at every autonomy setting.
+            # `build_executors` otherwise gives REQUIRED only at `high`, on
+            # the stated grounds that at lower settings "a person is at the
+            # keyboard". That holds for an objective cycle, which a person
+            # starts. It does not hold here: the portfolio daemon runs
+            # unattended by construction -- that is what it is for -- so the
+            # dial's premise is false for this caller, and taking the
+            # researcher's configured mode would mean a researcher lowering
+            # autonomy to be more careful got model-parameterised commands
+            # running uncontained with the full environment.
+            sandbox_mode=SandboxMode.REQUIRED,
         )
     )
 

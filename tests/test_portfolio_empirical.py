@@ -29,6 +29,7 @@ import subprocess
 from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -2447,3 +2448,94 @@ def test_no_schema_is_shown_for_an_output_the_project_never_committed(
     )
 
     assert "summary.overlap" not in rendered
+
+
+def test_the_record_says_whether_the_run_was_contained_and_how_long_it_took(
+    portfolio: PortfolioStore,
+    runtime_db: Database,
+    tmp_path: Path,
+    runtime_project: str,
+    project_repo: Path,
+) -> None:
+    """An invariant asserted where it should be measured cannot be checked.
+
+    `DESIGN_INVARIANTS.md` leans on containment -- `.git` and `.research/`
+    are bound read-only, so the repository is byte-identical -- and
+    `SandboxMode.PREFERRED` runs uncontained on a host with no backend, so
+    the two cases both exist. The permanent analysis artifact recorded
+    `job.detail` under the key `containment`, which for a local run is the
+    literal string "completed", and the same string again under
+    `wall_clock`. The duration `submit` measures had nowhere to go.
+    """
+
+    idea_id = _idea(portfolio, runtime_project)
+    context = _context(
+        portfolio=portfolio,
+        runtime_db=runtime_db,
+        tmp_path=tmp_path,
+        project_id=runtime_project,
+        idea_id=idea_id,
+        router=_router(runtime_db, design=design_answer(seed=5)),
+        repo=project_repo,
+    )
+    step = _advance(context)
+    assert step.ok, step.detail
+
+    experiment = portfolio.get_experiment(idea_id=idea_id, idea_version=1)
+    assert experiment is not None
+    job = context.runtime.get_external_job(experiment.job_id)
+    assert job is not None
+
+    assert job.contained is not None, "the row does not know whether it contained"
+    assert job.wall_clock_seconds is not None
+    assert job.wall_clock_seconds >= 0
+
+    document = json.loads(context.artifacts.get_text(experiment.analysis_artifact_id))
+    assert document["containment"] != job.detail
+    assert "completed" != document["resource_usage"]["wall_clock_seconds"]
+    assert float(document["resource_usage"]["wall_clock_seconds"]) >= 0
+    if job.contained:
+        assert "UNCONTAINED" not in document["containment"]
+    else:
+        assert document["containment"].startswith("UNCONTAINED")
+
+
+def test_an_output_too_large_to_hash_is_not_called_unproduced(
+    portfolio: PortfolioStore,
+    tmp_path: Path,
+) -> None:
+    """Two different facts, and the damning one was reported for both.
+
+    `_collect` hashes at most `MAX_COLLECTED_OUTPUTS` declared paths and
+    skips anything over `MAX_COLLECTED_BYTES`. A file dropped by either
+    bound is absent from `produced`, and the note read "declared outputs
+    were not produced" -- a false statement about a run that did produce
+    it, attached to an INSUFFICIENT conclusion that then looks like the
+    command failed.
+    """
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    (workspace / "made.json").write_text('{"a": 1}')
+    spec = SimpleNamespace(outputs=("made.json", "never-written.json"))
+
+    from research_os.portfolio import empirical as bridge
+
+    monkey = bridge.MAX_COLLECTED_BYTES
+    try:
+        bridge.MAX_COLLECTED_BYTES = 2  # smaller than the file it produced
+        analysis = bridge.analyse(
+            experiment=SimpleNamespace(no_rule_reason="none was fixed"),
+            rule=None,
+            workspace=workspace,
+            spec=spec,
+            exit_code=0,
+        )
+    finally:
+        bridge.MAX_COLLECTED_BYTES = monkey
+
+    (absent,) = [n for n in analysis.notes if n.startswith("declared outputs were not")]
+    (dropped,) = [n for n in analysis.notes if "not recorded" in n]
+    assert "never-written.json" in absent
+    assert "made.json" not in absent, "a file on disk was called unproduced"
+    assert "made.json" in dropped

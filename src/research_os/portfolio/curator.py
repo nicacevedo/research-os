@@ -725,7 +725,15 @@ def _ensure_worktree(*, repository: Path, target: Path, base: str) -> None:
     """
 
     if (target / ".git").exists() and _is_worktree_of(target, repository, base):
-        gitutil.git(["fetch", "--all", "--quiet"], cwd=target, check=False)
+        # No fetch. An earlier version ran `git fetch --all` here, which was
+        # three wrong things at once: a network call from a module whose job
+        # is to render rows, made while holding REPOSITORY_MUTATION for up to
+        # the git timeout, against a bank branch that is an orphan with no
+        # upstream and nothing to fetch. Worse, it moved `refs/remotes/*` in
+        # the canonical repository, and `canonical_fingerprint` reads those --
+        # so a curate pass that picked up an upstream commit during a coding
+        # run failed that run as an escape. That is the exact false positive
+        # `runtime/refs.py` exists to prevent.
         return
     if target.exists():
         gitutil.remove_worktree(repository=repository, target=target, force=True)

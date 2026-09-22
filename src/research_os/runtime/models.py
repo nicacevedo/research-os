@@ -387,6 +387,12 @@ class ExternalJob(_Record):
     failure_class: str | None
     exit_code: int | None
     detail: str | None
+    #: Whether the sandbox actually contained this run, and which backend
+    #: reported so. ``None`` on rows written before migration 0030, which is
+    #: "not recorded" and deliberately not ``False``.
+    contained: bool | None = None
+    containment: str | None = None
+    wall_clock_seconds: Decimal | None = None
     submitted_at: datetime
     last_polled_at: datetime | None
     finished_at: datetime | None
