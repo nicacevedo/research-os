@@ -1264,3 +1264,68 @@ def test_what_a_stage_says_about_itself_is_not_cut_mid_word(
     assert action.detail is not None
     assert len(action.detail) > 500, "cut at a literal nobody chose"
     assert action.detail.endswith(attempted[1].strip()), "cut mid-word"
+
+
+def test_a_screen_that_retrieved_nothing_assesses_nothing(
+    portfolio: PortfolioStore,
+    runtime_db: Database,
+    pg_dsn: str,
+    checkpoint_tables: str,
+    tmp_path: Path,
+    runtime_project: str,
+) -> None:
+    """Measured over 108 real screens: 74 of them had nothing to read.
+
+    The cheap screen writes a `novelty` dimension the allocator reads. When
+    retrieval comes back empty it says so in its own detail -- *"nothing was
+    retrieved, so this rests on model recollection only"* -- and then wrote
+    the same number it would have written with eight works in hand. A caveat
+    in prose beside a number that does not carry it is the caveat not
+    existing. `merged` already states the rule this restores: a stage that
+    assesses nothing must change nothing.
+    """
+
+    idea, _ = seed_idea(portfolio, runtime_project)
+    portfolio.set_status(idea_id=idea.idea_id, status=IdeaStatus.PROMISING)
+    result, trace = _drive_to(
+        portfolio,
+        runtime_db,
+        pg_dsn,
+        tmp_path,
+        runtime_project,
+        idea.idea_id,
+        _router(runtime_db),
+        Stage.NOVELTY_SCREEN,
+        literature=FakeLiterature(keys=()),
+    )
+    assert result.ok, trace
+    assert "nothing was retrieved" in result.detail
+    assert portfolio.require_version(idea.idea_id).dimensions.novelty is None
+
+
+def test_a_screen_that_read_something_still_assesses_novelty(
+    portfolio: PortfolioStore,
+    runtime_db: Database,
+    pg_dsn: str,
+    checkpoint_tables: str,
+    tmp_path: Path,
+    runtime_project: str,
+) -> None:
+    """Positive control: grounded, the screen still does its job."""
+
+    idea, _ = seed_idea(portfolio, runtime_project)
+    portfolio.set_status(idea_id=idea.idea_id, status=IdeaStatus.PROMISING)
+    result, trace = _drive_to(
+        portfolio,
+        runtime_db,
+        pg_dsn,
+        tmp_path,
+        runtime_project,
+        idea.idea_id,
+        _router(runtime_db),
+        Stage.NOVELTY_SCREEN,
+        literature=FakeLiterature(),
+    )
+    assert result.ok, trace
+    assert "nothing was retrieved" not in result.detail
+    assert portfolio.require_version(idea.idea_id).dimensions.novelty is not None

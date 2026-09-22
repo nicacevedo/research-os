@@ -549,11 +549,22 @@ def run_novelty_screen(
     # The screen's own opinion moves a *dimension*, which the allocator reads,
     # and never a status, which a gate reads. A screen that could demote an
     # idea would be a novelty judgement made without a retrieved source.
-    _merge_dimensions(
-        context,
-        snapshot,
-        QualityDimensions(novelty=0.2 if screen.likely_known else 0.7),
-    )
+    #
+    # And when nothing was retrieved it does not move that either. Measured
+    # over 108 real screens, 74 had an empty packet: the stage said so in its
+    # detail and then wrote the same 0.7 it would have written with eight
+    # works in hand, which is a caveat recorded everywhere except in the
+    # number the allocator actually reads. `merged` states the rule -- a
+    # stage that assesses nothing must change nothing -- and `None` already
+    # means "not assessed" rather than "assessed as worthless". The deep
+    # audit, which a gate reads and which requires retrieved sources, is
+    # where novelty is established; this was only ever advisory.
+    if supplied_keys:
+        _merge_dimensions(
+            context,
+            snapshot,
+            QualityDimensions(novelty=0.2 if screen.likely_known else 0.7),
+        )
     detail = (
         f"likely already known: {screen.nearest_known_work[:160]}"
         if screen.likely_known
