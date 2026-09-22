@@ -1133,8 +1133,8 @@ def test_a_replication_must_vary_something_and_an_identical_rerun_is_refused(
         idea_id=idea_id,
         router=ScriptedRouter(
             answers_by_prompt={
-                "experiment_designer@4": design_answer(seed=5),
-                "replication_designer@4": identical,
+                "experiment_designer@5": design_answer(seed=5),
+                "replication_designer@5": identical,
             },
             store=RuntimeStore(runtime_db),
         ),
@@ -1181,8 +1181,8 @@ def test_a_replication_that_varies_the_seed_produces_its_own_execution(
         idea_id=idea_id,
         router=ScriptedRouter(
             answers_by_prompt={
-                "experiment_designer@4": design_answer(seed=5),
-                "replication_designer@4": design_answer(
+                "experiment_designer@5": design_answer(seed=5),
+                "replication_designer@5": design_answer(
                     seed=14, out="results/replication.json", variation_kind="seed"
                 ),
             },
@@ -1223,8 +1223,8 @@ def test_the_replication_designer_is_not_shown_what_the_first_one_concluded(
     idea_id = _idea(portfolio, runtime_project)
     router = ScriptedRouter(
         answers_by_prompt={
-            "experiment_designer@4": design_answer(seed=5),
-            "replication_designer@4": design_answer(
+            "experiment_designer@5": design_answer(seed=5),
+            "replication_designer@5": design_answer(
                 seed=14, out="results/replication.json", variation_kind="seed"
             ),
         },
@@ -1242,7 +1242,7 @@ def test_the_replication_designer_is_not_shown_what_the_first_one_concluded(
     _advance(context)
     _advance(context, role=ExperimentRole.REPLICATION)
 
-    (request,) = router.requests_for_prompt("replication_designer@4")
+    (request,) = router.requests_for_prompt("replication_designer@5")
     assert "SUPPORTS" not in request.prompt
     assert "0.4" not in request.prompt
     assert "deliberately not shown" in request.prompt
@@ -1734,8 +1734,8 @@ def _empirical_router(runtime_db: Database) -> ScriptedRouter:
             "brancher": {"children": [], "relations": []},
         },
         answers_by_prompt={
-            "experiment_designer@4": design_answer(seed=5),
-            "replication_designer@4": design_answer(
+            "experiment_designer@5": design_answer(seed=5),
+            "replication_designer@5": design_answer(
                 seed=14, out="results/replication.json", variation_kind="seed"
             ),
         },
@@ -2006,7 +2006,7 @@ def test_an_inconclusive_replication_does_not_count_as_verification(
         model="scripted-1",
         role="replicator",
         status=ModelCallStatus.OK,
-        prompt_version="replication_designer@4",
+        prompt_version="replication_designer@5",
     )
     rule = REPLICATION_RULES[AdjudicationType.EMPIRICAL]
 
@@ -2368,3 +2368,82 @@ def test_a_host_that_cannot_contain_refuses_rather_than_running_uncontained(
     )
     assert record is not None
     assert record.reserved == Decimal(0) and record.spent == Decimal(0)
+
+
+def test_the_catalogue_shows_an_output_schema_without_showing_its_values(
+    project_repo: Path, runtime_project: str
+) -> None:
+    """The third instance of one mistake, and the designer named it itself.
+
+    Refusing an idea on 2026-09-22 it wrote: "its output schema is not
+    declared, so any metric_path I named inside the file I create would be a
+    guess rather than a preregistration." That is the correct standard, and
+    it made every declared command unusable because nothing told it what any
+    of them writes.
+
+    A command's declared output path comes from `experiments.yaml`, which the
+    researcher owns; this reads the file at that path when the project has
+    committed one from an earlier run -- the same file the command writes.
+
+    **And it shows keys, never values.** A threshold chosen to fit a result
+    that already exists is not a preregistration, so the one thing this must
+    not leak is the numbers.
+    """
+
+    results = project_repo / "results"
+    results.mkdir()
+    (results / "run.json").write_text(
+        json.dumps(
+            {
+                "summary": {"overlap": 0.4242, "runs": 7, "converged": True},
+                "cases": [{"seconds": 1.5}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "add", "results"], cwd=project_repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "a result"], cwd=project_repo, check=True)
+
+    commands = empirical.declared_commands(runtime_project)
+    declared = commands["measure"].model_copy(update={"outputs": ["results/run.json"]})
+    catalogue = empirical.command_catalogue(
+        {"measure": declared}, repository=project_repo
+    )
+    rendered = "\n".join(catalogue)
+
+    assert "summary.overlap" in rendered
+    assert "cases.0.seconds" in rendered, "a list is described by its first element"
+    assert "summary.converged" not in rendered, "a boolean is not a metric"
+    assert "0.4242" not in rendered, (
+        "the values leaked; a threshold fitted to an existing result is not a "
+        "preregistration"
+    )
+    assert "7" not in rendered.split("numeric paths")[-1].replace(
+        "cases.0.seconds", ""
+    ).replace("summary.runs", ""), "a value leaked"
+
+
+def test_no_schema_is_shown_for_an_output_the_project_never_committed(
+    project_repo: Path, runtime_project: str
+) -> None:
+    """The positive control, and the boundary that keeps this honest.
+
+    Only a *tracked* file counts, so a leftover from a previous experiment in
+    somebody's working tree cannot describe what a command writes, and a
+    command whose output nobody has committed is one the designer is told
+    nothing about -- which is the truth, and is why it then refuses rather
+    than guessing a path.
+    """
+
+    results = project_repo / "results"
+    results.mkdir()
+    (results / "run.json").write_text('{"summary": {"overlap": 0.4}}', encoding="utf-8")
+
+    commands = empirical.declared_commands(runtime_project)
+    declared = commands["measure"].model_copy(update={"outputs": ["results/run.json"]})
+
+    rendered = "\n".join(
+        empirical.command_catalogue({"measure": declared}, repository=project_repo)
+    )
+
+    assert "summary.overlap" not in rendered

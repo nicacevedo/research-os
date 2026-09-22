@@ -272,6 +272,100 @@ def input_candidates(
     return tuple(sorted(found)[:limit])
 
 
+#: How many numeric paths one declared output's schema listing shows.
+MAX_SCHEMA_PATHS = 40
+
+#: The largest committed result this will read a schema out of.
+MAX_SCHEMA_BYTES = 4 * 1024 * 1024
+
+
+def numeric_paths(document: Any, *, prefix: str = "") -> list[str]:
+    """Every dotted path in a parsed JSON document that addresses a number.
+
+    A list is described by its first element, because a decision rule indexes
+    one by integer and every element of a results array has the same shape.
+
+    A boolean is not a number: ``True`` is ``1`` in Python, and a rule
+    comparing a flag against a threshold would mean something nobody wrote
+    down. :func:`metric_from` refuses one for the same reason, and the two
+    have to agree or the catalogue would advertise a path the analyser will
+    not read.
+    """
+
+    if isinstance(document, Mapping):
+        found: list[str] = []
+        for key in sorted(str(item) for item in document):
+            found.extend(numeric_paths(document[key], prefix=f"{prefix}{key}."))
+        return found
+    if isinstance(document, Sequence) and not isinstance(document, str | bytes):
+        return numeric_paths(document[0], prefix=f"{prefix}0.") if document else []
+    leaf = prefix.rstrip(".")
+    if leaf and not isinstance(document, bool) and isinstance(document, int | float):
+        return [leaf]
+    return []
+
+
+def output_schema_lines(
+    commands: Mapping[str, Any], *, repository: Path | None
+) -> list[str]:
+    """What a declared output looks like, read from one the project committed.
+
+    **The third instance of one mistake, and the designer named it itself.**
+    Refusing an idea on 2026-09-22 it wrote: "its output schema is not
+    declared (declared outputs: none), so any metric_path I named inside the
+    file I create would be a guess rather than a preregistration." That is
+    the correct standard and it made every command unusable, because nothing
+    told it what any of them writes.
+
+    Nothing here invents that. A command's *declared* output path comes from
+    ``experiments.yaml``, which the researcher owns; this reads the file at
+    that path when the project has committed one from an earlier run, which
+    is the same file the command writes.
+
+    **Keys and types only, never values.** Showing the numbers a previous run
+    produced would let a design choose a threshold the last result already
+    satisfies, which is preregistration theatre -- the rule is supposed to be
+    fixed before the result exists, and a rule fitted to a result that does
+    exist is fixed after. So the listing is paths, and a designer that wants
+    to know what value to expect has to reason about the science.
+    """
+
+    if repository is None:
+        return []
+    from research_os.automation.gitutil import git
+
+    try:
+        tracked = set(
+            git(["ls-files", "-z"], cwd=repository, check=False).stdout.split("\0")
+        )
+    except ResearchOSError:  # pragma: no cover - a repository with no git
+        return []
+
+    lines: list[str] = []
+    for name, spec in sorted(commands.items()):
+        for relative in spec.outputs:
+            if relative not in tracked:
+                continue
+            target = repository / relative
+            try:
+                if not target.is_file() or target.stat().st_size > MAX_SCHEMA_BYTES:
+                    continue
+                document = json.loads(target.read_text(encoding="utf-8"))
+            except (OSError, ValueError, UnicodeDecodeError):
+                continue
+            paths = numeric_paths(document)[:MAX_SCHEMA_PATHS]
+            if not paths:
+                continue
+            lines.append(
+                f"{name} writes {relative}; a committed run of it has these "
+                f"numeric paths (names and shapes only -- the values are "
+                f"deliberately not shown, because a threshold chosen to fit "
+                f"a result that already exists is not a preregistration):"
+            )
+            lines.extend(f"    {item}" for item in paths)
+    return lines
+
+
 def command_catalogue(
     commands: Mapping[str, Any], *, repository: Path | None = None
 ) -> list[str]:
@@ -337,6 +431,10 @@ def command_catalogue(
             "refused here and fails when the command runs, having spent the "
             "whole execution."
         )
+    schema = output_schema_lines(commands, repository=repository)
+    if schema:
+        lines.append("")
+        lines.extend(schema)
     return lines
 
 

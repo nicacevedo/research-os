@@ -519,6 +519,13 @@ _EXPERIMENT_RULES = (
     "`output_path` must be a file this command writes: either one of its "
     "declared outputs, or the value you supplied for one of its path "
     "parameters. A path the command does not write fails the design.\n"
+    "Where the quoted block lists the numeric paths of a declared output, "
+    "those are read from a run of that command the project committed, so a "
+    "`metric_path` among them is a fact rather than a guess. The values are "
+    "deliberately withheld: a threshold chosen to fit a result that already "
+    "exists is not a preregistration. Where no such listing is given you do "
+    "not know what the command writes, and saying so is better than "
+    "guessing a path.\n"
     "The two predicates must not both hold for the same value. A rule whose "
     "success condition covers everything is read as INCONCLUSIVE, which "
     "wastes the run.\n"
@@ -542,7 +549,7 @@ _EXPERIMENT_RULES = (
 
 EXPERIMENT_DESIGNER = PromptTemplate(
     name="experiment_designer",
-    version=4,
+    version=5,
     role=ModelRole.EXPERIMENTALIST,
     capability=Capability.PLANNING,
     criticality=Criticality.NORMAL,
@@ -572,7 +579,7 @@ EXPERIMENT_DESIGNER = PromptTemplate(
 
 REPLICATION_DESIGNER = PromptTemplate(
     name="replication_designer",
-    version=4,
+    version=5,
     role=ModelRole.REPLICATOR,
     capability=Capability.PLANNING,
     criticality=Criticality.CRITICAL,
