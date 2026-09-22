@@ -1040,3 +1040,69 @@ def test_a_revision_can_re_run_the_cheap_ladder(
             (v2[0].dedup_key,),
         ).fetchone()
     assert int(row["n"]) == 1
+
+
+def test_resume_lets_a_stage_that_hit_its_ceiling_be_tried_again(
+    portfolio: PortfolioStore, runtime_db: Database, runtime_project: str
+) -> None:
+    """A ceiling that never decays is a wedge, not a bound.
+
+    `max_stage_failures` stops the allocator choosing a stage that will never
+    succeed, and `BLOCKED_EXTERNAL` says what is missing is a person fixing
+    something. What had no answer is *after* they fix it: the count is over
+    failed work items and never decays, so `portfolio resume` returned the
+    ideas to IDLE and the next tick read the same historical count and
+    blocked them again.
+
+    Measured on 2026-09-22 on the three empirical ideas of
+    `cg-sparse-regression`, whose evidence stage had failed while the
+    experiment route did not exist and which could not be retried once it
+    did.
+
+    The all-time count must keep moving -- `work_items.dedup_key` is built
+    from it against a permanently unique index -- so this asserts both: the
+    ceiling forgives and the key does not repeat.
+    """
+
+    from research_os.portfolio.allocation import ADVANCE_IDEA
+    from research_os.runtime.models import WorkStatus
+    from research_os.runtime.queue import WorkQueue
+
+    idea, version = seed_idea(portfolio, runtime_project)
+    portfolio.upsert_state(project_id=runtime_project)
+    queue = WorkQueue(runtime_db)
+    config = load_config()
+
+    key = (idea.idea_id, "falsify", str(version.version))
+    for index in range(config.bounds.max_stage_failures):
+        item = queue.enqueue(
+            project_id=runtime_project,
+            kind=ADVANCE_IDEA,
+            payload={
+                "idea_id": idea.idea_id,
+                "stage": "falsify",
+                "idea_version": version.version,
+            },
+            dedup_key=f"{ADVANCE_IDEA}:{idea.idea_id}:falsify:v1:{index}",
+        )
+        assert item.created
+        with runtime_db.tx() as conn:
+            conn.execute(
+                "update work_items set status = %s, updated_at = now() "
+                "where work_id = %s",
+                (str(WorkStatus.FAILED), item.item.work_id),
+            )
+
+    before = portfolio.stage_failures(runtime_project)[key]
+    assert before == (
+        config.bounds.max_stage_failures,
+        config.bounds.max_stage_failures,
+    )
+
+    portfolio.forgive_stage_failures(project_id=runtime_project)
+
+    after = portfolio.stage_failures(runtime_project)[key]
+    assert after[0] == config.bounds.max_stage_failures, (
+        "the all-time count moved, so a retry would re-use a spent dedup key"
+    )
+    assert after[1] == 0, "resume did not forgive the ceiling"

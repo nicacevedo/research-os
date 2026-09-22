@@ -53,7 +53,7 @@ LOG = logging.getLogger("research_os.runtime.budgets")
 
 BUDGET_COLUMNS = (
     "budget_id, scope, scope_id, dimension, limit_value, reserved, spent, "
-    "created_at, updated_at"
+    "explicit, created_at, updated_at"
 )
 RESERVATION_COLUMNS = (
     "reservation_id, budget_id, work_id, amount, status, created_at, settled_at"
@@ -125,16 +125,30 @@ class BudgetLedger:
         scope_id: str,
         dimension: Dimension,
         limit_value: Decimal | float,
+        explicit: bool = False,
     ) -> BudgetRecord:
-        """Create or raise/lower a limit, preserving what has been spent."""
+        """Create or raise/lower a limit, preserving what has been spent.
+
+        ``explicit`` records that a *person* set this number, and the default
+        is false because almost every caller here is the runtime deriving one
+        from configuration. Only ``researchctl runtime budget`` passes true.
+
+        Once true it stays true: a derived write over an explicit ceiling
+        must not quietly demote it back, or the protection would last until
+        the next time anything touched the row.
+        """
 
         with self._db.tx() as conn:
             row = conn.execute(
                 f"""
-                insert into budgets (budget_id, scope, scope_id, dimension, limit_value)
-                values (%(budget_id)s, %(scope)s, %(scope_id)s, %(dimension)s, %(limit_value)s)
+                insert into budgets
+                    (budget_id, scope, scope_id, dimension, limit_value, explicit)
+                values (%(budget_id)s, %(scope)s, %(scope_id)s, %(dimension)s,
+                        %(limit_value)s, %(explicit)s)
                 on conflict (scope, scope_id, dimension) do update
-                    set limit_value = excluded.limit_value, updated_at = now()
+                    set limit_value = excluded.limit_value,
+                        explicit = budgets.explicit or excluded.explicit,
+                        updated_at = now()
                 returning {BUDGET_COLUMNS}
                 """,
                 {
@@ -143,6 +157,7 @@ class BudgetLedger:
                     "scope_id": scope_id,
                     "dimension": str(dimension),
                     "limit_value": Decimal(str(limit_value)),
+                    "explicit": explicit,
                 },
             ).fetchone()
         return BudgetRecord.model_validate(row)

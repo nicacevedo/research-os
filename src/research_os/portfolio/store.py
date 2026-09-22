@@ -132,7 +132,7 @@ ACTION_COLUMNS = (
 STATE_COLUMNS = (
     "project_id, status, charter_digest, detail, paused_at, paused_by, "
     "last_tick_at, last_digest_at, bounds, bank_commit, bank_digest, "
-    "bank_written_at, created_at, updated_at"
+    "bank_written_at, failures_forgiven_at, created_at, updated_at"
 )
 SEED_COLUMNS = "seed_id, project_id, text, note, consumed_at, consumed_by, created_at"
 
@@ -2235,6 +2235,24 @@ class PortfolioStore:
             ).fetchall()
         return {str(row["operational_state"]): int(row["n"]) for row in rows}
 
+    def forgive_stage_failures(self, *, project_id: str) -> None:
+        """Mark this moment as the one a person said "look again".
+
+        Not a reset. :meth:`failed_stage_counts` keeps returning the all-time
+        count, because ``work_items.dedup_key`` is built from it against a
+        permanently unique index -- resetting it would re-use a spent key and
+        ``enqueue``'s ``on conflict do nothing`` would refuse the retry
+        silently, which is the wedge the count exists to prevent. What moves
+        is the point the *ceiling* counts from.
+        """
+
+        with self._db.tx() as conn:
+            conn.execute(
+                "update portfolio_state set failures_forgiven_at = now(), "
+                "updated_at = now() where project_id = %s",
+                (project_id,),
+            )
+
     def failed_stage_counts(self, project_id: str) -> dict[tuple[str, str, str], int]:
         """How many times each ``(idea, stage, version)`` advance failed terminally.
 
@@ -2276,24 +2294,56 @@ class PortfolioStore:
         is not "append the current time".
         """
 
+        return {
+            key: total
+            for key, (total, _recent) in self.stage_failures(project_id).items()
+        }
+
+    def stage_failures(
+        self, project_id: str
+    ) -> dict[tuple[str, str, str], tuple[int, int]]:
+        """``(all time, since the researcher last forgave)`` per stage key.
+
+        Two numbers because two things read them and they want different
+        answers.
+
+        The **dedup key** wants all time. It is built from the count against
+        a permanently unique index, so the count must only ever go up: a key
+        that repeats is one ``enqueue`` refuses silently.
+
+        The **ceiling** wants recent. A stage that failed three times because
+        a capability was missing must be retryable once the capability
+        arrives, and `researchctl portfolio resume` is the only signal in
+        this system that says it has. Before this, `resume` returned the
+        ideas to IDLE and the next tick blocked them again on the same
+        historical count -- measured on 2026-09-22, on the three empirical
+        ideas whose evidence stage had failed while the experiment route did
+        not exist.
+        """
+
         with self._db.tx() as conn:
             rows = conn.execute(
-                "select payload->>'idea_id' as idea_id, "
-                "       payload->>'stage' as stage, "
-                "       coalesce(payload->>'idea_version', '') as idea_version, "
-                "       count(*) as n "
-                "  from work_items "
-                " where project_id = %s "
-                "   and kind = 'portfolio_advance_idea' "
-                "   and status = 'FAILED' "
-                "   and payload->>'idea_id' is not null "
-                "   and payload->>'stage' is not null "
+                "select w.payload->>'idea_id' as idea_id, "
+                "       w.payload->>'stage' as stage, "
+                "       coalesce(w.payload->>'idea_version', '') as idea_version, "
+                "       count(*) as n, "
+                "       count(*) filter ("
+                "           where s.failures_forgiven_at is null "
+                "              or w.updated_at > s.failures_forgiven_at) as recent "
+                "  from work_items w "
+                "  left join portfolio_state s on s.project_id = w.project_id "
+                " where w.project_id = %s "
+                "   and w.kind = 'portfolio_advance_idea' "
+                "   and w.status = 'FAILED' "
+                "   and w.payload->>'idea_id' is not null "
+                "   and w.payload->>'stage' is not null "
                 " group by 1, 2, 3",
                 (project_id,),
             ).fetchall()
         return {
-            (str(row["idea_id"]), str(row["stage"]), str(row["idea_version"])): int(
-                row["n"]
+            (str(row["idea_id"]), str(row["stage"]), str(row["idea_version"])): (
+                int(row["n"]),
+                int(row["recent"]),
             )
             for row in rows
         }

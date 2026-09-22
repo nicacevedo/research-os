@@ -772,6 +772,10 @@ class PortfolioState(_Record):
     bank_commit: str | None = None
     bank_digest: str | None = None
     bank_written_at: datetime | None = None
+    #: When a person last said "look again" with `portfolio resume`. The
+    #: stage-failure ceiling counts only failures after it; the dedup key
+    #: still counts all of them. See ``sql/0029_failures_forgiven.sql``.
+    failures_forgiven_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
 

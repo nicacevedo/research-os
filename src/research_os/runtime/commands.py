@@ -1101,6 +1101,11 @@ def _budget(args: argparse.Namespace) -> int:
                 scope_id=project_id,
                 dimension=Dimension.MODEL_COST_USD,
                 limit_value=wanted,
+                # A person typed this. `cycles.ensure_budgets` raises a
+                # *derived* project ceiling when an objective's configuration
+                # wants more, and must not raise this one -- otherwise this
+                # command's effect lasts until the next cycle starts.
+                explicit=True,
             )
         if current is None:
             print(

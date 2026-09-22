@@ -473,6 +473,12 @@ def _resume(args: argparse.Namespace) -> int:
         # deliberately guesses at nothing else -- so a portfolio whose
         # blocker a person has just fixed had no command that restarted it.
         unblocked = store.unblock_ideas(project_id=project)
+        # And forgive the stage-failure ceiling, or unblocking is undone by
+        # the next tick: the ceiling counts failed work items and never
+        # decays, so an idea whose stage failed three times while a
+        # capability was missing was blocked again the moment it arrived.
+        # The count itself is untouched -- the dedup key is built from it.
+        store.forgive_stage_failures(project_id=project)
     _print(f"{project} resumed.")
     if unblocked:
         _print(

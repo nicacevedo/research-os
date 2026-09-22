@@ -447,6 +447,14 @@ class BudgetRecord(_Record):
     limit_value: Decimal
     reserved: Decimal
     spent: Decimal
+    #: Whether a person set this limit, rather than the runtime deriving it.
+    #:
+    #: The runtime raises a *derived* project ceiling when an objective needs
+    #: more than it -- see `cycles.ensure_budgets`, and the bricked project
+    #: that rule exists because of. It may not raise an explicit one: a
+    #: number a researcher typed is an authorisation, and multiplying it is
+    #: making one.
+    explicit: bool = False
     created_at: datetime
     updated_at: datetime
 

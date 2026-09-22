@@ -821,3 +821,106 @@ def test_a_larger_later_objective_raises_the_project_ceiling(
     assert Decimal(ceiling.limit_value) == generous * Decimal(
         config.settings.max_cycles_per_objective
     )
+
+
+def test_an_explicit_project_ceiling_is_not_raised_by_a_cycle(
+    runtime_db: Database, tmp_path: Any
+) -> None:
+    """The other direction of the defect above, measured the same way.
+
+    `apply_default_budgets` raises a project's cost ceiling to
+    `max_model_cost_usd * max_cycles_per_objective` whenever a cycle starts,
+    and that rule exists because deriving it from *one objective's* cap
+    bricked a project. What it left open is an operator's own number.
+
+    Observed on 2026-09-22 during the overnight run:
+    `researchctl runtime budget cg-sparse-regression --max-cost-usd 50.00`,
+    and minutes later a cycle the *reconciler* rescheduled -- one nobody
+    started -- raised the same ceiling to 300.00. Nothing said so. The
+    command whose whole purpose is to set a standing ceiling had an effect
+    that lasted until the next cycle began.
+
+    `docs/AUTONOMOUS_DISCOVERY_ARCHITECTURE.md` §13 puts unbounded budget
+    changes among the acts a human performs, so a machine multiplying a
+    human's number by six has made one.
+    """
+
+    from research_os.runtime.cycles import apply_default_budgets
+    from tests.runtime_graph_helpers import make_config
+
+    config = make_config(dsn="", artifacts_root=tmp_path / "artifacts")
+    ledger = BudgetLedger(runtime_db)
+    store = RuntimeStore(runtime_db)
+    store.upsert_project(project_id="capped-project", repo_path=str(tmp_path))
+    run = store.create_run(project_id="capped-project", objective="o")
+
+    # What `researchctl runtime budget --max-cost-usd 50` does.
+    ledger.set_limit(
+        scope=BudgetScope.PROJECT,
+        scope_id="capped-project",
+        dimension=Dimension.MODEL_COST_USD,
+        limit_value=Decimal(50),
+        explicit=True,
+    )
+    wanted = Decimal(str(config.budget.max_model_cost_usd)) * Decimal(
+        config.settings.max_cycles_per_objective
+    )
+    assert wanted > Decimal(50), (
+        "this test is vacuous unless the configuration would raise the ceiling"
+    )
+
+    apply_default_budgets(
+        ledger, config=config, run_id=run.run_id, project_id="capped-project"
+    )
+
+    ceiling = ledger.get(
+        scope=BudgetScope.PROJECT,
+        scope_id="capped-project",
+        dimension=Dimension.MODEL_COST_USD,
+    )
+    assert ceiling is not None
+    assert Decimal(ceiling.limit_value) == Decimal(50), (
+        "a cycle raised a ceiling a person had typed"
+    )
+    assert ceiling.explicit is True, "the flag was demoted by a derived write"
+
+
+def test_a_derived_project_ceiling_is_still_raised(
+    runtime_db: Database, tmp_path: Any
+) -> None:
+    """The positive control, and the defect the rule above must not reopen.
+
+    A ceiling the runtime derived is still raised when an objective needs
+    more than it. Without this the previous fix -- the one that stopped a
+    0.50 USD smoke run writing a lifetime ceiling that bricked the project --
+    would be undone by the new one.
+    """
+
+    from research_os.runtime.cycles import apply_default_budgets
+    from tests.runtime_graph_helpers import make_config
+
+    config = make_config(dsn="", artifacts_root=tmp_path / "artifacts")
+    ledger = BudgetLedger(runtime_db)
+    store = RuntimeStore(runtime_db)
+    store.upsert_project(project_id="derived-project", repo_path=str(tmp_path))
+    run = store.create_run(project_id="derived-project", objective="o")
+
+    ledger.set_limit(
+        scope=BudgetScope.PROJECT,
+        scope_id="derived-project",
+        dimension=Dimension.MODEL_COST_USD,
+        limit_value=Decimal(6),
+    )
+
+    apply_default_budgets(
+        ledger, config=config, run_id=run.run_id, project_id="derived-project"
+    )
+
+    ceiling = ledger.get(
+        scope=BudgetScope.PROJECT,
+        scope_id="derived-project",
+        dimension=Dimension.MODEL_COST_USD,
+    )
+    assert ceiling is not None
+    assert Decimal(ceiling.limit_value) > Decimal(6)
+    assert ceiling.explicit is False

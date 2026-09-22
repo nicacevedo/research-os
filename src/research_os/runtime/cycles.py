@@ -270,7 +270,29 @@ def apply_default_budgets(
         # Raised, never lowered. Lowering is `researchctl runtime budget`,
         # which is explicit and reversible; doing it implicitly from one
         # objective's cap is what bricked a project.
-        if existing is None or Decimal(existing.limit_value) < wanted_ceiling:
+        #
+        # **And never raised over a ceiling a person typed.** The rule above
+        # protects a project from one objective's cap; this protects the
+        # operator's own number from the configuration's. Without it,
+        # `researchctl runtime budget --max-cost-usd 50` lasted until the
+        # next cycle began and then became `25 * 12 = 300` with nothing
+        # saying so -- observed on 2026-09-22, raised by a cycle the
+        # *reconciler* rescheduled, so not even by an objective anybody had
+        # started. An objective that needs more than an explicit ceiling
+        # stops on BUDGET_EXHAUSTED, which is terminal and honest, and
+        # `researchctl runtime budget` is how a person grants more.
+        if existing is not None and existing.explicit:
+            if Decimal(existing.limit_value) < wanted_ceiling:
+                LOG.warning(
+                    "%s has an explicit cost ceiling of %s, which is below the "
+                    "%s this objective's configuration would use. It is left "
+                    "alone: raise it with `researchctl runtime budget` if that "
+                    "is what you want.",
+                    project_id,
+                    existing.limit_value,
+                    wanted_ceiling,
+                )
+        elif existing is None or Decimal(existing.limit_value) < wanted_ceiling:
             ledger.set_limit(
                 scope=BudgetScope.PROJECT,
                 scope_id=project_id,

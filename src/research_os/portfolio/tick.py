@@ -433,7 +433,7 @@ def _candidates(
     """
 
     found: list[allocation.Candidate] = []
-    failures = store.failed_stage_counts(project_id)
+    failures = store.stage_failures(project_id)
     for idea in store.list_ideas(project_id=project_id, limit=500):
         if not allocation.allocatable(idea):
             continue
@@ -468,10 +468,15 @@ def _candidates(
         stage, reason = select_stage(snapshot, config)
         if stage is None:
             continue
-        failed_attempts = failures.get(
-            (idea.idea_id, str(stage), str(version.version)), 0
+        failed_attempts, recent_failures = failures.get(
+            (idea.idea_id, str(stage), str(version.version)), (0, 0)
         )
-        if failed_attempts >= config.bounds.max_stage_failures:
+        # The ceiling reads the *recent* count and the dedup key reads the
+        # all-time one. A stage that failed while a capability was missing
+        # has to be retryable once `portfolio resume` says it arrived, and
+        # the key has to keep moving or `enqueue` refuses the retry against
+        # its permanently unique index. See `PortfolioStore.stage_failures`.
+        if recent_failures >= config.bounds.max_stage_failures:
             # Retried to its ceiling and still failing, so this is not a
             # transient. `BLOCKED_EXTERNAL` rather than a status change,
             # because the same rule that governs an exhausted budget governs
