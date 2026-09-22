@@ -2719,3 +2719,38 @@ the most important ones for a release decision:
    instead. In practice the active-track index serialises it; it is a
    second answer to a question the schema already answered once.
 
+### Y.14 Three fixes confirmed on the production path, after the fact
+
+Not in a test. In the running dogfood, after the daemon was restarted on
+the fixed code.
+
+**The truncation.** The first refusal recorded after the fix is **3,174
+characters** and is stored whole. Under the old code it would have reached
+the researcher as 500 characters ending mid-sentence. It is also the
+seventh consecutive refusal of the night and the most precise yet: it
+observes that `profile` exposes exactly the right variables
+(`cases.0.iterations`, `cases.0.n`, `cases.0.p`) and cannot be crossed with
+anything because it has no parameters; that `benchmark` has the design
+space but it lives in a plan file no agent may author; and that
+`adjudicate-pricing` varies only the replicate dimension. Then it reasons
+about the limits of the listing it was given --
+
+> Only `cases.0` paths are listed, so I do not even know that more than one
+> cell is written.
+
+-- and separates the falsifier's second limb as source inspection rather
+than a declared run, concluding that failing it *"leaves the historical-
+attribution sub-question unsettled rather than resolved"*.
+
+**The bank rendering.** The curator ran, re-rendered and committed at
+`333b1a3`, and the continuation lines of both stored refusals are now
+indented under their own bullet. Verified against the real page, not a
+fixture.
+
+**The Curator's fetch.** Removing it did not break curation: `333b1a3` is
+80 files, written after the deletion.
+
+Seven refusals now, across two sessions, three prompt versions and a
+restart on new code. Not one of them has proposed to measure something
+adjacent and call it the answer.
+
