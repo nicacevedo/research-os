@@ -273,6 +273,28 @@ LITERATURE_SCOUT = PromptTemplate(
 
 FALSIFIER = PromptTemplate(
     name="falsifier",
+    # Version 3: the `target` guidance was one-sided, measured.
+    #
+    # The overnight audit of 2026-09-22 read fourteen rejections in full and
+    # found two whose own first words name the falsifier -- "The falsifier's
+    # causal attribution is algebraically backwards", "The falsifier as
+    # specified produces a pattern consistent with either explanation" --
+    # recorded as FATAL/CLAIM. The second is this prompt's own canonical
+    # TEST example, an identification failure, which the text below already
+    # lists as TEST.
+    #
+    # So the guidance was not missing, it was unbalanced: it warned against
+    # over-using TEST and never against over-using CLAIM, and it never said
+    # that the two errors cost different things. A wrong CLAIM at FATAL ends
+    # a question permanently -- rejection is deliberately not revisited, and
+    # revival is a new idea. A wrong TEST costs one sharpening cycle bounded
+    # by `max_revisions_per_idea`, with the objection still standing. Naming
+    # the asymmetry is the change.
+    #
+    # Across 425 real objections the split was 79% CLAIM / 21% TEST, and 63
+    # FATAL/CLAIM against 10 FATAL/TEST. The other twelve rejections read
+    # were well judged; this is calibration, not repudiation.
+    #
     # Version 2: `target` on every objection.
     #
     # The first dogfood's scientific-quality audit found that this role's two
@@ -287,7 +309,7 @@ FALSIFIER = PromptTemplate(
     # review live: every verdict recorded by falsifier@1 is now superseded,
     # which is correct -- they were produced by a role that could not express
     # the distinction.
-    version=2,
+    version=3,
     role=ModelRole.FALSIFIER,
     capability=Capability.CRITIQUE,
     criticality=Criticality.CRITICAL,
@@ -324,6 +346,13 @@ FALSIFIER = PromptTemplate(
         "Do not use TEST to spare an idea you think is wrong. A TEST objection "
         "says you believe the question is still worth asking; if you do not "
         "believe that, say CLAIM and let it die.\n"
+        "And do not reach for CLAIM when your own objection is about the "
+        "design. If the sentence you wrote names the falsifier, the sweep, "
+        "the control, the proxy or the measurement -- rather than the "
+        "question -- it is TEST, whatever you think of the idea. The two "
+        "mistakes do not cost the same: a wrong CLAIM at FATAL ends a "
+        "research question permanently, and a wrong TEST costs one bounded "
+        "sharpening cycle with your objection still standing against it.\n"
         "Say in `attempted` what you looked for and did not find. 'I searched for "
         "a two-variable counterexample and did not find one' is worth recording; "
         "silence is indistinguishable from not looking."
