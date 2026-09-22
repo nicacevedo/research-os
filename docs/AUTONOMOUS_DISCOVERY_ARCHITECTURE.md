@@ -20,7 +20,7 @@ This document states what the system does, and every enforcement claim names
 the test that holds it. As of this revision the following exist and pass:
 
 ```text
-sql/0019 .. 0029                     the schema, head 0029
+sql/0019 .. 0030                     the schema, head 0030
 research_os/portfolio/
     ids, digests, models, config     identity, the three digests, the bounds
     empirical                        the bridge to the experiment machinery
@@ -1087,6 +1087,7 @@ Five changes, each forced by something measured:
 
 | change | forced by |
 |---|---|
+| `external_jobs.contained`, `.containment`, `.wall_clock_seconds` (`sql/0030`) | an independent review found the analysis artifact recording `job.detail` under the key `containment` -- the literal string "completed" for a local run -- so the permanent record could not tell a contained measurement from an uncontained one, which is the condition `DESIGN_INVARIANTS.md` relies on for "the repository is byte-identical". `NULL` means unrecorded and is not `False` |
 | `research_runs.run_kind` (`sql/0023`) | an idea-track stage needs a run row for budgets, provenance and `researchctl runtime run <id>`; without a discriminator, `parked_objectives` would open successor *cycles* for finished tracks and `stranded_runs` would enqueue `resume_cycle` for a thread that is not a cycle |
 | `runtime/refs.py` + the `canonical_fingerprint` exemption | curating during a coding run made that run report an escape it did not commit |
 | `policy.Dispatch` + fifteen `ActionKind` members | one authority table; `runtime doctor` must not report fifteen gaps that are not gaps |
