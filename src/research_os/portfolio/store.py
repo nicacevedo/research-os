@@ -164,6 +164,11 @@ def clipped_detail(detail: str | None) -> str | None:
     if detail is None:
         return None
     text = detail.strip()
+    if not text:
+        # What the two call sites this replaced both did, via `if detail`.
+        # NULL is how this column says "nothing recorded"; an empty string
+        # would be a second way to say it.
+        return None
     if len(text) <= MAX_DETAIL_CHARS:
         return text
     return text[: MAX_DETAIL_CHARS - len(_CLIP_MARKER)].rstrip() + _CLIP_MARKER
