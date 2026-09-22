@@ -2479,7 +2479,10 @@ budget ledger on a second science, and nothing after that.
 ### Y.10 What this run established, as figures
 
 Everything below is from the live dogfood database and the two project
-repositories, not from a fixture.
+repositories, not from a fixture. Figures are as of the end of the run;
+the soak was still producing ideas while this section was drafted, so
+earlier numbers quoted elsewhere in §Y are smaller and were correct when
+written.
 
 ```text
 ideas                    110      (cg 65, ccao 45)
@@ -2544,7 +2547,7 @@ released 3 stale budget reservation(s)
 
 Across the whole run it released 34 reservations totalling $7.40 against
 $22.05 settled -- reservations for work that was claimed, paid for in
-advance, and then interrupted. The held balance fell 12 -> 9 -> 6 -> 4
+advance, and then interrupted. The held balance fell 12 -> 9 -> 6 -> 3
 under observation without intervention.
 
 **No SQL was run against scientific state, at any point, for any reason.**
