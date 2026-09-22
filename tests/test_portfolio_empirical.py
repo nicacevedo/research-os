@@ -56,7 +56,7 @@ from research_os.portfolio.stages import TrackSnapshot, select_stage
 from research_os.portfolio.store import DuplicateExperimentError, PortfolioStore
 from research_os.runtime.artifacts import FilesystemArtifactStore
 from research_os.runtime.budgets import BudgetLedger, Dimension
-from research_os.runtime.db import Database
+from research_os.runtime.db import Database, jsonb
 from research_os.runtime.executors import LocalExecutor
 from research_os.runtime.failures import INFRASTRUCTURE, FailureClass
 from research_os.runtime.idempotency import InvocationLedger
@@ -2733,3 +2733,63 @@ def test_the_summary_does_not_say_a_produced_file_was_not_written(
     assert analysis.conclusion is EmpiricalConclusion.INSUFFICIENT
     assert "did not write" not in analysis.summary
     assert "past this run's collection limit" in analysis.summary
+
+
+def test_a_threshold_that_moved_after_the_run_cannot_read_the_result(
+    portfolio: PortfolioStore,
+    runtime_db: Database,
+    runtime_project: str,
+    project_repo: Path,
+    tmp_path: Path,
+) -> None:
+    """The sibling of the spec-digest test, which could not be written before.
+
+    §19.4's claim is that the rule is fixed before the number exists. The
+    spec was read back out of the immutable artifact and re-hashed; the
+    *rule* was read straight off the mutable row, so the thing checked
+    twice was what would run and the thing never checked was what the
+    result would mean. An independent review found it and noted there was
+    no test because there was nothing to test.
+
+    Moving the threshold in the database is what a post-hoc edit does. The
+    run has already happened here, so this is precisely "choose the
+    threshold once you have seen the number".
+    """
+
+    idea_id = _idea(portfolio, runtime_project)
+    context = _context(
+        portfolio=portfolio,
+        runtime_db=runtime_db,
+        tmp_path=tmp_path,
+        project_id=runtime_project,
+        idea_id=idea_id,
+        router=_router(runtime_db, design=design_answer(seed=5)),
+        repo=project_repo,
+    )
+    step = empirical.design(
+        context, portfolio.require_version(idea_id), role=ExperimentRole.PRIMARY
+    )
+    assert step.ok, step.detail
+    ran = empirical.submit(
+        context, portfolio.require_experiment(step.experiment.experiment_id)
+    )
+    assert ran.ok, ran.detail
+
+    moved = dict(
+        portfolio.require_experiment(step.experiment.experiment_id).decision_rule
+    )
+    moved["success"] = {**moved["success"], "threshold": 0.0}
+    with runtime_db.tx() as conn:
+        conn.execute(
+            "update idea_experiments set decision_rule = %s where experiment_id = %s",
+            (jsonb(moved), step.experiment.experiment_id),
+        )
+
+    result = empirical.interpret(
+        context, portfolio.require_experiment(step.experiment.experiment_id)
+    )
+
+    assert not result.ok
+    assert result.failure_class is FailureClass.MISSING_SCIENTIFIC_AUTHORITY
+    assert "fixed after the fact" in result.detail
+    assert portfolio.list_evidence(idea_id=idea_id, idea_version=1) == ()

@@ -1364,7 +1364,7 @@ def submit(context: Any, experiment: IdeaExperiment) -> ExperimentStep:
     )
 
     try:
-        spec = _preregistered_spec(context, experiment)
+        spec, _rule = _preregistered(context, experiment)
     except EmpiricalError as exc:
         # Returned rather than raised, because "the thing about to run is not
         # the thing that was written down" is a disposition of this
@@ -1654,13 +1654,26 @@ def submit(context: Any, experiment: IdeaExperiment) -> ExperimentStep:
     )
 
 
-def _preregistered_spec(context: Any, experiment: IdeaExperiment) -> ExecutionSpec:
-    """The specification as it was written down, or nothing runs.
+def _preregistered(
+    context: Any, experiment: IdeaExperiment
+) -> tuple[ExecutionSpec, DecisionRule | None]:
+    """The specification *and the rule* as they were written down.
 
-    Read back out of the preregistration artifact rather than rebuilt from the
-    design, and then hashed and compared against the digest on the experiment
-    row. Two hashes agreeing is what makes "was this the test we said we would
-    run" answerable without reading a diff of a manifest.
+    Both, and that is the point of this function's shape. The spec was
+    always read back out of the immutable artifact and re-hashed against
+    the row -- but the rule was read straight off the mutable row, so the
+    thing verified twice was *what would run* and the thing with no
+    verification at all was *what the result would mean*. An independent
+    review put it exactly that way. Nothing in this process mutates
+    `idea_experiments.decision_rule`, so §19.4's claim held by
+    absence-of-a-setter rather than by the mechanism the document
+    describes; a migration, a restore, or one future keyword argument
+    would have been enough, and nothing anywhere would have noticed.
+
+    Comparison is on the serialised form rather than a digest, because
+    there is no rule digest to compare against and inventing one would
+    mean a second thing to keep in step. What is returned is the
+    artifact's rule, never the row's.
     """
 
     if not experiment.preregistration_artifact_id:
@@ -1694,7 +1707,23 @@ def _preregistered_spec(context: Any, experiment: IdeaExperiment) -> ExecutionSp
             f"layer may decide.",
             failure_class=FailureClass.MISSING_SCIENTIFIC_AUTHORITY,
         )
-    return spec
+
+    stored = record.get("decision_rule")
+    rule = DecisionRule.model_validate(stored) if stored else None
+    current = (
+        DecisionRule.model_validate(experiment.decision_rule).model_dump(mode="json")
+        if experiment.decision_rule
+        else None
+    )
+    if current != (rule.model_dump(mode="json") if rule else None):
+        raise EmpiricalError(
+            f"the decision rule on {experiment.experiment_id} is not the one "
+            f"its preregistration records. A threshold that moved after the "
+            f"measurement exists is a rule fixed after the fact, and this "
+            f"layer may not read a result under it.",
+            failure_class=FailureClass.MISSING_SCIENTIFIC_AUTHORITY,
+        )
+    return spec, rule
 
 
 def _operational(
@@ -1800,7 +1829,7 @@ def interpret(context: Any, experiment: IdeaExperiment) -> ExperimentStep:
         if workspace.is_dir():
             try:
                 partial = _collect(
-                    workspace, _preregistered_spec(context, experiment).outputs
+                    workspace, _preregistered(context, experiment)[0].outputs
                 )
             except EmpiricalError:  # pragma: no cover - reported below anyway
                 partial = ()
@@ -1817,12 +1846,13 @@ def interpret(context: Any, experiment: IdeaExperiment) -> ExperimentStep:
             keep=partial,
         )
 
-    spec = _preregistered_spec(context, experiment)
-    rule = (
-        DecisionRule.model_validate(experiment.decision_rule)
-        if experiment.decision_rule
-        else None
-    )
+    try:
+        spec, rule = _preregistered(context, experiment)
+    except EmpiricalError as exc:
+        # The same disposition `submit` gives it: the row records why and no
+        # evidence is written. A rule that does not match its preregistration
+        # is not a crashed stage, it is a measurement nobody may read.
+        return _operational(context, experiment, str(exc), exc.failure_class)
     workspace = Path(experiment.workspace_path)
     if not workspace.is_dir():
         return _operational(
