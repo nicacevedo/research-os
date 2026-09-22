@@ -2278,3 +2278,83 @@ That is worth stating plainly as a release consideration: the depth of this
 portfolio has never been exercised on real ideas, by anything. It is
 covered by tests, and it has no production-path evidence whatsoever.
 
+### Y.6 The operator surface, audited by using it
+
+Every command below was run against the live dogfood, not a fixture.
+
+What it gets right, and these are not small things:
+
+- **Every idea listing is headed** *"Autonomous discovery candidates
+  (PIDEA-...). These are not your capsule's Idea objects (IDEA-0001) and
+  none of them is scientific state."* The A0 boundary is restated on the
+  surface a person actually reads, not only in a design document.
+- **`portfolio status` refuses to let a failure count imply a diagnosis**:
+  *"30 portfolio work item(s) have failed; work has succeeded since the last
+  of them, so these are history rather than a diagnosis."*
+- **It says what losing the database would cost**: *"uncurated ideas are the
+  only thing losing the operational database would lose."*
+- **`ideas show` and `portfolio top` volunteer the weakness of their own
+  evidence**: *"one model reviewed this; that is not independent review."*
+- **`runtime doctor` refuses to overstate three separate things**: that
+  provider tiers are *"CONFIGURED priority, not measured performance"*; that
+  the installed reviewers are *"different models (sonnet reviewing opus)
+  from the same family"*; and that bubblewrap is *"measured but not
+  proven"* because the adversarial containment suite has not been run
+  against this binary on this host. It also declines `systemd-run` on the
+  grounds that *"a containment that reports success without containing is
+  worse than none."*
+- Naming no project when two are registered is an exit-1 refusal with a
+  reason, not a guess.
+
+What it got wrong, now fixed (§Y.1, tenth defect): `ideas show` printed
+`next: evidence` for five ideas that were `BLOCKED_EXTERNAL`, one of them
+after five failed attempts at that same stage, and showed neither the block
+nor the refusal. The aggregate was never missing -- `portfolio status` has
+counted blocked ideas all along -- but the per-idea view is where a person
+goes to ask about one idea, and it read as work about to start.
+
+One thing that looked like a defect and was not: `portfolio status` lists
+the same refusal under two failure classes, `capability_denied
+StageExecutionError` and `unknown ResearchOSError`. The timestamps settle
+it -- `unknown` stops at 00:53:56 and `capability_denied` starts at
+01:07:26, which is exactly when `cb794f9` landed. Pre-fix history, not a
+live path.
+
+### Y.7 The engineering gates, and what the soak actually was
+
+Migrations were exercised twice, and the second is the stronger evidence.
+A fresh database applies all 29 and reports head 0029; running `migrate`
+again answers *"the operational schema is up to date"*. But the dogfood
+database itself is the real upgrade path, and it was upgraded **under
+load, five separate times, onto live scientific and operational state**:
+
+```text
+2026-09-21 00:25   0001..0024   (at clone)
+2026-09-21 12:30   0025
+2026-09-21 19:55   0026
+2026-09-21 20:21   0027
+2026-09-22 00:31   0028
+2026-09-22 00:38   0029
+```
+
+`validate-project` returns OK on both project capsules after the entire
+run.
+
+**The soak did not reach its target and this is the honest accounting.**
+Splitting the work-item record wherever nothing completed for ten minutes
+gives five unattended segments:
+
+```text
+longest single run     5h 06m   (2026-09-21 00:33 -> 05:38)
+second                 3h 01m
+total daemon-active   10h 42m   across 5 segments
+```
+
+The brief asked for a minimum of eight hours unattended if available. The
+longest single stretch was 5h 06m. Two things ended segments: the provider
+session limit -- visible in the bank as *"You've hit your session limit ·
+resets 5:10am"* -- and, more often, this author stopping the daemon to apply
+one of the ten fixes. The second reason is not the machine's failure, but
+it is not the eight hours either, and a run in which the code changed ten
+times is not the run the brief asked for.
+
