@@ -2000,7 +2000,17 @@ reconsiders.
 
 **The falsifier reached for CLAIM when its objection named the test.** See
 §Y.3; it is the one change here driven by the scientific-quality audit
-rather than by the machinery.
+rather than by the machinery, and **the one with no regression test**. That
+is deliberate and worth stating rather than hiding: no deterministic test
+asserts that a model picks the better of two labels, and writing one that
+pinned a fixed response would test the fixture. What *is* tested is the
+mechanism the fix depends on -- `test_a_prompt_version_bump_stales_the_board
+_and_the_track_recovers` -- because bumping to `falsifier@3` is what stops a
+verdict produced under one-sided guidance from counting as current. The
+evidence for the change itself is the measured rate: 425 real objections,
+79% CLAIM / 21% TEST, and 63 CLAIM against 10 TEST among the fatal ones.
+Nine of the ten defects have a regression test that fails on the broken
+implementation; this one has a measurement and says so.
 
 **A stage's account of itself was cut mid-word at 500 characters.** Found by
 trying to obey Phase 1 -- "record precisely what human-owned capability is
