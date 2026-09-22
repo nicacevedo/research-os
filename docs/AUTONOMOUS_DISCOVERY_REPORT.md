@@ -2985,17 +2985,35 @@ seven named capabilities in §Y.2, five of them measurements this project
 has not built -- and no agent may supply them. But the system's readiness
 is not established by having a good reason for not being exercised.
 
-**And the defect surface is not exhausted.** Fifteen defects this session.
-Ten found by this author; then an independent reviewer, given one
-afternoon and read-only access to code carrying 4,402 green tests that had
-already been audited twice tonight, found four more -- and every one of
-those four was **the permanent record asserting something untrue**. Every
-analysis artifact in the store said `"containment": "completed"`. The
-containment invariant that `DESIGN_INVARIANTS.md` leans on was
-unfalsifiable from the record it points at. A researcher lowering autonomy
-to be more careful got uncontained execution. Those are not refinements.
-Nothing in this run locates the edge of that surface, and a fourth audit
-finding a fifth class is the expectation, not the surprise.
+**And the defect surface is not exhausted. This is the deciding fact.**
+Twenty-one defects this session. Ten found by this author. Then two
+independent reviewers, each given one afternoon and read-only access to
+code carrying 4,402 green tests that had already been audited twice, found
+**eleven more between them** -- and they did not overlap.
+
+The first found four, every one of them the permanent record asserting
+something untrue: every analysis artifact in the store said
+`"containment": "completed"`, so the containment invariant
+`DESIGN_INVARIANTS.md` leans on was unfalsifiable from the record it
+points at, and a researcher *lowering* autonomy to be more careful got
+uncontained execution.
+
+The second found six, and the first of those is the one that should decide
+this verdict: **a `NaN` metric produced `SUPPORTS`.** A declared command
+whose solver diverged, wrote `{"overlap": NaN}` and exited 0 reached the
+arithmetic, and under the "not exactly zero" rule shape the code
+explicitly defends as intended, the success predicate fired. Evidence row,
+gates, VALIDATED. The permanent artifact recording it was not valid JSON.
+The same review found that the preregistered *rule* -- the entire content
+of §19.4's claim -- was never checked against its artifact while the
+specification was checked twice.
+
+None of these is a refinement. Two independent passes, no overlap, and
+both found record-integrity defects at the centre of the system's
+scientific claims. **Nothing in this run locates the edge of that
+surface.** A third review finding a seventh class is the expectation, not
+the surprise, and a system whose measurements can be trusted is precisely
+what has not been demonstrated.
 
 **Three known gaps are recorded and unfixed**, each because it is a
 person's decision rather than a defect: the authority table does not
@@ -3016,9 +3034,14 @@ In order, and the first is the only one that is not this system's to do:
 3. a second provider family, so "independent review" can be true
 4. one full unattended run, eight hours or more, on code that does not
    change during it
-5. an audit that finds only refinements
+5. adversarial value-domain tests: a fixture that writes malformed JSON,
+   a string where a number belongs, a NaN, an oversized document. §Y.16
+   is explicit that four of the six escape patterns are one disease, and
+   the critical defect lived in the gap this item names
+6. a review that finds only refinements
 ```
 
-Items 2 through 5 are all reachable once item 1 exists, and none of them
-is reachable before it.
+Items 2 through 4 are reachable only once item 1 exists. Item 5 is
+reachable today, costs an afternoon, and is the one thing on this list
+that would have caught the worst defect of the run.
 
