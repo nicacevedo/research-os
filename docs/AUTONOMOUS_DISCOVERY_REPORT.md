@@ -1955,7 +1955,7 @@ justify. Six defects were found on the production path, none of them
 reachable from a suite that was green at 4,402 tests. Four were found in the
 first twenty minutes.
 
-### Y.1 Twenty-one defects: the first ten, which this author found
+### Y.1 Twenty-seven defects: the first ten, which this author found
 
 **An explicit project cost ceiling was silently raised.** The operator set
 `--max-cost-usd 50.00`; a *reconciler-rescheduled* objective cycle -- one
@@ -2945,6 +2945,89 @@ contains*. They are weak where the property depends on what the outside
 world hands the system -- a provider that refuses, a host without a
 sandbox, a solver that writes NaN. Those are the same finding stated
 twice, and the fix named in §Z.4 item 5 follows from it directly.
+
+
+### Y.19 The security review
+
+A third independent reviewer, given `SECURITY.md` and the threat model
+the design assumes -- **a model chooses the parameter values of a command
+the researcher declared, and that command runs on the researcher's
+machine** -- with the model assumed adversarial.
+
+**Five fixed.** Three in `da4a130`, two in `4ee9dac`:
+
+- **A value could escape its type without escaping its slot.** A `path`
+  parameter accepted `--config=/home/u/.ssh/id_rsa`. The containment check
+  compares `worktree / value`, and a value with no leading slash is a
+  *relative* join, so it always lands inside the worktree whatever it
+  means to the program receiving it. It then arrives as one whole argv
+  token, where it is an option. Whether that buys anything depends on the
+  declared program's argument parser -- which is exactly the reasoning
+  this layer exists to make unnecessary.
+- **A `#SBATCH` directive is a bash comment until it contains a
+  newline.** Every other model-chosen string in the generated batch script
+  goes through `shlex.quote`; the directives did not, and everything after
+  an embedded newline is script body run under `set -euo pipefail`.
+  `resources` reaches the objective cycle as `{str(k): str(v)}` over a raw
+  provider dict with **no contract at all**. Latent -- the portfolio
+  hard-codes the local executor and no host here enables Slurm -- and
+  still the one place `SECURITY.md`'s *"nothing here interpolates into a
+  shell"* was untrue.
+- **`nan` satisfied every declared numeric bound** by failing to compare
+  with any of them. The same hazard as §Y.15's critical defect, on the
+  parameter side rather than the decision-rule side, found in the same
+  week.
+- **`argv[0]` could be a parameter.** A placeholder contains no `/` and
+  does not begin with `-`, so `argv: ["{tool}", ...]` passed, and a model
+  could then name `bash`, `env` or `curl`.
+- **A model could forge structure in the bank.** The committed page a
+  person reads before promoting rendered model-authored titles and
+  summaries verbatim, newlines and all, so a title could carry
+  `\n## Reviews` and add a heading, or a line shaped like the computed
+  provenance header. Sixteen rendering sites now collapse and neutralise.
+  Writing the test caught this author shipping half the fix: the first
+  pass patched eight sites and left eight.
+
+**Three recorded and not fixed**, all real and none cheap:
+
+1. The sandbox binds the *run directory* read-write, so a contained
+   command can rewrite `manifest.json` -- the file whose own docstring
+   says a reader "knows exactly what was run ... without trusting a log"
+   -- and the stdout/stderr that `_store_logs` later hashes into the
+   artifact store as the evidence a reviewer reads. Blast radius is its
+   own run directory, but the provenance record being writable by the
+   thing it records is the wrong shape. Relatedly, `_refused_as_root`
+   guards program-closure binds and not caller-declared ones.
+2. The path validator's symlink half never runs on the portfolio path,
+   because `build_spec` validates against a workspace that `submit`
+   creates later. At validation time the directory does not exist, so
+   `(root / value).resolve()` resolves nothing and only the structural
+   check applies.
+3. Output is unbounded: no cap on stdout/stderr before they are copied
+   into the artifact store, no `size=` on the sandbox's `/tmp` tmpfs, no
+   `RLIMIT_AS`/`RLIMIT_FSIZE`/`RLIMIT_CPU`, and on the uncontained path a
+   forking command outlives its own timeout. Wall clock, metric-document
+   size and collected-output size *are* bounded.
+
+**And what it found sound**, which is the part worth reading:
+`grep` for `shell=True`, `os.system`, `eval` and `exec` across `src/`
+returns nothing, and all 36 subprocess call sites pass a list.
+Placeholder abuse is closed four ways. `--clearenv` plus an allowlist
+means a *contained* command sees no provider key, no `SSH_AUTH_SOCK` and
+no DSN -- and Slurm's `--export=NONE` closes what would be the cleanest
+exfiltration in the system. `linked_worktree_paths` treats the `gitdir:`
+pointer as attacker-written and the reviewer could not find a fourth way
+through its four guards. Git is neutralised as a code-execution
+primitive at eleven separate settings. And it traced
+`SandboxMode.REQUIRED` end to end and confirmed the fix from §Y.13 holds:
+**there is no path by which a portfolio experiment runs uncontained.**
+
+The honest exception it states plainly: on the *uncontained* path
+`env = {**os.environ, **spec.env}`, so a command that prints its
+environment puts a credential into a stored artifact. That path is now
+unreachable from the portfolio and remains reachable from
+`researchctl experiment run`, which is human-initiated and which
+`SECURITY.md` reads as though it covers.
 
 ## Z. Final release assessment
 
