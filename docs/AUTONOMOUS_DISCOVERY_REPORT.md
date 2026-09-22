@@ -965,7 +965,12 @@ is still clean at `ad4d66c`; the second project is still clean at `8733ad7`;
 neither was written to, and both dogfoods ran against `--no-hardlinks` clones
 with `origin` removed.
 
-## U. Formal verdict
+## U. Formal verdict (as of §V's revision; superseded by §Z)
+
+> This section is the verdict recorded at an earlier revision and is kept
+> because this document is a record rather than a summary. **§Z is the
+> current one.** Both say `AUTONOMOUS_DISCOVERY_BETA`; they say it for
+> different reasons, and the difference is the point of reading both.
 
 Against the brief's own vocabulary:
 
@@ -2188,7 +2193,7 @@ to have. It is worth more than a traversal would have been, and it is the
 one result of the overnight run that could not have been obtained by writing
 a test.
 
-### Y.3 The scientific-quality audit found a calibration error
+### Y.3 The falsifier's CLAIM/TEST calibration, and the measurement behind it
 
 Fourteen rejections read in full. Twelve well judged, and several better
 than well judged: one refuted a proposal algebraically from
@@ -2225,6 +2230,8 @@ and a rejection is revived as a *new* idea with a `REVIVES` edge, so the
 record of what was rejected stays what it was.
 
 ### Y.4 The scientific-quality audit: 12 rejections and 11 survivors, read in full
+
+(§Y.3 is the one policy change this audit produced; this is the audit.)
 
 109 ideas across two projects, none VALIDATED, none HUMAN_READY, so the
 audit is of what the portfolio *killed* and what it is still carrying. The
