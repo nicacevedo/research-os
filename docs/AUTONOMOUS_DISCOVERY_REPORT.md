@@ -1955,7 +1955,7 @@ justify. Six defects were found on the production path, none of them
 reachable from a suite that was green at 4,402 tests. Four were found in the
 first twenty minutes.
 
-### Y.1 Fifteen defects: the first ten, which this author found
+### Y.1 Twenty-one defects: the first ten, which this author found
 
 **An explicit project cost ceiling was silently raised.** The operator set
 `--max-cost-usd 50.00`; a *reconciler-rescheduled* objective cycle -- one
@@ -2773,6 +2773,152 @@ fixture.
 Seven refusals now, across two sessions, three prompt versions and a
 restart on new code. Not one of them has proposed to measure something
 adjacent and call it the answer.
+
+
+### Y.15 The scientific-workflow review, and the defect that should have ended the run
+
+A second independent reviewer was given the branch, the scientific
+documents, read-only access and permission to run individual test files.
+It found six more. The first is the worst defect of this entire effort and
+it is the one that matters for the verdict.
+
+**A run that produced no number manufactured a positive result.** Python's
+`json` accepts `NaN`, `Infinity` and `-Infinity`, which no other JSON
+reader does, and `isinstance(float("nan"), float)` is `True`. So a
+declared command whose solver diverged, wrote `{"overlap": NaN}` and
+exited 0 reached the arithmetic. Confirmed against the real `analyse`:
+
+```text
+rule  !=0 / ==0    metric = NaN   ->  SUPPORTS
+rule  >0.5 / <=0.5 metric = NaN   ->  INCONCLUSIVE
+rule  >0.5 / <=0.5 metric = Inf   ->  SUPPORTS
+```
+
+The first line is the "not exactly zero" shape that `DecisionPredicate.
+holds`'s own docstring singles out as intended and defensible. `NaN != 0`
+is True and `NaN == 0` is False, so the success predicate fired and the
+failure predicate did not. From there: `EvidenceStrength.SUPPORTS`, an
+EXPERIMENT evidence row citing a real `external_jobs` id, `_substantive`
+and `_executed` both satisfied, VALIDATED reachable. **This is exactly the
+thing the operational/scientific boundary exists to prevent, arriving
+through the one door nobody had checked** -- not an operational failure
+becoming evidence, but a non-number becoming a number.
+
+§19.5 already said the answer -- "a metric that is not a number" is
+INSUFFICIENT -- and the code did not implement it.
+
+Second-order, and nearly as bad: `json.dumps({"observed": nan})` emits a
+bare `NaN` token, so the permanent, content-addressed analysis artifact --
+the one the evidence row points at, the one that satisfies
+`idea_experiments_interpreted_ck` -- **was not valid JSON**. `jq` rejects
+it. Every reader that is not Python rejects it.
+
+Three guards, each pinned by its own mutation, and the first mutation run
+earned its keep: it showed that the finiteness check alone covered every
+case the tests had, so the parse guard was untested. Rather than delete
+it, the question it raised -- should a document whose *irrelevant* field
+is NaN be read at all -- was settled deliberately (no: a bare NaN token is
+not JSON) and a test now pins that answer.
+
+**The preregistered rule was never verified.** §19.4's whole claim is that
+the rule is fixed before the number exists. `submit` read the
+specification back out of the immutable artifact and re-hashed it against
+the row. `interpret` read the *rule* straight off the mutable row. So the
+thing checked twice was what would run, and the thing never checked was
+what the result would mean. The reviewer noted there was no test for it
+because there was nothing to test. One function returns both now and
+checks both; the test is the one that could not previously be written --
+run the experiment, move the threshold in the database, try to read the
+result.
+
+**A missing provider family was recorded as a broken system.**
+`IndependenceUnavailableError` is a sibling of `ProviderCallFailedError`,
+not a subclass, so no portfolio handler caught it and it arrived at the
+catch-all as `UNKNOWN` -> `FATAL_INFRASTRUCTURE_ERROR`. §10 has said the
+answer is `WAITING_FOR_EXTERNAL_DEPENDENCY` all along and the objective
+cycle does it; this layer did not. That is a deployment policy decision
+recorded as a defect -- the shape the taxonomy exists to prevent.
+
+**Three smaller ones.** `analyse`'s *summary* still said a run "did not
+write" a rule output that was past the collection bound -- the same
+falsehood this session had already fixed in the *notes*, one branch over,
+so the evidence row carried the correction beside the false claim.
+`build_snapshot` resolved review liveness twice from two different
+configs, reintroducing at one call site the livelock a previous audit had
+closed for six. And a worktree left by an experiment that a *revision*
+superseded was never collected, because `supersede_experiments_below` is
+pure SQL with no repository in hand -- the fourth instance of the family
+§19.7a says was already paid for three times.
+
+### Y.16 What the second review said about the tests, which is the useful part
+
+The reviewer was asked why ~4,400 green tests missed everything above,
+and the answer is better than "not enough tests". The suite uses a real
+PostgreSQL, real Git worktrees, real subprocesses and real hashes, and
+drives the production entry point end to end. The escapes are structural:
+
+1. **The value domain is never adversarial.** Every number any test reads
+   comes from one fixture that always writes a well-formed finite float.
+   The two variants crash or write nothing. There is no script that emits
+   malformed JSON, a string-typed number, or a NaN -- and the one unit
+   table that enumerates bad metrics picks five shapes by hand and stops
+   short of the two that mattered. *That is where the critical defect
+   lived.*
+2. **Verification is tested where it exists, not where it is absent.**
+   There is a good test of the spec-digest rebuild and none of the rule,
+   because there was no check to test. A suite organised as one test per
+   enforcement is structurally incapable of finding a *missing*
+   enforcement.
+3. **The gate suite's positive control used the one type production
+   refuses.** `_build` defaults to MATHEMATICAL, which `run_evidence`
+   denies by §18, so `EVIDENCE_RULES[EMPIRICAL]` -- the rules every real
+   adjudicated idea in this dogfood has -- had only refusal tests. Now
+   fixed, and it is a recurrence of a shape `gates.py` already records an
+   earlier audit finding: the code was fixed and the control was not
+   generalised.
+4. **Assertions that read a value the double was configured to produce.**
+   `board_independence(live) == 3` tests that a `len(set())` counts, over
+   a router handed three families unconditionally. It establishes nothing
+   about the system obtaining three.
+5. **The one seam that matters for §10 was mocked out.** `ScriptedRouter`
+   ignores `independence_group` entirely and could not raise
+   `IndependenceUnavailableError`. That is how the missing handler
+   survived. The double can now fail that way.
+6. **A property test that supplies its own post-conditions.** "Terminates
+   from any starting point" passes complete evidence and complete reviews
+   on every iteration, so the EVIDENCE branch is never the live one and
+   the eighth loop §19.8 names is outside the property's domain.
+
+Four of the six are the same disease: **the test decides what the world
+hands the system, and hands it something reasonable.** A real provider,
+a real solver and a real host do not.
+
+### Y.17 Two findings recorded and deliberately not acted on
+
+**A threshold can still be re-selected after a number is visible, by
+revising the idea.** The measured value is written verbatim into the
+evidence summary, that row is in the frozen review packet, a reviewer who
+quotes the number in a CRITICAL objection carries it into `run_discover`
+(which is not given the evidence block, but is given the objections), the
+revision produces a new version, and `design` writes a **new rule with new
+thresholds** for a question whose answer is now known. Bounded at
+`max_revisions_per_idea`, so four further chances. Nothing records that
+the new rule postdates a visible result.
+
+Not fixed, because every available fix is a design decision: blind the
+objection text, forbid a new rule after an interpreted measurement, or
+mark such a rule in the record. The last is probably right and it is not
+an agent's call to make at 2am.
+
+**An objection is "answered" by a review that need not agree with
+anything.** `_try_resolve_objections` requires a review of that version by
+a different role that the revision named -- and applies no verdict filter,
+so a CRITICAL objection can be closed by a review whose verdict is
+REVISE or REJECT, and `candidates[0]` is whichever sorts first rather than
+the most relevant. The code and §9 agree with each other here, so this is
+a design weakness rather than a divergence; but "answered" reads far
+stronger in the severity table than "somebody else reviewed a version
+that claimed to address it".
 
 ## Z. Final release assessment
 
