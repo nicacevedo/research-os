@@ -53,6 +53,7 @@ from research_os.runtime.idempotency import InvocationLedger
 from research_os.runtime.interfaces import ModelProvider
 from research_os.runtime.locks import research_run_lock
 from research_os.runtime.models import Autonomy, RunKind, RunStatus, TerminalState
+from research_os.runtime.routing import IndependenceUnavailableError
 from research_os.runtime.store import RuntimeStore
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -459,6 +460,31 @@ def advance_idea(
                 durability=DURABILITY,
             )
             final = dict(app.get_state(graph_config).values or {})
+    except IndependenceUnavailableError as exc:
+        # A deployment fact, not a defect, and the taxonomy has a member for
+        # it. `IndependenceUnavailableError` is a sibling of
+        # `ProviderCallFailedError` rather than a subclass, so no stage
+        # handler caught it and it reached the catch-all below as UNKNOWN --
+        # which `_terminal_for` maps to FATAL_INFRASTRUCTURE_ERROR and
+        # `_operational_for` to IDLE. That sends a researcher looking for a
+        # broken system when what is missing is a second provider family
+        # they install. §10 of the architecture already says the answer is
+        # WAITING_FOR_EXTERNAL_DEPENDENCY; the objective cycle does this at
+        # `graphs/cycle.py:893` and this layer did not.
+        store.complete_action(
+            action_id=action.action_id,
+            status=ActionStatus.FAILED,
+            detail=f"required review independence is unavailable here: {exc}",
+            failure_class=str(FailureClass.CAPABILITY_DENIED),
+            operational_state=_operational_for(str(FailureClass.CAPABILITY_DENIED)),
+        )
+        runtime_store.set_run_status(
+            run.run_id,
+            RunStatus.FAILED,
+            terminal_state=TerminalState.WAITING_FOR_EXTERNAL_DEPENDENCY,
+            detail=str(exc)[:500],
+        )
+        raise
     except Exception as exc:
         store.complete_action(
             action_id=action.action_id,

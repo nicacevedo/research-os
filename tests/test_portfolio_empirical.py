@@ -2692,3 +2692,44 @@ def test_a_document_with_a_nan_token_anywhere_is_not_a_json_document(
     )
     assert analysis.conclusion is EmpiricalConclusion.INSUFFICIENT
     assert "could not be read as JSON" in analysis.summary
+
+
+def test_the_summary_does_not_say_a_produced_file_was_not_written(
+    tmp_path: Path,
+) -> None:
+    """The same falsehood, one branch over from where it was first fixed.
+
+    An earlier pass corrected the *notes* to distinguish "not produced"
+    from "produced but past the collection bound", and left the *summary*
+    saying the run "did not write" the rule's output. `_evidence_summary`
+    puts both into the same evidence row, so the row carried the
+    correction and the false claim together.
+    """
+
+    from research_os.portfolio import empirical as bridge
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    (workspace / "r.json").write_text('{"summary": {"overlap": 0.9}}')
+    rule = DecisionRule(
+        metric_path="summary.overlap",
+        output_path="r.json",
+        success=DecisionPredicate(comparator=">", threshold=0.5),
+        failure=DecisionPredicate(comparator="<=", threshold=0.5),
+    )
+    keep = bridge.MAX_COLLECTED_BYTES
+    try:
+        bridge.MAX_COLLECTED_BYTES = 2
+        analysis = bridge.analyse(
+            experiment=SimpleNamespace(no_rule_reason=""),
+            rule=rule,
+            workspace=workspace,
+            spec=SimpleNamespace(outputs=("r.json",)),
+            exit_code=0,
+        )
+    finally:
+        bridge.MAX_COLLECTED_BYTES = keep
+
+    assert analysis.conclusion is EmpiricalConclusion.INSUFFICIENT
+    assert "did not write" not in analysis.summary
+    assert "past this run's collection limit" in analysis.summary

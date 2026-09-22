@@ -24,7 +24,10 @@ from research_os.runtime.idempotency import InvocationLedger
 from research_os.runtime.interfaces import Independence, ModelRequest, ModelResponse
 from research_os.runtime.kernel import ScientificKernelAdapter
 from research_os.runtime.queue import WorkQueue
-from research_os.runtime.routing import ProviderCallFailedError
+from research_os.runtime.routing import (
+    IndependenceUnavailableError,
+    ProviderCallFailedError,
+)
 from research_os.runtime.store import RuntimeStore
 from tests.automation_helpers import commit_all
 from tests.fs_helpers import (
@@ -93,10 +96,20 @@ class ScriptedRouter:
     #: one family or with three. Falls back to ``scripted``.
     providers: dict[str, str] = field(default_factory=dict)
     models_by_role: dict[str, str] = field(default_factory=dict)
+    #: Roles for which no second provider family can be found. The real
+    #: router raises `IndependenceUnavailableError` here, and this double
+    #: could not, which is how the portfolio's missing handler for it
+    #: survived ~4,400 tests: every independence assertion in the portfolio
+    #: suite reads a value `providers` was configured to hand out.
+    independence_unavailable_roles: frozenset[str] = frozenset()
 
     def complete(self, request: ModelRequest) -> ModelResponse:
         self.requests.append(request)
         role = str(request.role)
+        if role in self.independence_unavailable_roles:
+            raise IndependenceUnavailableError(
+                f"no second provider family is installed for {role}"
+            )
         if self.unavailable or role in self.unavailable_roles:
             raise ProviderCallFailedError(
                 f"no healthy provider offers {request.capability} for {role}",

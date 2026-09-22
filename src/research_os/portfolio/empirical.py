@@ -740,14 +740,33 @@ def analyse(
         )
 
     if rule.output_path not in produced:
+        # The same distinction the notes above draw, and the first version of
+        # that fix did not carry it here -- so the evidence row held the
+        # correction and the falsehood side by side. A rule output past the
+        # collection bound is a file the run *did* write.
+        wrote_it = (workspace / rule.output_path).exists()
         return Analysis(
             conclusion=EmpiricalConclusion.INSUFFICIENT,
             summary=(
-                f"the run exited {exit_code} and did not write "
-                f"{rule.output_path}, which the preregistered rule reads"
+                (
+                    f"the run exited {exit_code} and wrote "
+                    f"{rule.output_path}, but it is past this run's "
+                    f"collection limit, so the preregistered metric was not "
+                    f"read out of it here"
+                )
+                if wrote_it
+                else (
+                    f"the run exited {exit_code} and did not write "
+                    f"{rule.output_path}, which the preregistered rule reads"
+                )
             ),
             outputs=outputs,
-            notes=(*notes, f"{rule.output_path} is absent"),
+            notes=(
+                *notes,
+                f"{rule.output_path} was produced but not collected"
+                if wrote_it
+                else f"{rule.output_path} is absent",
+            ),
         )
 
     target = workspace / rule.output_path

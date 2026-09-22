@@ -30,7 +30,9 @@ from research_os.portfolio.models import (
 from research_os.portfolio.store import DuplicateBasisError, PortfolioStore
 from research_os.portfolio.track import advance_idea, build_track_graph
 from research_os.runtime.db import Database
+from research_os.runtime.failures import FailureClass
 from research_os.runtime.models import RunKind, RunStatus
+from research_os.runtime.routing import IndependenceUnavailableError
 from research_os.runtime.store import RuntimeStore
 from tests.portfolio_helpers import idea_fields, portfolio, seed_idea
 from tests.runtime_graph_helpers import ScriptedRouter, make_config
@@ -1329,3 +1331,69 @@ def test_a_screen_that_read_something_still_assesses_novelty(
     assert result.ok, trace
     assert "nothing was retrieved" not in result.detail
     assert portfolio.require_version(idea.idea_id).dimensions.novelty is not None
+
+
+def test_unavailable_independence_is_an_external_dependency_not_a_crash(
+    portfolio: PortfolioStore,
+    runtime_db: Database,
+    pg_dsn: str,
+    checkpoint_tables: str,
+    tmp_path: Path,
+    runtime_project: str,
+) -> None:
+    """A deployment fact must not be recorded as a broken system.
+
+    `IndependenceUnavailableError` is a sibling of
+    `ProviderCallFailedError`, not a subclass, so no stage handler caught
+    it and it reached `advance_idea`'s catch-all as `UNKNOWN` --
+    `FATAL_INFRASTRUCTURE_ERROR`, operational state `IDLE`. What is
+    actually missing is a second provider family the researcher installs.
+    §10 says the answer is `WAITING_FOR_EXTERNAL_DEPENDENCY`, and the
+    objective cycle has done this all along.
+
+    It survived ~4,400 tests because `ScriptedRouter` could not raise it;
+    `independence_unavailable_roles` exists so that it can.
+    """
+
+    idea, _ = seed_idea(portfolio, runtime_project)
+    portfolio.set_status(idea_id=idea.idea_id, status=IdeaStatus.PROMISING)
+    router = _router(runtime_db)
+    # Keyed by the *role*, which is not the template name -- the
+    # `novelty_screen` template's role is `novelty_screener`. `falsify` is
+    # the third stage, after dedup (no neighbour, so no model call) and the
+    # cheap screen.
+    router.independence_unavailable_roles = frozenset({"falsifier"})
+
+    for _ in range(2):
+        _advance(
+            portfolio,
+            runtime_db,
+            pg_dsn,
+            tmp_path,
+            runtime_project,
+            idea.idea_id,
+            router,
+        )
+    with pytest.raises(IndependenceUnavailableError):
+        _advance(
+            portfolio,
+            runtime_db,
+            pg_dsn,
+            tmp_path,
+            runtime_project,
+            idea.idea_id,
+            router,
+        )
+
+    (action,) = [
+        item
+        for item in portfolio.list_actions(idea_id=idea.idea_id)
+        if item.status is ActionStatus.FAILED
+    ]
+    assert action.failure_class == str(FailureClass.CAPABILITY_DENIED)
+    assert "independence is unavailable" in (action.detail or "")
+    assert (
+        portfolio.require_idea(idea.idea_id).operational_state
+        is OperationalState.BLOCKED_EXTERNAL
+    )
+    assert portfolio.require_idea(idea.idea_id).status is not IdeaStatus.REJECTED
