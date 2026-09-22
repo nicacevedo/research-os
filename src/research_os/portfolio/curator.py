@@ -200,6 +200,23 @@ def _header(counts: dict[str, int]) -> list[str]:
     ]
 
 
+def _indented(detail: str) -> str:
+    """Keep a multi-paragraph explanation inside the bullet that owns it.
+
+    A stage that refuses says why in numbered prose with blank lines between
+    the reasons, and this is Markdown: an unindented blank line ends the list
+    item. Rendered flat, the page a researcher opens shows the history
+    stopping at the first refusal, its reasons loose in the body, and the
+    actions after it starting a second list. Two spaces is what a continuation
+    line costs.
+    """
+
+    head, *rest = detail.splitlines()
+    if not rest:
+        return head
+    return "\n".join([head, *(f"  {line}".rstrip() for line in rest)])
+
+
 def render_idea(store: PortfolioStore, idea: PortfolioIdea) -> str:
     """One idea's complete record: every version, its lineage, what it rests on."""
 
@@ -319,7 +336,7 @@ def render_idea(store: PortfolioStore, idea: PortfolioIdea) -> str:
             f"- {action.created_at:%Y-%m-%d %H:%M} `{action.stage}` "
             f"{action.status}"
             + (f" -> {action.disposition}" if action.disposition else "")
-            + (f" -- {action.detail}" if action.detail else "")
+            + (f" -- {_indented(action.detail)}" if action.detail else "")
         )
     lines.append("")
     return "\n".join(lines) + "\n"

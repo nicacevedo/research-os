@@ -22,10 +22,17 @@ from research_os.portfolio.curator import (
     snapshot_digest,
     worktree_root,
 )
-from research_os.portfolio.models import EvidenceKind, EvidenceStrength, IdeaStatus
-from research_os.portfolio.store import PortfolioStore
+from research_os.portfolio.models import (
+    ActionStatus,
+    EvidenceKind,
+    EvidenceStrength,
+    IdeaStatus,
+    Stage,
+)
+from research_os.portfolio.store import MAX_DETAIL_CHARS, PortfolioStore
 from research_os.runtime.actions.coding import canonical_fingerprint, escaped
 from research_os.runtime.db import Database
+from research_os.runtime.failures import FailureClass
 from research_os.runtime.refs import AUTONOMOUS_BANK_BRANCH, RESERVED_REF_VALUE
 from tests.fs_helpers import make_git_repo
 from tests.portfolio_helpers import portfolio, record_review, seed_idea
@@ -446,3 +453,107 @@ def test_the_bank_branch_carries_none_of_the_researchers_work(
     assert merge_base.returncode != 0, (
         "the bank branch must share no ancestor with the researcher's work"
     )
+
+
+# --------------------------------------------------- what a refusal says --
+def _refusal(portfolio: PortfolioStore, idea_id: str, detail: str) -> None:
+    """Complete one evidence action carrying the designer's own words."""
+
+    action = portfolio.open_action(
+        idea_id=idea_id,
+        idea_version=1,
+        stage=Stage.EVIDENCE,
+        basis_digest="basis-refusal",
+    )
+    portfolio.complete_action(
+        action_id=action.action_id,
+        status=ActionStatus.FAILED,
+        detail=detail,
+        failure_class=str(FailureClass.CAPABILITY_DENIED),
+    )
+
+
+def test_a_refusal_is_recorded_in_full_rather_than_cut_mid_word(
+    portfolio: PortfolioStore,
+    runtime_project: str,
+) -> None:
+    """The store keeps what the producing contract was allowed to write.
+
+    This pins the boundary rather than the defect: the 500-character cut
+    lived at the call site, so
+    ``test_what_a_stage_says_about_itself_is_not_cut_mid_word`` in
+    ``test_portfolio_track.py`` is the regression, and this is the guarantee
+    it relies on -- that having moved the bound here, here does not shrink
+    it.
+    """
+
+    idea, _ = seed_idea(portfolio, runtime_project)
+    reason = "PEAK MEMORY IS NOT MEASURED ANYWHERE. " * 40
+    assert len(reason) > 1_000
+    _refusal(portfolio, idea.idea_id, reason)
+
+    (action,) = [
+        item
+        for item in portfolio.list_actions(idea_id=idea.idea_id)
+        if item.stage == Stage.EVIDENCE
+    ]
+    assert action.detail is not None
+    assert action.detail == reason.strip()
+    assert "[clipped]" not in action.detail
+
+
+def test_an_explanation_longer_than_the_contract_allows_says_it_was_clipped(
+    portfolio: PortfolioStore,
+    runtime_project: str,
+) -> None:
+    """Positive control for the bound: it still exists, and it announces itself.
+
+    Unbounded is not the fix. A reader must be able to tell a reason that
+    ended from a reason that was cut, which is what the marker is for and why
+    ``ExperimentDesign`` already appends one.
+    """
+
+    idea, _ = seed_idea(portfolio, runtime_project)
+    reason = "x" * (MAX_DETAIL_CHARS + 500)
+    _refusal(portfolio, idea.idea_id, reason)
+
+    (action,) = [
+        item
+        for item in portfolio.list_actions(idea_id=idea.idea_id)
+        if item.stage == Stage.EVIDENCE
+    ]
+    assert action.detail is not None
+    assert len(action.detail) == MAX_DETAIL_CHARS
+    assert action.detail.endswith("[clipped]")
+
+
+def test_a_multi_line_refusal_stays_inside_its_own_bullet(
+    portfolio: PortfolioStore,
+    runtime_db: Database,
+    runtime_project: str,
+    repository: Path,
+) -> None:
+    """The bank is Markdown, and a blank line ends a list item.
+
+    Every refusal the designer wrote overnight is numbered prose with blank
+    lines between the reasons. Rendered into ``- {detail}`` unindented, the
+    second paragraph leaves the list: the page a researcher opens shows the
+    history stopping at the first refusal, its reasons floating free as body
+    text, and the later actions starting a fresh list. Continuation lines
+    belong indented under the bullet that owns them.
+    """
+
+    idea, _ = seed_idea(portfolio, runtime_project)
+    _refusal(
+        portfolio,
+        idea.idea_id,
+        "not testable, for two reasons.\n\n1. no command measures memory.\n\n"
+        "2. no command selects a hardware generation.",
+    )
+
+    page = snapshot(runtime_db, runtime_project)[f"{BANK_ROOT}/ideas/{idea.idea_id}.md"]
+    history = page.split("## What was done, and when", 1)[1]
+    for line in history.splitlines():
+        if not line.strip():
+            continue
+        assert line.startswith(("- ", "  ")), f"{line!r} escaped its bullet"

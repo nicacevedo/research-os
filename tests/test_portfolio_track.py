@@ -1206,3 +1206,61 @@ def test_an_adjudicated_duplicate_is_recorded_without_violating_the_schema(
         "a sibling merge cannot be a lineage edge; it violates idea_edges_acyclic_ck"
     )
     assert EdgeKind.DUPLICATE_OF in kinds
+
+
+def test_what_a_stage_says_about_itself_is_not_cut_mid_word(
+    portfolio: PortfolioStore,
+    runtime_db: Database,
+    pg_dsn: str,
+    checkpoint_tables: str,
+    tmp_path: Path,
+    runtime_project: str,
+) -> None:
+    """The overnight run's most valuable output was reaching the record cut.
+
+    Asked to measure three real empirical ideas, the designer answered each
+    time that no declared command can, and said at length which capability
+    was missing -- the entire return on the attempt. Every one of those
+    accounts stopped mid-word at 500 characters: four call sites had each
+    picked a literal, the smallest won, the column is ``text``, and the
+    contract that produces the string allows four thousand. The bound belongs
+    once, where the column is written.
+    """
+
+    idea, _ = seed_idea(portfolio, runtime_project)
+    portfolio.set_status(idea_id=idea.idea_id, status=IdeaStatus.PROMISING)
+    attempted = [
+        "searched for a subsuming theorem, " + "at considerable length, " * 20,
+        "built a two-variable counterexample, " + "and then a third, " * 20,
+    ]
+    router = _router(
+        runtime_db,
+        answers=_answers(
+            falsifier={
+                "summary": "no cheap kill found",
+                "objections": [],
+                "attempted": attempted,
+            }
+        ),
+    )
+    result, trace = _drive_to(
+        portfolio,
+        runtime_db,
+        pg_dsn,
+        tmp_path,
+        runtime_project,
+        idea.idea_id,
+        router,
+        Stage.FALSIFY,
+        literature=FakeLiterature(),
+    )
+    assert result.ok, trace
+
+    (action,) = [
+        item
+        for item in portfolio.list_actions(idea_id=idea.idea_id)
+        if item.stage == Stage.FALSIFY
+    ]
+    assert action.detail is not None
+    assert len(action.detail) > 500, "cut at a literal nobody chose"
+    assert action.detail.endswith(attempted[1].strip()), "cut mid-word"

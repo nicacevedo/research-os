@@ -463,7 +463,7 @@ def advance_idea(
         store.complete_action(
             action_id=action.action_id,
             status=ActionStatus.FAILED,
-            detail=str(exc)[:500],
+            detail=str(exc),
             failure_class=str(FailureClass.UNKNOWN),
             operational_state=OperationalState.IDLE,
         )
@@ -486,12 +486,16 @@ def advance_idea(
         action_id=action.action_id,
         status=ActionStatus.SUCCEEDED if ok else ActionStatus.FAILED,
         disposition=Disposition(disposition) if disposition else None,
-        detail=detail[:500],
+        detail=detail,
         failure_class=failure or None,
         cost_usd=cost,
         model_calls=calls,
         operational_state=_operational_for(failure),
     )
+    # The run row is the operational mirror and stays terse on purpose: the
+    # durable account of what a stage decided is the action, and the bank
+    # page rendered from it. Widening telemetry is R5's call, not this
+    # module's.
     runtime_store.set_run_status(
         run.run_id,
         RunStatus.SUCCEEDED if ok else RunStatus.FAILED,

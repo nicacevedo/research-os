@@ -33,6 +33,7 @@ from typing import Any
 
 from research_os.errors import ResearchOSError
 from research_os.portfolio import digests as pdigests
+from research_os.portfolio.contracts import MAX_SUMMARY_CHARS
 from research_os.portfolio.ids import (
     new_idea_action_id,
     new_idea_evidence_id,
@@ -136,6 +137,37 @@ STATE_COLUMNS = (
     "bank_written_at, failures_forgiven_at, created_at, updated_at"
 )
 SEED_COLUMNS = "seed_id, project_id, text, note, consumed_at, consumed_by, created_at"
+
+#: How much of a stage's own account of itself is kept.
+#:
+#: The same number the contract that produces the string enforces, because a
+#: store that keeps less than the producer may emit throws away the part
+#: nobody chose to lose. The dogfood measured the cost of disagreeing: four
+#: call sites had each picked their own literal, the smallest won at 500, the
+#: column is ``text`` and holds anything, and all three of the overnight run's
+#: refusals -- the only place the system says which capability a researcher
+#: would have to add -- reached the record cut mid-word.
+MAX_DETAIL_CHARS = MAX_SUMMARY_CHARS
+
+_CLIP_MARKER = " [clipped]"
+
+
+def clipped_detail(detail: str | None) -> str | None:
+    """Bound a stage's explanation, and say so when the bound bites.
+
+    Unbounded is not the answer either: ``detail`` is written on every action
+    and a runaway string is a runaway row. What matters is that a reader can
+    tell a reason that ended from a reason that was cut, which is the only
+    reason the marker exists.
+    """
+
+    if detail is None:
+        return None
+    text = detail.strip()
+    if len(text) <= MAX_DETAIL_CHARS:
+        return text
+    return text[: MAX_DETAIL_CHARS - len(_CLIP_MARKER)].rstrip() + _CLIP_MARKER
+
 
 #: The same version list, prefixed, for the queries that join ``ideas``. A bare
 #: ``idea_id`` beside the ideas table's own is ambiguous, and PostgreSQL says
@@ -1172,7 +1204,7 @@ class PortfolioStore:
                     "conclusion": str(conclusion) if conclusion else None,
                     "evidence_id": evidence_id,
                     "failure_class": failure_class,
-                    "detail": detail[:2000] if detail else None,
+                    "detail": clipped_detail(detail),
                     "count": count_attempt,
                 },
             ).fetchone()
@@ -1732,7 +1764,7 @@ class PortfolioStore:
                     "action_id": action_id,
                     "status": str(status),
                     "disposition": str(disposition) if disposition else None,
-                    "detail": detail,
+                    "detail": clipped_detail(detail),
                     "failure_class": failure_class,
                     "cost": Decimal(str(cost_usd)),
                     "calls": int(model_calls),

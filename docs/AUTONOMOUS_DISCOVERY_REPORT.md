@@ -1950,7 +1950,7 @@ justify. Six defects were found on the production path, none of them
 reachable from a suite that was green at 4,402 tests. Four were found in the
 first twenty minutes.
 
-### Y.1 Six defects, and what each one was
+### Y.1 Eight defects, and what each one was
 
 **An explicit project cost ceiling was silently raised.** The operator set
 `--max-cost-usd 50.00`; a *reconciler-rescheduled* objective cycle -- one
@@ -2002,6 +2002,29 @@ reconsiders.
 §Y.3; it is the one change here driven by the scientific-quality audit
 rather than by the machinery.
 
+**A stage's account of itself was cut mid-word at 500 characters.** Found by
+trying to obey Phase 1 -- "record precisely what human-owned capability is
+missing" -- and discovering that the record does not contain it. Every
+`detail` in the database was exactly 500 long at the maximum, because four
+call sites had each chosen a literal, the smallest won, the column is
+`text`, and the contract that produces the string permits four thousand. So
+the three refusals that are the entire return on the overnight run reach the
+researcher as `(master_solve_seconds, pr` and `which choose among this
+project's curr`. The bound now lives once, at the store boundary, is the
+producing contract's own number, and appends `[clipped]` when it bites --
+because a reader must be able to tell a reason that ended from a reason that
+was cut. The run row stays terse on purpose and says so: it is operational
+telemetry, and widening it is R5's call.
+
+**And the bank rendered those refusals outside their own bullet.** A stage
+that refuses writes numbered prose with blank lines between the reasons;
+`render_idea` interpolated it into `- {detail}` unindented, and in Markdown
+a blank line ends a list item. On the real page at `42cb8426` the history
+stops at the first refusal, its reasons float free as body text, and the
+next action starts a second list. Two spaces per continuation line. Both of
+these are the same shape as the four in §X.6: *a constraint nobody chose,
+applied where nobody would look for it*.
+
 ### Y.2 Phase 1, answered: the missing capability is human-owned
 
 No declared command can settle any of the three real empirical questions,
@@ -2043,6 +2066,32 @@ What would close it, precisely, and all of it the researcher's:
 Declaring an experiment command for someone's project is the act
 `experiments.yaml` lives outside every worktree to prevent an agent from
 performing, and none was performed.
+
+One correction to the above, which the third idea produced after the
+catalogue was corrected and which is worth more than the guess it replaces.
+The missing capability is not only the output file. Asked again, with the
+declared inputs and the output schemas in front of it, the designer refused
+the wall-clock/memory ablation twice, on two grounds neither of which a
+`--out` flag would answer:
+
+> (1) No handle on hardware. Arms (a) and (b) are defined by running on
+> original-era hardware, and arm (b) vs (c) IS the software-vs-hardware
+> separation the idea exists to perform. No declared command accepts a
+> hardware target, a machine generation, or a solver version.
+
+> 1. PEAK MEMORY IS NOT MEASURED ANYWHERE. The falsifier turns on memory as
+> much as on time: the claim fails "if it is faster only at the cost of
+> materially higher peak memory." The only command with a declared output
+> schema is `profile`, and its committed numeric paths are purely a timing
+> decomposition.
+
+So the list of missing human-owned capability has three entries, not one: a
+written verdict file, a parameter that selects a hardware or solver
+generation, and an instrument that records peak memory. The system is not
+confused about what it lacks. It is unusually precise about it, and it said
+so three times without once proposing to measure something adjacent and call
+it the answer -- which is the behaviour these refusals should be read as
+evidence *for*.
 
 ### Y.3 The scientific-quality audit found a calibration error
 
