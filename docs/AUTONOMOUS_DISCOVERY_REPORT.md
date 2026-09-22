@@ -1950,7 +1950,7 @@ justify. Six defects were found on the production path, none of them
 reachable from a suite that was green at 4,402 tests. Four were found in the
 first twenty minutes.
 
-### Y.1 Eight defects, and what each one was
+### Y.1 Ten defects, and what each one was
 
 **An explicit project cost ceiling was silently raised.** The operator set
 `--max-cost-usd 50.00`; a *reconciler-rescheduled* objective cycle -- one
@@ -2034,6 +2034,36 @@ stops at the first refusal, its reasons float free as body text, and the
 next action starts a second list. Two spaces per continuation line. Both of
 these are the same shape as the four in §X.6: *a constraint nobody chose,
 applied where nobody would look for it*.
+
+**The cheap screen scored novelty it had not read.** Measured over 108 real
+screens: 74 ran with an empty retrieval packet. The stage said so in its
+own detail -- *"nothing was retrieved, so this rests on model recollection
+only"* -- and then wrote exactly the `0.7` it would have written with eight
+works in hand. The allocator reads the dimension, not the prose, so the
+caveat was recorded everywhere except where it would have had an effect.
+It now assesses nothing when it read nothing, which is what `merged`
+already required in as many words: *a stage that assesses nothing must
+change nothing*. `select_stage` gates the screen on the action having
+succeeded rather than on the dimension, so leaving it unset cannot loop,
+and the deep audit -- which a gate reads and which requires retrieved
+sources -- is unaffected.
+
+**And `ideas show` would not say an idea was blocked.** Five ideas sat at
+`BLOCKED_EXTERNAL` overnight; the command for reading one idea in full
+printed `next: evidence` for one of them that had already failed that stage
+five times and twice explained at length why it could not be done. Read
+literally, it announced work that was about to start. Two lines now: the
+operational state when it is not IDLE, and the most recent failed attempt
+with its class, its count and its detail -- not filtered to the stage
+`next` names, because the two differ exactly when the machine gave up
+before reaching the stage it would choose. The aggregate was never missing;
+`portfolio status` has counted blocked ideas all along. It was missing from
+the view someone opens to ask about one idea.
+
+Of the ten, **four were found by auditing rather than by running**: the
+two above, the CLAIM/TEST calibration, and the truncation -- which was
+found by trying to obey Phase 1 and discovering the record did not contain
+what Phase 1 asked to be recorded.
 
 ### Y.2 Phase 1, answered: the missing capability is human-owned
 
