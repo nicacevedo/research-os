@@ -2546,3 +2546,71 @@ The only direct database writes this session made were reads, plus creating
 and dropping one throwaway database (`gate_fresh`) to prove migrations
 apply from empty.
 
+### Y.12 The catalogue the run actually used was not the corrected one
+
+Found late, by checking rather than assuming, and it corrects this
+document as much as anything else.
+
+The brief states that the human-owned catalogue has been corrected and
+validated, and that it exposes `benchmark`, `analyse-benchmark`,
+`adjudicate-pricing` and `profile`. **The catalogue the run loaded exposes
+three of those four.** There are two files:
+
+```text
+~/.config/research-os/experiments.yaml                    4 commands   modified 2026-09-22 00:15
+~/.local/state/.../dogfood/xdg/config/experiments.yaml    3 commands   modified 2026-09-21 19:55
+```
+
+The dogfood sets `RESEARCH_OS_CONFIG_HOME` to its own directory, which is
+the entire point of a dogfood -- it must not read or write the
+researcher's real configuration. So the correction landed in the real
+catalogue and never reached the run. `declared_commands('cg-sparse-
+regression')` returns `['adjudicate-pricing', 'benchmark', 'profile']`,
+and that is why not one of the six refusals mentions `analyse-benchmark`:
+the designer was never shown it.
+
+**Every refusal in this document was therefore produced against a
+three-command catalogue.** They remain correct *for what the designer was
+shown*, which is the only thing a refusal can be correct about, but the
+premise under which they were read in §Y.2 was wrong and is corrected
+here.
+
+Now the part that matters. Reading the missing declaration settles whether
+it would have changed anything, and it does not:
+
+```yaml
+analyse-benchmark:
+  argv: [..., "scripts/analyse_benchmark.py", "{input}"]
+  parameters:
+    - name: input
+      type: path
+      required: true
+  outputs: []
+  checks: []
+```
+
+It takes an `input` and **declares no outputs**, no `--out` parameter and
+no `outputs_exist` check. That is item 1 of the seven in §Y.2, stated by
+the researcher's own declaration rather than inferred from the script:
+the command performs *"deterministic post-processing only"* and writes
+nothing a preregistered metric path could address. `benchmark` likewise
+declares `outputs: []` and writes JSON *Lines*, which is not a document a
+metric path addresses.
+
+So the `benchmark -> analyse-benchmark` chain could not have closed on the
+corrected catalogue either, and the conclusion of §Y.2 survives its own
+premise being wrong. **The catalogue was not re-pointed and nothing was
+re-run.** Spending a real budget to reproduce a refusal that the
+declaration already proves would be buying an answer twice -- which is
+the mistake §Y.1's second defect exists to stop.
+
+Two things for the researcher, both small and both theirs:
+
+```text
+1. the dogfood config home has a stale copy of the catalogue; the
+   correction of 2026-09-22 00:15 is not in it
+2. analyse-benchmark, as declared in the corrected file, still writes
+   nothing -- so closing the chain needs the --out and the `outputs:`
+   entry, not just the declaration
+```
+
