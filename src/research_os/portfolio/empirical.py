@@ -52,7 +52,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from research_os.errors import ResearchOSError
+from research_os.errors import ExperimentSpecError, ResearchOSError
+from research_os.experiment.generated import GeneratedInput
 from research_os.portfolio.contracts import (
     ContractError,
     DecisionRule,
@@ -142,6 +143,14 @@ def variation_digest(spec: ExecutionSpec) -> str:
         "outputs": sorted(spec.outputs),
         "seeds": list(spec.seeds),
     }
+    if spec.inputs:
+        # A composed document is the most likely thing a replication varies,
+        # and it must count *as content*. The path in ``argv`` happens to
+        # carry the digest today, so this would mostly work without it --
+        # "mostly", because of a filename convention, which is not what
+        # `assert_varies` should be testing. Conditional for the reason
+        # `spec_digest` is: no digest written before this field existed moves.
+        payload["inputs"] = [list(item) for item in spec.inputs]
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
@@ -403,8 +412,28 @@ def command_catalogue(
                     "MUST be a relative in-tree path: no leading '/' or '~', "
                     "POSIX '/' separators, no '.' or '..' segments"
                 )
+            if str(parameter.type) == "generated":
+                parts.append(f"at most {parameter.max_bytes} canonical bytes")
+                parts.append(
+                    "supply the DOCUMENT ITSELF as a JSON object, never a "
+                    "path: Research OS freezes it, hashes it and decides "
+                    "where it lands"
+                )
             detail = f" -- {parameter.description}" if parameter.description else ""
             lines.append(f"    {parameter.name}: {', '.join(parts)}{detail}")
+            if str(parameter.type) == "generated":
+                # The schema in full, and not a summary of it. This is the
+                # whole description of what may be composed, and the checker
+                # refuses an undeclared key -- so a paraphrase that dropped
+                # one enum value would be the same defect as a bound that is
+                # enforced and never stated.
+                lines.append(
+                    "        it must satisfy this schema exactly (undeclared "
+                    "keys are refused, and the run does not start if it does "
+                    "not fit):"
+                )
+                rendered = json.dumps(parameter.input_schema, indent=2, sort_keys=True)
+                lines.extend(f"        {row}" for row in rendered.splitlines())
         if spec.outputs:
             lines.append("    declared outputs: " + ", ".join(spec.outputs))
         else:
@@ -447,7 +476,7 @@ def build_spec(
     commands: Mapping[str, Any],
     workspace: Path,
     max_seconds: int,
-) -> tuple[ExecutionSpec, DecisionRule | None]:
+) -> tuple[ExecutionSpec, DecisionRule | None, tuple[GeneratedInput, ...]]:
     """Turn a validated design into a frozen specification, or refuse it.
 
     Everything executable is checked by ordinary code against what the project
@@ -479,9 +508,30 @@ def build_spec(
             failure_class=FailureClass.POLICY_REFUSED,
         )
     spec = commands[chosen]
+    # Composed documents first, because freezing one is what produces the
+    # path the resolver then places. A document that does not satisfy the
+    # researcher's declared schema never reaches `resolve_command`, never
+    # reaches a workspace, and never becomes a specification -- which is
+    # what "operational rejection is not scientific evidence" requires: the
+    # refusal happens before anything runs.
+    try:
+        frozen_inputs = _freeze_generated(design, spec=spec, command=chosen)
+    except ResearchOSError as exc:
+        raise EmpiricalError(
+            f"the design's composed input does not fit {chosen}: {exc}",
+            failure_class=FailureClass.POLICY_REFUSED,
+        ) from None
+    supplied = {
+        name: value
+        for name, value in dict(design.command_parameters).items()
+        if name not in {item.parameter for item in frozen_inputs}
+    }
     try:
         resolved = resolve_command(
-            spec, dict(design.command_parameters), worktree=workspace
+            spec,
+            supplied,
+            worktree=workspace,
+            generated={item.parameter: item.path for item in frozen_inputs},
         )
     except ResearchOSError as exc:
         raise EmpiricalError(
@@ -527,8 +577,47 @@ def build_spec(
         timeout_seconds=min(int(resolved.timeout_seconds), int(max_seconds)),
         outputs=tuple(sorted(outputs)),
         seeds=seeds,
+        inputs=tuple(sorted((item.path, item.sha256) for item in frozen_inputs)),
     )
-    return frozen, rule
+    return frozen, rule, frozen_inputs
+
+
+def _freeze_generated(
+    design: ExperimentDesign, *, spec: Any, command: str
+) -> tuple[GeneratedInput, ...]:
+    """Freeze every composed document this command declares a parameter for.
+
+    The declaration decides which parameters these are, so a design cannot
+    turn an ordinary parameter into a composed one by supplying a mapping for
+    it -- and cannot skip one either, because ``resolve_command`` refuses a
+    generated parameter with nothing frozen for it.
+    """
+
+    from research_os.experiment.generated import freeze
+    from research_os.experiment.models import ParameterType
+
+    supplied = dict(design.command_parameters)
+    frozen: list[GeneratedInput] = []
+    for parameter in spec.parameters:
+        if parameter.type is not ParameterType.GENERATED:
+            continue
+        if parameter.name not in supplied:
+            if parameter.required:
+                raise ExperimentSpecError(
+                    f"command {command!r} requires a composed document for "
+                    f"{parameter.name!r} and the design supplied none"
+                )
+            continue
+        frozen.append(
+            freeze(
+                parameter=parameter.name,
+                document=supplied[parameter.name],
+                schema=parameter.input_schema,
+                max_bytes=parameter.max_bytes,
+                command=command,
+            )
+        )
+    return tuple(frozen)
 
 
 def _paths_this_command_writes(spec: Any, resolved: Any) -> set[str]:
@@ -989,7 +1078,7 @@ def design(
     experiment_id = _reserve_id()
     workspace = workspace_for(experiment_id)
     try:
-        spec, rule = build_spec(
+        spec, rule, frozen_inputs = build_spec(
             proposed,
             commands=commands,
             workspace=workspace,
@@ -1038,7 +1127,27 @@ def design(
         "spec_digest": digest,
         "variation_digest": variation,
         "spec": _spec_record(spec),
+        # What was composed, by digest and by the path this system chose --
+        # never by content. The bytes are in the artifact store under exactly
+        # this digest, so the record stays small and the document stays
+        # recoverable, and `submit` rehashes what it reads before writing it.
+        "generated_inputs": [item.record() for item in frozen_inputs],
     }
+    for item in frozen_inputs:
+        # Stored *before* the preregistration that names it, so a crash
+        # between the two leaves an unreferenced blob rather than a
+        # preregistration pointing at bytes nobody kept.
+        stored = context.artifacts.put_bytes(
+            item.canonical,
+            media_type="application/json",
+            role=f"idea_experiment_input:{item.sha256}",
+            producer=f"{response.provider}:{template.identity}",
+        )
+        context.artifacts.link(
+            stored,
+            role=f"idea_experiment_input:{item.sha256}",
+            run_id=context.run_id,
+        )
     ref = context.artifacts.put_text(
         json.dumps(
             record, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False
@@ -1116,7 +1225,7 @@ def _reserve_id() -> str:
 
 
 def _spec_record(spec: ExecutionSpec) -> dict[str, Any]:
-    return {
+    record: dict[str, Any] = {
         "name": spec.name,
         "argv": list(spec.argv),
         "cwd": spec.cwd,
@@ -1127,6 +1236,12 @@ def _spec_record(spec: ExecutionSpec) -> dict[str, Any]:
         "outputs": list(spec.outputs),
         "seeds": list(spec.seeds),
     }
+    if spec.inputs:
+        # Conditional for the same reason `spec_digest` is: a record written
+        # before generated inputs existed must round-trip to the identical
+        # specification and therefore to the identical digest.
+        record["inputs"] = [list(item) for item in spec.inputs]
+    return record
 
 
 def spec_from_record(record: Mapping[str, Any]) -> ExecutionSpec:
@@ -1147,6 +1262,12 @@ def spec_from_record(record: Mapping[str, Any]) -> ExecutionSpec:
         timeout_seconds=int(record["timeout_seconds"]),
         outputs=tuple(str(item) for item in record["outputs"]),
         seeds=tuple(int(seed) for seed in record["seeds"]),
+        # The one field read with a default, and the exception is the point:
+        # every preregistration written before generated inputs existed has
+        # no `inputs` key, and absent means "none" rather than "a record this
+        # build did not write". `spec_digest` omits it on the same condition,
+        # so such a record still rebuilds to its original digest.
+        inputs=tuple((str(path), str(sha)) for path, sha in record.get("inputs", ())),
     )
 
 
@@ -1478,7 +1599,13 @@ def submit(context: Any, experiment: IdeaExperiment) -> ExperimentStep:
         # with it and report the isolation machinery as an escape. What the
         # fingerprint is for is what the *command* did, and the command has
         # not run yet.
-        ensure_workspace(experiment, repository=repository)
+        workspace = ensure_workspace(experiment, repository=repository)
+        # Composed inputs are written from the artifact store rather than
+        # from anything this process still holds in memory, and rehashed on
+        # the way in. That is what makes a retry, a resume after a crash and
+        # a replay months later the same measurement: the bytes come from
+        # the digest the preregistration names, or nothing runs.
+        _materialise_inputs(context, spec, workspace=workspace)
         # **The run directory is not the workspace.** It is the runtime's
         # immutable directory under the data home, holding the frozen
         # manifest and the logs -- and it has to be somewhere else, because
@@ -1954,6 +2081,55 @@ def interpret(context: Any, experiment: IdeaExperiment) -> ExperimentStep:
         conclusion=analysis.conclusion,
         evidence_id=evidence_id,
     )
+
+
+def _materialise_inputs(context: Any, spec: ExecutionSpec, *, workspace: Path) -> None:
+    """Write each frozen input into the workspace, verified and read-only.
+
+    Three properties, and each is a line rather than a promise:
+
+    - the path came from :func:`research_os.experiment.generated.freeze` and
+      has already been through the worktree-containment rule, and is checked
+      again here against the resolved workspace, because a check applied
+      once at a distance is a check nobody is applying;
+    - the bytes are rehashed after reading and before writing, so a
+      corrupted or substituted blob stops the submission instead of being
+      measured;
+    - the file is written ``0o444``. A command cannot rewrite its own
+      preregistered input and then be measured against it, which is the
+      file-level form of "a model may not revise a plan after seeing
+      results".
+    """
+
+    if not spec.inputs:
+        return
+    root = workspace.resolve()
+    for relative, digest in spec.inputs:
+        destination = (root / relative).resolve()
+        if destination != root and root not in destination.parents:
+            raise EmpiricalError(
+                f"a composed input resolves to {destination}, outside the "
+                f"experiment workspace {root}",
+                failure_class=FailureClass.POLICY_REFUSED,
+            )
+        try:
+            payload = context.artifacts.get_bytes(digest)
+        except ResearchOSError as exc:
+            raise EmpiricalError(
+                f"the composed input {relative} is preregistered as {digest[:12]} "
+                f"and the artifact store does not have it: {exc}",
+                failure_class=FailureClass.ARTIFACT_MISSING,
+            ) from None
+        observed = hashlib.sha256(payload).hexdigest()
+        if observed != digest:
+            raise EmpiricalError(
+                f"the composed input {relative} hashes to {observed[:12]} and "
+                f"the preregistration says {digest[:12]}",
+                failure_class=FailureClass.ARTIFACT_MISSING,
+            )
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(payload)
+        destination.chmod(0o444)
 
 
 def _workspace_commit(workspace: Path) -> str:

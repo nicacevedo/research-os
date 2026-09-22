@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import math
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Self
@@ -208,6 +209,7 @@ def resolve_command(
     values: dict[str, Any] | None = None,
     *,
     worktree: Path | None = None,
+    generated: Mapping[str, str] | None = None,
 ) -> ResolvedCommand:
     """Fill one declared command's parameters and return an argv vector.
 
@@ -215,20 +217,62 @@ def resolve_command(
     before it is placed, and a value for a parameter that was not declared is
     refused rather than ignored: a plan that thinks it is controlling something
     it is not would produce a run whose record does not describe what happened.
+
+    ``generated`` carries the in-tree paths Research OS *chose* for
+    :class:`~research_os.experiment.models.ParameterType.GENERATED`
+    parameters, after freezing each composed document. They arrive separately
+    from ``values`` and that separation is the authority boundary in one
+    argument list: the caller composes content, this function is told where
+    that content landed, and a caller that tries to supply the path itself is
+    refused below.
     """
 
     supplied = dict(values or {})
+    placed = dict(generated or {})
     declared = {item.name for item in spec.parameters}
-    unknown = sorted(set(supplied) - declared)
+    unknown = sorted((set(supplied) | set(placed)) - declared)
     if unknown:
         raise ExperimentSpecError(
             f"command {spec.name!r} has no parameter(s) {', '.join(unknown)}. "
             "A plan may fill in the parameters the researcher declared and no "
             "others; it cannot add one."
         )
+    generated_names = {
+        item.name for item in spec.parameters if item.type is ParameterType.GENERATED
+    }
+    misplaced = sorted(set(placed) - generated_names)
+    if misplaced:
+        raise ExperimentSpecError(
+            f"command {spec.name!r} parameter(s) {', '.join(misplaced)} are not "
+            "generated parameters, so nothing may place a file for them"
+        )
+    named_directly = sorted(generated_names & set(supplied))
+    if named_directly:
+        raise ExperimentSpecError(
+            f"command {spec.name!r} parameter(s) {', '.join(named_directly)} "
+            "take a composed document, not a path. Research OS decides where a "
+            "generated document lands; a caller that names the location has "
+            "named a path it was not given."
+        )
 
     resolved: dict[str, str] = {}
     for parameter in spec.parameters:
+        if parameter.type is ParameterType.GENERATED:
+            if parameter.name not in placed:
+                raise ExperimentSpecError(
+                    f"command {spec.name!r} requires a composed document for "
+                    f"{parameter.name!r} and none was frozen"
+                )
+            # The same containment rule a `path` value faces, applied to a
+            # path this system chose. Not because it is suspected -- because
+            # a rule that is only applied to untrusted input is a rule nobody
+            # is checking.
+            resolved[parameter.name] = _validate_path(
+                placed[parameter.name],
+                where=f"command {spec.name!r} parameter {parameter.name!r}",
+                worktree=worktree,
+            )
+            continue
         if parameter.name in supplied:
             raw = supplied[parameter.name]
         elif parameter.default is not None:
@@ -326,6 +370,12 @@ def _validate_value(
                 f"{where} must be at most {parameter.maximum}, not {number}"
             )
         return str(number)
+
+    if parameter.type is ParameterType.GENERATED:  # pragma: no cover - unreachable
+        raise ExperimentSpecError(
+            f"{where} is a generated parameter and is placed rather than "
+            "validated as a value; `resolve_command` handles it before here"
+        )
 
     text = str(raw)
     if parameter.type is ParameterType.CHOICE:

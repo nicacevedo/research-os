@@ -347,6 +347,17 @@ class ExecutionSpec:
     #: Paths, relative to the run directory, that the run is expected to write.
     outputs: tuple[str, ...] = ()
     seeds: tuple[int, ...] = ()
+    #: Content-addressed inputs this execution must be given before it runs,
+    #: as sorted ``(workspace-relative path, sha256)`` pairs.
+    #:
+    #: Empty for every execution whose inputs are all files the repository
+    #: already tracks, which is what made adding it safe: ``spec_digest``
+    #: omits the key entirely when this is empty, so no digest written before
+    #: this field existed moves. A generated input is *part of the
+    #: specification* rather than a side channel, because two runs that differ
+    #: only in a composed plan are two different experiments and must not
+    #: share a digest, an idempotency key, or a preregistration.
+    inputs: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

@@ -66,6 +66,14 @@ MAX_MATRIX_ROWS = 24
 #: Items in any of the short lists on an idea.
 MAX_LIST_ITEMS = 12
 
+#: The longest a *scalar* command-parameter value may be. One argv token.
+MAX_SCALAR_PARAMETER_CHARS = 512
+
+#: The absolute ceiling on a composed document, independent of any
+#: declaration. The declaration's own ``max_bytes`` is what normally bounds
+#: one, and is checked against canonical bytes rather than against `str()`.
+MAX_GENERATED_BYTES = 1024 * 1024
+
 MAX_TITLE_CHARS = 200
 MAX_STATEMENT_CHARS = 2_000
 MAX_SUMMARY_CHARS = 4_000
@@ -659,10 +667,34 @@ class ExperimentDesign(_Contract):
     @field_validator("command_parameters")
     @classmethod
     def _bounded_parameters(cls, value: dict[str, Any]) -> dict[str, Any]:
+        """Scalars stay short; a composed document is bounded where it is frozen.
+
+        A value for a ``generated`` parameter is a whole JSON document and is
+        legitimately larger than an argv token, so the 512-character rule
+        cannot apply to it -- that rule exists because a scalar parameter
+        becomes one argument. What bounds a composed document is
+        ``ParameterSpec.max_bytes``, checked against its *canonical* bytes in
+        :func:`research_os.experiment.generated.freeze`, which is the only
+        place that knows which declaration it is being measured against.
+
+        The ceiling here is a second, declaration-independent one, so a
+        design cannot make a prompt or a database row enormous by composing a
+        document for a command that turns out not to declare a generated
+        parameter at all -- in which case ``resolve_command`` refuses it, but
+        only after this model has already been constructed.
+        """
+
         if len(value) > 32:
             raise ValueError("at most 32 command parameters")
         for name, supplied in value.items():
-            if len(str(name)) > 64 or len(str(supplied)) > 512:
+            if len(str(name)) > 64:
+                raise ValueError(f"parameter {name!r} has too long a name")
+            limit = (
+                MAX_GENERATED_BYTES
+                if isinstance(supplied, dict | list)
+                else MAX_SCALAR_PARAMETER_CHARS
+            )
+            if len(str(supplied)) > limit:
                 raise ValueError(f"parameter {name!r} is too long to be a value")
         return value
 

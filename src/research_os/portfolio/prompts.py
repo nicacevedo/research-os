@@ -537,7 +537,19 @@ _EXPERIMENT_RULES = (
     'A parameter of type "path" must be a RELATIVE in-tree path -- '
     '"results/2026/run.json", never "/home/you/..." and never "~/...". The '
     "command runs inside a disposable checkout whose location you are not "
-    "told.\n"
+    "told. As an INPUT it may only name a file the catalogue lists as "
+    "tracked.\n"
+    'A parameter of type "generated" is the one you may COMPOSE. Supply the '
+    "document itself as a JSON object under that parameter's name -- not a "
+    "path, not a string containing JSON. The catalogue prints the exact "
+    "schema it must satisfy; an undeclared key, an enum value that is not "
+    "listed, or a number outside its bounds is refused before anything runs, "
+    "so a design that does not fit costs a stage rather than an execution. "
+    "Research OS canonicalises what you compose, hashes it, writes it "
+    "read-only inside the checkout and puts that path in the command for "
+    "you. This is how a new design happens without a person committing a new "
+    "file, so use it to ask the question the falsifier actually asks rather "
+    "than the nearest question an existing file already encodes.\n"
     "\n"
     "FIX THE DECISION RULE NOW, BEFORE ANY RESULT EXISTS.\n"
     "`decision_rule` names one number in one JSON file the run will write, "
@@ -578,7 +590,7 @@ _EXPERIMENT_RULES = (
 
 EXPERIMENT_DESIGNER = PromptTemplate(
     name="experiment_designer",
-    version=5,
+    version=6,
     role=ModelRole.EXPERIMENTALIST,
     capability=Capability.PLANNING,
     criticality=Criticality.NORMAL,
@@ -608,7 +620,7 @@ EXPERIMENT_DESIGNER = PromptTemplate(
 
 REPLICATION_DESIGNER = PromptTemplate(
     name="replication_designer",
-    version=5,
+    version=6,
     role=ModelRole.REPLICATOR,
     capability=Capability.PLANNING,
     criticality=Criticality.CRITICAL,

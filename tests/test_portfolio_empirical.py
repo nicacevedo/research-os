@@ -52,6 +52,7 @@ from research_os.portfolio.models import (
     ReviewerRole,
     Stage,
 )
+from research_os.portfolio.prompts import TEMPLATES
 from research_os.portfolio.stages import TrackSnapshot, select_stage
 from research_os.portfolio.store import DuplicateExperimentError, PortfolioStore
 from research_os.runtime.artifacts import FilesystemArtifactStore
@@ -1137,8 +1138,8 @@ def test_a_replication_must_vary_something_and_an_identical_rerun_is_refused(
         idea_id=idea_id,
         router=ScriptedRouter(
             answers_by_prompt={
-                "experiment_designer@5": design_answer(seed=5),
-                "replication_designer@5": identical,
+                TEMPLATES["experiment_designer"].identity: design_answer(seed=5),
+                TEMPLATES["replication_designer"].identity: identical,
             },
             store=RuntimeStore(runtime_db),
         ),
@@ -1185,8 +1186,8 @@ def test_a_replication_that_varies_the_seed_produces_its_own_execution(
         idea_id=idea_id,
         router=ScriptedRouter(
             answers_by_prompt={
-                "experiment_designer@5": design_answer(seed=5),
-                "replication_designer@5": design_answer(
+                TEMPLATES["experiment_designer"].identity: design_answer(seed=5),
+                TEMPLATES["replication_designer"].identity: design_answer(
                     seed=14, out="results/replication.json", variation_kind="seed"
                 ),
             },
@@ -1227,8 +1228,8 @@ def test_the_replication_designer_is_not_shown_what_the_first_one_concluded(
     idea_id = _idea(portfolio, runtime_project)
     router = ScriptedRouter(
         answers_by_prompt={
-            "experiment_designer@5": design_answer(seed=5),
-            "replication_designer@5": design_answer(
+            TEMPLATES["experiment_designer"].identity: design_answer(seed=5),
+            TEMPLATES["replication_designer"].identity: design_answer(
                 seed=14, out="results/replication.json", variation_kind="seed"
             ),
         },
@@ -1246,7 +1247,7 @@ def test_the_replication_designer_is_not_shown_what_the_first_one_concluded(
     _advance(context)
     _advance(context, role=ExperimentRole.REPLICATION)
 
-    (request,) = router.requests_for_prompt("replication_designer@5")
+    (request,) = router.requests_for_prompt(TEMPLATES["replication_designer"].identity)
     assert "SUPPORTS" not in request.prompt
     assert "0.4" not in request.prompt
     assert "deliberately not shown" in request.prompt
@@ -1738,8 +1739,8 @@ def _empirical_router(runtime_db: Database) -> ScriptedRouter:
             "brancher": {"children": [], "relations": []},
         },
         answers_by_prompt={
-            "experiment_designer@5": design_answer(seed=5),
-            "replication_designer@5": design_answer(
+            TEMPLATES["experiment_designer"].identity: design_answer(seed=5),
+            TEMPLATES["replication_designer"].identity: design_answer(
                 seed=14, out="results/replication.json", variation_kind="seed"
             ),
         },
@@ -2010,7 +2011,7 @@ def test_an_inconclusive_replication_does_not_count_as_verification(
         model="scripted-1",
         role="replicator",
         status=ModelCallStatus.OK,
-        prompt_version="replication_designer@5",
+        prompt_version=TEMPLATES["replication_designer"].identity,
     )
     rule = REPLICATION_RULES[AdjudicationType.EMPIRICAL]
 
@@ -2092,8 +2093,6 @@ def test_an_experiment_designed_by_a_retired_prompt_is_redesigned(
     unable to reach the one idea it was for.
     """
 
-    from research_os.portfolio.prompts import TEMPLATES
-
     idea_id = _idea(portfolio, runtime_project)
     context = _context(
         portfolio=portfolio,
@@ -2144,8 +2143,6 @@ def test_an_interpreted_experiment_is_not_redesigned_when_its_prompt_retires(
     it because a prompt's wording changed would be a second bite at one
     question.
     """
-
-    from research_os.portfolio.prompts import TEMPLATES
 
     idea_id = _idea(portfolio, runtime_project)
     context = _context(

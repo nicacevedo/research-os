@@ -21,11 +21,12 @@ from __future__ import annotations
 
 import re
 from enum import StrEnum
-from typing import Self
+from typing import Any, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from research_os.automation.models import COMMIT_RE, SHA256_RE, utc_now
+from research_os.experiment.generated import assert_schema_supported
 from research_os.models import NonBlankStr
 
 EXPERIMENT_RUN_ID_RE = re.compile(r"^XRUN-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$")
@@ -87,6 +88,16 @@ ACTIVE_STATES: frozenset[ExecutionState] = frozenset(
 )
 
 
+#: Default and absolute ceilings on a ``generated`` document's canonical bytes.
+#:
+#: Finite because the document is composed by a model and then written into a
+#: workspace and hashed into a preregistration. 64 KiB is comfortably more than
+#: any plan this machine's real capabilities take and far less than anything
+#: that would make an artifact store or a prompt unwieldy.
+DEFAULT_GENERATED_MAX_BYTES = 64 * 1024
+MAX_GENERATED_BYTES = 1024 * 1024
+
+
 class ParameterType(StrEnum):
     """The value kinds an experiment parameter may have.
 
@@ -102,6 +113,26 @@ class ParameterType(StrEnum):
     CHOICE = "choice"
     PATH = "path"
     FLAG = "flag"
+    GENERATED = "generated"
+    """A structured document the caller supplies as *content* rather than a path.
+
+    The one parameter kind whose value a plan may compose rather than choose,
+    and it exists because the alternative was worse. Every other kind lets a
+    plan pick from what the repository already holds; a ``path`` in particular
+    can only name a **tracked** file. So a genuinely new experimental design
+    inside an already-approved capability required a person to author and
+    commit a plan file -- which is a human *operating* ordinary research
+    progression rather than governing it.
+
+    What a generated value is not: a path. The caller never says where this
+    lands. Research OS canonicalises the document, bounds it, hashes it,
+    chooses a path inside the disposable workspace, and substitutes *that*.
+    The declaration decides whether this is permitted at all, what shape the
+    document may have (``input_schema``) and how large it may be
+    (``max_bytes``), and the declaration lives in the researcher's
+    configuration outside every worktree. Authority stays at the capability;
+    only the individual measurement moves.
+    """
 
 
 class ParameterSpec(BaseModel):
@@ -122,6 +153,21 @@ class ParameterSpec(BaseModel):
     minimum: float | None = None
     maximum: float | None = None
     choices: list[str] = Field(default_factory=list)
+    input_schema: dict[str, Any] = Field(default_factory=dict)
+    """The JSON Schema a ``generated`` document must satisfy. Required for one.
+
+    The researcher's, not this system's. Research OS learns "validate a
+    document against a schema"; it does not learn what a sweep plan is, and
+    the enums that say which solvers and instance families exist are written
+    where the capability is authorised. A generated parameter with no schema
+    would be a model composing arbitrary structure for a program the
+    researcher trusts, which is the thing the declaration exists to prevent.
+    """
+
+    max_bytes: int = Field(
+        default=DEFAULT_GENERATED_MAX_BYTES, ge=1, le=MAX_GENERATED_BYTES
+    )
+    """Finite ceiling on the canonical bytes of a ``generated`` document."""
 
     @field_validator("name")
     @classmethod
@@ -144,6 +190,39 @@ class ParameterSpec(BaseModel):
             raise ValueError(
                 f"parameter {self.name!r} declares choices but is not a choice "
                 "parameter; the type decides how a value is checked"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _generated_parameters_declare_their_shape(self) -> Self:
+        """A generated parameter without a schema is not a declaration.
+
+        Fail-closed at *configuration* time rather than at design time. The
+        alternative -- accepting the declaration and refusing every document
+        later -- puts the error in a stage report where a model reads it,
+        when the thing that is wrong is a line the researcher wrote.
+        """
+
+        if self.type is ParameterType.GENERATED:
+            if not self.input_schema:
+                raise ValueError(
+                    f"parameter {self.name!r} accepts a generated document and "
+                    "declares no `input_schema`. The schema is what bounds "
+                    "what may be composed for it, so there is no safe default"
+                )
+            if self.default is not None:
+                raise ValueError(
+                    f"parameter {self.name!r} is generated and declares a "
+                    "default; a document is composed for each experiment or "
+                    "the parameter is not generated"
+                )
+            assert_schema_supported(
+                self.input_schema, where=f"parameter {self.name!r} input_schema"
+            )
+        elif self.input_schema:
+            raise ValueError(
+                f"parameter {self.name!r} declares an `input_schema` and is not "
+                "a generated parameter; the type decides how a value is checked"
             )
         return self
 

@@ -120,6 +120,15 @@ def spec_digest(spec: ExecutionSpec) -> str:
         "outputs": list(spec.outputs),
         "seeds": list(spec.seeds),
     }
+    if spec.inputs:
+        # Present only when there is one, so every digest computed before
+        # generated inputs existed is byte-identical afterwards. An
+        # unconditional `"inputs": []` would have re-hashed every stored
+        # preregistration and every idempotency key in the ledger, which is
+        # a migration disguised as a field addition. The same reasoning
+        # `docs/CAPSULE.md` applies to absent-versus-empty in the semantic
+        # projection, for the same reason.
+        payload["inputs"] = [list(item) for item in spec.inputs]
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
