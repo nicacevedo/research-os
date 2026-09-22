@@ -21,7 +21,7 @@ the crashed one did.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
@@ -44,10 +44,12 @@ from research_os.portfolio.store import (
     PortfolioStore,
 )
 from research_os.runtime.artifacts import FilesystemArtifactStore
+from research_os.runtime.budgets import BudgetLedger
 from research_os.runtime.checkpoints import DURABILITY, checkpointer
 from research_os.runtime.config import RuntimeConfig
 from research_os.runtime.db import Database
 from research_os.runtime.failures import FailureClass
+from research_os.runtime.idempotency import InvocationLedger
 from research_os.runtime.interfaces import ModelProvider
 from research_os.runtime.locks import research_run_lock
 from research_os.runtime.models import Autonomy, RunKind, RunStatus, TerminalState
@@ -295,7 +297,8 @@ def advance_idea(
     problem: str = "",
     established_facts: tuple[str, ...] = (),
     constraints: tuple[str, ...] = (),
-    can_execute: bool = False,
+    executors: Mapping[str, Any] | None = None,
+    work_id: str | None = None,
     run_id: str | None = None,
 ) -> TrackResult:
     """Advance one idea by exactly one stage.
@@ -350,7 +353,10 @@ def advance_idea(
         established_facts=established_facts,
         constraints=constraints,
         literature=literature,
-        can_execute=can_execute,
+        repo_path=repo_path,
+        executors=dict(executors or {}),
+        ledger=InvocationLedger(db),
+        budgets=BudgetLedger(db),
     )
     snapshot = runner.build_snapshot(context_probe)
     stage, reason = stages.select_stage(snapshot, portfolio_config)
@@ -414,15 +420,23 @@ def advance_idea(
         project_id=project_id,
         idea_id=idea_id,
         run_id=run.run_id,
+        work_id=work_id,
         charter=charter,
         problem=problem,
         established_facts=established_facts,
         constraints=constraints,
         literature=literature,
-        can_execute=can_execute,
+        # An experiment runs in a disposable worktree *of* this repository and
+        # its canonical state is fingerprinted before and after. The path was
+        # accepted and then discarded by this function for two releases, which
+        # is why an empirical idea could not be measured: the stage that would
+        # have done it had no repository to make a workspace from.
+        repo_path=repo_path,
+        executors=dict(executors or {}),
+        ledger=InvocationLedger(db),
+        budgets=BudgetLedger(db),
     )
     runtime_store.set_run_status(run.run_id, RunStatus.RUNNING)
-    del repo_path
 
     try:
         with (

@@ -263,7 +263,20 @@ def _advance(
     router: ScriptedRouter,
     literature: FakeLiterature | None = None,
     can_execute: bool = False,
+    repo_path: Path | None = None,
+    executors: dict[str, object] | None = None,
 ):
+    """Advance one idea by one stage, with this host's capabilities supplied.
+
+    ``can_execute`` is a *test* convenience and is no longer a parameter of
+    `advance_idea`: whether this host can measure anything is derived from
+    whether there is an executor and a repository, because passing it as a
+    flag is how the composition root came to pass ``False`` on a host that
+    could. A test that wants the capability supplies a stub executor; one
+    that wants its absence supplies nothing, which is what most of these
+    want.
+    """
+
     return advance_idea(
         runtime_config=make_config(pg_dsn, tmp_path / "artifacts"),
         portfolio_config=load_config(),
@@ -274,7 +287,12 @@ def _advance(
         literature=literature,
         charter="Understand sparse regression solvers.",
         problem="Do CG and working sets coincide?",
-        can_execute=can_execute,
+        repo_path=repo_path,
+        executors=(
+            executors
+            if executors is not None
+            else ({"local": object()} if can_execute else {})
+        ),
     )
 
 
@@ -290,6 +308,8 @@ def _drive_to(
     *,
     literature: FakeLiterature | None = None,
     can_execute: bool = False,
+    repo_path: Path | None = None,
+    executors: dict[str, object] | None = None,
     max_steps: int = 24,
     stop_before: bool = False,
 ):
@@ -320,6 +340,8 @@ def _drive_to(
             router,
             literature=literature,
             can_execute=can_execute,
+            repo_path=repo_path,
+            executors=executors,
         )
         trace.append(f"{result.stage} ok={result.ok} {result.detail[:70]}")
         if result.stage is target or result.stage is None:

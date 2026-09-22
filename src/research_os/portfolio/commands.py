@@ -467,7 +467,18 @@ def _resume(args: argparse.Namespace) -> int:
             status=PortfolioStatus.RUNNING,
             detail="resumed by the researcher",
         )
+        # Resuming the portfolio and unblocking its ideas are one act,
+        # because the tick cannot do the second by itself. It lifts
+        # BLOCKED_PROVIDER against provider health it can observe and
+        # deliberately guesses at nothing else -- so a portfolio whose
+        # blocker a person has just fixed had no command that restarted it.
+        unblocked = store.unblock_ideas(project_id=project)
     _print(f"{project} resumed.")
+    if unblocked:
+        _print(
+            f"  {unblocked} blocked idea(s) returned to IDLE. If what blocked "
+            f"them is still missing they will report it again."
+        )
     return EXIT_OK
 
 

@@ -457,6 +457,13 @@ def _candidates(
                 idea.lineage_root, 0
             ),
             depth_without_evidence=store.depth_without_evidence(idea.idea_id),
+            # The allocator's snapshot and the track's must agree about what
+            # runs next: the tick decides what to buy and `advance_idea`
+            # decides what to do, and a field present in one and absent from
+            # the other is two stage machines wearing one name.
+            experiments=store.list_experiments(
+                idea_id=idea.idea_id, idea_version=version.version
+            ),
         )
         stage, reason = select_stage(snapshot, config)
         if stage is None:

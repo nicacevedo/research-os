@@ -822,8 +822,25 @@ always been able to run as well as the autonomous one. `runtime/executors.py`'s
 carries `contained` and `containment`: "the tests passed" and "the tests passed
 inside a sandbox" are different facts about a run.
 
+**Both measurements below were superseded on this host, and are kept.** The
+targeted AppArmor profile in `deploy/apparmor-bwrap` now grants `bwrap` the
+`userns` capability while the global unprivileged-userns restriction stays
+on, so the first of the two no longer holds here: `runtime doctor` selects
+bubblewrap, `runtime containment-audit` records 38/38 adversarial checks
+held through the production `contain()` adapter, and the discovery
+portfolio's first real experiment ran inside it with the network denied and
+fifty-two packages installed from the throwaway cache overlay
+(`docs/AUTONOMOUS_DISCOVERY_REPORT.md` §X.5). `ROADMAP.md` retires the
+"no OS containment" entry on the same evidence. The second measurement --
+`systemd-run --user`'s directives being accepted and silently ineffective --
+is unchanged, and is why that backend is still never selected.
+
+They are left below rather than rewritten because the *reasoning* is what
+the section is for: a probe that looks for a binary rather than running it
+would have reported containment on the host these were taken on.
+
 **It refuses to pretend, and that is the load-bearing property.** Two
-measurements from this build's host:
+measurements from an earlier state of this build's host:
 
 - `bwrap` is installed and **cannot contain anything here**. Ubuntu 24.04 ships
   `kernel.apparmor_restrict_unprivileged_userns=1`, so a non-setuid `bwrap` gets

@@ -538,6 +538,24 @@ Claim, promotes a proposal or an insight, merges, or pushes;
 edge into science is the one that already exists: a `HUMAN_READY` idea becomes
 a `Proposal`, and a person promotes it.
 
+**The empirical route.** An idea whose falsifier asks for a measurement gets
+one: `portfolio/empirical.py` bridges an idea version to the experiment
+machinery that already existed -- the researcher's declared commands from
+`experiments.yaml`, `LocalExecutor` under `sandbox.py`, a disposable Git
+worktree, the invocation ledger, the budget ledger and the content-addressed
+artifact store. It adds one table, `idea_experiments`, for the one thing none
+of those can express: which idea version asked for the measurement and how far
+the asking has got.
+
+Two properties of it belong here rather than in the specification. The
+conclusion is reached by *ordinary code*: the design fixes one metric and two
+thresholds before any result exists, and Python applies them afterwards, so no
+model is ever asked what an output means. And an execution that did not happen
+is never evidence: `OPERATIONALLY_BLOCKED` is a conclusion the experiment can
+carry and the evidence table cannot, so a crashed executor cannot become a
+refuted idea. `docs/AUTONOMOUS_DISCOVERY_ARCHITECTURE.md` §19 is the
+specification.
+
 Three small things were added to the runtime for it, each forced rather than
 convenient, and all three keep the direction of dependency intact — the runtime
 does not import the portfolio, and deleting `research_os/portfolio` leaves a

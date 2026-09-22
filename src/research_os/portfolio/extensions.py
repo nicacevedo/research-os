@@ -147,7 +147,8 @@ def run_advance_idea(context: WorkContext) -> dict[str, Any]:
         ),
         repo_path=context.repo_path,
         literature=_literature(),
-        can_execute=False,
+        executors=_executors(context),
+        work_id=context.item.work_id,
     )
     payload = {
         "idea_id": result.idea_id,
@@ -167,6 +168,33 @@ def run_advance_idea(context: WorkContext) -> dict[str, Any]:
         # would become a permanent stop with no record of why.
         raise _as_error(result.failure_class, result.detail)
     return payload
+
+
+def _executors(context: WorkContext) -> dict[str, Any]:
+    """What this machine can actually run an experiment on, for this project.
+
+    The runtime's own builder, unchanged: it reads the project's
+    ``experiments.yaml``, probes for a scheduler, and picks the containment
+    mode -- ``required`` at high autonomy, because nobody is watching, and
+    the researcher's configured mode otherwise. Reusing it is the point.
+    Computing an executor set here would be a second answer to "can this host
+    run something", and the two would eventually differ.
+
+    ``can_execute=False`` was hard-coded in this function for two releases,
+    so an empirical idea reported that the host could not measure anything on
+    a host that could. Same shape as the literature source that was wired to
+    ``None``: a capability the system has, behind a seam no test crossed.
+    """
+
+    from research_os.runtime.executors import build_executors
+
+    return dict(
+        build_executors(
+            context.config,
+            project_id=context.item.project_id,
+            autonomy=context.config.autonomy,
+        )
+    )
 
 
 def run_explore(context: WorkContext) -> dict[str, Any]:

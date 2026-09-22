@@ -32,7 +32,10 @@ from research_os.portfolio.gates import EVIDENCE_RULES, _executed, _substantive
 from research_os.portfolio.models import (
     SEVERITY_ORDER,
     AdjudicationType,
+    ExperimentRole,
+    ExperimentState,
     IdeaEvidence,
+    IdeaExperiment,
     IdeaObjection,
     IdeaReview,
     IdeaStatus,
@@ -97,6 +100,13 @@ class TrackSnapshot:
     #: Whether the idea's lineage has produced new evidence recently enough to
     #: justify going deeper. Bounds depth-without-evidence.
     depth_without_evidence: int = 0
+    #: The measurements this *version* asked for, in whatever state they are.
+    #: Read by the evidence branch to decide when the empirical route has been
+    #: exhausted, which is the eighth way a portfolio can loop: an experiment
+    #: that ran and concluded INCONCLUSIVE leaves the evidence requirement
+    #: unmet forever, and without this the stage would be selected again every
+    #: tick and do nothing every time.
+    experiments: tuple[IdeaExperiment, ...] = ()
     notes: tuple[str, ...] = field(default_factory=tuple)
 
     @property
@@ -164,6 +174,24 @@ class TrackSnapshot:
             )
             if role not in present
         )
+
+    @property
+    def settled_measurement(self) -> IdeaExperiment | None:
+        """The primary experiment of this version, once it has been read.
+
+        ``INTERPRETED`` and nothing weaker. An experiment that is still
+        running, or that failed operationally, is one the track should come
+        back to; one that has been read is one whose answer is in, whatever
+        that answer was.
+        """
+
+        for item in self.experiments:
+            if (
+                item.role is ExperimentRole.PRIMARY
+                and item.state is ExperimentState.INTERPRETED
+            ):
+                return item
+        return None
 
     def literature_keys(self) -> set[str]:
         from research_os.portfolio.models import EvidenceKind
@@ -351,6 +379,25 @@ def select_stage(
                 "this lineage has gone "
                 f"{snapshot.depth_without_evidence} levels deep without new "
                 "evidence; deepening on reasoning alone stops here"
+            )
+        settled = snapshot.settled_measurement
+        if settled is not None:
+            # The measurement was taken and read, and what it produced does
+            # not meet this idea's evidence requirement. Selecting the stage
+            # again would find the same interpreted experiment and conclude
+            # the same thing -- at no cost, forever, while the portfolio
+            # reports the idea as active. The eighth loop, and the reason
+            # `TrackSnapshot.experiments` exists.
+            #
+            # Not a refutation. An INCONCLUSIVE or INSUFFICIENT measurement
+            # leaves the question open, and the reason says so rather than
+            # retiring the idea, because `select_stage` decides what runs
+            # next and never what an idea *is*.
+            return None, (
+                f"the experiment this idea asked for ran and was read "
+                f"({settled.conclusion}); it does not meet the evidence this "
+                f"kind of idea requires, and re-running the same measurement "
+                f"is not a different answer"
             )
         return Stage.EVIDENCE, "get the evidence this kind of idea would be settled by"
 

@@ -1492,3 +1492,446 @@ capsules          both unchanged; registry and shared index untouched
 Nine ideas are `SUPERSEDED` rather than occupying tracks, which is the
 recalibrated duplicate screen and the corrected edge kind working together;
 before this pass that number was one.
+
+---
+
+## X. The empirical execution path
+
+§W.5 named the gating item: **every adjudicated idea across both real
+projects is `empirical`**, the evidence stage refused all of them, and the
+review board, the meta-review and replication were therefore unreachable on
+real ideas. This section is what closing that took, what it reused, and what
+running it found.
+
+### X.0 The audit that came first
+
+Before any abstraction, what already exists. Written down because the answers
+decided what *not* to build.
+
+**What experiment objects exist.** Three layers, and they do not overlap.
+`docs/CAPSULE.md`'s `Experiment` is a scientific object a person wrote --
+purpose, hypotheses, predictions made before the result. `research_os.
+experiment.models` has `ExperimentRun` (one execution: argv, commit,
+executor, artifacts by hash) and `EvidencePacket`, which is explicit that it
+is a *candidate* and carries no verdict. `research_os.runtime` has
+`ExecutionSpec` (frozen, digested), `external_jobs` (the operational record)
+and `experiment_interpretations` (a durable claim binding one job to one
+reader version, added by `sql/0006` and `0010` because association by
+"whichever job finished last" was not traceability).
+
+**How executable commands are declared.** `~/.config/research-os/
+experiments.yaml`, per project, by name, with typed parameters. Its location
+is the security property: it is outside every worktree, so a write-enabled
+worker cannot add a command or widen one. `experiment/spec.py` substitutes
+by whole token, validates every value against the declared type, and refuses
+rather than escapes.
+
+**How preregistrations are represented.** An artifact, stored under a role
+carrying the spec digest, looked up by equality. `actions/experiments.py`
+rebuilds the spec from it and compares hashes before submitting.
+
+**How the executors work.** `runtime/executors.LocalExecutor` freezes the
+spec, creates an immutable run directory with a manifest, runs the argv
+under `sandbox.contain()` and returns a finished handle. `SlurmExecutor`
+wraps the v1 `sbatch`/`squeue`/`sacct` adapter, submits without blocking and
+lets the control plane reconcile; it honours `required` containment *by
+refusing*, because nothing here can contain a process on a compute node.
+
+**How artifacts are captured.** `runtime/artifacts.FilesystemArtifactStore`:
+content-addressed, so an artifact's id is the hash of its bytes and
+immutability is structural rather than enforced.
+
+**How containment works.** `sandbox.py` over bubblewrap, with `SandboxSpec`
+declaring writable, readable, protected and discarded paths; `.git` and
+`.research` are bound read-only *inside* a writable checkout because an
+adversarial review planted a `post-checkout` hook through the gap.
+
+**How failures are retried and reconciled.** `runtime/failures.py` maps a
+class to a response and has no member for a refuted hypothesis; the queue
+schedules against it; `runtime/idempotency.py` makes a side effect happen at
+most once and hands an abandoned one to a reconciler.
+
+**How results become evidence today.** They do not, and that is deliberate
+at both layers below this one: v1 produces a candidate packet for a person,
+and R5 produces an interpretation that records the criteria and the exit
+status and explicitly no verdict. The portfolio's gates need something
+neither produces -- an evidence *row*, bound to an idea version, with a
+strength a gate can read -- and producing it from arithmetic rather than
+from prose is what §X.2 is about.
+
+**The conclusion of the audit:** nothing needed replacing, one thing was
+missing (which idea version asked for which measurement), and one executor
+had a gap the coding pipeline had already closed for itself.
+
+### X.1 What was built
+
+One module and one table. Everything else already existed and is *used*
+rather than reimplemented:
+
+```text
+new
+  research_os/portfolio/empirical.py        the bridge, 2071 lines
+  sql/0026_idea_experiments.sql             one table
+  sql/0027_experiment_prompt_version.sql    design liveness, head 0027
+  contracts.ExperimentDesign                + DecisionRule, DecisionPredicate
+  prompts.EXPERIMENT_DESIGNER               reusing ModelRole.EXPERIMENTALIST
+  prompts.REPLICATION_DESIGNER              reusing ModelRole.REPLICATOR
+  models.ExperimentRole/State/Conclusion    + IdeaExperiment
+  tests/test_portfolio_empirical.py         50 tests, real subprocesses
+
+reused, unchanged
+  experiments.yaml, experiment/spec.py      the declared commands
+  runtime/executors.LocalExecutor           running one, contained
+  sandbox.py, automation/checks.py          the containment and uv's needs
+  automation/worktree.py                    the disposable workspace
+  runtime/idempotency.py                    running it exactly once
+  runtime/budgets.py                        reserve, settle, release
+  runtime/artifacts.py                      immutable outputs and analyses
+  runtime/store.external_jobs               the execution record
+  actions/coding.canonical_fingerprint      "the checkout did not change"
+  runtime/failures.py                       the taxonomy, not extended
+
+changed
+  runtime/executors.LocalExecutor           uv's interpreters, cache overlay
+                                            and the linked-worktree repo, all
+                                            of which the coding pipeline
+                                            already solved and this executor
+                                            did not
+  portfolio/track.advance_idea              `repo_path` was accepted and then
+                                            `del`-ed; executors and the two
+                                            ledgers are now supplied
+  portfolio/extensions.run_advance_idea     `can_execute=False` was hard-coded
+  portfolio/commands._resume                also unblocks what it resumes
+  portfolio/gates._replication_met          an INCONCLUSIVE second
+                                            measurement verifies nothing;
+                                            unreachable before this route
+```
+
+No dependency was added and nothing left `ARCHITECTURE.md` §12's postponed
+list. `DESIGN_INVARIANTS.md` carries the change-control record and
+`docs/AUTONOMOUS_DISCOVERY_ARCHITECTURE.md` §19 the specification.
+
+### X.2 The two properties that decide whether this is science
+
+**The conclusion is arithmetic.** The design fixes one metric in one file and
+two thresholds on it, *before* the run exists; ordinary Python reads the
+number afterwards and compares. No model is ever asked what an output means.
+Two predicates rather than one, so "neither held" is expressible and a
+success condition that covers every value reports `INCONCLUSIVE` instead of
+support.
+
+**An execution that did not happen is never evidence.**
+`EmpiricalConclusion.OPERATIONALLY_BLOCKED` exists for it and
+`EVIDENCE_STRENGTH_FOR_CONCLUSION` has no entry for it, so a crashed
+executor, an unreachable provider and a host that cannot contain each leave
+the idea's rows untouched. Both properties were mutated to check the tests
+see them: making a crashed run write evidence turns a `SystemExit(7)` into
+`SUPPORTS`, and three tests fail.
+
+### X.3 What was found by writing the tests
+
+Four defects, each found by a test that failed the first time it ran.
+
+**The workspace path did not match the experiment.** `design` reserved an id,
+derived the disposable worktree from it and put that path in the
+specification digest -- and then `create_experiment` minted a *different* id.
+Every submission failed with "the workspace was created at ..., not at the
+path this experiment already recorded". Found by the first test that ran an
+experiment end to end.
+
+**A new worktree branch read as an escape.** The canonical fingerprint was
+taken before `ensure_workspace`, so the branch that worktree isolation *is*
+appeared between the two readings and `after != before` called it drift. Two
+fixes, and both were needed: fingerprint after the workspace exists, and
+compare with `escaped()` rather than `!=`, because a reserved ref appearing
+-- the Curator's first bank commit during a measurement -- is permitted and
+inequality cannot express that.
+
+**A released workspace could never be re-run.** `release_worktree` keeps the
+branch, `create_worktree` refuses to reuse one, so an experiment whose
+workspace had been released was permanently unable to have another. Invariant
+6 of the brief -- a failed experiment stays recoverable -- fails on a branch
+name.
+
+**Logs were written into the thing being thrown away.** `LocalExecutor` puts
+`logs/stdout.txt` under the `run_dir` it is given, and the first version
+passed the *workspace*. So every run's output was destroyed with the
+worktree, and a directory the experiment never declared was written into the
+tree being measured. The run directory is now the runtime's own, under the
+data home, where the manifest already lives.
+
+### X.4 What was found by running it against a real provider
+
+The three real empirical ideas of `cg-sparse-regression` were advanced
+through `researchd`, against the real provider, on a clone of the real
+project with the researcher's own `experiments.yaml`.
+
+**Two contract bounds turned a good answer into a retry loop.** Asked to
+design for an idea no declared command can test, the designer answered
+`testable: false` -- which is the most useful answer available -- with a
+2,400-character account of why, and the contract discarded the whole
+response for being 400 characters over a limit nothing had told it about.
+The retry produced the same answer and failed identically. Then, one idea
+later, the same shape again: the designer wrote a *note* in `resources`
+(`machine: "a 2026 laptop; the thesis's hardware and Gurobi 12 are not..."`)
+and a 128-character value bound threw away an otherwise valid design.
+
+This is the third time this codebase has paid for the same mistake -- a
+constraint the model is graded on and never shown -- and
+`_parameter_contract` already carries the note about the first. The fix is
+three parts: explanations are clipped rather than refused (nothing reads them
+as evidence); `resources` keeps only the six keys an executor actually turns
+into a directive and drops the rest (the others reach nothing, and carrying a
+paragraph would put a model's commentary inside the specification digest);
+and both limits are now in the prompt.
+
+### X.5 The real trace
+
+Three real empirical ideas, advanced through `researchd` against the real
+provider, on the clone of `cg-sparse-regression` with the researcher's own
+`experiments.yaml`. The route ran in full and what it produced is below,
+unedited in substance.
+
+**Two ideas were refused, carefully, and that is the right answer.** The
+designer read every declared command and said why none of them tests the
+idea. In full, for `PIDEA-...-7c68ed14`:
+
+> The falsifier needs, at fixed (n,p,k,SNR): several correlation structures
+> (independent; AR(1) at rho in {0.3,0.6,0.9}; block at 2-3 settings), a
+> common fine lambda/lambda_max grid on each, rounds/time and achieved s at
+> every grid point, and the derived cross-design statistic R. No declared
+> command takes a parameter that sets correlation structure, (n,p,k,SNR), or
+> a lambda grid.
+>
+> `profile` has no parameters [...] With a single design there is no
+> across-design ratio to form, so neither fold-change is defined.
+>
+> `adjudicate-pricing` exposes only out and seed_offset [...] I have no
+> declared key in its output carrying rounds(lambda/lambda_max). Naming one
+> would be a guess, and a guessed metric_path fails the design.
+>
+> `benchmark` is the only command that could carry this [...] authoring [a
+> plan] would be writing the experiment myself, which this format forbids.
+
+No evidence row, no experiment row, `capability_denied`, and the idea
+untouched. That is the boundary working: **the empirical route's reach is
+exactly the surface the researcher declared**, and this project's three
+commands were written for the researcher's own hypotheses rather than for
+the questions the portfolio asks.
+
+**One idea produced a real experiment, and it ran.**
+`PEXP-20260921T231202Z-492c3191` over the declared `benchmark` command, with
+this preregistered decision rule:
+
+```json
+{"metric_path": "summary.memory_gated_min_speedup",
+ "output_path": "results/2026/modern_conic_vs_decomposition.json",
+ "success": {"comparator": ">=", "threshold": 1.2},
+ "failure": {"comparator": "<=", "threshold": 1.0},
+ "metric_description": "Worst-case (over instance sizes) ratio of median
+   decomposition wall-clock to median modern-conic-solver wall-clock, with
+   0.0 substituted at any size where the modern solver's peak RSS exceeds
+   1.25x the decomposition's."}
+```
+
+That is a good rule: one number, two thresholds, a stated gap between them,
+and a memory gate folded into the metric rather than argued about
+afterwards. It was fixed before anything ran.
+
+The execution went the whole way. A disposable worktree at the project's
+HEAD; `uv run --frozen` contained under bubblewrap with the network denied
+and **fifty-two packages installed from the throwaway cache overlay**; the
+frozen manifest and both logs in the run directory under the data home; the
+canonical checkout fingerprinted before and after. Then:
+
+```text
+FileNotFoundError: [Errno 2] No such file or directory:
+  'plans/2026/modern_conic_vs_decomposition.yaml'
+```
+
+The designer had invented a plan path. The bridge recorded
+`OPERATIONALLY_FAILED / executor_failed`, wrote **no evidence**, left the
+idea's rows untouched, and kept the experiment recoverable. Exactly the
+required behaviour, observed rather than asserted: *the executor failing is
+not the idea being wrong.*
+
+### X.6 The third instance of one mistake
+
+The invented path is the same defect as the two contract bounds, and as the
+absolute path `_parameter_contract` records from the thesis pilot: **a
+constraint or an input the model is graded on and never shown.** The
+catalogue described each command's parameters and named no file in the
+repository, so a designer asked for a plan path had nothing to choose from
+and wrote a plausible one. The refusal quoted above says so in words --
+"No plan encoding this sweep is known to exist in the tree" -- about a tree
+it had never been shown.
+
+`empirical.input_candidates` now lists the checkout's tracked data and
+configuration files, capsule excluded, bounded at sixty, and says plainly
+that a path outside that list is an output. `experiments/EXP-0001-plan.json`
+-- the real frozen plan, which exists and which the designer could not see --
+is in it.
+
+**Measured after, not only reasoned about.** The same idea, the same
+provider, one design call with the listing in the prompt and nothing else
+changed:
+
+```text
+before   plan = plans/2026/modern_conic_vs_decomposition.yaml   (invented)
+after    plan = experiments/EXP-0001-plan.json                  (the real one)
+```
+
+Same command, same shape of rule, a path that exists. $0.27.
+
+### X.6a And then the fix could not reach the idea it was for
+
+The improved designer had nothing to design: `PEXP-...-492c3191` was already
+on the row, holding the invented path, and every retry resubmits a
+preregistered specification rather than making a new one -- correctly, since
+re-designing after seeing a result is how a post-hoc change gets made.
+
+But no result existed. The command never ran. And the design had been made by
+a prompt this build had superseded, which the portfolio already has a rule
+for: `idea_reviews.prompt_version` is part of liveness because "a review
+produced by a prompt that has since been superseded is a review of a question
+no longer being asked". An experiment is the same object under a different
+name and had no such column.
+
+Migration `0027` adds `idea_experiments.prompt_version` and makes the
+identity index partial, so a stale design is retired to `SUPERSEDED` -- kept,
+as the record of what was designed and why it stopped being asked for -- and
+its successor can take the name. An `INTERPRETED` experiment is never stale:
+what was measured was measured.
+
+**That is the fourth defect of one shape on this branch.** The version-blind
+dedup key, the permanently-unique work item key, the released worktree's
+surviving branch, and this. Each wedged something forever; each was invisible
+until the thing in front of it was fixed; and none was found by a test.
+
+### X.6b One more, found by looking at the researcher's repository afterwards
+
+A failed experiment left its worktree *and its branch* in the project, because
+the workspace was released only on the path that succeeded. Three failed
+experiments in a soak would leave three of each, permanently, in a repository
+this layer promises to leave byte-identical.
+
+The diagnosis was never in the worktree -- the argument vector, the frozen
+manifest, the exit status and both logs are in the run directory under the
+data home -- so the failure path now collects whatever the run did write, by
+content hash, and then releases the workspace like every other path. The
+byte-identical claim is unconditional, and the test asserts it after a
+*failed* measurement as well as a successful one.
+
+### X.7 What this does and does not establish
+
+Established, against a real provider on a real project:
+
+```text
+design over a declared command                        yes
+a machine-checkable rule fixed before the result      yes
+preregistration stored, digested, re-hashed at submit yes
+contained execution in a disposable worktree          yes, 52 packages offline
+logs, manifest and exit status captured outside it    yes
+an execution failure recorded as operational          yes, and no evidence
+an idea no declared command can test, refused         yes, twice, with reasons
+canonical capsule and every ref unchanged             yes
+working tree clean afterwards                         yes
+```
+
+With one exception, which is §X.6b: the failed run left its worktree and its
+branch behind, and they were removed by hand after the pass. That is fixed
+and tested, and it is stated here rather than folded into the row above,
+because "byte-identical" was the claim and it was not true of that pass.
+
+Not established against a real provider, and the reason is the same each
+time -- the declared surface does not yet carry a command these ideas can
+use:
+
+```text
+a successful measurement of a real idea               no
+evidence from one reaching the review board           no
+meta-review and replication on empirical evidence     no
+```
+
+Those three *are* established end to end in
+`tests/test_portfolio_empirical.py`, through `advance_idea` with the real
+stage machine, the real gates and a real subprocess -- an idea goes
+`dedup → novelty_screen → falsify → discover → adjudicate →
+literature_audit → evidence(SUPPORTS) → review_board → meta_review →
+replicate → review_board → meta_review → HUMAN_READY` with the measurement
+taken by a real program. What is scripted there is the provider, not the
+machinery.
+
+So the honest claim is: **the empirical path is closed and exercised, and
+has not yet carried a real idea to a real conclusion.**
+
+### X.8 What stands between here and one, precisely
+
+Two things, and neither is code in this repository.
+
+**A declared command whose parameters span a question the portfolio asks.**
+The refusal quoted in §X.5 spells out what that would be for one idea: a
+committed plan that fixes (n,p,k,SNR), enumerates the correlation structures
+and sweeps a common lambda grid. The three commands this project declares
+were written for the researcher's own hypotheses, and the boundary that keeps
+a model from writing one is the boundary that limits the route's reach. That
+is the trade, and it is the right one.
+
+**A declared command whose output a decision rule can read.** `benchmark`
+writes JSON *Lines* -- one object per cell -- and its summarising step,
+`scripts/analyse_benchmark.py`, is not declared. A rule over `benchmark`'s
+output therefore cannot be evaluated whatever the designer names it, and the
+deterministic analyser would report `INSUFFICIENT`: honest, and not a
+refutation. The catalogue tells the designer each command's parameters and,
+now, which input files exist; it cannot tell it what a command *writes*,
+because nothing declares that.
+
+Both are the researcher's to close and neither was closed here, because
+declaring an experiment command for someone's project is exactly the act
+`experiments.yaml` lives outside every worktree to prevent an agent from
+performing.
+
+**The third thing is money, and it is the reason the pass stopped where it
+did.** The dogfood project's ceiling is $15.00, set by an earlier session; it
+stood at $14.46 when this pass ended. Raising it spends the researcher's own
+credit and is theirs to decide.
+
+### X.9 Figures
+
+```text
+model calls          307 total, 29.58 usd across two projects (+9 calls,
+                     +1.82 usd this pass, all `experimentalist`)
+roles exercised      9/14   + experimentalist
+stages exercised     7/11   evidence now runs rather than refusing
+experiments          1 designed, preregistered, executed, and operationally
+                     failed; 2 ideas correctly refused as untestable
+executions           1 contained run, 52 packages installed offline, 0 network
+capsules             both unchanged
+repository           capsule, refs and working tree unchanged; the one
+                     leftover branch was §X.6b, removed by hand, now fixed
+reservations         settled or released, none held
+```
+
+### X.10 Verdict
+
+```text
+AUTONOMOUS_DISCOVERY_BETA
+```
+
+Unchanged, and for a narrower reason than last time. §W.5's gating item is
+closed: the evidence stage no longer refuses the only kind of idea this
+portfolio generates, and the path from an empirical idea version to a
+version-bound evidence row, a review board, a meta-review and an independent
+replication runs end to end -- through the production entry point, with the
+real stage machine, the real gates and a real subprocess taking the
+measurement.
+
+What holds the verdict is the sentence the brief set as the bar: *a real
+empirical idea has traversed the experiment/evidence/review path.* One has
+traversed design, preregistration and contained execution, and stopped at an
+operational failure. It has not reached evidence, and no idea has reached a
+review board on an experiment.
+
+The two things standing in the way are declarations in the researcher's
+`experiments.yaml` (§X.8) and a budget ceiling that is theirs to raise. None
+of the three is a defect in this layer, and none is an agent's to decide.

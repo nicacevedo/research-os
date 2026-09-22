@@ -28,6 +28,7 @@ import logging
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
+from pathlib import Path
 from typing import Any, Protocol
 
 from research_os.portfolio import dedup as pdedup
@@ -54,6 +55,7 @@ from research_os.portfolio.models import (
     EdgeKind,
     EvidenceKind,
     EvidenceStrength,
+    ExperimentRole,
     IdeaOrigin,
     IdeaStatus,
     ObjectionTarget,
@@ -124,11 +126,35 @@ class TrackContext:
     established_facts: tuple[str, ...] = ()
     constraints: tuple[str, ...] = ()
     literature: LiteratureSource | None = None
-    #: Set when this machine can execute something. Its absence is why a
-    #: mathematical idea on a host with no executor stops below VALIDATED
-    #: rather than being validated on prose.
-    can_execute: bool = False
+    #: Where this project's repository is, when the daemon could resolve one.
+    #: An experiment runs in a disposable worktree *of* it, so its absence is
+    #: one of the two reasons this host cannot measure anything.
+    repo_path: Path | None = None
+    #: Executors available on this machine, by name. The other reason. Built
+    #: by the composition root from ``experiments.yaml`` and this host's
+    #: containment, exactly as the objective cycle's are.
+    executors: Mapping[str, Any] = field(default_factory=dict)
+    #: The durable side-effect ledger, so one submission happens once however
+    #: many times the work item is replayed. ``None`` on the paths that make
+    #: no side effect, which is every stage but the empirical one.
+    ledger: Any | None = None
+    #: Reserve, then settle or release. An experiment is the one thing this
+    #: layer does that costs something other than a model call.
+    budgets: Any | None = None
     notes: list[str] = field(default_factory=list)
+
+    @property
+    def can_execute(self) -> bool:
+        """Whether this host can take a measurement for this project at all.
+
+        Derived rather than passed, because it was passed and the composition
+        root passed ``False`` unconditionally -- the same shape of defect as
+        the literature source that was wired to nothing. Two facts decide it
+        and both are checkable: there is an executor, and there is a
+        repository to make a disposable worktree of.
+        """
+
+        return bool(self.executors) and self.repo_path is not None
 
 
 @dataclass(frozen=True, slots=True)
@@ -232,6 +258,9 @@ def build_snapshot(context: TrackContext) -> stages.TrackSnapshot:
             idea.lineage_root, 0
         ),
         depth_without_evidence=store.depth_without_evidence(context.idea_id),
+        experiments=store.list_experiments(
+            idea_id=context.idea_id, idea_version=version.version
+        ),
     )
 
 
@@ -282,6 +311,11 @@ _STAGE_FOR_TEMPLATE: dict[str, Stage] = {
     "falsifier": Stage.FALSIFY,
     "scientific_discovery": Stage.DISCOVER,
     "literature_scout": Stage.LITERATURE_AUDIT,
+    "experiment_designer": Stage.EVIDENCE,
+    # Charged against REPLICATE and not EVIDENCE, because that is the
+    # stage whose ceiling it spends: a replication design is bought by the
+    # replicate stage and an idea that never reaches it never pays for one.
+    "replication_designer": Stage.REPLICATE,
     "methodology_reviewer": Stage.REVIEW_BOARD,
     "novelty_reviewer": Stage.REVIEW_BOARD,
     "skeptic_reviewer": Stage.REVIEW_BOARD,
@@ -955,12 +989,7 @@ def run_evidence(context: TrackContext, snapshot: stages.TrackSnapshot) -> Stage
                 "reasoning about what the measurement would have shown.",
                 failure_class=FailureClass.CAPABILITY_DENIED,
             )
-        return StageOutcome.failed(
-            "the experiment pipeline is not wired into the idea track in this "
-            "build; the objective cycle owns it. See docs/"
-            "AUTONOMOUS_DISCOVERY_ARCHITECTURE.md §18.",
-            failure_class=FailureClass.CAPABILITY_DENIED,
-        )
+        return _run_experiment_stage(context, snapshot, role=ExperimentRole.PRIMARY)
     if AdjudicationType.MATHEMATICAL in declared:
         return StageOutcome.failed(
             "this idea is settled by derivation and by an executed counterexample "
@@ -971,6 +1000,62 @@ def run_evidence(context: TrackContext, snapshot: stages.TrackSnapshot) -> Stage
     return StageOutcome.failed(
         f"no evidence route for {sorted(str(item) for item in declared)}",
         failure_class=FailureClass.POLICY_REFUSED,
+    )
+
+
+def _run_experiment_stage(
+    context: TrackContext,
+    snapshot: stages.TrackSnapshot,
+    *,
+    role: ExperimentRole,
+) -> StageOutcome:
+    """Advance this idea version's measurement by one step.
+
+    The thin part of the bridge, deliberately. Everything it does --
+    designing over a declared command, freezing the specification, running it
+    contained in a disposable worktree, applying the prespecified rule --
+    lives in :mod:`research_os.portfolio.empirical`, which owns none of the
+    machinery it uses either. This function's whole job is to translate one
+    :class:`~research_os.portfolio.empirical.ExperimentStep` into the stage
+    vocabulary, and the translation that matters is the one at the bottom: an
+    execution that did not happen is ``ok=False`` with an operational failure
+    class, and never a disposition.
+    """
+
+    from research_os.portfolio import empirical
+
+    if context.ledger is None or context.budgets is None:
+        # Both are supplied by `advance_idea`. A context assembled without
+        # them cannot make a durable side effect safely, and running an
+        # experiment without the ledger is how a replay submits twice.
+        return StageOutcome.failed(
+            "this context has no invocation ledger or budget ledger, so an "
+            "experiment cannot be submitted safely from it",
+            failure_class=FailureClass.CAPABILITY_DENIED,
+        )
+    try:
+        step = empirical.advance(context, snapshot.version, role=role)
+    except empirical.EmpiricalError as exc:
+        return StageOutcome.failed(str(exc), failure_class=exc.failure_class)
+    if not step.ok:
+        return StageOutcome.failed(
+            step.detail,
+            failure_class=step.failure_class or FailureClass.EXECUTOR_FAILED,
+            cost_usd=Decimal(step.cost_usd),
+            model_calls=step.model_calls,
+        )
+    return StageOutcome.succeeded(
+        step.detail,
+        disposition=Disposition.CONTINUE,
+        cost_usd=Decimal(step.cost_usd),
+        model_calls=step.model_calls,
+        data={
+            "experiment_id": (
+                step.experiment.experiment_id if step.experiment else None
+            ),
+            "conclusion": str(step.conclusion) if step.conclusion else None,
+            "evidence_id": step.evidence_id,
+        },
     )
 
 
@@ -1264,10 +1349,25 @@ def run_replicate(
     # than in `select_stage` keeps the stage machine's vocabulary the same for
     # every type: `replicate` means "verify this a second way", and what that
     # is depends on how the idea would be settled.
-    if AdjudicationType.NOVELTY_OR_LITERATURE in set(
-        snapshot.version.adjudication_types
-    ):
+    declared = set(snapshot.version.adjudication_types)
+    if AdjudicationType.NOVELTY_OR_LITERATURE in declared:
         return run_literature_audit(context, snapshot, second_path=True)
+
+    # An empirical idea is replicated by measuring again, differently. A
+    # second model reading the first measurement's summary and agreeing with
+    # it is a second opinion, and `gates._replication_met` will not accept one
+    # -- it requires a REPLICATION row naming its own execution. So the route
+    # here is a second designed experiment that ordinary code has checked
+    # varies in argv, seeds or resources; see `empirical.assert_varies`.
+    if declared & {AdjudicationType.EMPIRICAL, AdjudicationType.DIAGNOSTIC}:
+        if not context.can_execute:
+            return StageOutcome.failed(
+                "this idea was settled by measurement and nothing on this host "
+                "can take a second one. It stops below HUMAN_READY, which is "
+                "the correct outcome.",
+                failure_class=FailureClass.CAPABILITY_DENIED,
+            )
+        return _run_experiment_stage(context, snapshot, role=ExperimentRole.REPLICATION)
 
     packet = packets.build_packet(
         version=snapshot.version,

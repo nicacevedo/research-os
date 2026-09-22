@@ -131,6 +131,29 @@ from one that is.` **No job has ever been submitted to a real cluster from this
 build.** The Slurm path is exercised end to end in tests against real fake
 binaries producing byte-for-byte Slurm output.
 
+## Two callers, one declaration
+
+Three things reach these declared commands, and none of them can add one.
+
+`researchctl experiment run` is a person, explicitly, with `--execute`.
+
+The **objective cycle** (`runtime/actions/experiments.py`) designs against a
+capsule Hypothesis, preregisters, submits through the runtime's own
+executors, and interprets against criteria fixed beforehand.
+
+The **discovery portfolio** (`portfolio/empirical.py`) does the same for an
+idea version rather than a Hypothesis, and differs in two ways worth knowing
+about here. It runs in a disposable Git worktree and removes it afterwards,
+branch included, so the canonical checkout is byte-identical. And its
+preregistration carries a *machine-checkable* decision rule -- one number in
+one file the run writes, and two thresholds on it -- which ordinary code
+applies once the result exists, so nothing is ever asked what the output
+meant. `docs/AUTONOMOUS_DISCOVERY_ARCHITECTURE.md` §19 specifies it.
+
+All three read the same `experiments.yaml`, which lives outside every
+worktree. A command the researcher has not declared is not runnable by any of
+them.
+
 ## Results: candidate packets, never Evidence
 
 After an execution the controller locates the declared outputs, hashes each one,

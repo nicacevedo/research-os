@@ -322,6 +322,109 @@ class Stage(StrEnum):
     BRANCH = "branch"
 
 
+class ExperimentRole(StrEnum):
+    """Which measurement this is: the one that settles, or the one that checks.
+
+    Two roles rather than a boolean, because an idea version may have exactly
+    one of each and the database says so with a unique index. A third
+    "another go at the same thing" is deliberately not expressible: retrying a
+    failed execution reuses the row it failed on, so a host that was down for
+    an hour does not leave an idea with four experiments.
+    """
+
+    PRIMARY = "PRIMARY"
+    REPLICATION = "REPLICATION"
+
+
+class ExperimentState(StrEnum):
+    """How far the asking has got. Six states, none of them a verdict.
+
+    The brief this closes is explicit that these must not be conflated, and
+    the reason is the one the failure taxonomy already states: *experiment
+    proposed*, *running* and *operationally failed* are facts about
+    machinery, and only ``INTERPRETED`` is a fact about the science. A system
+    with one "failed" state cannot tell a refutation from a dead node, and a
+    system that reached for one would eventually report the node.
+    """
+
+    PROPOSED = "PROPOSED"
+    """Designed and preregistered. Nothing has run, and nothing is owed."""
+
+    EXECUTABLE = "EXECUTABLE"
+    """The specification resolved against a declared command and a workspace
+    exists for it. Separate from PROPOSED because preparing the disposable
+    worktree is an irreversible act in the project repository, exactly as it
+    is for :class:`research_os.experiment.models.ExecutionState.PREPARING`."""
+
+    RUNNING = "RUNNING"
+    """Submitted. Local execution passes through this state and leaves it in
+    the same call; a cluster job stays here until the daemon polls it."""
+
+    COMPLETED = "COMPLETED"
+    """The executor finished and the outputs are collected. Nothing has been
+    concluded from them yet."""
+
+    OPERATIONALLY_FAILED = "OPERATIONALLY_FAILED"
+    """The measurement did not happen. Never evidence about the idea, and the
+    row carries the failure class that says why."""
+
+    INTERPRETED = "INTERPRETED"
+    """The frozen rule was applied to the collected outputs and a conclusion
+    recorded. This is the only state that says anything scientific."""
+
+    SUPERSEDED = "SUPERSEDED"
+    """The idea version that asked for this measurement has been revised, so
+    the question it answers is no longer the question being asked."""
+
+
+#: States in which an experiment is still owed something.
+OPEN_EXPERIMENT_STATES: frozenset[ExperimentState] = frozenset(
+    {
+        ExperimentState.PROPOSED,
+        ExperimentState.EXECUTABLE,
+        ExperimentState.RUNNING,
+        ExperimentState.COMPLETED,
+    }
+)
+
+
+class EmpiricalConclusion(StrEnum):
+    """What the frozen rule said about the result. Reached by ordinary Python.
+
+    Five values, and the fifth is the one the brief insists on:
+    ``OPERATIONALLY_BLOCKED`` exists so that "the executor died" has somewhere
+    to go that is not ``CONTRADICTS``. It is never stored on an evidence row,
+    because there is no evidence -- it is stored on the experiment, where it
+    describes the machinery.
+
+    ``INSUFFICIENT`` is the other one worth stating plainly: the run finished,
+    and what it produced does not answer the question -- a missing output, a
+    metric that is not in the file, or a design that never had a
+    machine-checkable rule. It is not a refutation and it must never be read
+    as one.
+    """
+
+    SUPPORTS = "SUPPORTS"
+    CONTRADICTS = "CONTRADICTS"
+    INCONCLUSIVE = "INCONCLUSIVE"
+    INSUFFICIENT = "INSUFFICIENT"
+    OPERATIONALLY_BLOCKED = "OPERATIONALLY_BLOCKED"
+
+
+#: How a conclusion is stored when it becomes an evidence row.
+#:
+#: A table rather than a cast, because the two vocabularies are deliberately
+#: different sizes: ``EvidenceStrength`` is what a *gate* reads and has no
+#: member for "nothing ran", so the two conclusions that mean that have no
+#: entry here and write no row at all.
+EVIDENCE_STRENGTH_FOR_CONCLUSION: dict[EmpiricalConclusion, EvidenceStrength] = {
+    EmpiricalConclusion.SUPPORTS: EvidenceStrength.SUPPORTS,
+    EmpiricalConclusion.CONTRADICTS: EvidenceStrength.CONTRADICTS,
+    EmpiricalConclusion.INCONCLUSIVE: EvidenceStrength.INCONCLUSIVE,
+    EmpiricalConclusion.INSUFFICIENT: EvidenceStrength.INCONCLUSIVE,
+}
+
+
 class ActionStatus(StrEnum):
     ACTIVE = "ACTIVE"
     SUCCEEDED = "SUCCEEDED"
@@ -574,6 +677,65 @@ class IdeaObjection(_Record):
         return self.open and self.severity in BLOCKING_SEVERITIES
 
 
+class IdeaExperiment(_Record):
+    """One measurement one idea version asked for, and how far it has got.
+
+    The row that did not exist, and whose absence is why every empirical idea
+    stopped at the evidence stage. It carries no interpretation of its own:
+    :attr:`conclusion` is what the frozen rule in :attr:`decision_rule` said
+    when ordinary Python applied it to the collected outputs, and
+    :attr:`analysis_artifact_id` is the document that shows the arithmetic.
+    """
+
+    experiment_id: str
+    idea_id: str
+    idea_version: int
+    project_id: str
+    role: ExperimentRole
+    state: ExperimentState
+    command: str
+    spec_digest: str
+    #: The execution's identity with the workspace path removed. What a
+    #: replication has to differ in; see
+    #: :func:`research_os.portfolio.empirical.variation_digest`.
+    variation_digest: str
+    workspace_path: str
+    preregistration_artifact_id: str | None = None
+    decision_rule: dict[str, Any] | None = None
+    no_rule_reason: str | None = None
+    job_id: str | None = None
+    analysis_artifact_id: str | None = None
+    conclusion: EmpiricalConclusion | None = None
+    evidence_id: str | None = None
+    failure_class: str | None = None
+    detail: str | None = None
+    attempts: int = 0
+    origin_call_id: str | None = None
+    #: ``role@version`` of the prompt that designed it. Part of liveness, for
+    #: the reason ``idea_reviews.prompt_version`` is: a design produced by a
+    #: prompt this build has superseded is a commitment to a question no
+    #: longer being asked, and resubmitting it forever is how an idea wedges.
+    prompt_version: str = ""
+    created_at: datetime
+    updated_at: datetime
+
+    @property
+    def open(self) -> bool:
+        return self.state in OPEN_EXPERIMENT_STATES
+
+    @property
+    def preregistered(self) -> bool:
+        """Whether a machine-checkable rule was fixed before the result.
+
+        ``False`` is a legitimate and recorded outcome -- some questions do
+        not have one -- and it is why :attr:`no_rule_reason` is required when
+        this is false. What it costs is the top of the scale: without a rule
+        the conclusion can only ever be ``INSUFFICIENT``.
+        """
+
+        return self.decision_rule is not None
+
+
 class IdeaAction(_Record):
     action_id: str
     idea_id: str
@@ -663,6 +825,9 @@ ENUM_CONSTRAINTS: dict[str, frozenset[str]] = {
         s.value for s in Severity if s is not Severity.NONE
     ),
     "idea_objections_target_ck": frozenset(s.value for s in ObjectionTarget),
+    "idea_experiments_role_ck": frozenset(s.value for s in ExperimentRole),
+    "idea_experiments_state_ck": frozenset(s.value for s in ExperimentState),
+    "idea_experiments_conclusion_ck": frozenset(s.value for s in EmpiricalConclusion),
     "idea_actions_status_ck": frozenset(s.value for s in ActionStatus),
     "idea_actions_stage_ck": frozenset(s.value for s in Stage),
     "idea_actions_disposition_ck": frozenset(s.value for s in Disposition),

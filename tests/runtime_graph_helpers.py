@@ -58,6 +58,16 @@ class ScriptedRouter:
     """
 
     answers: dict[str, dict[str, Any]] = field(default_factory=dict)
+    #: Answers keyed by *prompt identity* rather than by role, consulted
+    #: first.
+    #:
+    #: Two templates legitimately share one role -- the portfolio's explorers
+    #: reuse the runtime's, and its replication designer reuses
+    #: ``replicator`` -- because a role is a routing and provenance bucket
+    #: while the template is the question. A double keyed only by role cannot
+    #: tell them apart, which would make a test of one silently exercise the
+    #: other.
+    answers_by_prompt: dict[str, dict[str, Any]] = field(default_factory=dict)
     requests: list[ModelRequest] = field(default_factory=list)
     fail_roles: set[str] = field(default_factory=set)
     #: Roles the provider cannot serve at all. Empty set plus ``unavailable``
@@ -101,7 +111,9 @@ class ScriptedRouter:
                 error="scripted failure",
                 independence=Independence.NONE,
             )
-        structured = self.answers.get(role)
+        structured = self.answers_by_prompt.get(
+            request.prompt_version, self.answers.get(role)
+        )
         provider = self.providers.get(role, "scripted")
         model = self.models_by_role.get(role, "scripted-1")
         call_id = None
@@ -132,6 +144,9 @@ class ScriptedRouter:
 
     def requests_for(self, role: str) -> list[ModelRequest]:
         return [r for r in self.requests if str(r.role) == role]
+
+    def requests_for_prompt(self, prompt_version: str) -> list[ModelRequest]:
+        return [r for r in self.requests if r.prompt_version == prompt_version]
 
 
 def plan_answer(

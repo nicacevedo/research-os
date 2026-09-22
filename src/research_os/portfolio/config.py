@@ -95,6 +95,16 @@ class Bounds(BaseModel):
     #: infrastructure must not decide science; retrying *without a ceiling* is
     #: invariant 14's forbidden loop.
     max_stage_failures: int = Field(default=3, ge=1, le=20)
+    #: The longest one experiment may run, in seconds.
+    #:
+    #: A *portfolio* ceiling on top of the researcher's own. The declared
+    #: command already carries a ``timeout_seconds`` and this can only make it
+    #: shorter -- ``min`` of the two, never ``max`` -- which is the direction
+    #: every configurable number in this layer moves. It exists because an
+    #: idea track holds one work slot for the whole of a synchronous local
+    #: execution, so a declared six-hour benchmark run unattended would stop
+    #: the project's portfolio for six hours to measure one idea.
+    max_experiment_seconds: int = Field(default=1_800, ge=1, le=6 * 3600)
     #: How many explorer runs may succeed without producing a single new idea
     #: before the portfolio stops exploring. The sixth loop, and the one the
     #: other five do not cover: every explorer generating a near-duplicate

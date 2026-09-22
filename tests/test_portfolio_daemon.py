@@ -384,20 +384,37 @@ def test_the_control_plane_supplies_the_shared_literature_index(
     from research_os.portfolio import track
 
     monkeypatch.setattr(track, "advance_idea", _spy)
+    repository = tmp_path / "project"
+    repository.mkdir()
     context = SimpleNamespace(
-        config=SimpleNamespace(),
+        config=SimpleNamespace(autonomy="low"),
         db=None,
         item=SimpleNamespace(
             project_id="p", work_id="w", payload={"idea_id": "PIDEA-x"}
         ),
         models=lambda *a, **k: None,
-        repo_path=None,
+        repo_path=repository,
     )
     with pytest.raises(_Stop):
         portfolio_extensions.run_advance_idea(context)  # type: ignore[arg-type]
     assert captured["literature"] is not None, (
         "the handler did not pass the literature source, so every deep "
         "novelty audit reports capability_denied and nothing reaches VALIDATED"
+    )
+    # The same defect, one capability over, and found the same way. The
+    # handler passed `can_execute=False` unconditionally, so an empirical
+    # idea reported that this host could not measure anything on a host that
+    # could -- and every empirical idea is one, which is all of them here.
+    # Asserting on `_executors()` alone would be worthless for the identical
+    # reason: it passes whether or not anything calls it.
+    assert captured["executors"], (
+        "the handler did not pass any executor, so every empirical idea "
+        "reports capability_denied and no measurement is ever taken"
+    )
+    assert "local" in captured["executors"]
+    assert captured["repo_path"] == repository, (
+        "the handler did not pass the repository, so an experiment has no "
+        "checkout to make a disposable worktree of"
     )
 
 

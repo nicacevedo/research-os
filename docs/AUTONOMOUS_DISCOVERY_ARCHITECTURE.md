@@ -20,9 +20,10 @@ This document states what the system does, and every enforcement claim names
 the test that holds it. As of this revision the following exist and pass:
 
 ```text
-sql/0019 .. 0024                     the schema, head 0024
+sql/0019 .. 0027                     the schema, head 0027
 research_os/portfolio/
     ids, digests, models, config     identity, the three digests, the bounds
+    empirical                        the bridge to the experiment machinery
     store                            every read and write
     gates                            the deterministic quality gates
     dedup                            four layers, three of them arithmetic
@@ -54,23 +55,38 @@ tests/
     test_portfolio_daemon.py         schedule -> event -> work -> handler
     test_portfolio_authority.py      what this layer structurally cannot do
     test_portfolio_promotion.py      the whole ladder, written by production
+    test_portfolio_empirical.py      a measurement, and what it is not
 ```
 
 **What is implemented and what is proven are different claims**, and this
 document uses them precisely. Everything above is implemented and tested
-against scripted providers on a real PostgreSQL. Nothing here has been run
-against a real provider on a real project: there has been no dogfood, no
-unattended soak and no scientific-quality audit. See
-`docs/AUTONOMOUS_DISCOVERY_REPORT.md` for the evidence table, which
-distinguishes *implemented*, *unit-tested*, *integration-tested*,
-*dogfood-proven* and *unattended-proven* per claim.
+against scripted providers on a real PostgreSQL. Much of it has since been
+run against a real provider on two real projects, and
+`docs/AUTONOMOUS_DISCOVERY_REPORT.md` §V–§X record what that found; its
+evidence table distinguishes *implemented*, *unit-tested*,
+*integration-tested*, *dogfood-proven* and *unattended-proven* per claim.
 
-Two capabilities are deliberately absent and say so at the point of use: the
-evidence stage has no wiring to the derivation path or the experiment
-pipeline, so a mathematical or an empirical idea stops below `VALIDATED` on
-this build with a message naming what is missing. That is the correct
-behaviour rather than a gap papered over -- an idea that cannot be settled
-here must not be validated on prose -- and §18 records it as a limit.
+For §19 specifically, the state is: design, preregistration, contained
+execution in a disposable worktree, the deterministic analysis, the
+evidence row, the review board, the meta-review and replication are proven
+end to end through `advance_idea` with a real subprocess and a scripted
+provider. Against a *real* provider on a real project, design,
+preregistration, contained execution and the operational-failure path are
+proven, and a real idea has not yet reached a real conclusion -- for the two
+reasons §X.8 names, both of which are declarations the researcher owns.
+
+One capability is deliberately absent and says so at the point of use: the
+evidence stage has no wiring to the derivation path, so a *mathematical* idea
+stops below `VALIDATED` on this build with a message naming what is missing.
+That is the correct behaviour rather than a gap papered over -- an idea that
+cannot be settled here must not be validated on prose -- and §18 records it as
+a limit.
+
+The *empirical* route is no longer among them. §19 specifies it, and the
+reason it was built before the derivation path is measured rather than
+preferred: every adjudicated idea both real projects have produced is
+`empirical`, so on this corpus the empirical route is not one of four, it is
+the one that decides whether this layer produces validated science at all.
 
 ---
 
@@ -1163,6 +1179,15 @@ Enabling is *not* the undo for `pause`; a paused portfolio says so and names
 `resume`, because the obvious command to type after finding a quiet portfolio
 should not silently restart the thing the researcher stopped.
 
+`resume` also returns every **blocked** idea of that project to `IDLE`, and
+says how many. The tick lifts `BLOCKED_PROVIDER` by itself against provider
+health it can observe and deliberately guesses at nothing else -- a raised
+ceiling and an arrived capability are not facts it can read. A researcher
+typing `resume` is that fact, and it is the only one in the system. Without
+it a portfolio whose blocker had been fixed stayed stopped with no command
+that started it, which is exactly what happened to the three ideas the
+empirical route unblocked.
+
 `researchctl portfolio digest` rather than `researchctl digest show`: the
 kernel already owns `researchctl digest <OBJECT-ID>`, which prints a capsule
 object's semantic digest, and overloading it would make an object id named
@@ -1199,7 +1224,220 @@ acknowledged limit.
   the last curation do not. `researchctl portfolio status` reports the
   uncurated count so the exposure is a number rather than an assumption. §1's
   "nothing curated is deleted" is stated with that qualifier on purpose.
+- **It cannot test a question the project has not declared a command for.**
+  The empirical route chooses from `experiments.yaml` and fills in declared
+  parameters; a model cannot write a command, which is the boundary that
+  makes the route safe and is also the boundary that limits its reach. On
+  `cg-sparse-regression` two of three real empirical ideas were refused as
+  untestable for exactly this reason, each with an account of what a
+  command would have to take. It also cannot know what a command *writes*:
+  nothing declares an output schema, so a decision rule's metric path is a
+  guess unless the command's own description says otherwise.
+- It cannot settle a *mathematical* idea. That route needs an executed
+  counterexample search and the derivation path, and neither is wired into
+  the idea track; such an idea stops below `VALIDATED` with a message saying
+  so. The *empirical* route is wired and §19 specifies it.
 - It cannot tell whether an idea is *true*. Every gate above is a check that
   the right kinds of evidence and the right number of separate readings exist.
   None of them reads the science. That is what the researcher is for, and it is
   why the top tier is called `HUMAN_READY` rather than `CORRECT`.
+
+---
+
+## 19. The empirical route
+
+An idea that can only be settled by measuring something needs a measurement.
+Until this section's subject existed the evidence stage refused every such
+idea with "the experiment pipeline is not wired into the idea track", which
+made `review_board`, `meta_review` and `replicate` unreachable for them.
+
+**Why this route and not another.** All five ideas adjudicated across the two
+real projects are `empirical`, and not by classifier error: their falsifiers
+ask for grids to be run, bootstraps to be resampled and wall clock to be
+recorded. The literature route is not merely the weakest of the four here; it
+is the one real falsifiers almost never imply.
+
+### 19.1 What was built, and what was reused
+
+One module, `research_os/portfolio/empirical.py`, and one table. Everything
+else is machinery that already existed:
+
+```text
+reused                                          what it gives
+------------------------------------------------------------------------
+experiments.yaml + experiment/spec.py           the declared commands, and the
+                                                parameter contract that makes a
+                                                model unable to write one
+runtime/executors.py (LocalExecutor)            running it, contained
+sandbox.py + automation/checks.py helpers       the containment, and what a
+                                                contained `uv run` needs
+automation/worktree.py                          the disposable workspace
+runtime/idempotency.py                          running it exactly once
+runtime/budgets.py                              reserve, settle, release
+runtime/artifacts.py                            immutable, content-addressed
+                                                outputs and analyses
+runtime/store.external_jobs                     the execution record
+actions/coding.canonical_fingerprint            "the checkout did not change"
+runtime/failures.py                             the taxonomy, unchanged
+```
+
+Nothing was added to the failure taxonomy, no technology left the postponed
+list, and no second experiment framework exists.
+
+### 19.2 The object
+
+`idea_experiments` (migration `0026`) is the one thing none of the reused
+machinery can express: *which idea version asked for this measurement, and
+how far the asking has got.*
+
+```text
+experiment_id     PEXP-<stamp>-<hex>
+idea_id, idea_version    the exact version. A revision does not inherit it.
+role              PRIMARY | REPLICATION
+state             PROPOSED | EXECUTABLE | RUNNING | COMPLETED
+                  | OPERATIONALLY_FAILED | INTERPRETED | SUPERSEDED
+command           the name the researcher declared
+spec_digest       the frozen ExecutionSpec, hashed
+variation_digest  the same, with the workspace path removed
+decision_rule     the frozen, machine-checkable rule -- or
+no_rule_reason    why this question does not admit one
+job_id            the execution, in external_jobs
+prompt_version    role@version of the prompt that designed it (0027)
+analysis_artifact_id, conclusion, evidence_id
+```
+
+Three properties are schema rather than convention, because each is a rule
+the layer above would otherwise be trusted to keep: one *live* experiment per
+`(idea version, role)` -- a partial unique index, so a superseded design
+stays as a record without occupying the name; a terminal state carries what
+made it terminal; and a preregistration is a rule or a written reason there
+is none.
+
+### 19.3 The states are not one state
+
+```text
+experiment proposed          designed and preregistered, nothing run
+experiment executable        a workspace exists for it
+experiment running           submitted; the executor has not returned
+experiment operationally     the measurement did not happen, and the row
+  failed                     says with which failure class
+experiment completed         the executor returned; nothing concluded yet
+evidence interpreted         the frozen rule was applied and a conclusion
+                             recorded
+```
+
+Only the last says anything scientific. A system with one "failed" state
+cannot tell a refutation from a dead node, and a system that reached for one
+would eventually report the node.
+
+`RUNNING` is reachable in the machine and not on this build's path: the
+portfolio submits to `LocalExecutor` only, which returns finished. Cluster
+submission from an idea track would also mean holding a work slot across a
+queue wait, which is a scheduling change this release does not make.
+
+### 19.4 The rule is fixed before the number exists
+
+The experiment designer is asked, *before* anything runs, for one number in
+one file the run will write and two thresholds on it:
+
+```text
+decision_rule:
+  output_path    a file this command actually writes -- a declared output, or
+                 the value supplied for one of its `path` parameters
+  metric_path    a dotted path into that file's JSON
+  success        { comparator, threshold }   the idea's prediction held
+  failure        { comparator, threshold }   it did not
+```
+
+**Two predicates and not one, and that is the design.** A single success
+predicate makes every result that is not a success a refutation, which is
+false: a measurement can miss both. Requiring the refutation condition
+separately makes "neither" expressible, and makes a rule whose success
+condition covers everything detectable -- both hold, and the answer is
+`INCONCLUSIVE` rather than `SUPPORTS`.
+
+Afterwards, ordinary Python reads the number and compares it. There is no
+step at which a model reads an output and reports a verdict. Where a question
+genuinely has no single machine-checkable number, the design says so in
+`no_decision_rule_reason`; that is recorded, and it costs the idea the top of
+the scale, because the strongest conclusion available without a rule is
+`INSUFFICIENT`.
+
+### 19.5 The conclusions, and the one that is not evidence
+
+```text
+SUPPORTS               the success predicate held and the failure one did not
+CONTRADICTS            the reverse
+INCONCLUSIVE           both, or neither
+INSUFFICIENT           the run finished and did not answer: a missing output,
+                       a metric that is not a number, no frozen rule
+OPERATIONALLY_BLOCKED  the measurement did not happen
+```
+
+`EVIDENCE_STRENGTH_FOR_CONCLUSION` has no entry for the last one, so an
+operational failure cannot become an evidence row by accident. An executor
+that crashed, a provider that did not answer and a host that cannot contain
+are three operational failures and none of them writes a row.
+
+### 19.6 Where it runs, and what stays byte-identical
+
+Each experiment gets a disposable Git worktree whose path is a pure function
+of its `experiment_id` -- which matters because `cwd` is inside
+`spec_digest`, so a path derived from the clock would give one experiment a
+different digest on every retry and the preregistration comparison would
+reject every legitimate resubmission.
+
+The canonical checkout is fingerprinted before and after -- the capsule and
+every Git ref -- and a change that is not this experiment's own worktree
+branch appearing fails the stage as `POLICY_REFUSED` rather than being
+retried. When the measurement has been read, the worktree **and its branch**
+are removed: every output is already in the content-addressed store by
+digest and the analysis document records the argv, the seeds, the base commit
+and each output's hash, so the branch holds nothing that is not held better
+elsewhere -- and an unattended portfolio would otherwise leave one ref per
+experiment in the researcher's own repository, permanently.
+
+### 19.7 Replication varies something, in code
+
+For an empirical idea `replicate` is a *second designed experiment*, not a
+model agreeing with the first. The replication designer is shown what the
+first one ran and deliberately not what it concluded, must name what it
+varied, and its resulting specification is compared on `variation_digest` --
+argv, seeds, resources, expected outputs, with the workspace path removed.
+An identical rerun is refused before it runs. A reproducibility check is a
+useful thing and is not a replication, and this layer will not record one as
+the other.
+
+### 19.7a A design has liveness, the way a review does
+
+`idea_experiments.prompt_version` (migration `0027`) is `role@version` of the
+prompt that produced the design, and an experiment that has not yet been read
+is *stale* when that is no longer the current one -- exactly the rule
+`PortfolioStore.live_reviews` applies through `CURRENT_REVIEW_PROMPTS`, for
+exactly the reason it gives: a commitment produced by a prompt this build has
+superseded is a commitment to a question no longer being asked.
+
+A stale design is retired to `SUPERSEDED` and redesigned; the unique index is
+partial so the successor can take the name, and the retired row stays as the
+record of what was designed and why it stopped being asked for. An
+`INTERPRETED` experiment is never stale: what was measured was measured, and
+re-measuring it because a prompt's wording changed would be a second bite at
+one question.
+
+This is the fourth defect of one shape on this branch -- the version-blind
+dedup key, the permanently-unique work item key, the released worktree's
+surviving branch, and this. Each wedged something forever, and each was
+invisible until the thing in front of it was fixed.
+
+### 19.8 Termination
+
+An interpreted measurement that does not meet the idea's evidence
+requirement ends the track. Without that rule `select_stage` would choose
+`EVIDENCE` again on every tick, find the same interpreted experiment,
+conclude the same thing and change nothing -- at no cost, indefinitely, with
+the idea reported as active. That is the eighth way a portfolio can loop and
+the reason `TrackSnapshot.experiments` exists.
+
+The stop is not a refutation. An `INCONCLUSIVE` or `INSUFFICIENT`
+measurement leaves the question open, and the reason the researcher reads
+says so.

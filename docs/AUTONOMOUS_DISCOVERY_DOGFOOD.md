@@ -267,6 +267,37 @@ decrement — but that is an inference, and the observation is the part worth
 acting on. It is a pre-existing kernel behaviour, outside the work package
 that produced this document, and it is recorded here rather than fixed.
 
+## 7. If the empirical route is in scope
+
+Added after the pass of 2026-09-21, which is recorded in
+`docs/AUTONOMOUS_DISCOVERY_REPORT.md` §X. Three things a dogfood of §19 needs
+that the procedure above does not mention, and each cost a pass to learn.
+
+**Declared commands have to be visible in the redirected config home.** The
+four `*_HOME` variables move `experiments.yaml` out of sight with everything
+else, so a project whose commands the researcher declared appears to declare
+none and every empirical idea reports `capability_denied`:
+
+```bash
+cp ~/.config/research-os/experiments.yaml "$RESEARCH_OS_CONFIG_HOME/"
+researchctl experiment commands "$PROJ"     # and read what it prints
+```
+
+**Read them as the designer will.** The route can only reach a question one
+of those commands can answer. On `cg-sparse-regression` two of three real
+ideas were refused as untestable -- correctly, at length, and that *is* a
+result -- because the declared commands were written for the researcher's
+own hypotheses. Before spending anything, ask of each declared command:
+does it take a parameter that varies what the idea's falsifier varies, and
+does it write a JSON document with a number a decision rule could name? If
+the answer to either is no for every command, the pass will produce honest
+refusals and no measurement.
+
+**A blocked idea does not unblock itself.** `researchctl portfolio resume`
+now returns blocked ideas to IDLE, because the tick cannot observe that a
+missing capability has arrived. Run it after the first time the host gains
+one.
+
 Record what was found in `docs/AUTONOMOUS_DISCOVERY_REPORT.md` §O, replacing
 "**Not performed.**" with what happened — including, especially, if it went
 badly. The report's five-word vocabulary exists for this: a completed dogfood

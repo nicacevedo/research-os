@@ -36,6 +36,7 @@ from research_os.portfolio import digests as pdigests
 from research_os.portfolio.ids import (
     new_idea_action_id,
     new_idea_evidence_id,
+    new_idea_experiment_id,
     new_idea_id,
     new_idea_review_id,
     new_objection_id,
@@ -43,17 +44,24 @@ from research_os.portfolio.ids import (
     new_seed_id,
 )
 from research_os.portfolio.models import (
+    BLOCKED_STATES,
     CLOSED_IDEA_STATUSES,
+    OPEN_EXPERIMENT_STATES,
+    TERMINAL_IDEA_STATUSES,
     TIER_ORDER,
     ActionStatus,
     AdjudicationType,
     Disposition,
     EdgeKind,
+    EmpiricalConclusion,
     EvidenceKind,
     EvidenceStrength,
+    ExperimentRole,
+    ExperimentState,
     IdeaAction,
     IdeaEdge,
     IdeaEvidence,
+    IdeaExperiment,
     IdeaObjection,
     IdeaOrigin,
     IdeaReview,
@@ -73,7 +81,7 @@ from research_os.portfolio.models import (
     Severity,
     Stage,
 )
-from research_os.runtime.db import Database, jsonb
+from research_os.runtime.db import Database, RuntimeDatabaseError, jsonb
 from research_os.runtime.interfaces import Independence
 
 LOG = logging.getLogger("research_os.portfolio.store")
@@ -108,6 +116,13 @@ OBJECTION_COLUMNS = (
     "objection_id, idea_id, raised_in_review, raised_at_version, objection_key, "
     "severity, target, summary, addressed_at_version, response, resolved_by_review, "
     "resolved_at, created_at"
+)
+EXPERIMENT_COLUMNS = (
+    "experiment_id, idea_id, idea_version, project_id, role, state, command, "
+    "spec_digest, variation_digest, workspace_path, preregistration_artifact_id, "
+    "decision_rule, no_rule_reason, job_id, analysis_artifact_id, conclusion, "
+    "evidence_id, failure_class, detail, attempts, origin_call_id, "
+    "prompt_version, created_at, updated_at"
 )
 ACTION_COLUMNS = (
     "action_id, idea_id, idea_version, stage, basis_digest, status, work_id, "
@@ -154,6 +169,16 @@ class ActiveTrackExistsError(PortfolioStateError):
 
     A lost race rather than a defect: two portfolio ticks can both decide the
     same idea is next. The caller's response is to skip it, which is the truth.
+    """
+
+
+class DuplicateExperimentError(PortfolioStateError):
+    """Raised when an idea version already has an experiment in this role.
+
+    A lost race rather than a defect, and the reason the unique index exists:
+    "an empirical idea creates exactly one experiment spec" and "replay
+    creates no duplicate" are the same sentence seen from two sides, and the
+    place to hold them is the schema rather than a caller's memory.
     """
 
 
@@ -351,6 +376,24 @@ class PortfolioStore:
                 "update ideas set current_version = %s, updated_at = now() "
                 "where idea_id = %s",
                 (version, idea_id),
+            )
+            # An experiment measures one *version's* prediction. A revision
+            # does not inherit it, and an in-flight measurement of superseded
+            # text must stop being something the portfolio waits for. In the
+            # same transaction as the version, because a revision that
+            # committed while the retirement did not would leave the new
+            # version waiting on the old one's job.
+            conn.execute(
+                """
+                update idea_experiments
+                   set state = 'SUPERSEDED',
+                       detail = 'the idea version this measured was revised',
+                       updated_at = now()
+                 where idea_id = %(idea_id)s
+                   and idea_version < %(version)s
+                   and state in ('PROPOSED','EXECUTABLE','RUNNING','COMPLETED')
+                """,
+                {"idea_id": idea_id, "version": version},
             )
         return IdeaVersion.model_validate(row)
 
@@ -564,6 +607,45 @@ class PortfolioStore:
         if row is None:
             raise PortfolioStateError(f"{idea_id} is not an idea in this portfolio")
         return PortfolioIdea.model_validate(row)
+
+    def unblock_ideas(self, *, project_id: str) -> int:
+        """Return every blocked idea of one project to IDLE. A person's act.
+
+        ``tick._clear_blocks`` lifts ``BLOCKED_PROVIDER`` by itself, against
+        provider health it can observe, and deliberately guesses at nothing
+        else: ``BLOCKED_BUDGET`` lifts when a ceiling is raised and
+        ``BLOCKED_EXTERNAL`` when a missing capability appears, and neither
+        is a fact the tick can read.
+
+        A researcher typing ``portfolio resume`` *is* that fact. It is the one
+        signal in the system that means "whatever was blocking these, look
+        again", and without it a portfolio whose blocker was fixed -- a host
+        that can now run experiments, a provider family that was installed --
+        stays stopped with no command that starts it. That was true of the
+        three ideas this layer's empirical route unblocked: the capability
+        appeared and nothing said so.
+
+        Terminal statuses are left alone. A REJECTED idea is not blocked, it
+        is finished.
+        """
+
+        with self._db.tx() as conn:
+            rows = conn.execute(
+                """
+                update ideas
+                   set operational_state = 'IDLE', updated_at = now()
+                 where project_id = %(project_id)s
+                   and operational_state = any(%(blocked)s)
+                   and status <> all(%(terminal)s)
+                returning idea_id
+                """,
+                {
+                    "project_id": project_id,
+                    "blocked": [str(item) for item in sorted(BLOCKED_STATES)],
+                    "terminal": [str(item) for item in sorted(TERMINAL_IDEA_STATUSES)],
+                },
+            ).fetchall()
+        return len(rows)
 
     # -------------------------------------------------------------- edges --
     def add_edge(
@@ -877,6 +959,238 @@ class PortfolioStore:
             item.evidence_id
             for item in self.list_evidence(idea_id=idea_id, idea_version=idea_version)
         )
+
+    # --------------------------------------------------------- experiments --
+    def create_experiment(
+        self,
+        *,
+        idea_id: str,
+        idea_version: int,
+        project_id: str,
+        role: ExperimentRole,
+        command: str,
+        spec_digest: str,
+        variation_digest: str,
+        workspace_path: str,
+        decision_rule: Mapping[str, Any] | None,
+        no_rule_reason: str | None,
+        preregistration_artifact_id: str | None = None,
+        origin_call_id: str | None = None,
+        experiment_id: str | None = None,
+        prompt_version: str = "",
+    ) -> IdeaExperiment:
+        """Record the one experiment this idea version asks for in this role.
+
+        ``experiment_id`` is supplied by the caller when the id is already
+        load-bearing, and for the empirical bridge it is: the disposable
+        workspace path is derived from it and the workspace path is inside
+        the specification digest, so minting a second id here would produce a
+        row whose recorded digest describes a directory nothing will ever run
+        in. That is not hypothetical -- it was the first thing the tests
+        found.
+
+        Raises :class:`DuplicateExperimentError` when one already exists. That
+        is not a defect and is the reason the unique index is in the schema: a
+        replayed work item, a reclaimed lease and a duplicated portfolio tick
+        must all be unable to design a second experiment for one version, and
+        a caller that could catch "already there" and carry on is a caller
+        that submits twice.
+        """
+
+        experiment_id = experiment_id or new_idea_experiment_id()
+        try:
+            with self._db.tx() as conn:
+                row = conn.execute(
+                    f"""
+                    insert into idea_experiments
+                        (experiment_id, idea_id, idea_version, project_id, role,
+                         state, command, spec_digest, variation_digest,
+                         workspace_path, decision_rule, no_rule_reason,
+                         preregistration_artifact_id, origin_call_id,
+                         prompt_version)
+                    values (%(experiment_id)s, %(idea_id)s, %(version)s,
+                            %(project_id)s, %(role)s, 'PROPOSED', %(command)s,
+                            %(spec_digest)s, %(variation_digest)s, %(workspace)s,
+                            %(rule)s, %(reason)s, %(prereg)s, %(call_id)s,
+                            %(prompt_version)s)
+                    returning {EXPERIMENT_COLUMNS}
+                    """,
+                    {
+                        "experiment_id": experiment_id,
+                        "idea_id": idea_id,
+                        "version": idea_version,
+                        "project_id": project_id,
+                        "role": str(role),
+                        "command": command,
+                        "spec_digest": spec_digest,
+                        "variation_digest": variation_digest,
+                        "workspace": workspace_path,
+                        "rule": jsonb(dict(decision_rule)) if decision_rule else None,
+                        "reason": no_rule_reason,
+                        "prereg": preregistration_artifact_id,
+                        "call_id": origin_call_id,
+                        "prompt_version": prompt_version,
+                    },
+                ).fetchone()
+        except RuntimeDatabaseError:
+            # `Database.tx` has already turned the driver's constraint
+            # violation into this. Which constraint it was is answered by
+            # looking, rather than by matching on a message: the unique index
+            # is the only way this insert can conflict, and a row being there
+            # is the fact the caller needs either way.
+            existing = self.get_experiment(
+                idea_id=idea_id, idea_version=idea_version, role=role
+            )
+            if existing is None:
+                raise
+            raise DuplicateExperimentError(
+                f"{idea_id} v{idea_version} already has a {role} experiment "
+                f"({existing.experiment_id}); designing a second one is how a "
+                f"replay becomes a duplicate measurement"
+            ) from None
+        return IdeaExperiment.model_validate(row)
+
+    def get_experiment(
+        self,
+        *,
+        idea_id: str,
+        idea_version: int,
+        role: ExperimentRole = ExperimentRole.PRIMARY,
+    ) -> IdeaExperiment | None:
+        """The *live* experiment for this idea version and role, if there is one.
+
+        Superseded rows are excluded, and the partial unique index is what
+        makes "the live one" singular. They are excluded rather than ordered
+        past because a superseded experiment is history -- a design that was
+        made, and a record of why it stopped being the one being asked for --
+        and every caller that asks this question wants the one that is still
+        owed something. :meth:`require_experiment` reaches a retired one by
+        id.
+        """
+
+        with self._db.tx() as conn:
+            row = conn.execute(
+                f"select {EXPERIMENT_COLUMNS} from idea_experiments "
+                "where idea_id = %s and idea_version = %s and role = %s "
+                "and state <> 'SUPERSEDED'",
+                (idea_id, idea_version, str(role)),
+            ).fetchone()
+        return IdeaExperiment.model_validate(row) if row else None
+
+    def require_experiment(self, experiment_id: str) -> IdeaExperiment:
+        with self._db.tx() as conn:
+            row = conn.execute(
+                f"select {EXPERIMENT_COLUMNS} from idea_experiments "
+                "where experiment_id = %s",
+                (experiment_id,),
+            ).fetchone()
+        if row is None:
+            raise PortfolioStateError(f"no such experiment: {experiment_id}")
+        return IdeaExperiment.model_validate(row)
+
+    def list_experiments(
+        self, *, idea_id: str, idea_version: int | None = None
+    ) -> tuple[IdeaExperiment, ...]:
+        with self._db.tx() as conn:
+            if idea_version is None:
+                rows = conn.execute(
+                    f"select {EXPERIMENT_COLUMNS} from idea_experiments "
+                    "where idea_id = %s order by created_at, experiment_id",
+                    (idea_id,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    f"select {EXPERIMENT_COLUMNS} from idea_experiments "
+                    "where idea_id = %s and idea_version = %s "
+                    "order by created_at, experiment_id",
+                    (idea_id, idea_version),
+                ).fetchall()
+        return tuple(IdeaExperiment.model_validate(row) for row in rows)
+
+    def update_experiment(
+        self,
+        experiment_id: str,
+        *,
+        state: ExperimentState,
+        job_id: str | None = None,
+        analysis_artifact_id: str | None = None,
+        conclusion: EmpiricalConclusion | None = None,
+        evidence_id: str | None = None,
+        failure_class: str | None = None,
+        detail: str | None = None,
+        count_attempt: bool = False,
+    ) -> IdeaExperiment:
+        """Move an experiment forward, keeping everything already established.
+
+        Every nullable reference is ``coalesce``d, so a later step cannot
+        erase an earlier one's record by not repeating it. An experiment that
+        ran, failed to be analysed, and was analysed on the retry keeps the
+        job the first attempt submitted -- which is what makes retrying safe
+        rather than a second submission.
+        """
+
+        with self._db.tx() as conn:
+            row = conn.execute(
+                f"""
+                update idea_experiments
+                   set state = %(state)s,
+                       job_id = coalesce(%(job_id)s, job_id),
+                       analysis_artifact_id =
+                           coalesce(%(analysis)s, analysis_artifact_id),
+                       conclusion = coalesce(%(conclusion)s, conclusion),
+                       evidence_id = coalesce(%(evidence_id)s, evidence_id),
+                       failure_class = %(failure_class)s,
+                       detail = %(detail)s,
+                       attempts = attempts + case when %(count)s then 1 else 0 end,
+                       updated_at = now()
+                 where experiment_id = %(experiment_id)s
+                returning {EXPERIMENT_COLUMNS}
+                """,
+                {
+                    "experiment_id": experiment_id,
+                    "state": str(state),
+                    "job_id": job_id,
+                    "analysis": analysis_artifact_id,
+                    "conclusion": str(conclusion) if conclusion else None,
+                    "evidence_id": evidence_id,
+                    "failure_class": failure_class,
+                    "detail": detail[:2000] if detail else None,
+                    "count": count_attempt,
+                },
+            ).fetchone()
+        if row is None:
+            raise PortfolioStateError(f"no such experiment: {experiment_id}")
+        return IdeaExperiment.model_validate(row)
+
+    def supersede_experiments_below(self, *, idea_id: str, version: int) -> int:
+        """Retire every open experiment of a version older than ``version``.
+
+        Called when a revision appends a new version. An experiment measures
+        one *version's* prediction, so a revision does not inherit it -- and
+        an in-flight measurement of superseded text must stop being something
+        the portfolio waits for. Terminal rows are left exactly as they are:
+        what was measured was measured, and the record of it is the point.
+        """
+
+        with self._db.tx() as conn:
+            rows = conn.execute(
+                """
+                update idea_experiments
+                   set state = 'SUPERSEDED',
+                       detail = 'the idea version this measured was revised',
+                       updated_at = now()
+                 where idea_id = %(idea_id)s
+                   and idea_version < %(version)s
+                   and state = any(%(open)s)
+                returning experiment_id
+                """,
+                {
+                    "idea_id": idea_id,
+                    "version": version,
+                    "open": [str(item) for item in sorted(OPEN_EXPERIMENT_STATES)],
+                },
+            ).fetchall()
+        return len(rows)
 
     # ------------------------------------------------------------- reviews --
     def record_review(

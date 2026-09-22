@@ -394,6 +394,304 @@ class NoveltyAuditOutput(_Contract):
         return tuple(dict.fromkeys(row.source_key for row in self.rows))
 
 
+#: The comparators a frozen decision rule may use.
+#:
+#: Six, all of them total orders on a float, and deliberately no expression
+#: language. A decision rule the model could *write* rather than *fill in*
+#: would be model-authored code deciding what a result means, which is the
+#: thing this whole layer is arranged to prevent -- and it would be evaluated
+#: after the result exists, which is the thing preregistration is for.
+COMPARATORS: frozenset[str] = frozenset({"<", "<=", ">", ">=", "==", "!="})
+
+#: How far into a JSON document a metric may be addressed.
+MAX_METRIC_DEPTH = 8
+
+#: The resource settings an executor actually reads.
+#:
+#: Exactly the six `SlurmExecutor.build_script` turns into an `#SBATCH`
+#: directive. Anything else a design names is inert -- it reaches no
+#: executor and changes nothing about what runs -- so it is dropped rather
+#: than carried into the specification digest.
+RESOURCE_KEYS: frozenset[str] = frozenset(
+    {"partition", "time_limit", "account", "cpus", "memory", "gres"}
+)
+
+
+class DecisionPredicate(_Contract):
+    """One half of a frozen decision rule: a comparison against a threshold."""
+
+    comparator: str = Field(pattern=r"^(<=|>=|==|!=|<|>)$")
+    threshold: float
+
+    def holds(self, value: float) -> bool:
+        """Apply the comparison. Ordinary Python, and the only thing that is.
+
+        ``==`` and ``!=`` on floats are exact, and that is intended: a rule
+        that says "exactly zero errors" means exactly zero, and a tolerance
+        invented here would be a threshold nobody preregistered.
+        """
+
+        return {
+            "<": value < self.threshold,
+            "<=": value <= self.threshold,
+            ">": value > self.threshold,
+            ">=": value >= self.threshold,
+            "==": value == self.threshold,
+            "!=": value != self.threshold,
+        }[self.comparator]
+
+    def rendered(self) -> str:
+        return f"{self.comparator} {self.threshold}"
+
+
+class DecisionRule(_Contract):
+    """The prespecified rule that decides what the result means.
+
+    **Two predicates, not one, and that is the design.** A single "success"
+    predicate makes every result that is not a success a refutation, which is
+    false -- a measurement can miss both. Requiring the failure condition to
+    be stated separately makes "neither" expressible, and makes a rule whose
+    success condition is everything detectable: both predicates hold, and the
+    conclusion is ``INCONCLUSIVE`` rather than ``SUPPORTS``.
+
+    ``metric_path`` addresses a number inside a JSON document the experiment
+    declared it would write. Dotted, with integer segments indexing lists.
+    There is no expression language and there will not be one: the rule is
+    *filled in*, never written, so what it can say is fixed before any idea
+    exists.
+    """
+
+    output_path: str
+    metric_path: str
+    success: DecisionPredicate
+    failure: DecisionPredicate
+    #: What the number is, in the researcher's words. Not used by the
+    #: comparison; printed beside it, because a threshold with no units is a
+    #: number nobody can check.
+    metric_description: str = ""
+
+    @field_validator("output_path")
+    @classmethod
+    def _relative_output(cls, value: str) -> str:
+        stripped = _bounded(value, 512, "the decision rule's output path")
+        if stripped.startswith(("/", "~")) or "\\" in stripped:
+            raise ValueError("the output path must be a relative POSIX path")
+        if any(part in {"", ".", ".."} for part in stripped.split("/")):
+            raise ValueError("the output path must not contain '.' or '..' segments")
+        return stripped
+
+    @field_validator("metric_path")
+    @classmethod
+    def _addressable_metric(cls, value: str) -> str:
+        stripped = _bounded(value, 256, "the decision rule's metric path")
+        parts = stripped.split(".")
+        if len(parts) > MAX_METRIC_DEPTH:
+            raise ValueError(f"a metric path may have at most {MAX_METRIC_DEPTH} parts")
+        if any(not part for part in parts):
+            raise ValueError("a metric path must not contain an empty segment")
+        return stripped
+
+    @field_validator("metric_description")
+    @classmethod
+    def _bounded_description(cls, value: str) -> str:
+        stripped = value.strip()
+        if len(stripped) > MAX_STATEMENT_CHARS:
+            raise ValueError(f"at most {MAX_STATEMENT_CHARS} characters")
+        return stripped
+
+    def rendered(self) -> str:
+        return (
+            f"{self.metric_path} in {self.output_path}: "
+            f"supports when {self.success.rendered()}, "
+            f"contradicts when {self.failure.rendered()}"
+        )
+
+
+class ExperimentDesign(_Contract):
+    """One experiment over one declared command, preregistered.
+
+    Three things the model may *not* supply, each of which would be it
+    choosing its own bar:
+
+    - an argument vector. It names a command the researcher declared in
+      ``experiments.yaml`` -- a file outside every worktree -- and fills in
+      the parameters that command declares. Nothing else is runnable.
+    - a verdict. The design fixes the rule; ordinary Python applies it after
+      the result exists, and the model is never asked what the numbers mean.
+    - whether the experiment was preregistered. Either a
+      :class:`DecisionRule` is here or ``no_decision_rule_reason`` says why
+      there is none, and the second costs the idea the top of the scale.
+    """
+
+    testable: bool
+    untestable_reason: str = ""
+    command: str = ""
+    command_parameters: dict[str, Any] = Field(default_factory=dict)
+    seeds: tuple[int, ...] = ()
+    resources: dict[str, str] = Field(default_factory=dict)
+    primary_endpoint: str = ""
+    secondary_endpoints: tuple[str, ...] = ()
+    dataset_identity: str = ""
+    #: Which prediction of the idea this measurement would falsify. Quoted
+    #: from the idea's own falsifier by the model, so a design that tests
+    #: something else is visible rather than inferred.
+    falsification_criterion: str = ""
+    decision_rule: DecisionRule | None = None
+    no_decision_rule_reason: str = ""
+    #: What this replication varies, and how. Empty on a primary design; the
+    #: replication template requires it, and ordinary Python separately checks
+    #: that the resulting specification really is different.
+    variation_kind: str = ""
+    variation_detail: str = ""
+
+    @field_validator("command")
+    @classmethod
+    def _command_name(cls, value: str) -> str:
+        stripped = value.strip()
+        if len(stripped) > 64:
+            raise ValueError("a command name is at most 64 characters")
+        return stripped
+
+    @field_validator(
+        "primary_endpoint",
+        "dataset_identity",
+        "falsification_criterion",
+        "variation_kind",
+    )
+    @classmethod
+    def _statement(cls, value: str) -> str:
+        stripped = value.strip()
+        if len(stripped) > MAX_STATEMENT_CHARS:
+            raise ValueError(f"at most {MAX_STATEMENT_CHARS} characters")
+        return stripped
+
+    @field_validator("untestable_reason", "no_decision_rule_reason", "variation_detail")
+    @classmethod
+    def _explanation(cls, value: str) -> str:
+        """Clipped rather than refused, and only these three fields.
+
+        The dogfood found why. Asked to design an experiment for an idea no
+        declared command can test, the designer answered ``testable: false``
+        with a careful 2,400-character account of why -- which is the *right*
+        answer and the most useful one it could give -- and the contract
+        threw the whole response away for being 400 characters over a limit
+        nothing had told it about. The retry produced the same answer and
+        failed identically, which is the loop ``_parameter_contract`` already
+        records paying for once.
+
+        These three fields are explanation and nothing reads them as
+        evidence: they reach a work item's error, an action's detail and a
+        person. Clipping one loses a paragraph; refusing it loses the
+        answer. Every field that *is* content -- the command, its parameters,
+        the endpoint, the decision rule -- still refuses, because salvaging
+        half of one of those is how an unsupported conclusion comes to look
+        supported.
+        """
+
+        stripped = value.strip()
+        if len(stripped) <= MAX_SUMMARY_CHARS:
+            return stripped
+        return stripped[: MAX_SUMMARY_CHARS - 14].rstrip() + " [clipped]"
+
+    @field_validator("secondary_endpoints")
+    @classmethod
+    def _bounded_endpoints(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(value) > MAX_LIST_ITEMS:
+            raise ValueError(f"at most {MAX_LIST_ITEMS} secondary endpoints")
+        return tuple(
+            _bounded(item, MAX_STATEMENT_CHARS, "a secondary endpoint")
+            for item in value
+        )
+
+    @field_validator("seeds")
+    @classmethod
+    def _bounded_seeds(cls, value: tuple[int, ...]) -> tuple[int, ...]:
+        if len(value) > MAX_LIST_ITEMS:
+            raise ValueError(f"at most {MAX_LIST_ITEMS} seeds")
+        for seed in value:
+            if not 0 <= seed <= 2**31 - 1:
+                raise ValueError("a seed must fit in a non-negative 32-bit integer")
+        return value
+
+    @field_validator("command_parameters")
+    @classmethod
+    def _bounded_parameters(cls, value: dict[str, Any]) -> dict[str, Any]:
+        if len(value) > 32:
+            raise ValueError("at most 32 command parameters")
+        for name, supplied in value.items():
+            if len(str(name)) > 64 or len(str(supplied)) > 512:
+                raise ValueError(f"parameter {name!r} is too long to be a value")
+        return value
+
+    @field_validator("resources")
+    @classmethod
+    def _executor_resources(cls, value: dict[str, str]) -> dict[str, str]:
+        """Keep the settings an executor reads, and drop the rest.
+
+        The second thing the dogfood found, and the same shape as the first.
+        Asked for the resources its experiment needs, the designer wrote
+        ``machine: "a 2026 laptop; the thesis's hardware and Gurobi 12 are
+        not ..."`` -- a *note*, in a field for values -- and a 128-character
+        bound threw away an otherwise valid design. The retry wrote a note
+        again.
+
+        `RESOURCE_KEYS` is what `SlurmExecutor.build_script` actually turns
+        into a directive. Everything else is inert: it reaches no executor,
+        changes nothing about what runs, and its only effect is to enter the
+        specification digest -- so carrying a paragraph of prose there would
+        make the frozen identity of an experiment partly a model's commentary
+        on it.
+
+        Dropped rather than refused, and clipped rather than truncated
+        silently, because neither the note nor its length is a fact about the
+        experiment that anything downstream reads.
+        """
+
+        kept = {
+            str(name): str(supplied)[:128]
+            for name, supplied in value.items()
+            if str(name) in RESOURCE_KEYS
+        }
+        if len(kept) > len(RESOURCE_KEYS):  # pragma: no cover - unreachable
+            raise ValueError("more resource settings than there are resources")
+        return kept
+
+    def check(self) -> None:
+        """Refuse a design that contradicts itself.
+
+        Checked here rather than in the handler because every one of these is
+        a property of the answer alone, and a contract that needs a caller to
+        finish validating it is a contract two callers will finish
+        differently.
+        """
+
+        if not self.testable:
+            if not self.untestable_reason:
+                raise ContractError(
+                    "a design that says the idea is not testable must say why; "
+                    "'no' with no reason cannot be acted on or disagreed with"
+                )
+            return
+        if not self.command:
+            raise ContractError("a testable design must name a declared command")
+        if not self.primary_endpoint:
+            raise ContractError(
+                "a testable design must name its primary endpoint before the "
+                "result exists. That is what preregistration is."
+            )
+        if self.decision_rule is None and not self.no_decision_rule_reason:
+            raise ContractError(
+                "a design must carry a machine-checkable decision rule, or say "
+                "why this question does not admit one. An endpoint with neither "
+                "is one that can be read whichever way suits once the numbers "
+                "are in."
+            )
+        if self.decision_rule is not None and self.no_decision_rule_reason:
+            raise ContractError(
+                "a design carries a decision rule or a reason there is none, never both"
+            )
+
+
 class ReviewOutput(_Contract):
     """What each of the three independent reviewers returns.
 
@@ -627,6 +925,8 @@ CONTRACTS: dict[str, type[BaseModel]] = {
     "duplicate_adjudicator": DuplicateAdjudication,
     "novelty_screen": ScreenOutput,
     "literature_scout": NoveltyAuditOutput,
+    "experiment_designer": ExperimentDesign,
+    "replication_designer": ExperimentDesign,
     "falsifier": FalsifierOutput,
     "methodology_reviewer": ReviewOutput,
     "novelty_reviewer": ReviewOutput,

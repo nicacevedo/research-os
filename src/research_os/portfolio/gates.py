@@ -532,7 +532,19 @@ def _replication_met(
     if rule.new_literature_keys:
         return _second_terminology_path(evidence, rule.new_literature_keys)
 
-    candidates = [item for item in evidence if item.kind in rule.kinds]
+    # Substantive, for the same reason the evidence rule demands it: a
+    # replication that measured again and could not tell is a record of
+    # having looked, not a verification. Before the empirical route existed
+    # this was unreachable -- the only writer of a REPLICATION row wrote one
+    # solely when its reconstruction *agreed*, so every such row was
+    # SUPPORTS -- and a second measurement that comes back INCONCLUSIVE is
+    # now an ordinary outcome.
+    candidates = [
+        item
+        for item in evidence
+        if item.kind in rule.kinds
+        and item.strength in {EvidenceStrength.SUPPORTS, EvidenceStrength.CONTRADICTS}
+    ]
     if rule.requires_distinct_source:
         # A replication with no recorded call cannot demonstrate that it is
         # independent of anything, so it does not count. Conservative in the

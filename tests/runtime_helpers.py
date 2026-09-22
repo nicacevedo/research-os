@@ -47,6 +47,7 @@ RUNTIME_TABLES = (
     "portfolio_state",
     "idea_objections",
     "idea_reviews",
+    "idea_experiments",
     "idea_evidence",
     "idea_actions",
     "idea_edges",

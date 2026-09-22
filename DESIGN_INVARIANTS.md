@@ -202,3 +202,53 @@ a portfolio that keeps working  !=  a portfolio that keeps deciding
 Every idea it produces is a candidate. The two acts that make one scientific --
 promoting a proposal and recording a Review -- are unchanged, are human, and
 are not reachable from this package.
+
+## Change control record: the empirical execution path
+
+Per the change-control section above, a dedicated record. **No invariant
+changed, no technology was added and no dependency was added.** This layer
+uses the experiment declarations, the executors, the sandbox, the artifact
+store, the budgets, the failure taxonomy, the work queue, the leases and the
+invocation ledger that `ARCHITECTURE.md` §12 and §12a–§12b already permit.
+
+What changed is that an idea whose falsifier asks for a measurement can now
+obtain one. Invariant by invariant:
+
+| # | invariant | how the empirical route holds it |
+|---|---|---|
+| 1 | local before LLM | one model call on the whole route -- the design. Resolving the command, validating every parameter against the researcher's declared type, hashing the specification, creating the workspace, running it, collecting the outputs, reading the metric and applying the two thresholds are all ordinary Python |
+| 2 | no continuously thinking agents | unchanged; a measurement happens inside one claimed work item and ends |
+| 3 | expensive reasoning is event-triggered | the design call is one bounded request against a reserved budget, with a per-stage cost ceiling on the request itself |
+| 4 | project-isolated science | the experiment row carries `project_id`, the declared commands are read from the project's own section of `experiments.yaml`, and the workspace is a worktree of that project's repository |
+| 5 | shared literature | unchanged |
+| 6 | Git-tracked files are truth | strengthened, and measured rather than asserted. The measurement runs in a disposable worktree; `.git` and `.research/` are bound read-only *inside* the sandbox; the canonical capsule and every Git ref are fingerprinted before and after; and when the reading is done the worktree and its branch are removed, so the repository is byte-identical. `tests/test_portfolio_empirical.py::test_the_canonical_repository_is_byte_identical_afterwards` asserts that as an equality |
+| 7 | rebuildable indexes | unchanged. `idea_experiments` is operational state; the outputs it points at are content-addressed under the data home, where a result belongs |
+| 8 | no agent approves its own work | strengthened. The conclusion of an experiment is not a model's opinion at all: the model fixes a rule before the result exists and ordinary code applies it afterwards. There is no experiment author to approve anything |
+| 9 | reviewers start from clean context | unchanged, and extended to the replication designer, which is shown what the first experiment *ran* and deliberately not what it *concluded* |
+| 10 | claims traceable to evidence | unchanged, and the evidence is stronger: an experiment row names the execution, the analysis artifact and the exact idea version, and the analysis document carries the argv, the seeds, the base commit and every output by content hash. One gate was tightened rather than added: a second measurement that came back `INCONCLUSIVE` would have satisfied the replication requirement, which was unreachable while the only writer of a `REPLICATION` row wrote one solely when it agreed |
+| 11 | experiments traceable | this is the invariant the route exists to satisfy on this layer. The specification is frozen and digested before submission, stored as a preregistration artifact, and rebuilt and re-hashed before anything runs; two hashes disagreeing stops the submission. A design also carries the prompt identity that produced it (`0027`), so a commitment made by a prompt this build has superseded is stale rather than resubmitted forever -- the rule `idea_reviews.prompt_version` already applies to a review |
+| 12 | paid use has budgets | reserve → execute → settle or release, through the existing ledger, with both halves under test. The portfolio adds one ceiling of its own, `max_experiment_seconds`, which can only make a declared command shorter |
+| 13 | no unofficial automation | unchanged |
+| 14 | finite stop conditions | one new bound, and it closes a loop this route would otherwise have opened: an interpreted measurement that does not meet the evidence requirement ends the track instead of being re-selected forever. The existing per-stage failure ceiling bounds the operational retries |
+| 15 | explicit cross-project transfer | unchanged |
+
+The property worth stating as new rather than preserved:
+
+```text
+a portfolio that can ask a question  !=  a portfolio that can answer one
+```
+
+It could ask before. What it could not do was obtain a measurement, and an
+empirical question with no measurement is one that can only be settled by
+argument -- which is the failure mode every gate in this layer exists to
+prevent.
+
+And the one that is preserved and is the most important of them:
+
+```text
+the executor crashed  !=  the idea is wrong
+```
+
+`EmpiricalConclusion.OPERATIONALLY_BLOCKED` exists so that the first has
+somewhere to go, and `EVIDENCE_STRENGTH_FOR_CONCLUSION` has no entry for it,
+so it cannot become the second by accident.

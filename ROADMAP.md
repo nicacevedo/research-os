@@ -132,10 +132,11 @@ is **not merged and not released**; the branch carries
 `docs/AUTONOMOUS_DISCOVERY_ARCHITECTURE.md` as its specification and
 `docs/AUTONOMOUS_DISCOVERY_REPORT.md` as its build record.
 
-Implemented and integration-tested: the Idea object and its nine tables, the
-deterministic quality gates, four-layer deduplication, fourteen role contracts,
-the bounded idea track, the deterministic portfolio pass, the Git bank and its
-Curator, the digest, and the human-facing commands. 244 new tests in 14 files.
+Implemented and integration-tested: the Idea object and its ten tables, the
+deterministic quality gates, four-layer deduplication, sixteen role contracts,
+the bounded idea track, the empirical execution path, the deterministic
+portfolio pass, the Git bank and its Curator, the digest, and the
+human-facing commands. 294 new tests in 15 files.
 
 **Dogfooded, soaked and audited on 2026-09-21, and still beta.** A real
 provider was called 173 times against two materially different real projects
@@ -213,12 +214,53 @@ bounded only by the project budget, which reports the wrong cause. Both are
 fixed, both have tests, and both were found by typing the commands in the
 order a researcher would.
 
-Two evidence routes are deliberately unwired on that branch: a mathematical
-idea needs an executed counterexample search and an empirical one needs the
-experiment pipeline, and neither is connected to the idea track. Both stop
-below `VALIDATED` with a message naming what is missing, which is the correct
-behaviour — an idea that cannot be settled here must not be validated on prose
-— and it means the only route to `VALIDATED` today is the literature one.
+### The empirical execution path — closed
+
+The gating item above is closed. `research_os/portfolio/empirical.py` bridges
+an empirical idea version to the experiment machinery that already existed:
+the researcher's declared commands from `experiments.yaml`, `LocalExecutor`
+under the bubblewrap sandbox, a disposable Git worktree, the invocation
+ledger, the budget ledger and the content-addressed artifact store. One table
+(`idea_experiments`, migration 0026) records which idea version asked for
+which measurement and how far the asking has got. No technology left the
+postponed list and no second experiment framework exists;
+`docs/AUTONOMOUS_DISCOVERY_ARCHITECTURE.md` §19 is the specification and
+`DESIGN_INVARIANTS.md` carries the change-control record.
+
+Two properties decide whether this is science or theatre, and both are code
+rather than prose. The **conclusion is arithmetic**: the design fixes one
+metric and two thresholds *before* any result exists, and ordinary Python
+applies them afterwards, so no model is ever asked what an output means — and
+a rule whose success condition covers everything reports `INCONCLUSIVE`
+rather than support. And an **execution that did not happen is never
+evidence**: `OPERATIONALLY_BLOCKED` is a conclusion an experiment can carry
+and the evidence table cannot, so a crashed executor, an unreachable provider
+and a host that cannot contain each leave the idea untouched.
+
+One route remains deliberately unwired: a mathematical idea needs an executed
+counterexample search and the derivation path, and it stops below `VALIDATED`
+with a message naming what is missing. That is the correct behaviour — an
+idea that cannot be settled here must not be validated on prose.
+
+**Exercised against a real provider, and not yet carried to a conclusion.**
+On 2026-09-21 the three real empirical ideas of `cg-sparse-regression` were
+advanced through `researchd`. Two were refused as untestable with the
+commands that project declares, each with a careful account of why; the
+third produced a real preregistered experiment over the declared
+`benchmark` command, ran contained under bubblewrap in a disposable worktree
+with fifty-two packages installed offline and the network denied, failed on a
+plan path the designer had invented, and was recorded as an operational
+failure with **no evidence written**. Five defects were found and fixed,
+four of them the same shape — a constraint or an input the model is graded
+on and never shown, and a design a superseded prompt could never replace.
+
+What stands between that and a real conclusion is two *declarations*, not
+code: a declared command whose parameters span a question the portfolio
+asks, and one whose output a decision rule can read (`benchmark` writes JSON
+Lines and its summarising step is not declared). Both are the researcher's,
+and `experiments.yaml` lives outside every worktree precisely so that an
+agent cannot write them. `docs/AUTONOMOUS_DISCOVERY_REPORT.md` §X is the
+record.
 
 ## Two external prerequisites, and the policy on each
 

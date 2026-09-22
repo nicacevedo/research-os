@@ -24,6 +24,7 @@ IDEA_ID_RE = re.compile(r"^PIDEA-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$")
 IDEA_ACTION_ID_RE = re.compile(r"^IACT-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$")
 IDEA_REVIEW_ID_RE = re.compile(r"^IREV-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$")
 IDEA_EVIDENCE_ID_RE = re.compile(r"^IEVD-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$")
+IDEA_EXPERIMENT_ID_RE = re.compile(r"^PEXP-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$")
 OBJECTION_ID_RE = re.compile(r"^IOBJ-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$")
 PORTFOLIO_DIGEST_ID_RE = re.compile(r"^PDIG-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$")
 SEED_ID_RE = re.compile(r"^SEED-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$")
@@ -35,6 +36,7 @@ ID_PATTERNS: dict[str, re.Pattern[str]] = {
     "idea_action": IDEA_ACTION_ID_RE,
     "idea_review": IDEA_REVIEW_ID_RE,
     "idea_evidence": IDEA_EVIDENCE_ID_RE,
+    "idea_experiment": IDEA_EXPERIMENT_ID_RE,
     "objection": OBJECTION_ID_RE,
     "portfolio_digest": PORTFOLIO_DIGEST_ID_RE,
     "seed": SEED_ID_RE,
@@ -55,6 +57,19 @@ def new_idea_review_id(*, moment: datetime | None = None) -> str:
 
 def new_idea_evidence_id(*, moment: datetime | None = None) -> str:
     return new_id("IEVD", moment=moment)
+
+
+def new_idea_experiment_id(*, moment: datetime | None = None) -> str:
+    """A portfolio experiment id.
+
+    ``PEXP`` and not ``XRUN``: the v1 experiment layer already mints
+    ``XRUN-...`` for one *execution* it owns end to end, and this names the
+    portfolio's record of *which idea version asked*. Two ids that looked
+    alike would invite exactly the association-by-coincidence that
+    ``experiment_interpretations`` exists to prevent.
+    """
+
+    return new_id("PEXP", moment=moment)
 
 
 def new_objection_id(*, moment: datetime | None = None) -> str:

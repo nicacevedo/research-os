@@ -47,7 +47,8 @@ import shlex
 import shutil
 import subprocess
 import tempfile
-from dataclasses import dataclass
+from collections.abc import Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from research_os.errors import ResearchOSError
@@ -166,6 +167,61 @@ def _atomic_write(path: Path, text: str) -> None:
         raise ExecutorError(f"could not write {path}: {exc}") from None
 
 
+@dataclass(frozen=True, slots=True)
+class ToolingPaths:
+    """What a contained command needs from outside its workspace.
+
+    Assembled from the argument vector rather than guessed, and empty for
+    every program this module has no specific knowledge of. A sandbox that
+    inferred which paths a command might want would be a sandbox that
+    inferred wrongly in the direction of permitting.
+    """
+
+    readable: tuple[Path, ...] = ()
+    discarded: tuple[Path, ...] = ()
+    environment: dict[str, str] = field(default_factory=dict)
+
+
+def _tooling_paths(argv: Sequence[str], workdir: Path) -> ToolingPaths:
+    """The read-only and throwaway-writable paths this command needs.
+
+    Three reuses, no new policy. ``uv_readonly_paths`` is uv's managed
+    interpreters; ``uv_discarded_paths`` is its package cache, layered with a
+    tmpfs so nothing written to it survives; ``linked_worktree_paths`` is the
+    repository a linked Git worktree points at, which a worktree cannot
+    resolve itself without. Each is documented where it is defined, and each
+    was measured there rather than reasoned about.
+    """
+
+    from research_os.automation.checks import (
+        UV_CACHE_DIR,
+        UV_OFFLINE,
+        UV_PROGRAM,
+        uv_cache_dir,
+        uv_discarded_paths,
+        uv_readonly_paths,
+    )
+    from research_os.sandbox import linked_worktree_paths
+
+    environment: dict[str, str] = {}
+    if argv and argv[0] == UV_PROGRAM:
+        cache = uv_cache_dir()
+        if cache is not None:
+            # Point uv at the cache it is being handed as an overlay. Without
+            # this it uses the sandbox's own tmpfs HOME, which is empty, and
+            # an empty cache with no network installs nothing.
+            environment[UV_CACHE_DIR] = str(cache)
+        # Told there is no network, uv resolves from the cache. Not told, it
+        # attempts the index, retries three times, and fails the run with a
+        # DNS diagnosis of a containment decision.
+        environment[UV_OFFLINE] = "1"
+    return ToolingPaths(
+        readable=(*uv_readonly_paths(argv), *linked_worktree_paths(workdir)),
+        discarded=uv_discarded_paths(argv),
+        environment=environment,
+    )
+
+
 # ------------------------------------------------------------------- local --
 @dataclass(slots=True)
 class LocalExecutor:
@@ -206,13 +262,32 @@ class LocalExecutor:
         env = {**os.environ, **spec.env}
         stdout_path = run_dir / "logs" / "stdout.txt"
         stderr_path = run_dir / "logs" / "stderr.txt"
+        stdout_path.parent.mkdir(parents=True, exist_ok=True)
         try:
             workdir = Path(spec.cwd)
+            tooling = _tooling_paths(spec.argv, workdir)
             sandbox_spec = SandboxSpec(
                 workdir=workdir,
                 # The frozen run directory is where declared outputs are
                 # collected from, so the command has to be able to write it.
                 writable=(run_dir,),
+                # What a contained `uv run` needs to read -- its managed
+                # interpreters -- and, when the workdir is a linked Git
+                # worktree, the repository directory that worktree cannot
+                # resolve itself without. Both read-only.
+                #
+                # This was missing, and the omission had a shape: the coding
+                # pipeline's acceptance commands solved it in
+                # `automation.checks` and this executor did not, so a
+                # *declared experiment* whose command is `uv run` -- which is
+                # what both of this machine's real declarations are -- failed
+                # under containment with a DNS error attributed to the
+                # project. The fix is the same three helpers, reused.
+                readable=tooling.readable,
+                # uv's package cache, exposed with every write thrown away.
+                # Without it a contained `uv run` has no network and a cold
+                # cache, which cannot install a dependency at all.
+                discarded=tooling.discarded,
                 # The two things inside the checkout a declared experiment must
                 # not be able to write, whatever else it may.
                 #
@@ -226,11 +301,12 @@ class LocalExecutor:
                 protected=(workdir / ".git", workdir / ".research"),
                 network=False,
                 wall_seconds=spec.timeout_seconds,
-                # Only the seeds the spec froze. Not `os.environ`: an
-                # experiment that reads a provider key from the environment
-                # is an experiment whose result depends on something that is
-                # not in its provenance.
-                environment=dict(spec.env),
+                # Only the seeds the spec froze, plus the tool settings the
+                # *controller* decided -- where uv's cache is and that there
+                # is no network. Not `os.environ`: an experiment that reads a
+                # provider key from the environment is an experiment whose
+                # result depends on something that is not in its provenance.
+                environment={**spec.env, **tooling.environment},
             )
             prepared = contain(spec.argv, spec=sandbox_spec, mode=self.sandbox_mode)
         except SandboxPreparationError as exc:
