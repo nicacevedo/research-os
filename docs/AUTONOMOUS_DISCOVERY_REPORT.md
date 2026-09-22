@@ -3029,6 +3029,57 @@ unreachable from the portfolio and remains reachable from
 `researchctl experiment run`, which is human-initiated and which
 `SECURITY.md` reads as though it covers.
 
+
+### Y.20 Development-process incident: a broad signal sent by this author
+
+Recorded because the run is the record, and because the mistake was in
+operating the machine rather than in the machine.
+
+**What happened.** Two gate runs were left active at once. The first had
+its *monitor* stopped but not its *task*, and a second was then started
+against the same `fwd.log` / `rev.log` paths; their output interleaved,
+which is why one reading showed `FORWARD 0` beside an empty forward log.
+That incoherent reading should have been treated as a signal and was not.
+Cleaning it up, this author built a PID list with `ps | grep pytest` and
+sent `SIGTERM` to all of it. The pattern matched about sixty processes --
+because `pgserver` clusters used by pytest fixtures have "pytest" in their
+data-directory paths -- including one belonging to a **different working
+tree**, `research-os-rc`. The intent was to kill two known `gate.sh`
+children whose PIDs were already in hand.
+
+**What it did not do.** The dogfood database was read before and after,
+and every count is identical:
+
+```text
+ideas 133 | versions 168 | actions 490 | reviews 114 | reservations 462
+```
+
+36 `pgserver` instances remained alive afterwards, including
+`research-os-rc`'s (PID 2804181, uptime unchanged across the event), and
+`tests/test_portfolio_gates.py` ran 36 passed immediately after. **This
+was not a scientific-state or runtime-state corruption**, and it is not
+recorded as one. The clusters in question are per-run pytest fixtures and
+ephemeral by design; the realistic worst case was someone re-running a
+suite.
+
+**Consequence for the evidence in this document.** Every gate result
+produced while the two runs overlapped is treated as **invalid**,
+including the `4,437 passed / 8 skipped` forward result, regardless of
+how it looked. §Z's engineering-gate claim rests only on the single clean
+forward-and-reverse run recorded in §Y.7.
+
+**What it says about the product, which is the only part that could have
+warranted a code change: nothing.** `sandbox_audit.py` is the sole place
+in `src/` that pattern-matches processes at all, it does so
+**read-only** -- counting survivors, never selecting a kill target -- and
+every `terminate()` and `kill()` in the package is called on the exact
+`Popen` handle the same function created. Its pattern is a per-run UUID
+sentinel, and its own comment records this identical hazard being found
+and fixed there previously: *"It also matched `pgrep -f "sleep 300"`
+across the whole host, so an unrelated process could fail it."* The
+discipline this author failed to apply is already encoded in the code
+being audited. No product change was made and none is called for.
+
 ## Z. Final release assessment
 
 ### Z.1 What each verdict would require
