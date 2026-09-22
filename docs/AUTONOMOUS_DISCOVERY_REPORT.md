@@ -2921,6 +2921,31 @@ a design weakness rather than a divergence; but "answered" reads far
 stronger in the severity table than "somebody else reviewed a version
 that claimed to address it".
 
+
+### Y.18 And the suite caught one of mine
+
+Worth recording on a night spent cataloguing what ~4,400 tests missed.
+The first full gate run on the final code failed two tests:
+
+```text
+test_the_declared_schema_version_is_the_highest_shipped_migration
+test_the_declared_schema_version_matches_the_highest_migration
+```
+
+Migration 0030 had been written, applied to the live database and
+documented, and `RUNTIME_SCHEMA_VERSION` still said `"0029"`. Every fresh
+install would have expected 0029 and refused a database at 0030. Two
+tests, in two different files, asserting the same invariant from two
+directions, caught it inside one run.
+
+That is what the suite is for, and it says something the six escape
+patterns in §Y.16 do not: the tests are strong exactly where the property
+is a *relationship between two artefacts the repository already
+contains*. They are weak where the property depends on what the outside
+world hands the system -- a provider that refuses, a host without a
+sandbox, a solver that writes NaN. Those are the same finding stated
+twice, and the fix named in §Z.4 item 5 follows from it directly.
+
 ## Z. Final release assessment
 
 ### Z.1 What each verdict would require
