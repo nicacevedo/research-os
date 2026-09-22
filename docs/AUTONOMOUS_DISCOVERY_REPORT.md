@@ -2399,3 +2399,44 @@ has production-path evidence. §Y.2 and §Y.5 give the two chains. They
 reduce to the same sentence: nothing real got past EVIDENCE, so nothing real
 reached anything after it.
 
+### Y.9 The second project, which is the generality evidence
+
+`ccao-covariance-regressivity` is a different science in a different
+repository -- property-assessment regressivity under a covariance
+constraint, against a LightGBM pipeline -- with its own charter, its own
+capsule (carrying the researcher's own `CLAIM-0001` and `REV-0001`), its own
+derived $15.00 ceiling, and its own bank branch. It produced 45 ideas, 27
+of them rejected, through the same machinery.
+
+The useful part is not that it worked twice. It is that **it stopped one
+stage earlier, for a different reason, and was equally right to**:
+
+```text
+cg-sparse-regression    literature audit passes (17 sources, 26 evidence rows)
+                        -> reaches EVIDENCE
+                        -> refuses: no declared command fits the question
+
+ccao-covariance-...     no literature source configured
+                        -> refuses at LITERATURE_AUDIT
+                        -> never reaches EVIDENCE at all
+```
+
+Its refusal is worth quoting because of its last clause:
+
+> no literature source is configured, so novelty cannot be established.
+> This idea will not reach VALIDATED, which is the correct outcome rather
+> than a failure.
+
+Two projects, two different missing human-owned capabilities -- one a
+declared command, one a configured literature source -- caught at two
+different stages, both classed `capability_denied`, both stopping below
+VALIDATED, and both naming what is absent rather than proceeding without
+it. A system that produced the same refusal twice would have shown that it
+can repeat itself. This shows the refusal is computed from what the project
+actually has.
+
+It also means the second project is **weaker** evidence than it looks for
+anything downstream: it never reached the empirical bridge, so it exercised
+the explorer, dedup, novelty screen, falsifier, adjudicator, curator and
+budget ledger on a second science, and nothing after that.
+
