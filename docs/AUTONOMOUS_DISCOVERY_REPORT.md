@@ -2470,3 +2470,39 @@ anything downstream: it never reached the empirical bridge, so it exercised
 the explorer, dedup, novelty screen, falsifier, adjudicator, curator and
 budget ledger on a second science, and nothing after that.
 
+### Y.10 What this run established, as figures
+
+Everything below is from the live dogfood database and the two project
+repositories, not from a fixture.
+
+```text
+ideas                    110      (cg 65, ccao 45)
+versions                 142      one idea reached v5
+actions                  439
+reviews                  105      all from the falsifier; the board never ran
+evidence rows             26      all literature; 0 numerical, 0 executed
+model calls              377
+work items              1062      1009 succeeded, 43 failed, 9 pending, 1 leased
+spend                 $22.05 settled, $7.40 released, $0.15 held
+ceilings               cg $50.00 (explicit, human-set, never raised)
+                       ccao $15.00 (derived)
+experiments                1      superseded; none ever ran to a conclusion
+VALIDATED                  0
+HUMAN_READY                0
+schema                  0029      upgraded under load five times during the run
+capsules                  OK      both validate after the entire run
+human branches      unmoved      one reflog entry each, `clone:`
+```
+
+Work-item success rate is 95.0%. Of the 43 failures, 29 carry the
+pre-fix `unknown` class, 7 are `provider_unavailable`, 4
+`budget_exhausted` and 3 `capability_denied` -- and not one is a
+scientific rejection, because the taxonomy has no member for one.
+
+**Nothing in this table is a scientific result.** 105 reviews and 26
+evidence rows sound like a body of work; every review is the falsifier
+arguing with a proposal, and every evidence row is a retrieved citation.
+The columns that would carry a finding -- numerical evidence, executed
+evidence, experiments concluded, VALIDATED, HUMAN_READY -- are all zero,
+and §Y.2 says why in seven items, none of which an agent may supply.
+
