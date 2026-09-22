@@ -16,6 +16,12 @@ A model that returns two hundred candidate ideas has not been more helpful; it
 has produced something no reviewer will read and a prompt that will become the
 largest thing in the next request.
 
+And every string bound is **declared in the schema the role is given**, by
+:func:`_shown`. A ``field_validator`` contributes nothing to
+``model_json_schema()``, which is what a prompt template's ``output_schema``
+carries, so these limits were enforced and never stated -- and a response
+that exceeded one by a few hundred characters was discarded whole.
+
 **Closed.** ``extra="forbid"`` everywhere, so a field the contract does not
 know about is an error rather than silently dropped. A model inventing
 ``confidence_override`` should fail loudly.
@@ -82,6 +88,36 @@ def _bounded(value: str, limit: int, what: str) -> str:
     return stripped
 
 
+def _shown(chars: int, **field: Any) -> Any:
+    """Declare a bound where the role that has to respect it can see it.
+
+    The validators below are the enforcement and are unchanged. What this
+    adds is that the number reaches the *model*: a prompt template's
+    ``output_schema`` is ``model_json_schema()``, a ``field_validator`` puts
+    nothing into it, and so every one of these limits was checked against and
+    never stated.
+
+    Measured rather than anticipated, twice in ten minutes on one real
+    traversal. ``scientific_discovery`` returned a 2,000-character
+    ``obstacle`` on one idea and a 201-character ``refined.title`` on
+    another; both whole responses were discarded as
+    ``MODEL_OUTPUT_INVALID``, and three of those wedge an idea at
+    ``BLOCKED_EXTERNAL`` until a person runs ``researchctl portfolio
+    resume``. :meth:`ExperimentDesign._explanation` already records the same
+    accident in the same words -- "a limit nothing had told it about" -- and
+    answered it by clipping three fields on one contract. This is the general
+    form of that answer.
+
+    **Schema-only, deliberately.** The validators measure the *stripped*
+    value and a JSON Schema ``maxLength`` would not, so declaring these as
+    ``max_length`` constraints would refuse strings the validators accept.
+    Which outputs are acceptable does not change here; only whether the model
+    was told.
+    """
+
+    return Field(json_schema_extra={"maxLength": chars}, **field)
+
+
 class CandidateIdea(_Contract):
     """One proposed direction, as an explorer or a brancher returns it.
 
@@ -91,18 +127,18 @@ class CandidateIdea(_Contract):
     bar if they were fields here.
     """
 
-    title: str
-    research_question: str
-    core_idea: str
-    mechanism: str = ""
-    why_it_matters: str = ""
-    falsifier: str = ""
-    closest_prior_work: str = ""
-    claimed_difference: str = ""
+    title: str = _shown(MAX_TITLE_CHARS)
+    research_question: str = _shown(MAX_STATEMENT_CHARS)
+    core_idea: str = _shown(MAX_STATEMENT_CHARS)
+    mechanism: str = _shown(MAX_STATEMENT_CHARS, default="")
+    why_it_matters: str = _shown(MAX_STATEMENT_CHARS, default="")
+    falsifier: str = _shown(MAX_STATEMENT_CHARS, default="")
+    closest_prior_work: str = _shown(MAX_STATEMENT_CHARS, default="")
+    claimed_difference: str = _shown(MAX_STATEMENT_CHARS, default="")
     assumptions: tuple[str, ...] = ()
     alternative_explanations: tuple[str, ...] = ()
     open_uncertainties: tuple[str, ...] = ()
-    next_best_action: str = ""
+    next_best_action: str = _shown(MAX_STATEMENT_CHARS, default="")
     dimensions: QualityDimensions = QualityDimensions()
 
     @field_validator("title")
@@ -189,10 +225,10 @@ class DiscoveryOutput(_Contract):
     #: Required when it can. The sharpened idea replaces the candidate's text.
     refined: CandidateIdea | None = None
     #: Required when it cannot.
-    obstacle: str = ""
+    obstacle: str = _shown(MAX_STATEMENT_CHARS, default="")
     #: The smallest thing that would move this forward. Prose; the allocator
     #: does not parse it, a person reads it.
-    minimum_decisive_action: str = ""
+    minimum_decisive_action: str = _shown(MAX_STATEMENT_CHARS, default="")
 
     @field_validator("obstacle", "minimum_decisive_action")
     @classmethod
@@ -219,7 +255,7 @@ class Objection(_Contract):
     """One thing wrong with an idea, at a severity the gate reads."""
 
     severity: Severity
-    summary: str
+    summary: str = _shown(MAX_SUMMARY_CHARS)
     #: Whether this is wrong with the *idea* or with the way the idea proposes
     #: to settle itself. See :class:`ObjectionTarget`.
     #:
@@ -254,7 +290,7 @@ class FalsifierOutput(_Contract):
     """
 
     objections: tuple[Objection, ...] = ()
-    summary: str
+    summary: str = _shown(MAX_SUMMARY_CHARS)
     #: What, specifically, was searched for and not found. Distinguishes "I
     #: looked for a counterexample and there isn't an obvious one" from "I did
     #: not look".
@@ -302,8 +338,8 @@ class ScreenOutput(_Contract):
     """
 
     likely_known: bool
-    nearest_known_work: str = ""
-    rationale: str = ""
+    nearest_known_work: str = _shown(MAX_STATEMENT_CHARS, default="")
+    rationale: str = _shown(MAX_STATEMENT_CHARS, default="")
 
     @field_validator("nearest_known_work", "rationale")
     @classmethod
@@ -324,11 +360,11 @@ class NoveltyRow(_Contract):
     reached some other way.
     """
 
-    proposed_component: str
-    closest_known_result: str
+    proposed_component: str = _shown(MAX_STATEMENT_CHARS)
+    closest_known_result: str = _shown(MAX_STATEMENT_CHARS)
     relation: str = Field(pattern="^(same|partial|different)$")
-    precise_difference: str = ""
-    source_key: str
+    precise_difference: str = _shown(MAX_STATEMENT_CHARS, default="")
+    source_key: str = _shown(MAX_STATEMENT_CHARS)
     confidence: float = Field(ge=0.0, le=1.0)
 
     @field_validator("proposed_component", "closest_known_result", "source_key")
@@ -362,7 +398,7 @@ class NoveltyAuditOutput(_Contract):
 
     rows: tuple[NoveltyRow, ...] = ()
     queries: tuple[str, ...] = ()
-    summary: str = ""
+    summary: str = _shown(MAX_SUMMARY_CHARS, default="")
 
     @field_validator("queries")
     @classmethod
@@ -468,14 +504,14 @@ class DecisionRule(_Contract):
     exists.
     """
 
-    output_path: str
-    metric_path: str
+    output_path: str = _shown(512)
+    metric_path: str = _shown(256)
     success: DecisionPredicate
     failure: DecisionPredicate
     #: What the number is, in the researcher's words. Not used by the
     #: comparison; printed beside it, because a threshold with no units is a
     #: number nobody can check.
-    metric_description: str = ""
+    metric_description: str = _shown(MAX_STATEMENT_CHARS, default="")
 
     @field_validator("output_path")
     @classmethod
@@ -531,25 +567,25 @@ class ExperimentDesign(_Contract):
     """
 
     testable: bool
-    untestable_reason: str = ""
-    command: str = ""
+    untestable_reason: str = _shown(MAX_SUMMARY_CHARS, default="")
+    command: str = _shown(64, default="")
     command_parameters: dict[str, Any] = Field(default_factory=dict)
     seeds: tuple[int, ...] = ()
     resources: dict[str, str] = Field(default_factory=dict)
-    primary_endpoint: str = ""
+    primary_endpoint: str = _shown(MAX_STATEMENT_CHARS, default="")
     secondary_endpoints: tuple[str, ...] = ()
-    dataset_identity: str = ""
+    dataset_identity: str = _shown(MAX_STATEMENT_CHARS, default="")
     #: Which prediction of the idea this measurement would falsify. Quoted
     #: from the idea's own falsifier by the model, so a design that tests
     #: something else is visible rather than inferred.
-    falsification_criterion: str = ""
+    falsification_criterion: str = _shown(MAX_STATEMENT_CHARS, default="")
     decision_rule: DecisionRule | None = None
-    no_decision_rule_reason: str = ""
+    no_decision_rule_reason: str = _shown(MAX_SUMMARY_CHARS, default="")
     #: What this replication varies, and how. Empty on a primary design; the
     #: replication template requires it, and ordinary Python separately checks
     #: that the resulting specification really is different.
-    variation_kind: str = ""
-    variation_detail: str = ""
+    variation_kind: str = _shown(MAX_STATEMENT_CHARS, default="")
+    variation_detail: str = _shown(MAX_SUMMARY_CHARS, default="")
 
     @field_validator("command")
     @classmethod
@@ -708,7 +744,7 @@ class ReviewOutput(_Contract):
     """
 
     verdict: ReviewVerdict
-    summary: str
+    summary: str = _shown(MAX_SUMMARY_CHARS)
     objections: tuple[Objection, ...] = ()
     dimensions: QualityDimensions = QualityDimensions()
 
@@ -755,7 +791,7 @@ class MetaReviewOutput(_Contract):
     """
 
     recommendation: Disposition
-    summary: str
+    summary: str = _shown(MAX_SUMMARY_CHARS)
     unresolved_disagreements: tuple[str, ...] = ()
 
     @field_validator("summary")
@@ -786,7 +822,7 @@ class DuplicateAdjudication(_Contract):
 
     verdict: str = Field(pattern="^(duplicate|merge|distinct)$")
     of_idea_id: str = ""
-    rationale: str = ""
+    rationale: str = _shown(MAX_STATEMENT_CHARS, default="")
 
     @field_validator("rationale")
     @classmethod

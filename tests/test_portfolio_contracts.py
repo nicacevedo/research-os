@@ -11,11 +11,15 @@ the scientific record.
 from __future__ import annotations
 
 import pytest
+from pydantic import ValidationError
 
 from research_os.portfolio import prompts as pprompts
 from research_os.portfolio.contracts import (
     CONTRACTS,
+    MAX_STATEMENT_CHARS,
+    MAX_TITLE_CHARS,
     BranchOutput,
+    CandidateIdea,
     ContractError,
     DiscoveryOutput,
     DuplicateAdjudication,
@@ -24,6 +28,7 @@ from research_os.portfolio.contracts import (
     MetaReviewOutput,
     NoveltyAuditOutput,
     ReviewOutput,
+    _Contract,
     parse,
 )
 from research_os.portfolio.models import (
@@ -456,3 +461,112 @@ def test_an_unmapped_template_raises_rather_than_taking_a_default() -> None:
 
     with pytest.raises(KeyError, match="no stage ceiling"):
         _stage_for("a_template_nobody_registered")
+
+
+# ------------------------------------------ limits the model is shown --
+def _contract_models() -> list[type]:
+    """Every contract class in the module, nested ones included.
+
+    ``CONTRACTS`` maps roles to the *top-level* output of each. The limit a
+    real traversal broke was on ``CandidateIdea.title``, which is reached
+    only through ``DiscoveryOutput.refined``, so a check that walks the
+    registry alone would not have caught it.
+    """
+
+    import inspect
+
+    import research_os.portfolio.contracts as module
+
+    return [
+        value
+        for value in vars(module).values()
+        if inspect.isclass(value)
+        and issubclass(value, _Contract)
+        and value is not _Contract
+    ]
+
+
+def test_every_length_checked_string_says_so_in_the_schema() -> None:
+    """A limit a role is graded on has to be a limit the role is shown.
+
+    A prompt template's ``output_schema`` is ``model_json_schema()``, and a
+    ``field_validator`` contributes nothing to it. Every string bound in the
+    module was therefore enforced and never stated -- 119 string fields, not
+    one of them advertising a maximum.
+
+    Twice in ten minutes on one real traversal, ``scientific_discovery``
+    exceeded one: a 2,000-character ``obstacle`` on one idea and a
+    201-character ``refined.title`` on another. Both whole responses were
+    discarded as ``MODEL_OUTPUT_INVALID``, and three of those wedge an idea
+    at ``BLOCKED_EXTERNAL`` until a person runs ``portfolio resume``.
+
+    Scoped to strings covered by a validator, which is exactly the set that
+    can be refused for length. Fields with no validator have no bound to
+    state, and list *items* are deliberately not covered here -- no observed
+    failure was one, and inventing bounds for them would be a behaviour
+    change rather than a disclosure.
+    """
+
+    unstated = [
+        f"{model.__name__}.{name}"
+        for model in _contract_models()
+        for name, field in model.model_fields.items()
+        if field.annotation is str
+        and name
+        in {
+            covered
+            for decorator in model.__pydantic_decorators__.field_validators.values()
+            for covered in decorator.info.fields
+        }
+        and "maxLength" not in model.model_json_schema()["properties"][name]
+    ]
+    assert unstated == [], (
+        "these fields are refused for being too long and the schema the model "
+        f"is given does not say how long: {', '.join(unstated)}"
+    )
+
+
+def test_the_two_fields_a_real_traversal_broke_state_their_own_limits() -> None:
+    """The specific reproduction, kept alongside the general rule.
+
+    Both halves matter and only the second was failing: the limits were
+    always enforced, and never declared.
+    """
+
+    with pytest.raises(ValidationError):
+        CandidateIdea(
+            title="x" * (MAX_TITLE_CHARS + 1),
+            research_question="whether this is refused",
+            core_idea="it is",
+        )
+    assert (
+        CandidateIdea.model_json_schema()["properties"]["title"]["maxLength"]
+        == MAX_TITLE_CHARS
+    )
+
+    with pytest.raises(ValidationError):
+        DiscoveryOutput(
+            can_be_made_precise=False,
+            obstacle="x" * (MAX_STATEMENT_CHARS + 1),
+        )
+    assert (
+        DiscoveryOutput.model_json_schema()["properties"]["obstacle"]["maxLength"]
+        == MAX_STATEMENT_CHARS
+    )
+
+
+def test_declaring_the_bound_did_not_change_which_outputs_are_accepted() -> None:
+    """Schema-only, and that is the point of ``_shown``.
+
+    The validators measure the stripped value; a JSON Schema ``maxLength``
+    would not. Declaring these as ``max_length`` constraints would start
+    refusing a padded string the contract has always accepted, which is a
+    behaviour change smuggled in beside a disclosure.
+    """
+
+    padded = "  " + "x" * MAX_TITLE_CHARS + "  "
+    assert len(padded) > MAX_TITLE_CHARS
+    idea = CandidateIdea(
+        title=padded, research_question="still accepted", core_idea="yes"
+    )
+    assert len(idea.title) == MAX_TITLE_CHARS
