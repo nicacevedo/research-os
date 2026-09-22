@@ -82,6 +82,7 @@ from research_os.portfolio.models import (
     Stage,
 )
 from research_os.runtime.db import Database, RuntimeDatabaseError, jsonb
+from research_os.runtime.failures import FailureClass
 from research_os.runtime.interfaces import Independence
 
 LOG = logging.getLogger("research_os.portfolio.store")
@@ -216,6 +217,23 @@ def _fields_of(version_fields: Mapping[str, Any]) -> dict[str, Any]:
         ],
         "next_best_action": str(version_fields.get("next_best_action", "") or ""),
     }
+
+
+#: Failure classes that mean "the system worked and said no".
+#:
+#: The taxonomy already calls each of these terminal. What the portfolio adds
+#: is that a *stage* which produced one will produce it again: "no declared
+#: command can test this idea" does not become true on the third attempt, and
+#: each attempt is a paid frontier call. So one of these blocks the idea and
+#: `researchctl portfolio resume` is what reconsiders it -- which is the same
+#: sentence the blocked state has always meant.
+REFUSAL_CLASSES: frozenset[FailureClass] = frozenset(
+    {
+        FailureClass.CAPABILITY_DENIED,
+        FailureClass.POLICY_REFUSED,
+        FailureClass.MISSING_SCIENTIFIC_AUTHORITY,
+    }
+)
 
 
 class PortfolioStore:
@@ -2301,8 +2319,8 @@ class PortfolioStore:
 
     def stage_failures(
         self, project_id: str
-    ) -> dict[tuple[str, str, str], tuple[int, int]]:
-        """``(all time, since the researcher last forgave)`` per stage key.
+    ) -> dict[tuple[str, str, str], tuple[int, int, int]]:
+        """``(all time, recent, recent refusals)`` per stage key.
 
         Two numbers because two things read them and they want different
         answers.
@@ -2319,6 +2337,15 @@ class PortfolioStore:
         historical count -- measured on 2026-09-22, on the three empirical
         ideas whose evidence stage had failed while the experiment route did
         not exist.
+
+        The third is **refusals**, and it wants one rather than three.
+        `REFUSAL_CLASSES` are the answers the failure taxonomy already calls
+        terminal: the system worked and said no. "No declared command can
+        test this idea" is the same answer next time and the time after, and
+        each retry is a paid frontier call -- six identical refusals were
+        bought across two sessions before anyone counted. Retrying a
+        *transient* is the point of the ceiling; retrying a policy answer is
+        buying the same sentence three times.
         """
 
         with self._db.tx() as conn:
@@ -2329,21 +2356,29 @@ class PortfolioStore:
                 "       count(*) as n, "
                 "       count(*) filter ("
                 "           where s.failures_forgiven_at is null "
-                "              or w.updated_at > s.failures_forgiven_at) as recent "
+                "              or w.updated_at > s.failures_forgiven_at) as recent, "
+                "       count(*) filter ("
+                "           where (s.failures_forgiven_at is null "
+                "                  or w.updated_at > s.failures_forgiven_at) "
+                "             and w.failure_class = any(%(refusals)s)) as refusals "
                 "  from work_items w "
                 "  left join portfolio_state s on s.project_id = w.project_id "
-                " where w.project_id = %s "
+                " where w.project_id = %(project_id)s "
                 "   and w.kind = 'portfolio_advance_idea' "
                 "   and w.status = 'FAILED' "
                 "   and w.payload->>'idea_id' is not null "
                 "   and w.payload->>'stage' is not null "
                 " group by 1, 2, 3",
-                (project_id,),
+                {
+                    "project_id": project_id,
+                    "refusals": [str(item) for item in sorted(REFUSAL_CLASSES)],
+                },
             ).fetchall()
         return {
             (str(row["idea_id"]), str(row["stage"]), str(row["idea_version"])): (
                 int(row["n"]),
                 int(row["recent"]),
+                int(row["refusals"]),
             )
             for row in rows
         }

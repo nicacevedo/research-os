@@ -321,9 +321,21 @@ def _as_error(failure_class: FailureClass, detail: str) -> Exception:
     The mapping is the runtime's own: a provider failure raises what the router
     raises, so the queue schedules against the breaker's cooldown rather than
     against a stopwatch, which is `docs/RUNTIME.md` §17 I5.
+
+    **Everything else states its class too**, and until 2026-09-22 it did
+    not: a bare `ResearchOSError` carries no class, `Daemon._classify` falls
+    through its type table to `UNKNOWN`, and so every portfolio stage
+    failure in the operational record read `unknown`. Twenty-seven of them
+    did. That cost three things at once -- `portfolio status` could not say
+    *why* anything failed, the retry policy could not tell a provider outage
+    from a policy answer, and the allocator could not tell a refusal that
+    will be identical next time from a transient worth retrying.
+
+    `StageExecutionError` exists for exactly this and `_classify` believes a
+    declared class before consulting its table.
     """
 
-    from research_os.errors import ResearchOSError
+    from research_os.runtime.failures import StageExecutionError
     from research_os.runtime.routing import ProviderCallFailedError
 
     if failure_class in {
@@ -333,7 +345,7 @@ def _as_error(failure_class: FailureClass, detail: str) -> Exception:
         return ProviderCallFailedError(
             detail, failure_class=failure_class, attempted=True
         )
-    return ResearchOSError(detail)
+    return StageExecutionError(detail, failure_class=failure_class)
 
 
 def register() -> None:

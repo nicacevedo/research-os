@@ -1093,16 +1093,138 @@ def test_resume_lets_a_stage_that_hit_its_ceiling_be_tried_again(
                 (str(WorkStatus.FAILED), item.item.work_id),
             )
 
-    before = portfolio.stage_failures(runtime_project)[key]
-    assert before == (
-        config.bounds.max_stage_failures,
-        config.bounds.max_stage_failures,
-    )
+    ceiling = config.bounds.max_stage_failures
+    assert portfolio.stage_failures(runtime_project)[key] == (ceiling, ceiling, 0)
 
     portfolio.forgive_stage_failures(project_id=runtime_project)
 
-    after = portfolio.stage_failures(runtime_project)[key]
-    assert after[0] == config.bounds.max_stage_failures, (
+    total, recent, refusals = portfolio.stage_failures(runtime_project)[key]
+    assert total == ceiling, (
         "the all-time count moved, so a retry would re-use a spent dedup key"
     )
-    assert after[1] == 0, "resume did not forgive the ceiling"
+    assert recent == 0, "resume did not forgive the ceiling"
+    assert refusals == 0, "these failures carried no class, so none is a refusal"
+
+
+def test_a_refusal_blocks_the_idea_once_rather_than_three_times(
+    portfolio: PortfolioStore, runtime_db: Database, runtime_project: str
+) -> None:
+    """Buying the same "no" three times is not a retry policy.
+
+    `max_stage_failures` exists so a *transient* is retried and then stops.
+    A refusal is not transient: "no declared command can test this idea" is
+    the same answer next time and the time after, and each attempt is a paid
+    frontier call. Six identical refusals were bought across two sessions
+    before anyone counted them.
+
+    The classes here are the ones the failure taxonomy already calls
+    terminal, so this is the allocator agreeing with the policy table rather
+    than a new policy. `portfolio resume` is what reconsiders it, which is
+    what the blocked state has always meant.
+    """
+
+    from research_os.portfolio.allocation import ADVANCE_IDEA
+    from research_os.portfolio.store import REFUSAL_CLASSES
+    from research_os.runtime.failures import FailureClass, Response, response_for
+    from research_os.runtime.models import WorkStatus
+    from research_os.runtime.queue import WorkQueue
+
+    for item in REFUSAL_CLASSES:
+        assert response_for(item) in {
+            Response.FAIL_PERMANENTLY,
+            Response.INTERRUPT_FOR_HUMAN,
+        }, f"{item} is not terminal in the taxonomy, so one must not block"
+
+    idea, version = seed_idea(portfolio, runtime_project)
+    portfolio.upsert_state(project_id=runtime_project)
+    queue = WorkQueue(runtime_db)
+
+    result = queue.enqueue(
+        project_id=runtime_project,
+        kind=ADVANCE_IDEA,
+        payload={
+            "idea_id": idea.idea_id,
+            "stage": "evidence",
+            "idea_version": version.version,
+        },
+        dedup_key=f"{ADVANCE_IDEA}:{idea.idea_id}:evidence:v1:0",
+    )
+    with runtime_db.tx() as conn:
+        conn.execute(
+            "update work_items set status = %s, failure_class = %s, "
+            "updated_at = now() where work_id = %s",
+            (
+                str(WorkStatus.FAILED),
+                str(FailureClass.CAPABILITY_DENIED),
+                result.item.work_id,
+            ),
+        )
+
+    total, recent, refusals = portfolio.stage_failures(runtime_project)[
+        (idea.idea_id, "evidence", str(version.version))
+    ]
+    assert (total, recent, refusals) == (1, 1, 1)
+
+    # And a transient does not count as one, or the ceiling would collapse
+    # to a single retry for everything.
+    other = queue.enqueue(
+        project_id=runtime_project,
+        kind=ADVANCE_IDEA,
+        payload={
+            "idea_id": idea.idea_id,
+            "stage": "falsify",
+            "idea_version": version.version,
+        },
+        dedup_key=f"{ADVANCE_IDEA}:{idea.idea_id}:falsify:v1:0",
+    )
+    with runtime_db.tx() as conn:
+        conn.execute(
+            "update work_items set status = %s, failure_class = %s, "
+            "updated_at = now() where work_id = %s",
+            (
+                str(WorkStatus.FAILED),
+                str(FailureClass.PROVIDER_UNAVAILABLE),
+                other.item.work_id,
+            ),
+        )
+    assert portfolio.stage_failures(runtime_project)[
+        (idea.idea_id, "falsify", str(version.version))
+    ] == (1, 1, 0)
+
+
+def test_a_portfolio_stage_failure_reaches_the_queue_with_its_class(
+    runtime_project: str,
+) -> None:
+    """Twenty-seven failures were recorded as `unknown`, which is three losses.
+
+    `Daemon._classify` believes an exception that states its class and falls
+    through to `UNKNOWN` otherwise, and the portfolio raised a bare
+    `ResearchOSError` for everything that was not a provider failure. So
+    `portfolio status` could not say why anything failed, the retry policy
+    could not tell an outage from a policy answer, and the allocator could
+    not tell a refusal from a transient -- which is what made the rule above
+    unimplementable before it.
+    """
+
+    from research_os.portfolio import extensions
+    from research_os.runtime.failures import FailureClass
+
+    for item in (
+        FailureClass.CAPABILITY_DENIED,
+        FailureClass.POLICY_REFUSED,
+        FailureClass.MODEL_OUTPUT_INVALID,
+        FailureClass.EXECUTOR_FAILED,
+        FailureClass.BUDGET_EXHAUSTED,
+    ):
+        error = extensions._as_error(item, "a detail")
+        assert getattr(error, "failure_class", None) is item, (
+            f"{item} reaches the queue as unknown"
+        )
+
+    # A provider failure still raises what the router raises, so the queue
+    # schedules against the breaker's cooldown rather than a stopwatch.
+    from research_os.runtime.routing import ProviderCallFailedError
+
+    outage = extensions._as_error(FailureClass.PROVIDER_UNAVAILABLE, "no provider")
+    assert isinstance(outage, ProviderCallFailedError)
+    assert outage.failure_class is FailureClass.PROVIDER_UNAVAILABLE
