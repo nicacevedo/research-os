@@ -23,6 +23,7 @@ Nothing ever reaches a shell: the result is an argv list for ``subprocess.run``.
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -292,6 +293,16 @@ def _validate_value(
             raise ExperimentSpecError(
                 f"{where} takes a {parameter.type}, not {raw!r}"
             ) from exc
+        if isinstance(number, float) and not math.isfinite(number):
+            # `nan < minimum` and `nan > maximum` are both False, so a NaN
+            # satisfies every bound a researcher declared by failing to
+            # compare with any of them. An infinity clears one side. This
+            # function's contract is that a value is checked against the
+            # bounds that were written down, and a value that cannot be
+            # compared has not been.
+            raise ExperimentSpecError(
+                f"{where} takes a finite {parameter.type}, not {raw!r}"
+            )
         if parameter.minimum is not None and number < parameter.minimum:
             raise ExperimentSpecError(
                 f"{where} must be at least {parameter.minimum}, not {number}"
@@ -320,7 +331,31 @@ def _validate_value(
             "carrying whitespace, quoting, or shell syntax is refused rather "
             "than escaped"
         )
+    _assert_not_a_flag(text, where)
     return text
+
+
+def _assert_not_a_flag(value: str, where: str) -> None:
+    """A parameter value may not start with ``-``.
+
+    Without this a value stays inside its argv slot and escapes its *type*:
+    the declared program sees an option where the researcher declared data.
+    A security review of this branch showed `--config=/home/u/.ssh/id_rsa`
+    passing as a ``path`` -- the containment test compares
+    ``worktree / value``, which for a value with no leading slash is a
+    relative join and therefore always inside the worktree, whatever the
+    value means to the program that receives it.
+
+    Numbers do not come through here: `_validate_value` returns
+    ``str(number)`` before either check, so a negative number is unaffected.
+    """
+
+    if value.startswith("-"):
+        raise ExperimentSpecError(
+            f"{where} must not begin with '-': {value!r} would reach the "
+            f"declared command as an option rather than as the value the "
+            f"researcher declared"
+        )
 
 
 def _validate_path(value: str, *, where: str, worktree: Path | None) -> str:
@@ -336,6 +371,7 @@ def _validate_path(value: str, *, where: str, worktree: Path | None) -> str:
         _assert_relative(value, where)
     except ValueError as exc:
         raise ExperimentSpecError(str(exc)) from exc
+    _assert_not_a_flag(value, where)
     if worktree is None:
         return value
     root = worktree.resolve()

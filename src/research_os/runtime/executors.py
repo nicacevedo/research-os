@@ -43,6 +43,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -481,6 +482,44 @@ def job_status_for(raw: str) -> ExternalJobStatus:
     return _JOB_STATUS.get(state, ExternalJobStatus.UNKNOWN)
 
 
+#: What a scheduler directive value may contain.
+#:
+#: The same shape `experiment/config.py` requires of a researcher-written
+#: partition name, widened only to admit the `time`, `mem` and `gres` forms
+#: (`01:00:00`, `16G`, `gpu:a100:2`).
+_DIRECTIVE_VALUE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:+-]{0,63}$")
+
+
+def _directive_value(value: str, key: str) -> str:
+    """One `#SBATCH` value, or refuse to write the script at all.
+
+    Every other model-chosen string in this file reaches the batch script
+    through `shlex.quote`. These did not, and a `#SBATCH` line is a *bash
+    comment* -- right up until the value contains a newline, at which point
+    everything after it is script body that Slurm will run. A security
+    review of this branch found it, and found that `resources` arrives from
+    the objective cycle as `{str(k): str(v)}` over a raw provider dict with
+    no contract at all.
+
+    Latent today: the portfolio hard-codes the local executor and Slurm is
+    not enabled on any host this has run on. It is still the one place in
+    the system where a model-chosen string was concatenated into something
+    a shell interprets, which `SECURITY.md` says does not happen.
+
+    Refused rather than quoted. A directive is not a shell word and
+    quoting one would produce a partition name nobody has.
+    """
+
+    if _DIRECTIVE_VALUE_RE.fullmatch(value) is None:
+        raise ExecutorError(
+            f"the scheduler directive {key!r} was given {value!r}, which is "
+            f"not a plain directive value. These are written into a batch "
+            f"script the scheduler executes, so they are refused rather "
+            f"than escaped."
+        )
+    return value
+
+
 @dataclass(slots=True)
 class SlurmExecutor:
     """Submits to Slurm and returns immediately.
@@ -556,7 +595,7 @@ class SlurmExecutor:
         ):
             value = resources.get(key)
             if value:
-                lines.append(f"#SBATCH --{directive}={value}")
+                lines.append(f"#SBATCH --{directive}={_directive_value(value, key)}")
         lines.extend(
             [
                 f"#SBATCH --output={run_dir / 'logs' / 'slurm-stdout.txt'}",

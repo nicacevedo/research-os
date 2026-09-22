@@ -258,3 +258,101 @@ def test_nothing_a_plan_supplies_can_change_the_program_that_runs() -> None:
 
     assert resolved.argv[0] == "uv"
     assert list(resolved.argv[:5]) == ["uv", "run", "python", "-m", "widget.fit"]
+
+
+# -- what a value may not become ----------------------------------------------
+@pytest.mark.parametrize(
+    "value",
+    [
+        "--config=/home/someone/.ssh/id_rsa",
+        "--output=/etc/passwd",
+        "-rf",
+        "-",
+    ],
+)
+def test_a_path_value_that_is_really_a_flag_is_refused(value: str) -> None:
+    """It stayed in its slot and escaped its type.
+
+    A security review of this branch found that the containment check
+    compares `worktree / value`, and for a value with no leading slash that
+    is a *relative* join -- so `--config=/home/u/.ssh/id_rsa` resolves to
+    `<worktree>/--config=/home/u/.ssh/id_rsa`, inside the worktree, and was
+    accepted. The string then reaches the declared program as one whole
+    argv token, where it is an option and not a path.
+
+    Whether that buys anything depends on the declared program's argument
+    parser, which is exactly the reasoning this layer exists to make
+    unnecessary.
+    """
+
+    command = spec(
+        argv=["uv", "run", "python", "-m", "widget.fit", "--plan", "{plan}"],
+        parameters=[{"name": "plan", "type": "path", "required": True}],
+    )
+    with pytest.raises(ExperimentSpecError, match="must not begin with"):
+        resolve_command(command, {"plan": value})
+
+
+def test_a_token_value_that_is_really_a_flag_is_refused() -> None:
+    command = spec(
+        argv=["uv", "run", "python", "-m", "widget.fit", "--mode", "{mode}"],
+        parameters=[{"name": "mode", "type": "token", "required": True}],
+    )
+    with pytest.raises(ExperimentSpecError, match="must not begin with"):
+        resolve_command(command, {"mode": "--trace"})
+
+
+def test_an_ordinary_relative_path_is_still_accepted(tmp_path: Path) -> None:
+    """Positive control: the rule rejects flags, not paths."""
+
+    command = spec(
+        argv=["uv", "run", "python", "-m", "widget.fit", "--plan", "{plan}"],
+        parameters=[{"name": "plan", "type": "path", "required": True}],
+    )
+    resolved = resolve_command(command, {"plan": "experiments/EXP-0001-plan.json"})
+    assert "experiments/EXP-0001-plan.json" in resolved.argv
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf"])
+def test_a_non_finite_number_does_not_satisfy_a_declared_bound(value: str) -> None:
+    """`nan < minimum` and `nan > maximum` are both False.
+
+    So a NaN satisfies every bound a researcher wrote by failing to compare
+    with any of them, and this function's contract is that a value is
+    checked against the bounds that were written down. The decision-rule
+    side of the same hazard is handled in `contracts.DecisionPredicate`;
+    this is the parameter side, and it was open.
+    """
+
+    command = spec(
+        argv=["uv", "run", "python", "-m", "widget.fit", "--rate", "{rate}"],
+        parameters=[
+            {
+                "name": "rate",
+                "type": "number",
+                "required": True,
+                "minimum": 0.0,
+                "maximum": 1.0,
+            }
+        ],
+    )
+    with pytest.raises(ExperimentSpecError):
+        resolve_command(command, {"rate": value})
+
+
+def test_a_finite_number_inside_its_bounds_is_accepted() -> None:
+    """Positive control, including a negative value, which has no leading-dash rule."""
+
+    command = spec(
+        argv=["uv", "run", "python", "-m", "widget.fit", "--shift", "{shift}"],
+        parameters=[
+            {
+                "name": "shift",
+                "type": "number",
+                "required": True,
+                "minimum": -1.0,
+                "maximum": 1.0,
+            }
+        ],
+    )
+    assert "-0.5" in resolve_command(command, {"shift": -0.5}).argv
