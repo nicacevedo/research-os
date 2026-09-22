@@ -1235,8 +1235,15 @@ acknowledged limit.
 - It cannot establish novelty from model memory: a literature evidence row
   without a retrieved source key or an artifact is refused by the database.
 - It cannot record a numerical witness as proof, for the same reason.
-- It cannot let a generator choose its own evidentiary bar: the adjudication
-  type is computed from the falsifier by ordinary Python.
+- It cannot let a generator choose its own evidentiary bar *downward*. The
+  adjudication type is computed by ordinary Python, from the falsifier **and
+  the research question** -- the union of two readings, not one field. An
+  independent review was right that the earlier wording overstated this and
+  `classify_adjudication`'s own docstring is the honest version: the
+  falsifier is written by a model, the classifier is keyword scoring, and
+  the discovery prompt tells the model outright that the kind of work which
+  would settle the idea is read from that sentence. What the union buys is
+  the direction: steering can *add* a requirement and cannot remove one.
 - It cannot clear an objection by rewording. A revision stales the approvals
   too, and a standing objection is answered only by a different role reviewing
   a version that named it.

@@ -6,12 +6,14 @@ whole suite green, and the `CANDIDATE -> PROMISING` transition was never
 exercised at all -- so "this machine can promote an idea" was unproven as unit,
 integration and production evidence simultaneously.
 
-It drives the only adjudication route this build can actually complete: a
-literature-adjudicated idea, whose evidence is retrieved sources and whose
-replication is a second search with different words. The mathematical and
-empirical routes need an executed check and an experiment pipeline, and the
-report says neither is wired; a positive control on a route the system cannot
-run would prove nothing about the one it can.
+It drives a literature-adjudicated idea, whose evidence is retrieved sources
+and whose replication is a second search with different words. When this file
+was written that was the only route this build could complete. It no longer
+is: §19 wired the empirical route, and
+`tests/test_portfolio_empirical.py::test_a_real_empirical_idea_traverses_experiment_evidence_and_review`
+is a positive control that drives it to HUMAN_READY with a real subprocess.
+The mathematical route still needs an executed check and remains unwired --
+`run_evidence` refuses it, by §18.
 """
 
 from __future__ import annotations
