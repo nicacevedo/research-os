@@ -2316,8 +2316,13 @@ def test_a_host_that_cannot_contain_refuses_rather_than_running_uncontained(
     A declared command is the researcher's argument vector with validated
     parameter values in it, which is a weaker exposure than the coding
     pipeline's -- and it is still project code executing with model-chosen
-    parameters, which is why `build_executors` raises the mode to
-    ``required`` at high autonomy, where nobody is watching.
+    parameters, which is why the portfolio asks `build_executors` for
+    ``required`` at *every* autonomy setting. It used to inherit the
+    cycle's rule, which raises the mode only at ``high`` because at lower
+    settings "a person is at the keyboard". An independent review pointed
+    out that the premise is false here: the portfolio daemon runs
+    unattended by construction, so a researcher lowering autonomy to be
+    more careful got the opposite.
 
     What is under test is the response when the host cannot provide it.
     `CAPABILITY_DENIED` is terminal in the failure taxonomy -- no repair
