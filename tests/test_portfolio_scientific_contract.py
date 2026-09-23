@@ -1147,3 +1147,83 @@ def test_an_execution_that_moved_under_its_contract_does_not_run(
     assert len(RuntimeStore(runtime_db).list_external_jobs()) == (jobs_before), (
         "nothing may run under a contract it does not realise"
     )
+
+
+def test_a_declared_capability_resumes_the_blocked_contract_from_its_frozen_analysis(
+    portfolio: PortfolioStore,
+    runtime_db: Database,
+    pg_dsn: str,
+    runtime_project: str,
+    tmp_path: Path,
+    runtime_xdg: Path,
+) -> None:
+    """Refusal kept; a person declares the command; the tick notices; it resumes.
+
+    The analysis frozen while no command could produce it is the analysis the
+    eventual design is judged against -- same contract, same analysis digest.
+    Nothing scientific is re-decided because a capability arrived.
+    """
+
+    from research_os.portfolio.models import OperationalState
+    from research_os.portfolio.tick import tick
+    from tests.runtime_graph_helpers import make_config
+
+    config_home = Path(str(runtime_xdg)).parent / "config"
+    config_home.mkdir(parents=True, exist_ok=True)
+    (config_home / "experiments.yaml").write_text(
+        "schema_version: 1\nprojects: {}\n", encoding="utf-8"
+    )
+    idea = _idea(portfolio, runtime_project)
+    router = _router(
+        runtime_db,
+        analysis=_analysis_answer(),
+        design=_design_answer([1, 2, 4], [1, 3]),
+    )
+    refused = _advance(
+        _context(
+            portfolio, runtime_db, tmp_path, runtime_project, idea, router, tmp_path
+        )
+    )
+    assert refused.failure_class is FailureClass.CAPABILITY_DENIED
+    blocked = portfolio.live_contract(
+        idea_id=idea, idea_version=1, role=ExperimentRole.PRIMARY
+    )
+    assert blocked is not None and blocked.state is ContractState.BLOCKED_CAPABILITY
+    # What the track does with a refusal (tested in test_portfolio_track).
+    portfolio.set_operational_state(
+        idea_id=idea, state=OperationalState.BLOCKED_EXTERNAL
+    )
+
+    def run_tick() -> Any:
+        return tick(
+            db=runtime_db,
+            project_id=runtime_project,
+            runtime_config=make_config(pg_dsn, tmp_path / "artifacts"),
+            portfolio_config=load_config(),
+        )
+
+    assert run_tick().capability_unblocked == 0  # first observation records only
+    assert (
+        portfolio.require_idea(idea).operational_state
+        is OperationalState.BLOCKED_EXTERNAL
+    )
+
+    repo = _project(
+        tmp_path / "declared", runtime_xdg, runtime_project, script=GRID_SCRIPT
+    )
+    report = run_tick()
+    assert report.capability_unblocked == 1, report.notes
+    assert portfolio.require_idea(idea).operational_state is OperationalState.IDLE
+
+    resumed = _advance(
+        _context(portfolio, runtime_db, tmp_path, runtime_project, idea, router, repo)
+    )
+    assert resumed.ok, resumed.detail
+    frozen = portfolio.require_contract(resumed.experiment.contract_id)
+    assert frozen.contract_id == blocked.contract_id
+    assert frozen.analysis_digest == blocked.analysis_digest
+    assert frozen.state is ContractState.FROZEN
+    assert resumed.conclusion is EmpiricalConclusion.SUPPORTS
+    assert (
+        len(router.requests_for_prompt(TEMPLATES["analysis_designer"].identity)) == 1
+    ), "the analysis is not re-designed when a capability arrives"

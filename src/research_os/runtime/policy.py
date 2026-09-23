@@ -131,6 +131,14 @@ class ActionKind(StrEnum):
     REVIVE_IDEA = "revive_idea"
     PRODUCE_PORTFOLIO_DIGEST = "produce_portfolio_digest"
     CURATE_IDEA_BANK = "curate_idea_bank"
+    # --- the research loop around the portfolio --------------------------
+    FREEZE_SCIENTIFIC_CONTRACT = "freeze_scientific_contract"
+    RECORD_EXPLORATORY_READING = "record_exploratory_reading"
+    OPEN_FOLLOW_UP = "open_follow_up"
+    ANSWER_LITERATURE_REQUEST = "answer_literature_request"
+    WATCH_LITERATURE = "watch_literature"
+    SYNTHESIZE_EVIDENCE = "synthesize_evidence"
+    REFEREE_SYNTHESIS = "referee_synthesis"
 
     # --- A2: human scientific authority ----------------------------------
     CHANGE_PRIMARY_ENDPOINT = "change_primary_endpoint"
@@ -420,6 +428,59 @@ ACTIONS: dict[ActionKind, ActionPolicy] = {
         "the project repository, from a worktree of its own. It never writes "
         "under .research/, never touches the researcher's branch, and never "
         "merges or pushes.",
+        dispatch=Dispatch.PORTFOLIO,
+    ),
+    ActionKind.FREEZE_SCIENTIFIC_CONTRACT: ActionPolicy(
+        AutonomyLevel.A0,
+        frozenset({Permission.READ_REPO}),
+        "Freezes an analysis before any design exists, then the design against "
+        "it, as an immutable operational record. It changes no capsule object, "
+        "and once frozen nothing in this system -- or a psql session -- can "
+        "edit it; changing a preregistration stays A2.",
+        dispatch=Dispatch.PORTFOLIO,
+    ),
+    ActionKind.RECORD_EXPLORATORY_READING: ActionPolicy(
+        AutonomyLevel.A0,
+        frozenset(),
+        "Re-reads a stored measurement under a new, labelled EXPLORATORY rule "
+        "that names the contract it departs from. The preregistration is not "
+        "touched and the reading writes no evidence.",
+        dispatch=Dispatch.PORTFOLIO,
+    ),
+    ActionKind.OPEN_FOLLOW_UP: ActionPolicy(
+        AutonomyLevel.A0,
+        frozenset(),
+        "Turns one recorded event into new candidate ideas with lineage and "
+        "provenance. The idea the event came from is never edited.",
+        dispatch=Dispatch.PORTFOLIO,
+    ),
+    ActionKind.ANSWER_LITERATURE_REQUEST: ActionPolicy(
+        AutonomyLevel.A0,
+        frozenset({Permission.NETWORK_READ}),
+        "Retrieves sources for one idea's question and stores only statements "
+        "whose citations and quotations were verified against them.",
+        dispatch=Dispatch.PORTFOLIO,
+    ),
+    ActionKind.WATCH_LITERATURE: ActionPolicy(
+        AutonomyLevel.A0,
+        frozenset(),
+        "A scheduled, deterministic pass that raises targeted literature "
+        "requests. Not enabled unless a schedule is created.",
+        dispatch=Dispatch.PORTFOLIO,
+    ),
+    ActionKind.SYNTHESIZE_EVIDENCE: ActionPolicy(
+        AutonomyLevel.A0,
+        frozenset(),
+        "Writes a synthesis of the portfolio's reviewed evidence in which every "
+        "statement cites evidence or verified literature, checked by code. It "
+        "is operational text, not a manuscript and not a capsule object.",
+        dispatch=Dispatch.PORTFOLIO,
+    ),
+    ActionKind.REFEREE_SYNTHESIS: ActionPolicy(
+        AutonomyLevel.A0,
+        frozenset(),
+        "Challenges a synthesis and returns findings that become new frontier "
+        "requests. It grants no approval: accepting a claim remains A2.",
         dispatch=Dispatch.PORTFOLIO,
     ),
     ActionKind.CHANGE_PRIMARY_ENDPOINT: ActionPolicy(

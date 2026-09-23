@@ -69,6 +69,8 @@ class TickReport:
     blocks_cleared: int = 0
     #: Ideas with nothing left to run that this pass gave an explicit state.
     settled: int = 0
+    #: Capability-blocked ideas released because the declared commands changed.
+    capability_unblocked: int = 0
     open_requests: int = 0
     allocations: tuple[allocation.Allocation, ...] = ()
     work_enqueued: int = 0
@@ -93,6 +95,7 @@ class TickReport:
             "stale_actions_reclaimed": self.stale_actions_reclaimed,
             "blocks_cleared": self.blocks_cleared,
             "settled": self.settled,
+            "capability_unblocked": self.capability_unblocked,
             "open_requests": self.open_requests,
             "work_enqueued": self.work_enqueued,
             "work_refused": self.work_refused,
@@ -143,6 +146,7 @@ def tick(
     # --- reconcile -------------------------------------------------------
     report.stale_actions_reclaimed = _reclaim_stale(store, project_id, config)
     report.blocks_cleared = _clear_blocks(store, runtime, project_id)
+    report.capability_unblocked = _observe_capability(store, report, state)
 
     # --- inspect capacity ------------------------------------------------
     report.active_tracks = store.active_count(project_id)
@@ -465,6 +469,59 @@ def _clear_blocks(store: PortfolioStore, runtime: RuntimeStore, project_id: str)
         store.set_operational_state(idea_id=idea.idea_id, state=OperationalState.IDLE)
         cleared += 1
     return cleared
+
+
+def _observe_capability(store: PortfolioStore, report: TickReport, state: Any) -> int:
+    """Release ideas blocked on a capability when the declared commands change.
+
+    ``_clear_blocks`` says a capability arriving is not a fact the tick can
+    read. For the empirical route it now is: the declared commands live in
+    ``experiments.yaml``, outside every worktree, so a change to them is a
+    *person's* act -- exactly what ``portfolio resume`` stands for -- and the
+    tick can observe it by digest. A capability-blocked contract records the
+    command set it was judged against; when that differs from today's, its
+    idea is released and the stage-failure watermark moves, so the refusal
+    that blocked it is not counted against the retry. The idea resumes from
+    its frozen analysis: nothing scientific is re-decided.
+
+    The first observation only records the digest. Nothing had changed.
+    """
+
+    from research_os.portfolio.models import ContractState
+    from research_os.portfolio.scicontract import (
+        command_set_digest,
+        declared_command_set,
+    )
+
+    current = command_set_digest(declared_command_set(report.project_id))
+    previous = state.command_set_digest
+    if previous == current:
+        return 0
+    store.set_command_set_digest(project_id=report.project_id, digest=current)
+    if previous is None:
+        return 0
+    released = 0
+    for contract in store.list_contracts(
+        project_id=report.project_id, states=[ContractState.BLOCKED_CAPABILITY]
+    ):
+        if contract.command_set_digest == current:
+            continue
+        idea = store.get_idea(contract.idea_id)
+        if (
+            idea is None
+            or idea.operational_state is not OperationalState.BLOCKED_EXTERNAL
+        ):
+            continue
+        store.set_operational_state(idea_id=idea.idea_id, state=OperationalState.IDLE)
+        released += 1
+    if released:
+        store.forgive_stage_failures(project_id=report.project_id)
+        report.notes.append(
+            f"the declared experiment commands changed; {released} idea(s) "
+            f"blocked on a capability were released to resume from their "
+            f"frozen analysis"
+        )
+    return released
 
 
 def _origin_counts(ideas: Sequence[Any]) -> dict[IdeaOrigin, int]:

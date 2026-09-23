@@ -223,18 +223,10 @@ def declared_commands(project_id: str) -> dict[str, Any]:
     From ``experiments.yaml``, which lives under the config home -- outside
     every worktree, so a write-enabled worker cannot reach it. This is the
     boundary that makes "no model writes a command" true by construction, and
-    it is the same function the objective cycle's experimentalist uses.
+    it is the same declaration the objective cycle's experimentalist reads.
     """
 
-    from research_os.experiment.config import load_config as load_experiment_config
-
-    try:
-        config = load_experiment_config()
-    except ResearchOSError as exc:
-        LOG.debug("no experiment configuration: %s", exc)
-        return {}
-    project = config.projects.get(project_id)
-    return dict(project.commands) if project is not None else {}
+    return scicontract.declared_command_set(project_id)
 
 
 #: Extensions a ``path`` parameter plausibly names as an *input*.

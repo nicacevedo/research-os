@@ -544,6 +544,26 @@ def capability_request_from_analysis(
     }
 
 
+def declared_command_set(project_id: str) -> dict[str, Any]:
+    """The experiment commands the researcher declared for this project.
+
+    From ``experiments.yaml`` under the config home, outside every worktree:
+    what exists here is a person's decision. Empty when nothing is declared
+    or the file is absent. Lives here, beside the digest over it, so the
+    tick can observe a change to it without importing the empirical route.
+    """
+
+    from research_os.errors import ResearchOSError as _Error
+    from research_os.experiment.config import load_config as load_experiment_config
+
+    try:
+        config = load_experiment_config()
+    except _Error:
+        return {}
+    project = config.projects.get(project_id)
+    return dict(project.commands) if project is not None else {}
+
+
 def command_set_digest(commands: Mapping[str, Any]) -> str:
     """The declared experiment capability of one project, by digest.
 
