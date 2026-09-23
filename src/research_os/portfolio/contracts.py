@@ -38,8 +38,10 @@ judged does not supply the judgement.
 from __future__ import annotations
 
 import json
+import math
+import re
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
@@ -502,6 +504,53 @@ RESOURCE_KEYS: frozenset[str] = frozenset(
 )
 
 
+def _checked_seeds(value: tuple[int, ...]) -> tuple[int, ...]:
+    if len(value) > MAX_LIST_ITEMS:
+        raise ValueError(f"at most {MAX_LIST_ITEMS} seeds")
+    for seed in value:
+        if not 0 <= seed <= 2**31 - 1:
+            raise ValueError("a seed must fit in a non-negative 32-bit integer")
+    return value
+
+
+def _checked_parameters(value: dict[str, Any]) -> dict[str, Any]:
+    """Scalars stay short; a composed document is bounded where it is frozen.
+
+    See :meth:`ExperimentDesign._bounded_parameters` for why the two limits
+    differ.
+    """
+
+    if len(value) > 32:
+        raise ValueError("at most 32 command parameters")
+    for name, supplied in value.items():
+        if len(str(name)) > 64:
+            raise ValueError(f"parameter {name!r} has too long a name")
+        limit = (
+            MAX_GENERATED_BYTES
+            if isinstance(supplied, dict | list)
+            else MAX_SCALAR_PARAMETER_CHARS
+        )
+        if len(str(supplied)) > limit:
+            raise ValueError(f"parameter {name!r} is too long to be a value")
+    return value
+
+
+def _checked_resources(value: dict[str, str]) -> dict[str, str]:
+    """Keep the settings an executor reads, and drop the rest.
+
+    See :meth:`ExperimentDesign._executor_resources`.
+    """
+
+    kept = {
+        str(name): str(supplied)[:128]
+        for name, supplied in value.items()
+        if str(name) in RESOURCE_KEYS
+    }
+    if len(kept) > len(RESOURCE_KEYS):  # pragma: no cover - unreachable
+        raise ValueError("more resource settings than there are resources")
+    return kept
+
+
 class DecisionPredicate(_Contract):
     """One half of a frozen decision rule: a comparison against a threshold."""
 
@@ -700,12 +749,7 @@ class ExperimentDesign(_Contract):
     @field_validator("seeds")
     @classmethod
     def _bounded_seeds(cls, value: tuple[int, ...]) -> tuple[int, ...]:
-        if len(value) > MAX_LIST_ITEMS:
-            raise ValueError(f"at most {MAX_LIST_ITEMS} seeds")
-        for seed in value:
-            if not 0 <= seed <= 2**31 - 1:
-                raise ValueError("a seed must fit in a non-negative 32-bit integer")
-        return value
+        return _checked_seeds(value)
 
     @field_validator("command_parameters")
     @classmethod
@@ -727,19 +771,7 @@ class ExperimentDesign(_Contract):
         only after this model has already been constructed.
         """
 
-        if len(value) > 32:
-            raise ValueError("at most 32 command parameters")
-        for name, supplied in value.items():
-            if len(str(name)) > 64:
-                raise ValueError(f"parameter {name!r} has too long a name")
-            limit = (
-                MAX_GENERATED_BYTES
-                if isinstance(supplied, dict | list)
-                else MAX_SCALAR_PARAMETER_CHARS
-            )
-            if len(str(supplied)) > limit:
-                raise ValueError(f"parameter {name!r} is too long to be a value")
-        return value
+        return _checked_parameters(value)
 
     @field_validator("resources")
     @classmethod
@@ -765,14 +797,7 @@ class ExperimentDesign(_Contract):
         experiment that anything downstream reads.
         """
 
-        kept = {
-            str(name): str(supplied)[:128]
-            for name, supplied in value.items()
-            if str(name) in RESOURCE_KEYS
-        }
-        if len(kept) > len(RESOURCE_KEYS):  # pragma: no cover - unreachable
-            raise ValueError("more resource settings than there are resources")
-        return kept
+        return _checked_resources(value)
 
     def check(self) -> None:
         """Refuse a design that contradicts itself.
@@ -807,6 +832,782 @@ class ExperimentDesign(_Contract):
         if self.decision_rule is not None and self.no_decision_rule_reason:
             raise ContractError(
                 "a design carries a decision rule or a reason there is none, never both"
+            )
+
+
+# ---------------------------------------------------- the scientific contract --
+#
+# An experiment used to be preregistered by the same call that chose its
+# design: one model composed the grid *and* fixed the threshold, which is the
+# co-design the discovery report's §AB.5 demonstrated arithmetically -- with
+# `lambda_ratios: [0.5, 0.5]` the live statistic's denominator is 1.0 by
+# construction, so a "preregistered" SUPPORTS is reachable by choosing the
+# grid. And the only analysis the route could express was "read one number
+# out of one file", so an idea whose falsifier asked for a regression
+# coefficient was INSUFFICIENT before anything ran (§AB.3): a missing
+# *analysis* was still human-owned.
+#
+# The contract below splits the two acts and gives the second a language:
+#
+#   AnalysisSpec          authored FIRST, by its own role, blind to any design:
+#                         the estimand, the raw observables, the inclusion
+#                         rules, a closed set of reductions, the primary
+#                         statistic, its uncertainty, the two-predicate
+#                         decision, what the data must exhibit before the
+#                         statistic means anything, and what happens when
+#                         something is missing.
+#   DesignSpecification   authored SECOND, by the experiment designer, against
+#                         the frozen analysis -- whose thresholds it is not
+#                         shown -- choosing the declared command and the grid.
+#
+# Both are *filled in*, never written: every operation is a member of a closed
+# set that ordinary Python in `research_os.portfolio.analysis` evaluates, so
+# no model-authored code ever decides what a result means.
+
+#: A name the analysis gives an observable or a reduction. Lower-case, short,
+#: and unambiguous inside a prompt or a JSON document.
+ANALYSIS_NAME_PATTERN = r"^[a-z][a-z0-9_]{0,47}$"
+
+#: A field of a record, addressed by dotted path inside the record: at most
+#: :data:`MAX_FIELD_CHARS` characters and :data:`MAX_FIELD_DEPTH` segments.
+FIELD_PATTERN = r"^[A-Za-z_][A-Za-z0-9_\-]*(\.[A-Za-z0-9_\-]+)*$"
+MAX_FIELD_CHARS = 128
+MAX_FIELD_DEPTH = 6
+
+#: Everything a frozen analysis may compute. A closed set, and deliberately
+#: no expression language: see the section comment above.
+ANALYSIS_OPERATIONS: tuple[str, ...] = (
+    "value",
+    "count",
+    "fraction",
+    "mean",
+    "median",
+    "std",
+    "min",
+    "max",
+    "sum",
+    "quantile",
+    "difference",
+    "ratio",
+    "correlation",
+    "ols_coefficient",
+)
+
+#: Operations over one field of a records observable.
+FIELD_OPERATIONS: frozenset[str] = frozenset(
+    {"mean", "median", "std", "min", "max", "sum", "quantile"}
+)
+
+MAX_OBSERVABLES = 8
+MAX_REDUCTIONS = 24
+MAX_CONDITIONS = 8
+MAX_SUPPORT_RULES = 8
+MAX_OLS_TERMS = 6
+MAX_DESIGN_VARIABLES = 12
+MAX_LEVELS = 64
+
+
+def _relative_path(value: str, what: str) -> str:
+    stripped = _bounded(value, 512, what)
+    if stripped.startswith(("/", "~")) or "\\" in stripped:
+        raise ValueError(f"{what} must be a relative POSIX path")
+    if any(part in {"", ".", ".."} for part in stripped.split("/")):
+        raise ValueError(f"{what} must not contain '.' or '..' segments")
+    return stripped
+
+
+def _field_name(value: str, what: str) -> str:
+    stripped = value.strip()
+    if len(stripped) > MAX_FIELD_CHARS or len(stripped.split(".")) > MAX_FIELD_DEPTH:
+        raise ValueError(
+            f"{what} is at most {MAX_FIELD_CHARS} characters and "
+            f"{MAX_FIELD_DEPTH} dotted segments"
+        )
+    if not re.fullmatch(FIELD_PATTERN, stripped):
+        raise ValueError(
+            f"{what} {value!r} is not a field name: letters, digits, '_' and '-', "
+            f"optionally dotted into a nested record"
+        )
+    return stripped
+
+
+class Condition(_Contract):
+    """One inclusion rule: a comparison a record must satisfy to be analysed.
+
+    Numeric comparisons on numbers, and ``==`` / ``!=`` on strings too, so a
+    categorical field can select a regime ("solver == 'cold'"). Nothing else:
+    no pattern, no arithmetic, no reference to another field.
+    """
+
+    field: str = _shown(128)
+    comparator: str = Field(pattern=r"^(<=|>=|==|!=|<|>)$")
+    value: float | int | str | bool
+
+    @field_validator("field")
+    @classmethod
+    def _field(cls, value: str) -> str:
+        return _field_name(value, "a condition's field")
+
+    @field_validator("value")
+    @classmethod
+    def _value(cls, value: float | str | bool) -> float | int | str | bool:
+        if isinstance(value, str) and len(value) > 128:
+            raise ValueError("a condition's value is at most 128 characters")
+        if isinstance(value, float) and math.isnan(value):
+            raise ValueError("a condition's value must be a number, not NaN")
+        return value
+
+    def rendered(self) -> str:
+        return f"{self.field} {self.comparator} {self.value!r}"
+
+
+class Observable(_Contract):
+    """One raw output the analysis reads, and how.
+
+    ``scalar`` addresses one number by dotted path, which is what the route
+    could always express. ``records`` addresses a list of records -- a JSON
+    array of objects at ``path``, or every row of a CSV file -- and is what
+    lets a reduction, a regression or an uncertainty exist at all.
+    """
+
+    name: str = Field(pattern=ANALYSIS_NAME_PATTERN)
+    #: The file the run must write. Relative to the experiment's workspace.
+    source: str = _shown(512)
+    kind: Literal["scalar", "records"]
+    #: Dotted path inside the document. For ``records``, empty means the
+    #: document itself is the list (and is the only value a CSV accepts).
+    path: str = _shown(256, default="")
+    #: Fields every analysed record must carry.
+    fields: tuple[str, ...] = _shown_list(
+        items=128, count=MAX_CONDITIONS * 2, default=()
+    )
+    #: The inclusion rules. A record failing any is excluded, and counted.
+    include: tuple[Condition, ...] = ()
+    #: What happens to a record missing a required field or holding a value
+    #: that is not a finite number where one is required. Fixed before the
+    #: run, like everything else here, so "drop the awkward rows" is a
+    #: decision made in advance or not at all.
+    incomplete_records: Literal["insufficient", "exclude"] = "insufficient"
+    description: str = _shown(MAX_STATEMENT_CHARS, default="")
+
+    @field_validator("source")
+    @classmethod
+    def _source(cls, value: str) -> str:
+        return _relative_path(value, "an observable's source")
+
+    @field_validator("path")
+    @classmethod
+    def _path(cls, value: str) -> str:
+        stripped = value.strip()
+        if len(stripped) > 256:
+            raise ValueError("an observable's path is at most 256 characters")
+        if stripped and any(not part for part in stripped.split(".")):
+            raise ValueError("an observable's path must not contain an empty segment")
+        if len(stripped.split(".")) > MAX_METRIC_DEPTH:
+            raise ValueError(
+                f"an observable's path has at most {MAX_METRIC_DEPTH} parts"
+            )
+        return stripped
+
+    @field_validator("fields")
+    @classmethod
+    def _fields(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(value) > MAX_CONDITIONS * 2:
+            raise ValueError(f"at most {MAX_CONDITIONS * 2} fields")
+        return tuple(_field_name(item, "an observable's field") for item in value)
+
+    @field_validator("include")
+    @classmethod
+    def _include(cls, value: tuple[Condition, ...]) -> tuple[Condition, ...]:
+        if len(value) > MAX_CONDITIONS:
+            raise ValueError(f"at most {MAX_CONDITIONS} inclusion rules")
+        return value
+
+    @field_validator("description")
+    @classmethod
+    def _description(cls, value: str) -> str:
+        stripped = value.strip()
+        if len(stripped) > MAX_STATEMENT_CHARS:
+            raise ValueError(f"at most {MAX_STATEMENT_CHARS} characters")
+        return stripped
+
+
+class Reduction(_Contract):
+    """One named quantity, computed by a member of a closed set of operations.
+
+    Reductions are evaluated in the order given and may only refer to
+    reductions named *earlier*, so the analysis is a straight line and cannot
+    express a loop. Which arguments each operation takes is checked by
+    :meth:`AnalysisSpec.check`, because it is a relationship between fields.
+    """
+
+    name: str = Field(pattern=ANALYSIS_NAME_PATTERN)
+    op: Literal[
+        "value",
+        "count",
+        "fraction",
+        "mean",
+        "median",
+        "std",
+        "min",
+        "max",
+        "sum",
+        "quantile",
+        "difference",
+        "ratio",
+        "correlation",
+        "ols_coefficient",
+    ]
+    #: The observable this reads, for every operation but difference/ratio.
+    observable: str = Field(default="", pattern=r"^([a-z][a-z0-9_]{0,47})?$")
+    #: The field a field operation aggregates; the first of a correlation.
+    field: str = _shown(128, default="")
+    #: The second field of a correlation.
+    other_field: str = _shown(128, default="")
+    #: Extra selection for this reduction only (``fraction`` counts them).
+    where: tuple[Condition, ...] = ()
+    #: For ``quantile``: which one, strictly between 0 and 1.
+    q: float | None = Field(default=None, gt=0.0, lt=1.0)
+    #: For ``difference`` / ``ratio``: exactly two earlier reductions, in order.
+    of: tuple[str, ...] = _shown_list(items=48, count=2, default=())
+    #: For ``ols_coefficient``: the response field, the predictor terms (a
+    #: field, or two fields joined by ':' for their product) and which term's
+    #: coefficient is the quantity. An intercept is always included.
+    response: str = _shown(128, default="")
+    terms: tuple[str, ...] = _shown_list(items=260, count=MAX_OLS_TERMS, default=())
+    coefficient: str = _shown(260, default="")
+
+    @field_validator("field", "other_field", "response")
+    @classmethod
+    def _optional_field(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            return ""
+        return _field_name(stripped, "a reduction's field")
+
+    @field_validator("terms")
+    @classmethod
+    def _terms(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(value) > MAX_OLS_TERMS:
+            raise ValueError(f"at most {MAX_OLS_TERMS} regression terms")
+        checked: list[str] = []
+        for term in value:
+            parts = term.strip().split(":")
+            if not 1 <= len(parts) <= 2:
+                raise ValueError(
+                    f"a term is a field or two fields joined by ':': {term!r}"
+                )
+            checked.append(
+                ":".join(_field_name(part, "a term's field") for part in parts)
+            )
+        return tuple(checked)
+
+    @field_validator("coefficient")
+    @classmethod
+    def _coefficient(cls, value: str) -> str:
+        stripped = value.strip()
+        if len(stripped) > 260:
+            raise ValueError("a coefficient name is at most 260 characters")
+        return stripped
+
+    @field_validator("where")
+    @classmethod
+    def _where(cls, value: tuple[Condition, ...]) -> tuple[Condition, ...]:
+        if len(value) > MAX_CONDITIONS:
+            raise ValueError(f"at most {MAX_CONDITIONS} conditions")
+        return value
+
+    @field_validator("of")
+    @classmethod
+    def _of(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(value) > 2:
+            raise ValueError("difference and ratio take exactly two reductions")
+        for item in value:
+            if not re.fullmatch(ANALYSIS_NAME_PATTERN, item):
+                raise ValueError(f"{item!r} is not a reduction name")
+        return value
+
+    def fields_read(self) -> tuple[str, ...]:
+        """Every record field this reduction reads, for the required set."""
+
+        found = [self.field, self.other_field, self.response]
+        for term in self.terms:
+            found.extend(term.split(":"))
+        found.extend(item.field for item in self.where)
+        return tuple(dict.fromkeys(item for item in found if item))
+
+
+class Uncertainty(_Contract):
+    """How the primary statistic's uncertainty is computed, fixed in advance.
+
+    One method: a percentile bootstrap over the analysed records, with the
+    seed written down, so the interval is a deterministic function of the
+    data and the contract rather than of when it was computed.
+    """
+
+    method: Literal["bootstrap_percentile"] = "bootstrap_percentile"
+    level: float = Field(default=0.95, ge=0.5, le=0.999)
+    resamples: int = Field(default=1000, ge=100, le=5000)
+    seed: int = Field(default=20260915, ge=0, le=2**31 - 1)
+
+
+class SupportRequirement(_Contract):
+    """What the data must exhibit before the statistic may mean anything.
+
+    Declared by the analysis designer, who has not seen the design, and
+    checked by ordinary code against the records the run actually wrote. This
+    is the defence the co-design finding asked for and could not have at the
+    time: a design that collapses the variable a statistic depends on -- two
+    identical lambda levels, one instance size -- produces data that fails
+    its own contract, and the conclusion is INSUFFICIENT rather than a number
+    that means what the grid made it mean.
+    """
+
+    observable: str = Field(pattern=ANALYSIS_NAME_PATTERN)
+    min_records: int = Field(default=1, ge=1, le=1_000_000)
+    #: Field -> the least number of distinct values the analysed records must
+    #: hold for it.
+    min_distinct: dict[str, int] = Field(default_factory=dict)
+
+    @field_validator("min_distinct")
+    @classmethod
+    def _distinct(cls, value: dict[str, int]) -> dict[str, int]:
+        if len(value) > MAX_CONDITIONS:
+            raise ValueError(f"at most {MAX_CONDITIONS} distinctness requirements")
+        checked: dict[str, int] = {}
+        for name, count in value.items():
+            if not 1 <= int(count) <= 100_000:
+                raise ValueError("a distinctness requirement is between 1 and 100000")
+            checked[_field_name(name, "a distinctness field")] = int(count)
+        return checked
+
+
+class AnalysisSpec(_Contract):
+    """The analysis half of a scientific contract. See the section comment.
+
+    ``analysable: false`` is a complete answer, exactly as ``testable: false``
+    is for a design: "the observables this project can produce do not
+    identify the quantity this idea is about" is recorded, frozen, and caps
+    what any measurement of the idea may conclude at INSUFFICIENT.
+    """
+
+    analysable: bool
+    unanalysable_reason: str = _shown(MAX_SUMMARY_CHARS, default="")
+    #: The quantity the idea is about, in words.
+    estimand: str = _shown(MAX_STATEMENT_CHARS, default="")
+    #: What a SUPPORTS conclusion would mean about the idea, in words.
+    target_claim: str = _shown(MAX_STATEMENT_CHARS, default="")
+    observables: tuple[Observable, ...] = ()
+    reductions: tuple[Reduction, ...] = ()
+    primary_statistic: str = Field(default="", pattern=r"^([a-z][a-z0-9_]{0,47})?$")
+    uncertainty: Uncertainty | None = None
+    success: DecisionPredicate | None = None
+    failure: DecisionPredicate | None = None
+    support: tuple[SupportRequirement, ...] = ()
+    #: Fixed, and stated so the frozen record says it: one execution of the
+    #: preregistered specification, read once. No interim looks, no "run it
+    #: again until it clears".
+    stopping_rule: Literal["fixed_single_execution"] = "fixed_single_execution"
+    #: Fixed, and stated for the same reason: a required observable, field or
+    #: reduction that is absent, non-numeric or undefined makes the
+    #: conclusion INSUFFICIENT. There is no other value, and in particular no
+    #: "estimate it".
+    on_missing: Literal["INSUFFICIENT"] = "INSUFFICIENT"
+
+    @field_validator("unanalysable_reason")
+    @classmethod
+    def _reason(cls, value: str) -> str:
+        stripped = value.strip()
+        if len(stripped) <= MAX_SUMMARY_CHARS:
+            return stripped
+        return stripped[: MAX_SUMMARY_CHARS - 14].rstrip() + " [clipped]"
+
+    @field_validator("estimand", "target_claim")
+    @classmethod
+    def _statement(cls, value: str) -> str:
+        stripped = value.strip()
+        if len(stripped) > MAX_STATEMENT_CHARS:
+            raise ValueError(f"at most {MAX_STATEMENT_CHARS} characters")
+        return stripped
+
+    @field_validator("observables")
+    @classmethod
+    def _bounded_observables(
+        cls, value: tuple[Observable, ...]
+    ) -> tuple[Observable, ...]:
+        if len(value) > MAX_OBSERVABLES:
+            raise ValueError(f"at most {MAX_OBSERVABLES} observables")
+        return value
+
+    @field_validator("reductions")
+    @classmethod
+    def _bounded_reductions(cls, value: tuple[Reduction, ...]) -> tuple[Reduction, ...]:
+        if len(value) > MAX_REDUCTIONS:
+            raise ValueError(f"at most {MAX_REDUCTIONS} reductions")
+        return value
+
+    @field_validator("support")
+    @classmethod
+    def _bounded_support(
+        cls, value: tuple[SupportRequirement, ...]
+    ) -> tuple[SupportRequirement, ...]:
+        if len(value) > MAX_SUPPORT_RULES:
+            raise ValueError(f"at most {MAX_SUPPORT_RULES} support requirements")
+        return value
+
+    # -- relationships the field validators cannot see ----------------------
+    def check(self) -> None:
+        """Refuse an analysis that is incoherent before anything is frozen."""
+
+        if not self.analysable:
+            if not self.unanalysable_reason:
+                raise ContractError(
+                    "an analysis that says the idea cannot be analysed must say "
+                    "why; the reason is what a person reads to add the missing "
+                    "observable"
+                )
+            if self.observables or self.reductions or self.success or self.failure:
+                raise ContractError(
+                    "an unanalysable answer carries a reason and nothing else; a "
+                    "half-specified analysis is how a rule gets finished after "
+                    "the numbers are in"
+                )
+            return
+        if self.unanalysable_reason:
+            raise ContractError(
+                "an analysis is either specified or declared impossible, never both"
+            )
+        if not self.estimand:
+            raise ContractError("an analysis must name its estimand before any result")
+        if not self.observables:
+            raise ContractError("an analysis must read at least one raw observable")
+        if not self.reductions:
+            raise ContractError("an analysis must compute at least one quantity")
+        if self.success is None or self.failure is None:
+            raise ContractError(
+                "an analysis must fix both predicates -- the one under which the "
+                "idea's prediction held and the one under which it failed -- "
+                "before any result exists"
+            )
+
+        observables = {item.name: item for item in self.observables}
+        names = list(observables) + [item.name for item in self.reductions]
+        if len(set(names)) != len(names):
+            raise ContractError("observable and reduction names must all be distinct")
+
+        defined: dict[str, Reduction] = {}
+        for item in self.reductions:
+            self._check_reduction(item, observables=observables, defined=defined)
+            defined[item.name] = item
+
+        if self.primary_statistic not in defined:
+            raise ContractError(
+                f"the primary statistic {self.primary_statistic!r} is not a "
+                f"reduction this analysis computes"
+            )
+        if self.uncertainty is not None:
+            exact = [
+                predicate.comparator
+                for predicate in (self.success, self.failure)
+                if predicate.comparator in {"==", "!="}
+            ]
+            if exact:
+                raise ContractError(
+                    "an interval cannot be compared for exact equality; with an "
+                    "uncertainty the predicates must be <, <=, > or >="
+                )
+            if not self._depends_on_records(
+                self.primary_statistic, defined, observables
+            ):
+                raise ContractError(
+                    "a bootstrap resamples records, and the primary statistic "
+                    "reads none; drop the uncertainty or compute it from records"
+                )
+        for rule in self.support:
+            observable = observables.get(rule.observable)
+            if observable is None:
+                raise ContractError(
+                    f"a support requirement names {rule.observable!r}, which is "
+                    f"not an observable of this analysis"
+                )
+            if observable.kind != "records" and (
+                rule.min_distinct or rule.min_records > 1
+            ):
+                raise ContractError(
+                    f"{rule.observable!r} is a scalar; only a records observable "
+                    f"can be required to hold records or distinct values"
+                )
+
+    @staticmethod
+    def _check_reduction(
+        item: Reduction,
+        *,
+        observables: Mapping[str, Observable],
+        defined: Mapping[str, Reduction],
+    ) -> None:
+        op = item.op
+        if op in {"difference", "ratio"}:
+            if len(item.of) != 2:
+                raise ContractError(f"{item.name}: {op} takes exactly two reductions")
+            missing = [name for name in item.of if name not in defined]
+            if missing:
+                raise ContractError(
+                    f"{item.name}: {op} refers to {missing}, which are not "
+                    f"reductions computed earlier in the list"
+                )
+            return
+        if item.of:
+            raise ContractError(f"{item.name}: only difference and ratio take 'of'")
+        observable = observables.get(item.observable)
+        if observable is None:
+            raise ContractError(
+                f"{item.name}: {op} must read an observable of this analysis, and "
+                f"{item.observable!r} is not one"
+            )
+        if op == "value":
+            if observable.kind != "scalar":
+                raise ContractError(f"{item.name}: value reads a scalar observable")
+            return
+        if observable.kind != "records":
+            raise ContractError(f"{item.name}: {op} reads a records observable")
+        if op in FIELD_OPERATIONS and not item.field:
+            raise ContractError(f"{item.name}: {op} needs the field it aggregates")
+        if op == "quantile" and item.q is None:
+            raise ContractError(f"{item.name}: a quantile needs q")
+        if op != "quantile" and item.q is not None:
+            raise ContractError(f"{item.name}: only a quantile takes q")
+        if op == "fraction" and not item.where:
+            raise ContractError(
+                f"{item.name}: a fraction is the share of records satisfying its "
+                f"conditions, so it needs at least one"
+            )
+        if op == "correlation" and not (item.field and item.other_field):
+            raise ContractError(f"{item.name}: a correlation needs two fields")
+        if op == "ols_coefficient":
+            if not item.response or not item.terms:
+                raise ContractError(
+                    f"{item.name}: a regression needs a response field and terms"
+                )
+            if item.coefficient not in item.terms:
+                raise ContractError(
+                    f"{item.name}: the coefficient {item.coefficient!r} must be one "
+                    f"of the terms {list(item.terms)}"
+                )
+            if len(set(item.terms)) != len(item.terms):
+                raise ContractError(f"{item.name}: a term is listed twice")
+
+    @staticmethod
+    def _depends_on_records(
+        name: str,
+        defined: Mapping[str, Reduction],
+        observables: Mapping[str, Observable],
+    ) -> bool:
+        item = defined[name]
+        if item.op in {"difference", "ratio"}:
+            return any(
+                AnalysisSpec._depends_on_records(other, defined, observables)
+                for other in item.of
+            )
+        observable = observables.get(item.observable)
+        return observable is not None and observable.kind == "records"
+
+    def sources(self) -> tuple[str, ...]:
+        """Every raw output this analysis reads, in a stable order."""
+
+        return tuple(sorted({item.source for item in self.observables}))
+
+    def rendered_decision(self) -> str:
+        if not self.analysable or self.success is None or self.failure is None:
+            return "no analysis: " + (self.unanalysable_reason or "(no reason)")
+        interval = (
+            f" over the {self.uncertainty.level:g} bootstrap interval"
+            if self.uncertainty
+            else ""
+        )
+        return (
+            f"{self.primary_statistic}{interval}: supports when "
+            f"{self.success.rendered()}, contradicts when {self.failure.rendered()}"
+        )
+
+
+class DesignVariable(_Contract):
+    """One variable of an experimental design, and its levels."""
+
+    name: str = _shown(64)
+    role: Literal["manipulated", "controlled", "measured", "blocking"]
+    levels: tuple[float | int | str | bool, ...] = ()
+    description: str = _shown(MAX_STATEMENT_CHARS, default="")
+
+    @field_validator("name")
+    @classmethod
+    def _name(cls, value: str) -> str:
+        return _bounded(value, 64, "a design variable's name")
+
+    @field_validator("levels")
+    @classmethod
+    def _levels(
+        cls, value: tuple[float | int | str | bool, ...]
+    ) -> tuple[float | int | str | bool, ...]:
+        if len(value) > MAX_LEVELS:
+            raise ValueError(f"at most {MAX_LEVELS} levels")
+        for item in value:
+            if isinstance(item, str) and len(item) > 128:
+                raise ValueError("a level is at most 128 characters")
+        return value
+
+    @field_validator("description")
+    @classmethod
+    def _description(cls, value: str) -> str:
+        stripped = value.strip()
+        if len(stripped) > MAX_STATEMENT_CHARS:
+            raise ValueError(f"at most {MAX_STATEMENT_CHARS} characters")
+        return stripped
+
+
+class CapabilityRequest(_Contract):
+    """What a command would have to do for this idea to be testable here.
+
+    Designed autonomously and executable by nobody: declaring a command is the
+    researcher's act, in ``experiments.yaml``, outside every worktree. What a
+    request buys is that the refusal is *scientifically useful* -- it names
+    the capability precisely, in terms of the frozen analysis's observables,
+    and it survives on the contract so the idea resumes from here the moment
+    a person declares it.
+    """
+
+    name: str = _shown(64)
+    purpose: str = _shown(MAX_STATEMENT_CHARS)
+    inputs: str = _shown(MAX_STATEMENT_CHARS, default="")
+    outputs: str = _shown(MAX_STATEMENT_CHARS)
+    why_declared_commands_do_not_suffice: str = _shown(MAX_SUMMARY_CHARS, default="")
+
+    @field_validator("name")
+    @classmethod
+    def _name(cls, value: str) -> str:
+        return _bounded(value, 64, "a requested capability's name")
+
+    @field_validator("purpose", "outputs")
+    @classmethod
+    def _required(cls, value: str) -> str:
+        return _bounded(value, MAX_STATEMENT_CHARS, "this field")
+
+    @field_validator("inputs")
+    @classmethod
+    def _inputs(cls, value: str) -> str:
+        stripped = value.strip()
+        if len(stripped) > MAX_STATEMENT_CHARS:
+            raise ValueError(f"at most {MAX_STATEMENT_CHARS} characters")
+        return stripped
+
+    @field_validator("why_declared_commands_do_not_suffice")
+    @classmethod
+    def _why(cls, value: str) -> str:
+        stripped = value.strip()
+        if len(stripped) <= MAX_SUMMARY_CHARS:
+            return stripped
+        return stripped[: MAX_SUMMARY_CHARS - 14].rstrip() + " [clipped]"
+
+
+class DesignSpecification(_Contract):
+    """The design half of a scientific contract, authored against a frozen analysis.
+
+    What is *absent* is the point: there is no decision rule, no threshold
+    and no primary statistic here. The analysis already fixed them, before
+    this design existed, and the designer is not shown the thresholds -- so a
+    grid cannot be chosen to land on the right side of a number it does not
+    know. A design that tries to carry its own rule is refused by the
+    contract (``extra="forbid"``), not by a sentence in a prompt.
+    """
+
+    testable: bool
+    untestable_reason: str = _shown(MAX_SUMMARY_CHARS, default="")
+    #: When no declared command can produce the analysis's observables: the
+    #: command that would. Optional, and valuable.
+    required_capability: CapabilityRequest | None = None
+    command: str = _shown(64, default="")
+    command_parameters: dict[str, Any] = Field(default_factory=dict)
+    seeds: tuple[int, ...] = ()
+    resources: dict[str, str] = Field(default_factory=dict)
+    #: The experimental variables and their levels -- the grid, in words the
+    #: frozen record keeps beside the parameters that realise it.
+    variables: tuple[DesignVariable, ...] = ()
+    #: How the grid or sample is drawn, and how the parameters realise it.
+    sampling: str = _shown(MAX_STATEMENT_CHARS, default="")
+    dataset_identity: str = _shown(MAX_STATEMENT_CHARS, default="")
+    #: Which clause of the idea's falsifier this measurement tests.
+    falsification_criterion: str = _shown(MAX_STATEMENT_CHARS, default="")
+    #: Replication only: what this second measurement varies, and how.
+    variation_kind: str = _shown(MAX_STATEMENT_CHARS, default="")
+    variation_detail: str = _shown(MAX_SUMMARY_CHARS, default="")
+
+    @field_validator("command")
+    @classmethod
+    def _command_name(cls, value: str) -> str:
+        stripped = value.strip()
+        if len(stripped) > 64:
+            raise ValueError("a command name is at most 64 characters")
+        return stripped
+
+    @field_validator(
+        "sampling", "dataset_identity", "falsification_criterion", "variation_kind"
+    )
+    @classmethod
+    def _statement(cls, value: str) -> str:
+        stripped = value.strip()
+        if len(stripped) > MAX_STATEMENT_CHARS:
+            raise ValueError(f"at most {MAX_STATEMENT_CHARS} characters")
+        return stripped
+
+    @field_validator("untestable_reason", "variation_detail")
+    @classmethod
+    def _explanation(cls, value: str) -> str:
+        # Clipped rather than refused, for the reason
+        # `ExperimentDesign._explanation` records: an explanation nothing
+        # reads as evidence should not cost the answer it explains.
+        stripped = value.strip()
+        if len(stripped) <= MAX_SUMMARY_CHARS:
+            return stripped
+        return stripped[: MAX_SUMMARY_CHARS - 14].rstrip() + " [clipped]"
+
+    @field_validator("variables")
+    @classmethod
+    def _bounded_variables(
+        cls, value: tuple[DesignVariable, ...]
+    ) -> tuple[DesignVariable, ...]:
+        if len(value) > MAX_DESIGN_VARIABLES:
+            raise ValueError(f"at most {MAX_DESIGN_VARIABLES} design variables")
+        return value
+
+    # The same bounds `ExperimentDesign` applies, for the same reasons, and
+    # through the same functions so the two shapes cannot drift apart.
+    @field_validator("seeds")
+    @classmethod
+    def _bounded_seeds(cls, value: tuple[int, ...]) -> tuple[int, ...]:
+        return _checked_seeds(value)
+
+    @field_validator("command_parameters")
+    @classmethod
+    def _bounded_parameters(cls, value: dict[str, Any]) -> dict[str, Any]:
+        return _checked_parameters(value)
+
+    @field_validator("resources")
+    @classmethod
+    def _executor_resources(cls, value: dict[str, str]) -> dict[str, str]:
+        return _checked_resources(value)
+
+    def check(self) -> None:
+        if not self.testable:
+            if not self.untestable_reason:
+                raise ContractError(
+                    "a design that says the idea is not testable must say why"
+                )
+            return
+        if not self.command:
+            raise ContractError("a testable design must name a declared command")
+        if not self.falsification_criterion:
+            raise ContractError(
+                "a testable design must quote the clause of the idea's falsifier "
+                "it tests, so a design that tests something else is visible"
             )
 
 
@@ -1049,8 +1850,9 @@ CONTRACTS: dict[str, type[BaseModel]] = {
     "duplicate_adjudicator": DuplicateAdjudication,
     "novelty_screen": ScreenOutput,
     "literature_scout": NoveltyAuditOutput,
-    "experiment_designer": ExperimentDesign,
-    "replication_designer": ExperimentDesign,
+    "analysis_designer": AnalysisSpec,
+    "experiment_designer": DesignSpecification,
+    "replication_designer": DesignSpecification,
     "falsifier": FalsifierOutput,
     "methodology_reviewer": ReviewOutput,
     "novelty_reviewer": ReviewOutput,

@@ -219,6 +219,11 @@ _ADAPTER_ROLE: dict[ModelRole, AutomationRole] = {
     # judgement about text this system produced, not a reading of literature
     # and not a critique of science.
     ModelRole.DUPLICATE_ADJUDICATOR: AutomationRole.ANALYST,
+    # ANALYST, and deliberately not PLANNER: the experimentalist routes to
+    # PLANNER, and the author of a threshold should not be drawn from the
+    # pool that authors the grid it will be applied to. On a one-family host
+    # both are the same family anyway, and that is recorded, not hidden.
+    ModelRole.ANALYSIS_DESIGNER: AutomationRole.ANALYST,
 }
 
 

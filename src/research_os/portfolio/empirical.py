@@ -54,24 +54,35 @@ from typing import Any
 
 from research_os.errors import ExperimentSpecError, ResearchOSError
 from research_os.experiment.generated import GeneratedInput
+from research_os.portfolio import scicontract
 from research_os.portfolio.contracts import (
+    AnalysisSpec,
     ContractError,
     DecisionRule,
+    DesignSpecification,
     ExperimentDesign,
+    Observable,
+    Reduction,
     parse,
 )
 from research_os.portfolio.models import (
     EVIDENCE_STRENGTH_FOR_CONCLUSION,
     AdjudicationType,
+    ContractKind,
+    ContractState,
     EmpiricalConclusion,
     EvidenceKind,
     ExperimentRole,
     ExperimentState,
     IdeaExperiment,
     IdeaVersion,
+    ScientificContract,
 )
 from research_os.portfolio.prompts import TEMPLATES as PORTFOLIO_TEMPLATES
-from research_os.portfolio.store import DuplicateExperimentError
+from research_os.portfolio.store import (
+    DuplicateContractError,
+    DuplicateExperimentError,
+)
 from research_os.runtime.budgets import BudgetExhaustedError, Dimension
 from research_os.runtime.executors import (
     LOCAL,
@@ -495,11 +506,12 @@ def command_catalogue(
 
 
 def build_spec(
-    design: ExperimentDesign,
+    design: ExperimentDesign | DesignSpecification,
     *,
     commands: Mapping[str, Any],
     workspace: Path,
     max_seconds: int,
+    required_outputs: Sequence[str] = (),
 ) -> tuple[ExecutionSpec, DecisionRule | None, tuple[GeneratedInput, ...]]:
     """Turn a validated design into a frozen specification, or refuse it.
 
@@ -577,8 +589,29 @@ def build_spec(
         ) from None
 
     written = _paths_this_command_writes(spec, resolved)
-    rule = design.decision_rule
+    # A contract-bound design carries no rule -- `DesignSpecification` has no
+    # field for one -- and names what it must produce through the frozen
+    # analysis instead, as `required_outputs`.
+    rule = getattr(design, "decision_rule", None)
     outputs = list(resolved.outputs)
+    missing = [item for item in required_outputs if item not in written]
+    if missing:
+        # MODEL_OUTPUT_INVALID rather than POLICY_REFUSED: the analysis is
+        # frozen and correct, and a *different design* can satisfy it, so
+        # this costs a retry of the design rather than blocking the idea
+        # until a person returns -- the distinction `build_spec` already
+        # draws for a composed document that does not fit.
+        raise EmpiricalError(
+            f"the frozen analysis reads {', '.join(missing)}, which this design "
+            f"of {chosen} does not write. It writes: "
+            f"{', '.join(sorted(written)) or '(nothing declared)'}. A design "
+            f"must produce every observable its analysis was fixed over; set "
+            f"the output path parameter to the source the analysis names.",
+            failure_class=FailureClass.MODEL_OUTPUT_INVALID,
+        )
+    for item in required_outputs:
+        if item not in outputs:
+            outputs.append(item)
     if rule is not None:
         if rule.output_path not in written:
             raise EmpiricalError(
@@ -620,7 +653,7 @@ def build_spec(
 
 
 def _freeze_generated(
-    design: ExperimentDesign, *, spec: Any, command: str
+    design: ExperimentDesign | DesignSpecification, *, spec: Any, command: str
 ) -> tuple[GeneratedInput, ...]:
     """Freeze every composed document this command declares a parameter for.
 
@@ -1006,6 +1039,65 @@ def analyse(
     )
 
 
+def analyse_contract(
+    *,
+    verified: scicontract.VerifiedContract,
+    workspace: Path,
+    spec: ExecutionSpec,
+    exit_code: int | None,
+) -> tuple[Analysis, Any]:
+    """Apply a frozen contract's analysis to what the run wrote. No model.
+
+    The evaluation itself is :func:`research_os.portfolio.analysis.evaluate`,
+    over the documents read here; this function's job is the two things that
+    need the workspace. It collects and hashes every declared output, as
+    :func:`analyse` does. And it refuses to let the repository answer for
+    the run: a source byte-identical to the copy committed at the base
+    commit was not written by this measurement, so it is handed to the
+    analysis as *unavailable* -- which makes the conclusion INSUFFICIENT
+    rather than a reading of a number committed to Git before the question
+    was asked.
+    """
+
+    from research_os.portfolio import analysis as engine
+
+    outputs = _collect(workspace, spec.outputs)
+    produced = {path for path, _digest, _size in outputs}
+    absent = [item for item in spec.outputs if item not in produced]
+    missing = [item for item in absent if not (workspace / item).exists()]
+    unrecorded = [item for item in absent if (workspace / item).exists()]
+    notes: list[str] = []
+    if missing:
+        notes.append("declared outputs were not produced: " + ", ".join(missing))
+    if unrecorded:
+        notes.append(
+            "declared outputs were produced but not recorded, being past this "
+            f"run's limit of {MAX_COLLECTED_OUTPUTS} files or "
+            f"{MAX_COLLECTED_BYTES // (1024 * 1024)}MB each: " + ", ".join(unrecorded)
+        )
+    documents: dict[str, Any] = {}
+    for source in verified.analysis.sources():
+        stale = _was_already_in_the_checkout(workspace, source)
+        if stale is not None:
+            documents[source] = engine.Unavailable(
+                f"{source} is still byte-identical to the copy committed at "
+                f"{stale[:12]}, so it was not written by this run (exit {exit_code})"
+            )
+            continue
+        documents[source] = engine.load_document(workspace / source)
+    result = engine.evaluate(verified.analysis, documents)
+    return (
+        Analysis(
+            conclusion=result.conclusion,
+            summary=result.summary,
+            observed=result.statistic,
+            outputs=outputs,
+            notes=(*notes, *result.notes),
+        ),
+        result,
+    )
+
+
 def _was_already_in_the_checkout(workspace: Path, relative: str) -> str | None:
     """The base commit, when ``relative`` there is byte-identical to the committed copy.
 
@@ -1088,6 +1180,356 @@ class ExperimentStep:
     evidence_id: str | None = None
 
 
+def _analysis_designer() -> Any:
+    return PORTFOLIO_TEMPLATES["analysis_designer"]
+
+
+def _contract_is_stale(context: Any, contract: ScientificContract) -> bool:
+    """Whether this contract was frozen by a prompt this build has retired.
+
+    The rule `_is_stale` applies to a design, one level up and for the same
+    reason: a commitment produced by a superseded prompt is a commitment to a
+    question no longer being asked. **Never** once anything has been read
+    under it -- what was measured was measured, and re-freezing a contract
+    because a prompt's wording changed would be a second bite at one
+    question. An inherited analysis (a replication's) is judged by its
+    design alone, because re-inheriting it would inherit the same analysis.
+    """
+
+    if contract.state is ContractState.SUPERSEDED:
+        return False
+    if any(
+        item.contract_id == contract.contract_id
+        and item.state is ExperimentState.INTERPRETED
+        for item in context.portfolio.list_experiments(idea_id=contract.idea_id)
+    ):
+        return False
+    current = _analysis_designer().identity
+    analysed_here = contract.analysis_prompt.startswith(f"{_analysis_designer().name}@")
+    if analysed_here and contract.analysis_prompt != current:
+        return True
+    return bool(
+        contract.design_prompt
+        and contract.design_prompt != designer_for(contract.role).identity
+    )
+
+
+def analysis_from_legacy_rule(
+    rule: DecisionRule | None, *, reason: str | None
+) -> AnalysisSpec:
+    """The frozen analysis a pre-contract experiment's rule *was*.
+
+    Deterministic, and exact: a legacy rule read one number at one path in
+    one file and compared it with two predicates, which is the analysis
+    ``value`` of one scalar observable. Used when a replication is designed
+    against a primary that predates contracts, so the replication inherits
+    the rule the primary was actually read under rather than a new one.
+    """
+
+    if rule is None:
+        return AnalysisSpec(
+            analysable=False,
+            unanalysable_reason=reason or "the primary experiment fixed no rule",
+        )
+    return AnalysisSpec(
+        analysable=True,
+        estimand=rule.metric_description or rule.metric_path,
+        observables=(
+            Observable(
+                name="metric",
+                source=rule.output_path,
+                kind="scalar",
+                path=rule.metric_path,
+            ),
+        ),
+        reductions=(Reduction(name="statistic", op="value", observable="metric"),),
+        primary_statistic="statistic",
+        success=rule.success,
+        failure=rule.failure,
+    )
+
+
+def _freeze_analysis(
+    context: Any,
+    version: IdeaVersion,
+    *,
+    role: ExperimentRole,
+    spec: AnalysisSpec,
+    provenance: Mapping[str, Any],
+    analysis_prompt: str,
+    analysis_call_id: str | None,
+) -> ScientificContract:
+    """Store one analysis immutably and open its contract. Raises on a race."""
+
+    from research_os.portfolio.ids import new_contract_id
+
+    contract_id = new_contract_id()
+    document = scicontract.analysis_document(
+        contract_id=contract_id,
+        project_id=context.project_id,
+        version=version,
+        role=str(role),
+        kind=ContractKind.PREREGISTERED,
+        spec=spec,
+        provenance=provenance,
+    )
+    ref = context.artifacts.put_text(
+        json.dumps(
+            document, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False
+        ),
+        media_type="application/json",
+        role=f"idea_analysis:{document['analysis_digest']}",
+        producer=analysis_prompt or "portfolio.empirical",
+    )
+    context.artifacts.link(
+        ref, role=f"idea_analysis:{document['analysis_digest']}", run_id=context.run_id
+    )
+    return context.portfolio.create_contract(
+        contract_id=contract_id,
+        project_id=context.project_id,
+        idea_id=version.idea_id,
+        idea_version=version.version,
+        role=role,
+        hypothesis_digest=version.content_digest,
+        analysable=spec.analysable,
+        analysis_digest=document["analysis_digest"],
+        analysis_artifact_id=ref.artifact_id,
+        analysis_prompt=analysis_prompt,
+        analysis_call_id=analysis_call_id,
+    )
+
+
+def ensure_analysis(
+    context: Any,
+    version: IdeaVersion,
+    *,
+    role: ExperimentRole = ExperimentRole.PRIMARY,
+    previous: IdeaExperiment | None = None,
+    commands: Mapping[str, Any] | None = None,
+) -> ExperimentStep | HeldContract:
+    """The live contract for this idea version and role, its analysis frozen.
+
+    **The analysis is fixed first, by its own role, before any design
+    exists.** That order is the fix for the co-design the discovery report's
+    §AB.5 demonstrated: when one call chose both the grid and the threshold,
+    a "preregistered" SUPPORTS was reachable by choosing the grid. Here the
+    threshold's author has not seen a grid, because there is not one yet, and
+    the grid's author is not shown the threshold.
+
+    A replication does not get a new analysis. It inherits the primary's,
+    verified against the primary's contract, so "the replication measures
+    what the primary measured" is a property of the digest rather than a
+    comparison of two model-written paths.
+
+    Returns the contract, or a failed :class:`ExperimentStep` saying why none
+    could be frozen.
+    """
+
+    store = context.portfolio
+    contract = store.live_contract(
+        idea_id=version.idea_id, idea_version=version.version, role=role
+    )
+    if contract is not None and _contract_is_stale(context, contract):
+        _retire_contract(
+            context,
+            contract,
+            detail=(
+                f"frozen by {contract.analysis_prompt or 'an unrecorded prompt'}"
+                f"{' / ' + contract.design_prompt if contract.design_prompt else ''}, "
+                f"which this build has retired, before anything was measured"
+            ),
+        )
+        contract = None
+    if contract is not None:
+        return HeldContract(contract)
+
+    if role is ExperimentRole.REPLICATION:
+        return _inherit_analysis(context, version, previous=previous)
+
+    template = _analysis_designer()
+    catalogue = (
+        command_catalogue(
+            commands,
+            repository=Path(context.repo_path) if context.repo_path else None,
+        )
+        if commands
+        else [
+            (
+                "This project declares NO experiment commands. Nothing here can "
+                "be run, so any observable you name is one a command would have "
+                "to be declared to produce. Name the observables the question "
+                "needs -- files, fields, what each record is -- precisely enough "
+                "that a researcher could declare that command from your "
+                "description; or say the idea is not analysable and why."
+            )
+        ]
+    )
+    from research_os.portfolio.runner import _ask, _cost
+
+    try:
+        response = _ask(
+            context,
+            template,
+            blocks={"idea": _idea_block(version), "observable_catalogue": catalogue},
+        )
+    except ProviderCallFailedError as exc:
+        return ExperimentStep(
+            ok=False,
+            detail=f"the analysis designer could not be reached: {exc}",
+            failure_class=FailureClass.PROVIDER_UNAVAILABLE,
+        )
+    except BudgetExhaustedError as exc:
+        return ExperimentStep(
+            ok=False, detail=str(exc), failure_class=FailureClass.BUDGET_EXHAUSTED
+        )
+    cost = str(_cost(response))
+    if not response.ok:
+        return ExperimentStep(
+            ok=False,
+            detail=f"the analysis designer returned nothing usable: {response.error}",
+            failure_class=FailureClass.MODEL_OUTPUT_INVALID,
+            cost_usd=cost,
+            model_calls=1,
+        )
+    try:
+        spec = parse(
+            AnalysisSpec,
+            structured=response.structured,
+            text=response.text,
+            role=template.name,
+        )
+        spec.check()
+    except ContractError as exc:
+        return ExperimentStep(
+            ok=False,
+            detail=str(exc),
+            failure_class=FailureClass.MODEL_OUTPUT_INVALID,
+            cost_usd=cost,
+            model_calls=1,
+        )
+    try:
+        contract = _freeze_analysis(
+            context,
+            version,
+            role=role,
+            spec=spec,
+            provenance={
+                "analysis_role": str(template.role),
+                "analysis_prompt": template.identity,
+                "analysis_call_id": response.call_id,
+                "provider": response.provider,
+                "model": response.model,
+            },
+            analysis_prompt=template.identity,
+            analysis_call_id=response.call_id,
+        )
+    except DuplicateContractError:
+        # Another pass froze one first, and that one is the commitment.
+        existing = store.live_contract(
+            idea_id=version.idea_id, idea_version=version.version, role=role
+        )
+        if existing is None:  # pragma: no cover - the index says otherwise
+            raise
+        return HeldContract(existing, cost_usd=cost, model_calls=1)
+    return HeldContract(contract, cost_usd=cost, model_calls=1)
+
+
+@dataclass(frozen=True, slots=True)
+class HeldContract:
+    """A live contract, and what freezing its analysis cost *this* call."""
+
+    contract: ScientificContract
+    cost_usd: str = "0"
+    model_calls: int = 0
+
+
+def _inherit_analysis(
+    context: Any, version: IdeaVersion, *, previous: IdeaExperiment | None
+) -> ExperimentStep | HeldContract:
+    if previous is None:  # pragma: no cover - advance() refuses first
+        return ExperimentStep(
+            ok=False,
+            detail="a replication is designed against the experiment it replicates",
+            failure_class=FailureClass.POLICY_REFUSED,
+        )
+    if previous.contract_id:
+        primary = context.portfolio.require_contract(previous.contract_id)
+        try:
+            verified = scicontract.verify(context.artifacts, primary, version=version)
+        except scicontract.ContractIntegrityError as exc:
+            return ExperimentStep(
+                ok=False, detail=str(exc), failure_class=exc.failure_class
+            )
+        spec = verified.analysis
+        source = primary.contract_id
+    else:
+        legacy = (
+            DecisionRule.model_validate(previous.decision_rule)
+            if previous.decision_rule
+            else None
+        )
+        spec = analysis_from_legacy_rule(legacy, reason=previous.no_rule_reason)
+        source = previous.experiment_id
+    try:
+        contract = _freeze_analysis(
+            context,
+            version,
+            role=ExperimentRole.REPLICATION,
+            spec=spec,
+            provenance={"inherited_from": source},
+            analysis_prompt=f"inherited:{source}",
+            analysis_call_id=None,
+        )
+    except DuplicateContractError:
+        existing = context.portfolio.live_contract(
+            idea_id=version.idea_id,
+            idea_version=version.version,
+            role=ExperimentRole.REPLICATION,
+        )
+        if existing is None:  # pragma: no cover
+            raise
+        return HeldContract(existing)
+    return HeldContract(contract)
+
+
+def _retire_contract(
+    context: Any, contract: ScientificContract, *, detail: str
+) -> None:
+    """Supersede a contract and every open execution of it, workspaces included."""
+
+    for item in context.portfolio.list_experiments(idea_id=contract.idea_id):
+        if item.contract_id != contract.contract_id or not item.open:
+            continue
+        context.portfolio.update_experiment(
+            item.experiment_id, state=ExperimentState.SUPERSEDED, detail=detail
+        )
+        if context.repo_path is not None:
+            release_workspace(item, repository=Path(context.repo_path))
+    context.portfolio.supersede_contract(contract.contract_id, detail=detail)
+
+
+def row_rule(spec: AnalysisSpec, contract_id: str) -> dict[str, Any] | None:
+    """What an experiment row records as its rule when a contract holds the real one.
+
+    A summary for readers of the row, and compared -- as a whole dict -- with
+    the same summary in the preregistration before anything is read. The
+    authority is the contract, which `scicontract.verify` re-hashes.
+    """
+
+    if not spec.analysable or spec.success is None or spec.failure is None:
+        return None
+    return {
+        "contract_id": contract_id,
+        "primary_statistic": spec.primary_statistic,
+        "success": spec.success.model_dump(mode="json"),
+        "failure": spec.failure.model_dump(mode="json"),
+        "uncertainty": (
+            spec.uncertainty.model_dump(mode="json") if spec.uncertainty else None
+        ),
+        "analysis_digest": scicontract.analysis_digest(spec),
+    }
+
+
 def design(
     context: Any,
     version: IdeaVersion,
@@ -1095,46 +1537,116 @@ def design(
     role: ExperimentRole = ExperimentRole.PRIMARY,
     previous: IdeaExperiment | None = None,
 ) -> ExperimentStep:
-    """Ask for one experiment over a declared command, and freeze it.
+    """Freeze a scientific contract for this idea version, then an execution of it.
 
-    The one model call on the empirical route. What comes back is checked
-    against the project's own declarations by ordinary code before anything is
-    stored, and what is stored is the *resolved* specification -- so the thing
-    that later runs is the thing that was preregistered, not a second reading
-    of the same design.
+    Two model calls, by two roles, in a fixed order -- the analysis designer
+    and then the experiment designer -- and everything between and after them
+    is ordinary code: freezing the analysis, checking the design against the
+    declared commands and against the analysis's observables, hashing the
+    design, the contract and the specification, and storing each immutably
+    before anything could run. A crash anywhere leaves the halves already
+    frozen, and the next attempt resumes from them rather than asking again.
+
+    **An undeclared capability is refused, and the refusal is kept.** When no
+    declared command can produce what the frozen analysis reads, the contract
+    is recorded as ``BLOCKED_CAPABILITY`` with a request describing the
+    command that would -- and the analysis stays frozen, so the idea resumes
+    from here, not from scratch, when a person declares one.
     """
 
     commands = declared_commands(context.project_id)
-    if not commands:
+    replication = role is ExperimentRole.REPLICATION
+    if replication and previous is None:  # pragma: no cover - the caller always has one
+        raise EmpiricalError(
+            "a replication is designed against the experiment it replicates",
+            failure_class=FailureClass.CODE_EXCEPTION,
+        )
+    held = ensure_analysis(
+        context, version, role=role, previous=previous, commands=commands
+    )
+    if isinstance(held, ExperimentStep):
+        return held
+    contract = held.contract
+    analysis_cost, analysis_calls = held.cost_usd, held.model_calls
+    try:
+        verified = scicontract.verify(context.artifacts, contract, version=version)
+    except scicontract.ContractIntegrityError as exc:
+        return ExperimentStep(
+            ok=False,
+            detail=str(exc),
+            failure_class=exc.failure_class,
+            cost_usd=analysis_cost,
+            model_calls=analysis_calls,
+        )
+    analysis = verified.analysis
+
+    if contract.state is ContractState.FROZEN:
+        # Frozen, and nothing live executes it: a crash between freezing the
+        # contract and recording the experiment. Recover the execution the
+        # contract recorded rather than designing anything twice.
+        return _recover_execution(context, verified)
+
+    current_commands = scicontract.command_set_digest(commands)
+    if (
+        contract.state is ContractState.BLOCKED_CAPABILITY
+        and contract.command_set_digest == current_commands
+    ):
+        request = contract.capability_request or {}
         return ExperimentStep(
             ok=False,
             detail=(
-                "no experiment commands are declared for this project, so there "
-                "is nothing this runtime may run. Declare one in "
-                "experiments.yaml; until then an empirical idea cannot be "
-                "settled here."
+                "still waiting for a capability no declared command provides; "
+                "nothing about the declared commands has changed since this was "
+                "judged. Requested: "
+                + str(request.get("purpose") or request.get("name") or "(see contract)")
+                + f" [contract {contract.contract_id}]"
             ),
             failure_class=FailureClass.CAPABILITY_DENIED,
+            cost_usd=analysis_cost,
+            model_calls=analysis_calls,
+        )
+    if not commands:
+        reason = (
+            "no experiment commands are declared for this project, so there is "
+            "nothing this runtime may run. The frozen analysis says what a "
+            "command would have to write; declaring one in experiments.yaml is "
+            "the researcher's decision."
+        )
+        context.portfolio.block_contract_on_capability(
+            contract.contract_id,
+            capability_request=scicontract.capability_request_from_analysis(
+                analysis, reason=reason
+            ),
+            command_set_digest=current_commands,
+            detail=reason,
+        )
+        return ExperimentStep(
+            ok=False,
+            detail=f"{reason} [contract {contract.contract_id}]",
+            failure_class=FailureClass.CAPABILITY_DENIED,
+            cost_usd=analysis_cost,
+            model_calls=analysis_calls,
         )
 
-    replication = role is ExperimentRole.REPLICATION
     template = designer_for(role)
     blocks: dict[str, Sequence[str]] = {
         "idea": _idea_block(version),
+        "analysis_requirements": scicontract.requirements_block(analysis),
         "declared_commands": command_catalogue(
             commands,
             repository=Path(context.repo_path) if context.repo_path else None,
         ),
     }
     if replication:
-        if previous is None:  # pragma: no cover - the caller always has one
-            raise EmpiricalError(
-                "a replication is designed against the experiment it replicates",
-                failure_class=FailureClass.CODE_EXCEPTION,
-            )
+        assert previous is not None
         blocks["first_experiment"] = _first_experiment_block(previous)
 
     from research_os.portfolio.runner import _ask, _cost
+
+    def spent(cost: str, calls: int) -> tuple[str, int]:
+        from decimal import Decimal
+
+        return str(Decimal(analysis_cost) + Decimal(cost)), analysis_calls + calls
 
     try:
         response = _ask(
@@ -1152,23 +1664,29 @@ def design(
             ok=False,
             detail=f"the experiment designer could not be reached: {exc}",
             failure_class=FailureClass.PROVIDER_UNAVAILABLE,
+            cost_usd=analysis_cost,
+            model_calls=analysis_calls,
         )
     except BudgetExhaustedError as exc:
         return ExperimentStep(
-            ok=False, detail=str(exc), failure_class=FailureClass.BUDGET_EXHAUSTED
+            ok=False,
+            detail=str(exc),
+            failure_class=FailureClass.BUDGET_EXHAUSTED,
+            cost_usd=analysis_cost,
+            model_calls=analysis_calls,
         )
-    cost = str(_cost(response))
+    cost, calls = spent(str(_cost(response)), 1)
     if not response.ok:
         return ExperimentStep(
             ok=False,
             detail=f"the experiment designer returned nothing usable: {response.error}",
             failure_class=FailureClass.MODEL_OUTPUT_INVALID,
             cost_usd=cost,
-            model_calls=1,
+            model_calls=calls,
         )
     try:
         proposed = parse(
-            ExperimentDesign,
+            DesignSpecification,
             structured=response.structured,
             text=response.text,
             role=template.name,
@@ -1180,32 +1698,52 @@ def design(
             detail=str(exc),
             failure_class=FailureClass.MODEL_OUTPUT_INVALID,
             cost_usd=cost,
-            model_calls=1,
+            model_calls=calls,
         )
 
     if not proposed.testable:
-        # A complete and useful answer. "This idea cannot be measured with the
-        # commands this project declares" is better science than measuring
-        # something else and calling it a test of the idea.
+        # A complete and useful answer, and now a kept one: the request says
+        # what command would make this testable, in terms of the frozen
+        # analysis's observables, and the contract resumes from here.
+        request = (
+            proposed.required_capability.model_dump(mode="json")
+            if proposed.required_capability is not None
+            else scicontract.capability_request_from_analysis(
+                analysis, reason=proposed.untestable_reason
+            )
+        )
+        request["untestable_reason"] = proposed.untestable_reason
+        request["observables"] = [
+            {"source": item.source, "kind": item.kind, "path": item.path}
+            for item in analysis.observables
+        ]
+        context.portfolio.block_contract_on_capability(
+            contract.contract_id,
+            capability_request=request,
+            command_set_digest=current_commands,
+            detail=proposed.untestable_reason,
+        )
         return ExperimentStep(
             ok=False,
             detail=(
                 "this idea is not testable with the commands this project "
-                f"declares: {proposed.untestable_reason}"
+                f"declares: {proposed.untestable_reason} [contract "
+                f"{contract.contract_id}]"
             ),
             failure_class=FailureClass.CAPABILITY_DENIED,
             cost_usd=cost,
-            model_calls=1,
+            model_calls=calls,
         )
 
     experiment_id = _reserve_id()
     workspace = workspace_for(experiment_id)
     try:
-        spec, rule, frozen_inputs = build_spec(
+        spec, _rule, frozen_inputs = build_spec(
             proposed,
             commands=commands,
             workspace=workspace,
             max_seconds=context.config.bounds.max_experiment_seconds,
+            required_outputs=analysis.sources(),
         )
     except EmpiricalError as exc:
         return ExperimentStep(
@@ -1213,49 +1751,32 @@ def design(
             detail=str(exc),
             failure_class=exc.failure_class,
             cost_usd=cost,
-            model_calls=1,
+            model_calls=calls,
         )
 
     variation = variation_digest(spec)
     if replication and previous is not None:
         try:
             assert_varies(replication=variation, primary=previous.variation_digest)
-            assert_measures_the_same_thing(rule, previous)
         except EmpiricalError as exc:
             return ExperimentStep(
                 ok=False,
                 detail=str(exc),
                 failure_class=exc.failure_class,
                 cost_usd=cost,
-                model_calls=1,
+                model_calls=calls,
             )
 
-    digest = spec_digest(spec)
-    record = {
-        "schema": "portfolio-preregistration-v1",
-        "experiment_id": experiment_id,
-        "idea_id": context.idea_id,
-        "idea_version": version.version,
-        "idea_content_digest": version.content_digest,
-        "role": str(role),
-        "command": proposed.command,
-        "command_parameters": dict(spec_parameters(spec, proposed)),
-        "primary_endpoint": proposed.primary_endpoint,
-        "secondary_endpoints": list(proposed.secondary_endpoints),
-        "falsification_criterion": proposed.falsification_criterion,
-        "dataset_identity": proposed.dataset_identity,
-        "decision_rule": rule.model_dump(mode="json") if rule else None,
-        "no_decision_rule_reason": proposed.no_decision_rule_reason,
-        "variation_kind": proposed.variation_kind,
-        "variation_detail": proposed.variation_detail,
-        "spec_digest": digest,
-        "variation_digest": variation,
-        "spec": _spec_record(spec),
-        # What was composed, by digest and by the path this system chose --
-        # never by content. The bytes are in the artifact store under exactly
-        # this digest, so the record stays small and the document stays
-        # recoverable, and `submit` rehashes what it reads before writing it.
-        "generated_inputs": [item.record() for item in frozen_inputs],
+    composed = {item.parameter: item.sha256 for item in frozen_inputs}
+    design_record = scicontract.design_payload(proposed, spec=spec, composed=composed)
+    design_hash = scicontract.design_digest(design_record)
+    provenance = {
+        **dict(verified.document.get("provenance") or {}),
+        "design_role": str(template.role),
+        "design_prompt": template.identity,
+        "design_call_id": response.call_id,
+        "design_provider": response.provider,
+        "design_model": response.model,
     }
     for item in frozen_inputs:
         # Stored *before* the preregistration that names it, so a crash
@@ -1272,16 +1793,101 @@ def design(
             role=f"idea_experiment_input:{item.sha256}",
             run_id=context.run_id,
         )
-    ref = context.artifacts.put_text(
+    design_ref = context.artifacts.put_text(
         json.dumps(
-            record, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False
+            {
+                "schema": scicontract.DESIGN_SCHEMA,
+                "contract_id": contract.contract_id,
+                "design": design_record,
+                "design_digest": design_hash,
+                "provenance": provenance,
+            },
+            indent=2,
+            sort_keys=True,
+            ensure_ascii=False,
+            allow_nan=False,
+        ),
+        media_type="application/json",
+        role=f"idea_design:{design_hash}",
+        producer=f"{response.provider}:{template.identity}",
+    )
+    context.artifacts.link(
+        design_ref, role=f"idea_design:{design_hash}", run_id=context.run_id
+    )
+
+    contract_hash = scicontract.contract_digest(
+        idea_id=contract.idea_id,
+        idea_version=contract.idea_version,
+        hypothesis_digest=contract.hypothesis_digest,
+        role=str(contract.role),
+        kind=contract.kind,
+        analysis_digest=contract.analysis_digest,
+        design_digest=design_hash,
+    )
+    rule_summary = row_rule(analysis, contract.contract_id)
+    digest = spec_digest(spec)
+    prereg = _preregistration_record(
+        experiment_id=experiment_id,
+        context=context,
+        version=version,
+        role=role,
+        design=proposed,
+        spec=spec,
+        spec_hash=digest,
+        variation=variation,
+        frozen_inputs=frozen_inputs,
+        contract=contract,
+        contract_hash=contract_hash,
+        design_hash=design_hash,
+        analysis=analysis,
+        rule_summary=rule_summary,
+    )
+    prereg_ref = context.artifacts.put_text(
+        json.dumps(
+            prereg, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False
         ),
         media_type="application/json",
         role=f"idea_preregistration:{digest}",
         producer=f"{response.provider}:{template.identity}",
     )
     context.artifacts.link(
-        ref, role=f"idea_preregistration:{digest}", run_id=context.run_id
+        prereg_ref, role=f"idea_preregistration:{digest}", run_id=context.run_id
+    )
+    document = scicontract.contract_document(
+        contract=contract,
+        version=version,
+        spec=analysis,
+        design=design_record,
+        execution={
+            "experiment_id": experiment_id,
+            "command": proposed.command,
+            "spec_digest": digest,
+            "variation_digest": variation,
+            "workspace_path": str(workspace),
+            "preregistration_artifact_id": prereg_ref.artifact_id,
+            "implementation": scicontract.implementation_fields(spec),
+        },
+        provenance=provenance,
+    )
+    contract_ref = context.artifacts.put_text(
+        json.dumps(
+            document, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False
+        ),
+        media_type="application/json",
+        role=f"idea_contract:{contract_hash}",
+        producer="portfolio.scicontract",
+    )
+    context.artifacts.link(
+        contract_ref, role=f"idea_contract:{contract_hash}", run_id=context.run_id
+    )
+    contract = context.portfolio.freeze_contract(
+        contract.contract_id,
+        design_digest=design_hash,
+        design_artifact_id=design_ref.artifact_id,
+        contract_digest=contract_hash,
+        contract_artifact_id=contract_ref.artifact_id,
+        design_prompt=template.identity,
+        design_call_id=response.call_id,
     )
 
     try:
@@ -1294,42 +1900,344 @@ def design(
             spec_digest=digest,
             variation_digest=variation,
             workspace_path=str(workspace),
-            decision_rule=rule.model_dump(mode="json") if rule else None,
-            no_rule_reason=proposed.no_decision_rule_reason or None,
-            preregistration_artifact_id=ref.artifact_id,
+            decision_rule=rule_summary,
+            no_rule_reason=(
+                None if rule_summary is not None else analysis.unanalysable_reason
+            ),
+            preregistration_artifact_id=prereg_ref.artifact_id,
             origin_call_id=response.call_id,
-            # The id reserved above, not a fresh one. `workspace_for` derives
-            # the disposable worktree from it and `spec.cwd` is inside the
-            # specification digest, so a row with a different id would carry
-            # a digest describing a directory nothing runs in.
             experiment_id=experiment_id,
             prompt_version=template.identity,
+            contract_id=contract.contract_id,
         )
     except DuplicateExperimentError as exc:
-        # Another pass designed one first. Not a defect, and not something to
-        # work around: the row that is there is the commitment, and this
-        # design is discarded rather than stored beside it.
         return ExperimentStep(
             ok=False,
             detail=str(exc),
             failure_class=FailureClass.POLICY_REFUSED,
             cost_usd=cost,
-            model_calls=1,
+            model_calls=calls,
         )
     return ExperimentStep(
         ok=True,
         detail=(
-            f"preregistered {role} experiment {experiment.experiment_id} over the "
-            f"declared command {proposed.command} ({digest[:12]}); "
-            + (rule.rendered() if rule else "no machine-checkable rule")
+            f"froze contract {contract.contract_id} ({contract_hash[:24]}) and "
+            f"preregistered {role} experiment {experiment.experiment_id} over "
+            f"the declared command {proposed.command} ({digest[:12]}); "
+            + analysis.rendered_decision()
         ),
         experiment=experiment,
         cost_usd=cost,
-        model_calls=1,
+        model_calls=calls,
     )
 
 
-def spec_parameters(spec: ExecutionSpec, design: ExperimentDesign) -> Mapping[str, Any]:
+def _preregistration_record(
+    *,
+    experiment_id: str,
+    context: Any,
+    version: IdeaVersion,
+    role: ExperimentRole,
+    design: DesignSpecification,
+    spec: ExecutionSpec,
+    spec_hash: str,
+    variation: str,
+    frozen_inputs: Sequence[GeneratedInput],
+    contract: ScientificContract,
+    contract_hash: str,
+    design_hash: str,
+    analysis: AnalysisSpec,
+    rule_summary: Mapping[str, Any] | None,
+    repair_of: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "schema": "portfolio-preregistration-v2",
+        "experiment_id": experiment_id,
+        "idea_id": version.idea_id,
+        "idea_version": version.version,
+        "idea_content_digest": version.content_digest,
+        "role": str(role),
+        "command": design.command,
+        "command_parameters": dict(spec_parameters(spec, design)),
+        "contract_id": contract.contract_id,
+        "contract_digest": contract_hash,
+        "analysis_digest": contract.analysis_digest,
+        "design_digest": design_hash,
+        "estimand": analysis.estimand,
+        "falsification_criterion": design.falsification_criterion,
+        "dataset_identity": design.dataset_identity,
+        "decision_rule": dict(rule_summary) if rule_summary else None,
+        "no_decision_rule_reason": (
+            None if rule_summary is not None else analysis.unanalysable_reason
+        ),
+        "variation_kind": design.variation_kind,
+        "variation_detail": design.variation_detail,
+        "spec_digest": spec_hash,
+        "variation_digest": variation,
+        "spec": _spec_record(spec),
+        "implementation": scicontract.implementation_fields(spec),
+        "repair_of": repair_of,
+        "generated_inputs": [item.record() for item in frozen_inputs],
+    }
+
+
+def amend_contract(
+    context: Any,
+    parent: ScientificContract,
+    *,
+    spec: AnalysisSpec,
+    reason: str,
+) -> ScientificContract:
+    """A rule changed after a result: a new EXPLORATORY contract, never an edit.
+
+    Sometimes the right scientific move after seeing a result is to ask it a
+    different question -- a looser threshold, a different reduction, an
+    exclusion nobody anticipated. What makes that science rather than
+    fishing is that it is *labelled*: the original contract is untouched
+    (the database refuses the edit anyway), and the new one is
+    ``EXPLORATORY``, names its parent, inherits the parent's design because
+    it re-reads the parent's measurement, and carries its own digest. No gate
+    counts an exploratory reading as confirmatory; confirming it takes a new
+    idea with a preregistered contract and a new execution.
+    """
+
+    from research_os.portfolio.ids import new_contract_id
+
+    if parent.state is not ContractState.FROZEN:
+        raise EmpiricalError(
+            f"{parent.contract_id} is {parent.state}; only a frozen contract has a "
+            f"measurement to re-read",
+            failure_class=FailureClass.POLICY_REFUSED,
+        )
+    spec.check()
+    grandparent = (
+        context.portfolio.get_contract(parent.parent_contract_id)
+        if parent.parent_contract_id
+        else None
+    )
+    verified = scicontract.verify(context.artifacts, parent, parent=grandparent)
+    version = context.portfolio.require_version(parent.idea_id, parent.idea_version)
+    contract_id = new_contract_id()
+    analysis_doc = scicontract.analysis_document(
+        contract_id=contract_id,
+        project_id=parent.project_id,
+        version=version,
+        role=str(parent.role),
+        kind=ContractKind.EXPLORATORY,
+        spec=spec,
+        provenance={"amends": parent.contract_id, "reason": reason},
+        parent_contract_id=parent.contract_id,
+    )
+    analysis_ref = context.artifacts.put_text(
+        json.dumps(
+            analysis_doc, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False
+        ),
+        media_type="application/json",
+        role=f"idea_analysis:{analysis_doc['analysis_digest']}",
+        producer="portfolio.empirical.amend_contract",
+    )
+    design = dict(verified.design or {})
+    document = scicontract.contract_document(
+        identity={
+            "contract_id": contract_id,
+            "project_id": parent.project_id,
+            "idea_id": parent.idea_id,
+            "idea_version": parent.idea_version,
+            "role": str(parent.role),
+            "kind": ContractKind.EXPLORATORY,
+            "hypothesis_digest": parent.hypothesis_digest,
+            "analysis_digest": analysis_doc["analysis_digest"],
+            "parent_contract_id": parent.contract_id,
+        },
+        version=version,
+        spec=spec,
+        design=design,
+        execution={"re_reads": parent.contract_id},
+        provenance={"amends": parent.contract_id, "reason": reason},
+        parent_contract_digest=parent.contract_digest,
+    )
+    contract_ref = context.artifacts.put_text(
+        json.dumps(
+            document, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False
+        ),
+        media_type="application/json",
+        role=f"idea_contract:{document['contract_digest']}",
+        producer="portfolio.empirical.amend_contract",
+    )
+    return context.portfolio.create_contract(
+        contract_id=contract_id,
+        project_id=parent.project_id,
+        idea_id=parent.idea_id,
+        idea_version=parent.idea_version,
+        role=parent.role,
+        hypothesis_digest=parent.hypothesis_digest,
+        analysable=spec.analysable,
+        analysis_digest=analysis_doc["analysis_digest"],
+        analysis_artifact_id=analysis_ref.artifact_id,
+        analysis_prompt="exploratory",
+        kind=ContractKind.EXPLORATORY,
+        parent_contract_id=parent.contract_id,
+        design={
+            "design_digest": parent.design_digest,
+            "design_artifact_id": parent.design_artifact_id,
+            "design_prompt": parent.design_prompt,
+            "design_call_id": parent.design_call_id,
+            "contract_digest": document["contract_digest"],
+            "contract_artifact_id": contract_ref.artifact_id,
+        },
+    )
+
+
+def reanalyse(context: Any, contract: ScientificContract) -> Any:
+    """Read a parent's stored measurement under an exploratory contract.
+
+    From the content-addressed store, never from a workspace: the outputs
+    were hashed when the measurement was interpreted, and re-reading them by
+    digest is what makes the exploratory reading about the same bytes. The
+    result is recorded as an artifact that says ``confirmatory: false`` and
+    writes **no** evidence row -- a rule fixed after its result exists does
+    not get to count as a test of anything.
+    """
+
+    from research_os.portfolio import analysis as engine
+
+    if contract.kind is not ContractKind.EXPLORATORY or not contract.parent_contract_id:
+        raise EmpiricalError(
+            f"{contract.contract_id} is not an exploratory contract; a "
+            f"preregistered one is read when its own measurement is interpreted",
+            failure_class=FailureClass.POLICY_REFUSED,
+        )
+    parent = context.portfolio.require_contract(contract.parent_contract_id)
+    verified = scicontract.verify(context.artifacts, contract, parent=parent)
+    measured = [
+        item
+        for item in context.portfolio.list_experiments(idea_id=contract.idea_id)
+        if item.contract_id == parent.contract_id
+        and item.state is ExperimentState.INTERPRETED
+        and item.analysis_artifact_id
+    ]
+    if not measured:
+        raise EmpiricalError(
+            f"{parent.contract_id} has no interpreted measurement to re-read",
+            failure_class=FailureClass.ARTIFACT_MISSING,
+        )
+    source = measured[-1]
+    stored = json.loads(context.artifacts.get_text(source.analysis_artifact_id or ""))
+    by_path = {item["path"]: item for item in stored.get("stored_outputs", [])}
+    documents: dict[str, Any] = {}
+    for path in verified.analysis.sources():
+        entry = by_path.get(path)
+        if entry is None:
+            documents[path] = engine.Unavailable(
+                f"{path} was not among the outputs {source.experiment_id} stored"
+            )
+            continue
+        data = context.artifacts.get_bytes(entry["artifact_id"])
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            documents[path] = engine.Unavailable(f"{path} is not text: {exc}")
+            continue
+        documents[path] = engine.parse_document(text, name=path)
+    result = engine.evaluate(verified.analysis, documents)
+    record = {
+        "schema": "portfolio-exploratory-analysis-v1",
+        "confirmatory": False,
+        "contract_id": contract.contract_id,
+        "contract_digest": contract.contract_digest,
+        "parent_contract_id": parent.contract_id,
+        "measurement": source.experiment_id,
+        "job_id": source.job_id,
+        "result": result.record(),
+        "summary": result.summary,
+    }
+    ref = context.artifacts.put_text(
+        json.dumps(
+            record, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False
+        ),
+        media_type="application/json",
+        role=f"idea_exploratory_analysis:{contract.contract_id}",
+        producer="portfolio.analysis.evaluate@1",
+    )
+    context.artifacts.link(
+        ref,
+        role=f"idea_exploratory_analysis:{contract.contract_id}",
+        run_id=context.run_id,
+    )
+    return result
+
+
+def _recover_execution(
+    context: Any, verified: scicontract.VerifiedContract
+) -> ExperimentStep:
+    """Record the experiment a frozen contract says it was about to run.
+
+    The contract document holds the reserved id, the specification and the
+    preregistration, all written before the contract froze. So a crash
+    between freezing and recording costs nothing but this: no model is asked
+    and nothing is redesigned.
+    """
+
+    execution = dict(verified.document.get("execution") or {})
+    contract = verified.contract
+    experiment_id = str(execution.get("experiment_id") or "")
+    if not experiment_id:
+        return ExperimentStep(
+            ok=False,
+            detail=f"{contract.contract_id} is frozen and records no execution",
+            failure_class=FailureClass.ARTIFACT_MISSING,
+        )
+    try:
+        existing = context.portfolio.require_experiment(experiment_id)
+    except ResearchOSError:
+        existing = None
+    if existing is not None:
+        # The recorded execution exists and is not live -- it was retired.
+        # A frozen contract is executed again only through an implementation
+        # repair, which is a decision `advance` makes, never a side effect of
+        # asking for a design.
+        return ExperimentStep(
+            ok=False,
+            detail=(
+                f"{contract.contract_id} is frozen and its execution "
+                f"{experiment_id} is {existing.state}; it is not redesigned"
+            ),
+            failure_class=FailureClass.POLICY_REFUSED,
+            experiment=existing,
+        )
+    analysis = verified.analysis
+    rule_summary = row_rule(analysis, contract.contract_id)
+    experiment = context.portfolio.create_experiment(
+        idea_id=contract.idea_id,
+        idea_version=contract.idea_version,
+        project_id=contract.project_id,
+        role=contract.role,
+        command=str(
+            execution.get("command") or (verified.design or {}).get("command", "")
+        ),
+        spec_digest=str(execution["spec_digest"]),
+        variation_digest=str(execution["variation_digest"]),
+        workspace_path=str(execution["workspace_path"]),
+        decision_rule=rule_summary,
+        no_rule_reason=None
+        if rule_summary is not None
+        else analysis.unanalysable_reason,
+        preregistration_artifact_id=str(execution["preregistration_artifact_id"]),
+        origin_call_id=contract.design_call_id,
+        experiment_id=experiment_id,
+        prompt_version=contract.design_prompt or "",
+        contract_id=contract.contract_id,
+    )
+    return ExperimentStep(
+        ok=True,
+        detail=f"recovered the execution {experiment_id} of frozen contract {contract.contract_id}",
+        experiment=experiment,
+    )
+
+
+def spec_parameters(
+    spec: ExecutionSpec, design: ExperimentDesign | DesignSpecification
+) -> Mapping[str, Any]:
     """The parameter values that were accepted, for the preregistration record.
 
     Taken from the design rather than re-derived from the argv: the resolver
@@ -1433,6 +2341,18 @@ def _first_experiment_block(previous: IdeaExperiment) -> list[str]:
     """
 
     rule = previous.decision_rule or {}
+    if previous.contract_id:
+        return [
+            f"command: {previous.command}",
+            f"specification digest: {previous.spec_digest}",
+            f"variation digest: {previous.variation_digest}",
+            (
+                f"analysis: the frozen analysis of contract {previous.contract_id} "
+                f"({rule.get('analysis_digest', '(unrecorded)')}) reads both "
+                f"measurements -- yours must produce the observables it names"
+            ),
+            "(the first experiment's outcome is deliberately not shown)",
+        ]
     return [
         f"command: {previous.command}",
         f"specification digest: {previous.spec_digest}",
@@ -2017,6 +2937,10 @@ def _preregistered(
             failure_class=FailureClass.MISSING_SCIENTIFIC_AUTHORITY,
         )
 
+    if experiment.contract_id:
+        _verified_contract(context, experiment, record=record, spec=spec)
+        return spec, None
+
     stored = record.get("decision_rule")
     rule = DecisionRule.model_validate(stored) if stored else None
     current = (
@@ -2033,6 +2957,103 @@ def _preregistered(
             failure_class=FailureClass.MISSING_SCIENTIFIC_AUTHORITY,
         )
     return spec, rule
+
+
+def _verified_contract(
+    context: Any,
+    experiment: IdeaExperiment,
+    *,
+    record: Mapping[str, Any] | None = None,
+    spec: ExecutionSpec | None = None,
+) -> scicontract.VerifiedContract:
+    """The frozen contract an experiment executes, re-verified, or a refusal.
+
+    Four checks, each against something the model that designed the
+    experiment could not have written afterwards:
+
+    1. the contract's stored halves re-hash to its row
+       (:func:`research_os.portfolio.scicontract.verify`);
+    2. the preregistration names this contract and its digest;
+    3. the rule summary on the experiment row is the one preregistered;
+    4. the specification that will run realises the frozen *design* --
+       argv, outputs, composed inputs and seeds -- so an execution whose
+       scientific content moved under an unchanged contract is refused.
+       This is what makes an implementation repair unable to change the
+       science: it may change what `scicontract.IMPLEMENTATION_FIELDS`
+       names and nothing else.
+    """
+
+    if record is None or spec is None:
+        spec, _rule = _preregistered(context, experiment)
+        record = json.loads(
+            context.artifacts.get_text(experiment.preregistration_artifact_id or "")
+        )
+    assert record is not None and spec is not None
+    contract = context.portfolio.get_contract(experiment.contract_id or "")
+    if contract is None:
+        raise EmpiricalError(
+            f"{experiment.experiment_id} names contract {experiment.contract_id}, "
+            f"which does not exist",
+            failure_class=FailureClass.MISSING_SCIENTIFIC_AUTHORITY,
+        )
+    if contract.state is not ContractState.FROZEN:
+        raise EmpiricalError(
+            f"{contract.contract_id} is {contract.state}; nothing runs or is read "
+            f"under a contract that is not frozen",
+            failure_class=FailureClass.MISSING_SCIENTIFIC_AUTHORITY,
+        )
+    version = context.portfolio.require_version(
+        experiment.idea_id, experiment.idea_version
+    )
+    try:
+        verified = scicontract.verify(context.artifacts, contract, version=version)
+    except scicontract.ContractIntegrityError as exc:
+        raise EmpiricalError(str(exc), failure_class=exc.failure_class) from None
+    if (
+        record.get("contract_id") != contract.contract_id
+        or record.get("contract_digest") != contract.contract_digest
+    ):
+        raise EmpiricalError(
+            f"the preregistration of {experiment.experiment_id} names contract "
+            f"{record.get('contract_id')} ({record.get('contract_digest')}), not "
+            f"{contract.contract_id} ({contract.contract_digest})",
+            failure_class=FailureClass.MISSING_SCIENTIFIC_AUTHORITY,
+        )
+    if (experiment.decision_rule or None) != (record.get("decision_rule") or None):
+        raise EmpiricalError(
+            f"the decision rule on {experiment.experiment_id} is not the one "
+            f"its preregistration records. A threshold that moved after the "
+            f"measurement exists is a rule fixed after the fact, and this "
+            f"layer may not read a result under it.",
+            failure_class=FailureClass.MISSING_SCIENTIFIC_AUTHORITY,
+        )
+    _assert_realises(verified, spec)
+    return verified
+
+
+def _assert_realises(
+    verified: scicontract.VerifiedContract, spec: ExecutionSpec
+) -> None:
+    design = dict(verified.design or {})
+    moved = [
+        name
+        for name, value in (
+            ("argv", list(spec.argv)),
+            ("outputs", sorted(spec.outputs)),
+            ("inputs", [list(item) for item in spec.inputs]),
+            ("seeds", list(spec.seeds)),
+        )
+        if design.get(name) != value
+    ]
+    if moved:
+        raise EmpiricalError(
+            f"the specification about to run under contract "
+            f"{verified.contract.contract_id} differs from its frozen design in "
+            f"{', '.join(moved)}. Only {sorted(scicontract.IMPLEMENTATION_FIELDS)} "
+            f"may change under a frozen contract; anything else is a different "
+            f"experiment and needs a contract of its own.",
+            failure_class=FailureClass.MISSING_SCIENTIFIC_AUTHORITY,
+        )
 
 
 def _operational(
@@ -2155,8 +3176,11 @@ def interpret(context: Any, experiment: IdeaExperiment) -> ExperimentStep:
             keep=partial,
         )
 
+    verified: scicontract.VerifiedContract | None = None
     try:
         spec, rule = _preregistered(context, experiment)
+        if experiment.contract_id:
+            verified = _verified_contract(context, experiment)
     except EmpiricalError as exc:
         # The same disposition `submit` gives it: the row records why and no
         # evidence is written. A rule that does not match its preregistration
@@ -2175,13 +3199,19 @@ def interpret(context: Any, experiment: IdeaExperiment) -> ExperimentStep:
             FailureClass.ARTIFACT_MISSING,
         )
 
-    analysis = analyse(
-        experiment=experiment,
-        rule=rule,
-        workspace=workspace,
-        spec=spec,
-        exit_code=job.exit_code,
-    )
+    contract_result: Any = None
+    if verified is not None:
+        analysis, contract_result = analyse_contract(
+            verified=verified, workspace=workspace, spec=spec, exit_code=job.exit_code
+        )
+    else:
+        analysis = analyse(
+            experiment=experiment,
+            rule=rule,
+            workspace=workspace,
+            spec=spec,
+            exit_code=job.exit_code,
+        )
     stored = _store_outputs(context, experiment, workspace=workspace, analysis=analysis)
     document = analysis.record(
         experiment=experiment,
@@ -2190,6 +3220,20 @@ def interpret(context: Any, experiment: IdeaExperiment) -> ExperimentStep:
         exit_code=job.exit_code,
         contained=_containment(job),
     )
+    if verified is not None:
+        # The chain of hashes that makes the number traceable: this reading,
+        # of this measurement, under this frozen analysis and design, of this
+        # hypothesis. Every digest below is re-verified before it is written.
+        document["schema"] = "portfolio-empirical-analysis-v2"
+        document["contract"] = {
+            "contract_id": verified.contract.contract_id,
+            "contract_digest": verified.contract.contract_digest,
+            "kind": str(verified.contract.kind),
+            "hypothesis_digest": verified.contract.hypothesis_digest,
+            "analysis_digest": verified.contract.analysis_digest,
+            "design_digest": verified.contract.design_digest,
+        }
+        document["analysis_result"] = contract_result.record()
     document["stored_outputs"] = stored
     document["stored_logs"] = _store_logs(
         context, experiment, run_dir=Path(job.run_dir)
@@ -2236,7 +3280,13 @@ def interpret(context: Any, experiment: IdeaExperiment) -> ExperimentStep:
             idea_version=experiment.idea_version,
             kind=kind,
             strength=strength,
-            summary=_evidence_summary(experiment, analysis, composed=spec.inputs),
+            summary=_evidence_summary(
+                experiment,
+                analysis,
+                composed=spec.inputs,
+                contract=verified,
+                result=contract_result,
+            ),
             artifact_id=ref.artifact_id,
             job_id=job.job_id,
             # The *design* call, so a replication can be shown to be
@@ -2386,6 +3436,8 @@ def _evidence_summary(
     analysis: Analysis,
     *,
     composed: tuple[tuple[str, str], ...] = (),
+    contract: scicontract.VerifiedContract | None = None,
+    result: Any = None,
 ) -> str:
     """What a reviewer reads. Facts, and the rule that was fixed beforehand.
 
@@ -2401,6 +3453,29 @@ def _evidence_summary(
         f"{analysis.conclusion}"
     )
     parts = [headline, analysis.summary]
+    if contract is not None:
+        # The sentence a reviewer needs to judge whether the design could have
+        # chosen its own answer: the analysis was frozen first, by another
+        # role, and here is what it demanded of the data and what the data
+        # held.
+        parts.append(
+            f"read under contract {contract.contract.contract_id} "
+            f"({(contract.contract.contract_digest or '')[:28]}): the analysis "
+            f"was frozen before the design existed, by a separate role; "
+            f"{contract.analysis.rendered_decision()}"
+        )
+        if result is not None and result.support:
+            parts.append(
+                "support: "
+                + "; ".join(
+                    f"{item['observable']} {item['records']} record(s)"
+                    + "".join(
+                        f", {name} {value['observed']} distinct (needs {value['required']})"
+                        for name, value in item["distinct"].items()
+                    )
+                    for item in result.support
+                )
+            )
     if composed:
         # Said in the evidence row itself, because this is the sentence a
         # reviewer needs in order to ask the right question: the plan this
@@ -2557,6 +3632,199 @@ def _release_superseded(context: Any) -> None:
         release_workspace(item, repository=repository)
 
 
+def _stale(context: Any, experiment: IdeaExperiment, *, role: ExperimentRole) -> bool:
+    """Whether this experiment should be retired and designed again.
+
+    A contract-bound experiment is stale exactly when its contract is --
+    :func:`_contract_is_stale` -- and a pre-contract one by its own prompt,
+    as :func:`_is_stale` always judged it.
+    """
+
+    if experiment.state in {ExperimentState.INTERPRETED, ExperimentState.SUPERSEDED}:
+        return False
+    if experiment.contract_id:
+        contract = context.portfolio.get_contract(experiment.contract_id)
+        return contract is not None and _contract_is_stale(context, contract)
+    return _is_stale(experiment, role=role)
+
+
+#: How many times one frozen contract may be re-executed by an implementation
+#: repair. Invariant 14: a repair that keeps failing is a loop, and this is
+#: its stop condition. The stage-failure ceiling bounds the attempts around
+#: it as well.
+MAX_IMPLEMENTATION_REPAIRS = 2
+
+
+def _repair_if_warranted(
+    context: Any, experiment: IdeaExperiment
+) -> IdeaExperiment | None:
+    """The one implementation repair this build makes on its own, or nothing.
+
+    A run that timed out under a time limit tighter than the one now
+    permitted -- because a person raised ``max_experiment_seconds``, or the
+    declared command's own ceiling -- is re-executed under the new limit, as
+    a new execution of the *same* frozen contract. Deterministic, bounded by
+    :data:`MAX_IMPLEMENTATION_REPAIRS`, and unable to touch the science:
+    :func:`repair_implementation` accepts only implementation fields and
+    refuses a specification that no longer realises the frozen design.
+    """
+
+    if experiment.failure_class != str(FailureClass.EXECUTOR_FAILED):
+        return None
+    if "timed out after" not in (experiment.detail or ""):
+        return None
+    commands = declared_commands(context.project_id)
+    declared = commands.get(experiment.command)
+    if declared is None:
+        return None
+    try:
+        spec, _rule = _preregistered(context, experiment)
+    except EmpiricalError:
+        return None
+    allowed = min(
+        int(declared.timeout_seconds), int(context.config.bounds.max_experiment_seconds)
+    )
+    if allowed <= spec.timeout_seconds:
+        return None
+    executions = [
+        item
+        for item in context.portfolio.list_experiments(idea_id=experiment.idea_id)
+        if item.contract_id == experiment.contract_id
+    ]
+    if len(executions) > MAX_IMPLEMENTATION_REPAIRS:
+        return None
+    try:
+        return repair_implementation(context, experiment, timeout_seconds=allowed)
+    except EmpiricalError as exc:
+        LOG.warning(
+            "implementation repair of %s refused: %s", experiment.experiment_id, exc
+        )
+        return None
+
+
+def repair_implementation(
+    context: Any,
+    experiment: IdeaExperiment,
+    *,
+    timeout_seconds: int | None = None,
+    resources: Mapping[str, str] | None = None,
+) -> IdeaExperiment:
+    """Re-execute a frozen contract with different *implementation* settings.
+
+    The only fields that may change are the ones
+    :data:`research_os.portfolio.scicontract.IMPLEMENTATION_FIELDS` names --
+    the time limit and the scheduler resources -- and the signature has no
+    way to express anything else. The new specification is then checked
+    against the frozen design (argv, outputs, composed inputs, seeds) before
+    anything is recorded, so a repair that would change what is measured is
+    refused rather than recorded as the same experiment. What is measured,
+    how it is read and what would count as support are all the contract's,
+    and the contract does not move.
+    """
+
+    if not experiment.contract_id:
+        raise EmpiricalError(
+            f"{experiment.experiment_id} predates contracts; a repair re-executes "
+            f"a frozen contract and there is none",
+            failure_class=FailureClass.POLICY_REFUSED,
+        )
+    if experiment.state is not ExperimentState.OPERATIONALLY_FAILED:
+        raise EmpiricalError(
+            f"{experiment.experiment_id} is {experiment.state}; only an execution "
+            f"that did not happen is repaired",
+            failure_class=FailureClass.POLICY_REFUSED,
+        )
+    verified = _verified_contract(context, experiment)
+    spec, _rule = _preregistered(context, experiment)
+    commands = declared_commands(context.project_id)
+    declared = commands.get(experiment.command)
+    ceiling = min(
+        int(declared.timeout_seconds) if declared is not None else spec.timeout_seconds,
+        int(context.config.bounds.max_experiment_seconds),
+    )
+    timeout = int(
+        timeout_seconds if timeout_seconds is not None else spec.timeout_seconds
+    )
+    if not 1 <= timeout <= ceiling:
+        raise EmpiricalError(
+            f"a repaired time limit of {timeout}s is outside what the declaration "
+            f"and the portfolio allow (at most {ceiling}s)",
+            failure_class=FailureClass.POLICY_REFUSED,
+        )
+    kept = dict(spec.resources)
+    if resources is not None:
+        from research_os.portfolio.contracts import RESOURCE_KEYS
+
+        kept = {
+            str(name): str(value)[:128]
+            for name, value in resources.items()
+            if str(name) in RESOURCE_KEYS
+        }
+    new_id = _reserve_id()
+    workspace = workspace_for(new_id)
+    from dataclasses import replace as _replace
+
+    repaired = _replace(
+        spec, cwd=str(workspace), timeout_seconds=timeout, resources=kept
+    )
+    _assert_realises(verified, repaired)
+    digest = spec_digest(repaired)
+    variation = variation_digest(repaired)
+    record = json.loads(
+        context.artifacts.get_text(experiment.preregistration_artifact_id or "")
+    )
+    record.update(
+        {
+            "experiment_id": new_id,
+            "spec_digest": digest,
+            "variation_digest": variation,
+            "spec": _spec_record(repaired),
+            "implementation": scicontract.implementation_fields(repaired),
+            "repair_of": experiment.experiment_id,
+        }
+    )
+    ref = context.artifacts.put_text(
+        json.dumps(
+            record, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False
+        ),
+        media_type="application/json",
+        role=f"idea_preregistration:{digest}",
+        producer="portfolio.empirical.repair_implementation",
+    )
+    context.artifacts.link(
+        ref, role=f"idea_preregistration:{digest}", run_id=context.run_id
+    )
+    context.portfolio.update_experiment(
+        experiment.experiment_id,
+        state=ExperimentState.SUPERSEDED,
+        failure_class=experiment.failure_class,
+        detail=(
+            f"implementation repaired as {new_id}: time limit "
+            f"{spec.timeout_seconds}s -> {timeout}s under the unchanged contract "
+            f"{verified.contract.contract_id}"
+        ),
+    )
+    if context.repo_path is not None:
+        release_workspace(experiment, repository=Path(context.repo_path))
+    return context.portfolio.create_experiment(
+        idea_id=experiment.idea_id,
+        idea_version=experiment.idea_version,
+        project_id=experiment.project_id,
+        role=experiment.role,
+        command=experiment.command,
+        spec_digest=digest,
+        variation_digest=variation,
+        workspace_path=str(workspace),
+        decision_rule=experiment.decision_rule,
+        no_rule_reason=experiment.no_rule_reason,
+        preregistration_artifact_id=ref.artifact_id,
+        origin_call_id=experiment.origin_call_id,
+        experiment_id=new_id,
+        prompt_version=experiment.prompt_version,
+        contract_id=experiment.contract_id,
+    )
+
+
 def _is_stale(experiment: IdeaExperiment, *, role: ExperimentRole) -> bool:
     """Whether this design was made by a prompt this build no longer uses.
 
@@ -2627,7 +3895,7 @@ def advance(
         existing = step.experiment
         design_cost, design_calls = step.cost_usd, step.model_calls
 
-    if _is_stale(existing, role=role):
+    if _stale(context, existing, role=role):
         # Designed by a prompt this build has superseded. The portfolio
         # already treats a review that way -- `PortfolioStore.live_reviews`
         # reads `CURRENT_REVIEW_PROMPTS` and calls the rest stale, because a
@@ -2639,17 +3907,28 @@ def advance(
         #
         # Retired rather than deleted. What it measured, or failed to, is a
         # record, and the partial unique index lets the successor take the
-        # name.
-        context.portfolio.update_experiment(
-            existing.experiment_id,
-            state=ExperimentState.SUPERSEDED,
-            detail=(
-                f"designed by {existing.prompt_version or 'an unrecorded prompt'}, "
-                f"which this build has superseded"
-            ),
+        # name. A contract-bound experiment retires with its contract: the
+        # contract is what was designed by the retired prompt, and nothing
+        # has been read under it.
+        detail = (
+            f"designed by {existing.prompt_version or 'an unrecorded prompt'}, "
+            f"which this build has superseded"
         )
-        if context.repo_path is not None:
-            release_workspace(existing, repository=Path(context.repo_path))
+        contract = (
+            context.portfolio.get_contract(existing.contract_id)
+            if existing.contract_id
+            else None
+        )
+        if contract is not None:
+            _retire_contract(context, contract, detail=detail)
+        else:
+            context.portfolio.update_experiment(
+                existing.experiment_id,
+                state=ExperimentState.SUPERSEDED,
+                detail=detail,
+            )
+            if context.repo_path is not None:
+                release_workspace(existing, repository=Path(context.repo_path))
         step = design(context, version, role=role, previous=previous)
         if not step.ok or step.experiment is None:
             return step
@@ -2676,6 +3955,11 @@ def advance(
             failure_class=FailureClass.POLICY_REFUSED,
             experiment=existing,
         )
+
+    if existing.state is ExperimentState.OPERATIONALLY_FAILED and existing.contract_id:
+        repaired = _repair_if_warranted(context, existing)
+        if repaired is not None:
+            existing = repaired
 
     if existing.state in {
         ExperimentState.PROPOSED,

@@ -35,6 +35,7 @@ from research_os.errors import ResearchOSError
 from research_os.portfolio import digests as pdigests
 from research_os.portfolio.contracts import MAX_SUMMARY_CHARS
 from research_os.portfolio.ids import (
+    new_contract_id,
     new_idea_action_id,
     new_idea_evidence_id,
     new_idea_experiment_id,
@@ -52,6 +53,8 @@ from research_os.portfolio.models import (
     TIER_ORDER,
     ActionStatus,
     AdjudicationType,
+    ContractKind,
+    ContractState,
     Disposition,
     EdgeKind,
     EmpiricalConclusion,
@@ -79,6 +82,7 @@ from research_os.portfolio.models import (
     QualityTier,
     ReviewerRole,
     ReviewVerdict,
+    ScientificContract,
     Severity,
     Stage,
 )
@@ -124,7 +128,15 @@ EXPERIMENT_COLUMNS = (
     "spec_digest, variation_digest, workspace_path, preregistration_artifact_id, "
     "decision_rule, no_rule_reason, job_id, analysis_artifact_id, conclusion, "
     "evidence_id, failure_class, detail, attempts, origin_call_id, "
-    "prompt_version, created_at, updated_at"
+    "prompt_version, contract_id, created_at, updated_at"
+)
+CONTRACT_COLUMNS = (
+    "contract_id, project_id, idea_id, idea_version, role, kind, state, "
+    "hypothesis_digest, analysable, analysis_digest, analysis_artifact_id, "
+    "analysis_prompt, analysis_call_id, design_digest, design_artifact_id, "
+    "design_prompt, design_call_id, contract_digest, contract_artifact_id, "
+    "parent_contract_id, capability_request, command_set_digest, detail, "
+    "created_at, updated_at, frozen_at"
 )
 ACTION_COLUMNS = (
     "action_id, idea_id, idea_version, stage, basis_digest, status, work_id, "
@@ -134,7 +146,8 @@ ACTION_COLUMNS = (
 STATE_COLUMNS = (
     "project_id, status, charter_digest, detail, paused_at, paused_by, "
     "last_tick_at, last_digest_at, bounds, bank_commit, bank_digest, "
-    "bank_written_at, failures_forgiven_at, created_at, updated_at"
+    "bank_written_at, failures_forgiven_at, command_set_digest, created_at, "
+    "updated_at"
 )
 SEED_COLUMNS = "seed_id, project_id, text, note, consumed_at, consumed_by, created_at"
 
@@ -217,6 +230,16 @@ class DuplicateExperimentError(PortfolioStateError):
     "an empirical idea creates exactly one experiment spec" and "replay
     creates no duplicate" are the same sentence seen from two sides, and the
     place to hold them is the schema rather than a caller's memory.
+    """
+
+
+class DuplicateContractError(PortfolioStateError):
+    """Raised when an idea version already has a live contract in this role.
+
+    The same race `DuplicateExperimentError` names, one level up: two passes
+    both freezing an analysis for one version would be two preregistrations
+    of one question, and the second is exactly the "try again until the rule
+    looks better" this table exists to make unrepresentable.
     """
 
 
@@ -447,6 +470,27 @@ class PortfolioStore:
                  where idea_id = %(idea_id)s
                    and idea_version < %(version)s
                    and state in ('PROPOSED','EXECUTABLE','RUNNING','COMPLETED')
+                """,
+                {"idea_id": idea_id, "version": version},
+            )
+            # And the contracts those versions froze, for the same reason:
+            # a contract tests one hypothesis, and the hypothesis just
+            # changed. A contract under which something was *read* stays
+            # FROZEN -- what was measured was measured, and the record of
+            # which rule it was read under must stay the record.
+            conn.execute(
+                """
+                update scientific_contracts c
+                   set state = 'SUPERSEDED',
+                       detail = 'the idea version this tested was revised',
+                       updated_at = now()
+                 where c.idea_id = %(idea_id)s
+                   and c.idea_version < %(version)s
+                   and c.state <> 'SUPERSEDED'
+                   and not exists (
+                       select 1 from idea_experiments e
+                        where e.contract_id = c.contract_id
+                          and e.state = 'INTERPRETED')
                 """,
                 {"idea_id": idea_id, "version": version},
             )
@@ -1033,6 +1077,7 @@ class PortfolioStore:
         origin_call_id: str | None = None,
         experiment_id: str | None = None,
         prompt_version: str = "",
+        contract_id: str | None = None,
     ) -> IdeaExperiment:
         """Record the one experiment this idea version asks for in this role.
 
@@ -1062,12 +1107,12 @@ class PortfolioStore:
                          state, command, spec_digest, variation_digest,
                          workspace_path, decision_rule, no_rule_reason,
                          preregistration_artifact_id, origin_call_id,
-                         prompt_version)
+                         prompt_version, contract_id)
                     values (%(experiment_id)s, %(idea_id)s, %(version)s,
                             %(project_id)s, %(role)s, 'PROPOSED', %(command)s,
                             %(spec_digest)s, %(variation_digest)s, %(workspace)s,
                             %(rule)s, %(reason)s, %(prereg)s, %(call_id)s,
-                            %(prompt_version)s)
+                            %(prompt_version)s, %(contract_id)s)
                     returning {EXPERIMENT_COLUMNS}
                     """,
                     {
@@ -1085,6 +1130,7 @@ class PortfolioStore:
                         "prereg": preregistration_artifact_id,
                         "call_id": origin_call_id,
                         "prompt_version": prompt_version,
+                        "contract_id": contract_id,
                     },
                 ).fetchone()
         except RuntimeDatabaseError:
@@ -1246,6 +1292,278 @@ class PortfolioStore:
                 },
             ).fetchall()
         return len(rows)
+
+    # ----------------------------------------------------------- contracts --
+    def create_contract(
+        self,
+        *,
+        project_id: str,
+        idea_id: str,
+        idea_version: int,
+        role: ExperimentRole,
+        hypothesis_digest: str,
+        analysable: bool,
+        analysis_digest: str,
+        analysis_artifact_id: str,
+        analysis_prompt: str = "",
+        analysis_call_id: str | None = None,
+        kind: ContractKind = ContractKind.PREREGISTERED,
+        parent_contract_id: str | None = None,
+        contract_id: str | None = None,
+        design: Mapping[str, Any] | None = None,
+    ) -> ScientificContract:
+        """Freeze an analysis: the first half of a scientific contract.
+
+        ``design`` is for the one case that freezes both halves in one act --
+        an exploratory contract, which re-reads its parent's measurement under
+        a new rule and so inherits the parent's design. It is a mapping of the
+        design columns and is refused for a preregistered contract, whose
+        design must be authored *after* its analysis is frozen.
+        """
+
+        if design is not None and kind is ContractKind.PREREGISTERED:
+            raise PortfolioStateError(
+                "a preregistered contract freezes its analysis before its design "
+                "exists; the two halves cannot be written in one act"
+            )
+        contract_id = contract_id or new_contract_id()
+        state = (
+            ContractState.FROZEN
+            if design is not None
+            else ContractState.ANALYSIS_FROZEN
+        )
+        columns = dict(design or {})
+        try:
+            with self._db.tx() as conn:
+                row = conn.execute(
+                    f"""
+                    insert into scientific_contracts
+                        (contract_id, project_id, idea_id, idea_version, role, kind,
+                         state, hypothesis_digest, analysable, analysis_digest,
+                         analysis_artifact_id, analysis_prompt, analysis_call_id,
+                         parent_contract_id, design_digest, design_artifact_id,
+                         design_prompt, design_call_id, contract_digest,
+                         contract_artifact_id, frozen_at)
+                    values (%(contract_id)s, %(project_id)s, %(idea_id)s,
+                            %(version)s, %(role)s, %(kind)s, %(state)s,
+                            %(hypothesis)s, %(analysable)s, %(analysis)s,
+                            %(analysis_artifact)s, %(analysis_prompt)s,
+                            %(analysis_call)s, %(parent)s, %(design_digest)s,
+                            %(design_artifact)s, %(design_prompt)s,
+                            %(design_call)s, %(contract_digest)s,
+                            %(contract_artifact)s,
+                            case when %(frozen)s then now() else null end)
+                    returning {CONTRACT_COLUMNS}
+                    """,
+                    {
+                        "contract_id": contract_id,
+                        "project_id": project_id,
+                        "idea_id": idea_id,
+                        "version": idea_version,
+                        "role": str(role),
+                        "kind": str(kind),
+                        "state": str(state),
+                        "hypothesis": hypothesis_digest,
+                        "analysable": analysable,
+                        "analysis": analysis_digest,
+                        "analysis_artifact": analysis_artifact_id,
+                        "analysis_prompt": analysis_prompt,
+                        "analysis_call": analysis_call_id,
+                        "parent": parent_contract_id,
+                        "design_digest": columns.get("design_digest"),
+                        "design_artifact": columns.get("design_artifact_id"),
+                        "design_prompt": columns.get("design_prompt"),
+                        "design_call": columns.get("design_call_id"),
+                        "contract_digest": columns.get("contract_digest"),
+                        "contract_artifact": columns.get("contract_artifact_id"),
+                        "frozen": design is not None,
+                    },
+                ).fetchone()
+        except RuntimeDatabaseError:
+            if kind is ContractKind.PREREGISTERED:
+                existing = self.live_contract(
+                    idea_id=idea_id, idea_version=idea_version, role=role
+                )
+                if existing is not None:
+                    raise DuplicateContractError(
+                        f"{idea_id} v{idea_version} already has a live {role} "
+                        f"contract ({existing.contract_id})"
+                    ) from None
+            raise
+        return ScientificContract.model_validate(row)
+
+    def freeze_contract(
+        self,
+        contract_id: str,
+        *,
+        design_digest: str,
+        design_artifact_id: str,
+        contract_digest: str,
+        contract_artifact_id: str,
+        design_prompt: str = "",
+        design_call_id: str | None = None,
+    ) -> ScientificContract:
+        """Freeze the design half, and the contract with it.
+
+        Only from ``ANALYSIS_FROZEN`` or ``BLOCKED_CAPABILITY``. The database
+        trigger refuses any later change to what this writes; the ``where``
+        clause refuses writing it twice.
+        """
+
+        with self._db.tx() as conn:
+            row = conn.execute(
+                f"""
+                update scientific_contracts
+                   set state = 'FROZEN',
+                       design_digest = %(design_digest)s,
+                       design_artifact_id = %(design_artifact)s,
+                       design_prompt = %(design_prompt)s,
+                       design_call_id = %(design_call)s,
+                       contract_digest = %(contract_digest)s,
+                       contract_artifact_id = %(contract_artifact)s,
+                       frozen_at = now(),
+                       updated_at = now()
+                 where contract_id = %(contract_id)s
+                   and state in ('ANALYSIS_FROZEN','BLOCKED_CAPABILITY')
+                   and design_digest is null
+                returning {CONTRACT_COLUMNS}
+                """,
+                {
+                    "contract_id": contract_id,
+                    "design_digest": design_digest,
+                    "design_artifact": design_artifact_id,
+                    "design_prompt": design_prompt,
+                    "design_call": design_call_id,
+                    "contract_digest": contract_digest,
+                    "contract_artifact": contract_artifact_id,
+                },
+            ).fetchone()
+        if row is None:
+            current = self.require_contract(contract_id)
+            raise PortfolioStateError(
+                f"{contract_id} is {current.state}; its design is already frozen "
+                f"or it no longer takes one"
+            )
+        return ScientificContract.model_validate(row)
+
+    def block_contract_on_capability(
+        self,
+        contract_id: str,
+        *,
+        capability_request: Mapping[str, Any],
+        command_set_digest: str,
+        detail: str,
+    ) -> ScientificContract:
+        """Record that no declared command can produce what the analysis reads."""
+
+        with self._db.tx() as conn:
+            row = conn.execute(
+                f"""
+                update scientific_contracts
+                   set state = 'BLOCKED_CAPABILITY',
+                       capability_request = %(request)s,
+                       command_set_digest = %(commands)s,
+                       detail = %(detail)s,
+                       updated_at = now()
+                 where contract_id = %(contract_id)s
+                   and state in ('ANALYSIS_FROZEN','BLOCKED_CAPABILITY')
+                returning {CONTRACT_COLUMNS}
+                """,
+                {
+                    "contract_id": contract_id,
+                    "request": jsonb(dict(capability_request)),
+                    "commands": command_set_digest,
+                    "detail": clipped_detail(detail),
+                },
+            ).fetchone()
+        if row is None:
+            current = self.require_contract(contract_id)
+            raise PortfolioStateError(
+                f"{contract_id} is {current.state} and cannot be capability-blocked"
+            )
+        return ScientificContract.model_validate(row)
+
+    def supersede_contract(
+        self, contract_id: str, *, detail: str
+    ) -> ScientificContract:
+        with self._db.tx() as conn:
+            row = conn.execute(
+                f"""
+                update scientific_contracts
+                   set state = 'SUPERSEDED', detail = %(detail)s, updated_at = now()
+                 where contract_id = %(contract_id)s
+                returning {CONTRACT_COLUMNS}
+                """,
+                {"contract_id": contract_id, "detail": clipped_detail(detail)},
+            ).fetchone()
+        if row is None:
+            raise PortfolioStateError(f"no such contract: {contract_id}")
+        return ScientificContract.model_validate(row)
+
+    def get_contract(self, contract_id: str) -> ScientificContract | None:
+        with self._db.tx() as conn:
+            row = conn.execute(
+                f"select {CONTRACT_COLUMNS} from scientific_contracts "
+                "where contract_id = %s",
+                (contract_id,),
+            ).fetchone()
+        return ScientificContract.model_validate(row) if row else None
+
+    def require_contract(self, contract_id: str) -> ScientificContract:
+        found = self.get_contract(contract_id)
+        if found is None:
+            raise PortfolioStateError(f"no such contract: {contract_id}")
+        return found
+
+    def live_contract(
+        self, *, idea_id: str, idea_version: int, role: ExperimentRole
+    ) -> ScientificContract | None:
+        """The one preregistered contract still being asked for, if any."""
+
+        with self._db.tx() as conn:
+            row = conn.execute(
+                f"select {CONTRACT_COLUMNS} from scientific_contracts "
+                "where idea_id = %s and idea_version = %s and role = %s "
+                "and kind = 'PREREGISTERED' and state <> 'SUPERSEDED'",
+                (idea_id, idea_version, str(role)),
+            ).fetchone()
+        return ScientificContract.model_validate(row) if row else None
+
+    def list_contracts(
+        self,
+        *,
+        project_id: str | None = None,
+        idea_id: str | None = None,
+        states: Sequence[ContractState] | None = None,
+        limit: int = 500,
+    ) -> tuple[ScientificContract, ...]:
+        clauses: list[str] = []
+        params: dict[str, Any] = {"limit": limit}
+        if project_id is not None:
+            clauses.append("project_id = %(project_id)s")
+            params["project_id"] = project_id
+        if idea_id is not None:
+            clauses.append("idea_id = %(idea_id)s")
+            params["idea_id"] = idea_id
+        if states:
+            clauses.append("state = any(%(states)s)")
+            params["states"] = [str(item) for item in states]
+        where = f"where {' and '.join(clauses)}" if clauses else ""
+        with self._db.tx() as conn:
+            rows = conn.execute(
+                f"select {CONTRACT_COLUMNS} from scientific_contracts {where} "
+                "order by created_at, contract_id limit %(limit)s",
+                params,
+            ).fetchall()
+        return tuple(ScientificContract.model_validate(row) for row in rows)
+
+    def set_command_set_digest(self, *, project_id: str, digest: str) -> None:
+        with self._db.tx() as conn:
+            conn.execute(
+                "update portfolio_state set command_set_digest = %s, "
+                "updated_at = now() where project_id = %s",
+                (digest, project_id),
+            )
 
     # ------------------------------------------------------------- reviews --
     def record_review(

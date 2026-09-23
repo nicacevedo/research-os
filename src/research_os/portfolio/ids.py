@@ -28,6 +28,7 @@ IDEA_EXPERIMENT_ID_RE = re.compile(r"^PEXP-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$")
 OBJECTION_ID_RE = re.compile(r"^IOBJ-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$")
 PORTFOLIO_DIGEST_ID_RE = re.compile(r"^PDIG-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$")
 SEED_ID_RE = re.compile(r"^SEED-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$")
+CONTRACT_ID_RE = re.compile(r"^PCON-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$")
 
 #: Every id pattern this package mints, so a test can assert none of them can
 #: match a capsule id and none can match another runtime id.
@@ -40,6 +41,7 @@ ID_PATTERNS: dict[str, re.Pattern[str]] = {
     "objection": OBJECTION_ID_RE,
     "portfolio_digest": PORTFOLIO_DIGEST_ID_RE,
     "seed": SEED_ID_RE,
+    "contract": CONTRACT_ID_RE,
 }
 
 
@@ -82,6 +84,18 @@ def new_portfolio_digest_id(*, moment: datetime | None = None) -> str:
 
 def new_seed_id(*, moment: datetime | None = None) -> str:
     return new_id("SEED", moment=moment)
+
+
+def new_contract_id(*, moment: datetime | None = None) -> str:
+    """A scientific contract id.
+
+    ``PCON``: the portfolio's frozen hypothesis + analysis + design. Not a
+    capsule object -- a contract is operational state about a candidate idea,
+    and it never reaches ``.research/`` -- which is why it is not shaped like
+    ``EXP-0001``.
+    """
+
+    return new_id("PCON", moment=moment)
 
 
 def track_thread_id(run_id: str) -> str:

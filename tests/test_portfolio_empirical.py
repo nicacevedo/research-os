@@ -42,6 +42,7 @@ from research_os.portfolio.contracts import DecisionPredicate, DecisionRule
 from research_os.portfolio.models import (
     EVIDENCE_STRENGTH_FOR_CONCLUSION,
     AdjudicationType,
+    ContractState,
     EmpiricalConclusion,
     EvidenceKind,
     EvidenceStrength,
@@ -58,13 +59,18 @@ from research_os.portfolio.stages import TrackSnapshot, select_stage
 from research_os.portfolio.store import DuplicateExperimentError, PortfolioStore
 from research_os.runtime.artifacts import FilesystemArtifactStore
 from research_os.runtime.budgets import BudgetLedger, Dimension
-from research_os.runtime.db import Database, jsonb
+from research_os.runtime.db import Database, RuntimeDatabaseError, jsonb
 from research_os.runtime.executors import LocalExecutor
 from research_os.runtime.failures import INFRASTRUCTURE, FailureClass
 from research_os.runtime.idempotency import InvocationLedger
 from research_os.runtime.models import BudgetScope
 from research_os.runtime.store import RuntimeStore
-from tests.portfolio_helpers import idea_fields, portfolio
+from tests.portfolio_helpers import (
+    contract_answers,
+    contract_prompt_answers,
+    idea_fields,
+    portfolio,
+)
 from tests.runtime_graph_helpers import ScriptedRouter
 from tests.runtime_helpers import pg_dsn, runtime_db, runtime_project, runtime_xdg
 
@@ -233,7 +239,7 @@ def design_answer(
 def _router(
     runtime_db: Database, *, design: dict[str, Any] | None = None, **kwargs: Any
 ) -> ScriptedRouter:
-    answers = {"experimentalist": design if design is not None else design_answer()}
+    answers = contract_answers(design if design is not None else design_answer())
     return ScriptedRouter(answers=answers, store=RuntimeStore(runtime_db), **kwargs)
 
 
@@ -378,9 +384,17 @@ def test_a_real_measurement_becomes_one_version_bound_evidence_row(
     # And the arithmetic is on the record, not just its conclusion.
     document = json.loads(context.artifacts.get_text(row.artifact_id))
     assert document["observed"] == pytest.approx(0.4)
-    assert document["decision_rule"]["metric_path"] == "summary.overlap"
+    assert document["analysis_result"]["statistics"]["statistic"] == pytest.approx(0.4)
     assert document["experiment_id"] == experiment.experiment_id
     assert document["outputs"], "the run's declared output was not hashed"
+    # And it was read under the contract frozen before the design: the
+    # analysis document names the contract and its digests, and the frozen
+    # analysis is the one that addressed `summary.overlap`.
+    contract = portfolio.require_contract(experiment.contract_id)
+    assert document["contract"]["contract_digest"] == contract.contract_digest
+    assert document["contract"]["analysis_digest"] == contract.analysis_digest
+    frozen = json.loads(context.artifacts.get_text(contract.contract_artifact_id))
+    assert frozen["analysis"]["observables"][0]["path"] == "summary.overlap"
 
 
 def test_the_measurement_can_refute_the_idea_and_that_is_a_success(
@@ -880,6 +894,12 @@ def test_a_decision_rule_over_a_file_the_command_never_writes_is_refused(
     Discovering after a measurement that its endpoint was unreadable leaves a
     result and no rule, which is the state in which someone reads the numbers
     and decides what they meant.
+
+    Under a contract the analysis is frozen first, so what is refused is a
+    *design* that does not produce what the analysis reads. That is a
+    model-output failure and retryable -- a different design could satisfy
+    the same frozen analysis -- rather than the refusal that blocks an idea
+    until a person returns. Nothing runs either way.
     """
 
     idea_id = _idea(portfolio, runtime_project)
@@ -898,8 +918,14 @@ def test_a_decision_rule_over_a_file_the_command_never_writes_is_refused(
     step = _advance(context)
 
     assert not step.ok
-    assert step.failure_class is FailureClass.POLICY_REFUSED
+    assert step.failure_class is FailureClass.MODEL_OUTPUT_INVALID
     assert "does not write" in step.detail
+    assert portfolio.get_experiment(idea_id=idea_id, idea_version=1) is None
+    # The analysis stayed frozen: the next design is judged against it.
+    contract = portfolio.live_contract(
+        idea_id=idea_id, idea_version=1, role=ExperimentRole.PRIMARY
+    )
+    assert contract is not None and contract.state is ContractState.ANALYSIS_FROZEN
 
 
 def test_a_specification_that_changed_after_preregistration_does_not_run(
@@ -931,7 +957,21 @@ def test_a_specification_that_changed_after_preregistration_does_not_run(
         context, portfolio.require_version(idea_id), role=ExperimentRole.PRIMARY
     )
     assert step.ok, step.detail
+    # The database refuses the edit outright now -- what an experiment
+    # preregistered is immutable by trigger (`sql/0031`).
+    with (
+        pytest.raises(RuntimeDatabaseError, match="preregistered is frozen"),
+        runtime_db.tx() as conn,
+    ):
+        conn.execute(
+            "update idea_experiments set spec_digest = %s where experiment_id = %s",
+            ("f" * 64, step.experiment.experiment_id),
+        )
+    # And the application check behind it still holds when the trigger is
+    # bypassed (a restore, a superuser session): defence in depth, each
+    # layer tested on its own.
     with runtime_db.tx() as conn:
+        conn.execute("set local session_replication_role = replica")
         conn.execute(
             "update idea_experiments set spec_digest = %s where experiment_id = %s",
             ("f" * 64, step.experiment.experiment_id),
@@ -1173,10 +1213,9 @@ def test_a_replication_must_vary_something_and_an_identical_rerun_is_refused(
         project_id=runtime_project,
         idea_id=idea_id,
         router=ScriptedRouter(
-            answers_by_prompt={
-                TEMPLATES["experiment_designer"].identity: design_answer(seed=5),
-                TEMPLATES["replication_designer"].identity: identical,
-            },
+            answers_by_prompt=contract_prompt_answers(
+                primary=design_answer(seed=5), replication=identical
+            ),
             store=RuntimeStore(runtime_db),
         ),
         repo=project_repo,
@@ -1221,12 +1260,13 @@ def test_a_replication_that_varies_the_seed_produces_its_own_execution(
         project_id=runtime_project,
         idea_id=idea_id,
         router=ScriptedRouter(
-            answers_by_prompt={
-                TEMPLATES["experiment_designer"].identity: design_answer(seed=5),
-                TEMPLATES["replication_designer"].identity: design_answer(
-                    seed=14, out="results/replication.json", variation_kind="seed"
-                ),
-            },
+            # The replication writes to the same relative path the primary
+            # did -- in its own disposable worktree -- because it inherits the
+            # primary's frozen analysis, and that analysis reads that path.
+            answers_by_prompt=contract_prompt_answers(
+                primary=design_answer(seed=5),
+                replication=design_answer(seed=14, variation_kind="seed"),
+            ),
             store=RuntimeStore(runtime_db),
         ),
         repo=project_repo,
@@ -1263,12 +1303,10 @@ def test_the_replication_designer_is_not_shown_what_the_first_one_concluded(
 
     idea_id = _idea(portfolio, runtime_project)
     router = ScriptedRouter(
-        answers_by_prompt={
-            TEMPLATES["experiment_designer"].identity: design_answer(seed=5),
-            TEMPLATES["replication_designer"].identity: design_answer(
-                seed=14, out="results/replication.json", variation_kind="seed"
-            ),
-        },
+        answers_by_prompt=contract_prompt_answers(
+            primary=design_answer(seed=5),
+            replication=design_answer(seed=14, variation_kind="seed"),
+        ),
         store=RuntimeStore(runtime_db),
     )
     context = _context(
@@ -1774,12 +1812,10 @@ def _empirical_router(runtime_db: Database) -> ScriptedRouter:
             },
             "brancher": {"children": [], "relations": []},
         },
-        answers_by_prompt={
-            TEMPLATES["experiment_designer"].identity: design_answer(seed=5),
-            TEMPLATES["replication_designer"].identity: design_answer(
-                seed=14, out="results/replication.json", variation_kind="seed"
-            ),
-        },
+        answers_by_prompt=contract_prompt_answers(
+            primary=design_answer(seed=5),
+            replication=design_answer(seed=14, variation_kind="seed"),
+        ),
         store=RuntimeStore(runtime_db),
         providers={
             "methodology_reviewer": "alpha",
@@ -2812,7 +2848,16 @@ def test_a_threshold_that_moved_after_the_run_cannot_read_the_result(
         portfolio.require_experiment(step.experiment.experiment_id).decision_rule
     )
     moved["success"] = {**moved["success"], "threshold": 0.0}
+    with (
+        pytest.raises(RuntimeDatabaseError, match="preregistered is frozen"),
+        runtime_db.tx() as conn,
+    ):
+        conn.execute(
+            "update idea_experiments set decision_rule = %s where experiment_id = %s",
+            (jsonb(moved), step.experiment.experiment_id),
+        )
     with runtime_db.tx() as conn:
+        conn.execute("set local session_replication_role = replica")
         conn.execute(
             "update idea_experiments set decision_rule = %s where experiment_id = %s",
             (jsonb(moved), step.experiment.experiment_id),

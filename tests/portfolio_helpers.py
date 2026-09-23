@@ -6,7 +6,7 @@ and shaped the same way so that a reader who knows one knows the other.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from typing import Any
 
 import pytest
@@ -135,3 +135,97 @@ def seed_idea(
         origin_role="blind_explorer",
         dimensions=dimensions,
     )
+
+
+# ------------------------------------------------- the scientific contract --
+#: Keys a pre-contract design carried that a contract-bound design does not:
+#: the rule moved to the analysis, and the endpoint became its estimand.
+_RULE_KEYS = frozenset(
+    {
+        "decision_rule",
+        "no_decision_rule_reason",
+        "primary_endpoint",
+        "secondary_endpoints",
+    }
+)
+
+
+def analysis_answer(design: Mapping[str, Any]) -> dict[str, Any]:
+    """The analysis a pre-contract design's rule *was*, in the contract's shape.
+
+    A design written the old way named one number in one file and two
+    thresholds on it. That is exactly the analysis ``value`` of one scalar
+    observable, so a test scripted in the old shape keeps meaning what it
+    meant: the same number, read by the same predicates -- now frozen first,
+    by the analysis designer, rather than by the design.
+    """
+
+    rule = design.get("decision_rule")
+    if not rule:
+        return {
+            "analysable": False,
+            "unanalysable_reason": design.get("no_decision_rule_reason")
+            or "no single machine-checkable number settles this",
+        }
+    return {
+        "analysable": True,
+        "estimand": rule.get("metric_description") or rule["metric_path"],
+        "observables": [
+            {
+                "name": "metric",
+                "source": rule["output_path"],
+                "kind": "scalar",
+                "path": rule["metric_path"],
+            }
+        ],
+        "reductions": [{"name": "statistic", "op": "value", "observable": "metric"}],
+        "primary_statistic": "statistic",
+        "success": rule["success"],
+        "failure": rule["failure"],
+    }
+
+
+def design_spec_answer(design: Mapping[str, Any]) -> dict[str, Any]:
+    """The same design with its rule removed: what a v7 designer returns."""
+
+    shaped = {key: value for key, value in design.items() if key not in _RULE_KEYS}
+    if shaped.get("testable", True):
+        shaped.setdefault(
+            "falsification_criterion", "the clause of the falsifier this measures"
+        )
+    return shaped
+
+
+def contract_answers(design: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    """Role -> answer for both halves of a contract, from one old-shape design."""
+
+    return {
+        "analysis_designer": analysis_answer(design),
+        "experimentalist": design_spec_answer(design),
+    }
+
+
+def contract_prompt_answers(
+    *,
+    primary: Mapping[str, Any],
+    replication: Mapping[str, Any] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Prompt identity -> answer, for scripting both contract roles by template.
+
+    The replication designer shares the ``replicator`` role, so a double
+    keyed by role cannot tell it from the replicator; keyed by prompt it can.
+    A replication inherits the primary's frozen analysis, so only its design
+    is scripted.
+    """
+
+    from research_os.portfolio.prompts import TEMPLATES
+
+    answers = {
+        TEMPLATES["analysis_designer"].identity: analysis_answer(primary),
+        TEMPLATES["experiment_designer"].identity: design_spec_answer(primary),
+    }
+    if replication is not None:
+        answers[TEMPLATES["replication_designer"].identity] = design_spec_answer(
+            replication
+        )
+    return answers

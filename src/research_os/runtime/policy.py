@@ -569,6 +569,10 @@ ROLE_PERMISSIONS: dict[ModelRole, frozenset[Permission]] = {
     # same idea; a repository would tell it nothing it needs and would give it
     # somewhere to go.
     ModelRole.DUPLICATE_ADJUDICATOR: frozenset(),
+    # Reads the repository's declared outputs, as the experimentalist does,
+    # because an analysis of an observable nothing writes analyses nothing.
+    # Writes nothing and runs nothing: it fixes a rule ordinary code applies.
+    ModelRole.ANALYSIS_DESIGNER: frozenset({Permission.READ_REPO}),
 }
 
 #: What the runtime may hold at each configured autonomy setting. The *setting*

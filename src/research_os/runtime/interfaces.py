@@ -178,6 +178,18 @@ class ModelRole(StrEnum):
     identity on two runs.
     """
 
+    ANALYSIS_DESIGNER = "analysis_designer"
+    """Fixes how a measurement will be read, before any design exists.
+
+    Its own role, and deliberately not the experimentalist's second question,
+    because the whole point is that the author of the threshold is not the
+    author of the grid. A design composed by the same call that fixes its
+    decision rule can choose the grid that makes the rule pass; routing the
+    two to different roles -- and showing the designer the analysis's
+    requirements but never its thresholds -- is what makes a preregistration
+    precede the design rather than accompany it.
+    """
+
     NOMINATOR = "nominator"
     """Judges whether one project's finding is candidate knowledge for others.
 

@@ -425,6 +425,42 @@ EVIDENCE_STRENGTH_FOR_CONCLUSION: dict[EmpiricalConclusion, EvidenceStrength] = 
 }
 
 
+class ContractKind(StrEnum):
+    """Whether a scientific contract was fixed before its result or after one.
+
+    ``PREREGISTERED`` is the only kind a gate reads as confirmatory. An
+    ``EXPLORATORY`` contract exists because a post-result change of rule is
+    sometimes the right scientific move -- and it must then be a new,
+    labelled object that names the contract it departs from, never an edit of
+    that contract. The database refuses the edit; this is where the
+    alternative goes.
+    """
+
+    PREREGISTERED = "PREREGISTERED"
+    EXPLORATORY = "EXPLORATORY"
+
+
+class ContractState(StrEnum):
+    """How far a scientific contract has been frozen."""
+
+    ANALYSIS_FROZEN = "ANALYSIS_FROZEN"
+    """The analysis is fixed and no design exists yet."""
+
+    FROZEN = "FROZEN"
+    """Analysis and design are both fixed. The contract digest covers both
+    and the hypothesis, and executions are bound to it."""
+
+    BLOCKED_CAPABILITY = "BLOCKED_CAPABILITY"
+    """The analysis is fixed and no declared command can produce what it
+    reads. The capability request says what would; the contract resumes from
+    here when a person declares one."""
+
+    SUPERSEDED = "SUPERSEDED"
+    """No longer the contract being asked for -- its idea version was
+    revised, or it was designed by a prompt this build has retired before
+    anything was measured. Kept as the record."""
+
+
 class ActionStatus(StrEnum):
     ACTIVE = "ACTIVE"
     SUCCEEDED = "SUCCEEDED"
@@ -716,6 +752,10 @@ class IdeaExperiment(_Record):
     #: prompt this build has superseded is a commitment to a question no
     #: longer being asked, and resubmitting it forever is how an idea wedges.
     prompt_version: str = ""
+    #: The scientific contract this execution realises. ``None`` for every
+    #: experiment written before contracts existed, whose design carried its
+    #: own rule in :attr:`decision_rule`.
+    contract_id: str | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -734,6 +774,47 @@ class IdeaExperiment(_Record):
         """
 
         return self.decision_rule is not None
+
+
+class ScientificContract(_Record):
+    """Hypothesis + analysis + design, frozen before any result. See ``sql/0031``.
+
+    Read model only. The two halves are digests and artifact ids here; the
+    content lives in the content-addressed store and is re-verified against
+    these digests by :func:`research_os.portfolio.scicontract.verify` every
+    time anything is executed or interpreted under the contract.
+    """
+
+    contract_id: str
+    project_id: str
+    idea_id: str
+    idea_version: int
+    role: ExperimentRole
+    kind: ContractKind
+    state: ContractState
+    hypothesis_digest: str
+    analysable: bool
+    analysis_digest: str
+    analysis_artifact_id: str
+    analysis_prompt: str = ""
+    analysis_call_id: str | None = None
+    design_digest: str | None = None
+    design_artifact_id: str | None = None
+    design_prompt: str | None = None
+    design_call_id: str | None = None
+    contract_digest: str | None = None
+    contract_artifact_id: str | None = None
+    parent_contract_id: str | None = None
+    capability_request: dict[str, Any] | None = None
+    command_set_digest: str | None = None
+    detail: str | None = None
+    created_at: datetime
+    updated_at: datetime
+    frozen_at: datetime | None = None
+
+    @property
+    def frozen(self) -> bool:
+        return self.state is ContractState.FROZEN
 
 
 class IdeaAction(_Record):
@@ -776,6 +857,9 @@ class PortfolioState(_Record):
     #: stage-failure ceiling counts only failures after it; the dedup key
     #: still counts all of them. See ``sql/0029_failures_forgiven.sql``.
     failures_forgiven_at: datetime | None = None
+    #: The declared experiment capability this portfolio last saw, by digest.
+    #: See ``sql/0031_scientific_contracts.sql``.
+    command_set_digest: str | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -832,6 +916,9 @@ ENUM_CONSTRAINTS: dict[str, frozenset[str]] = {
     "idea_experiments_role_ck": frozenset(s.value for s in ExperimentRole),
     "idea_experiments_state_ck": frozenset(s.value for s in ExperimentState),
     "idea_experiments_conclusion_ck": frozenset(s.value for s in EmpiricalConclusion),
+    "scientific_contracts_role_ck": frozenset(s.value for s in ExperimentRole),
+    "scientific_contracts_kind_ck": frozenset(s.value for s in ContractKind),
+    "scientific_contracts_state_ck": frozenset(s.value for s in ContractState),
     "idea_actions_status_ck": frozenset(s.value for s in ActionStatus),
     "idea_actions_stage_ck": frozenset(s.value for s in Stage),
     "idea_actions_disposition_ck": frozenset(s.value for s in Disposition),

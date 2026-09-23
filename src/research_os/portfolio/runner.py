@@ -282,6 +282,9 @@ _STAGE_FOR_TEMPLATE: dict[str, Stage] = {
     "falsifier": Stage.FALSIFY,
     "scientific_discovery": Stage.DISCOVER,
     "literature_scout": Stage.LITERATURE_AUDIT,
+    # The analysis is frozen inside the evidence stage, before the design,
+    # so its call is charged against the same ceiling.
+    "analysis_designer": Stage.EVIDENCE,
     "experiment_designer": Stage.EVIDENCE,
     # Charged against REPLICATE and not EVIDENCE, because that is the
     # stage whose ceiling it spends: a replication design is bought by the

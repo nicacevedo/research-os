@@ -1559,3 +1559,83 @@ now has something real to compare.
 inputs, so every preregistration written before this route existed rebuilds
 to its original hash. `tests/test_experiment_generated_input.py` pins the
 real stored specification of `PEXP-20260922T195752Z-4331c06a` to prove it.
+
+### 19.10 The scientific contract: analysis first, design second, both frozen
+
+§AB.5 of the report demonstrated the defect this section closes: the same
+model call composed the plan *and* fixed the threshold, so a
+"preregistered" `SUPPORTS` was reachable by choosing the grid. And §AB.3
+located the other half: the only analysis the route could express was "read
+one number out of one file", so a question whose falsifier asked for a
+regression coefficient was `INSUFFICIENT` before anything ran -- a missing
+*analysis* was still human-owned.
+
+A measurement is now governed by a **scientific contract**
+(`scientific_contracts`, migration `0031`; `portfolio/scicontract.py`):
+
+```text
+hypothesis   idea version content digest                  what is claimed
+analysis     AnalysisSpec, frozen FIRST by analysis_designer   how it is read
+design       DesignSpecification, frozen SECOND by the         how it is measured
+             experiment designer, against the frozen analysis
+contract     digest over all three                         what executions bind to
+```
+
+**The order is the fix.** `analysis_designer@1` is asked before any design
+exists: estimand, raw observables (a scalar at a path, or a list of records
+in JSON or CSV), inclusion rules, what an incomplete record does, reductions
+from a closed set (`value`, `count`, `fraction`, `mean`, `median`, `std`,
+`min`, `max`, `sum`, `quantile`, `difference`, `ratio`, `correlation`,
+`ols_coefficient`), the primary statistic, an optional seeded percentile
+bootstrap, the two predicates, and **support requirements** -- how many
+records and how many distinct values of each compared variable the data must
+hold. `experiment_designer@7` is then shown the analysis's *requirements*
+(`scicontract.requirements_block`) and deliberately **not its thresholds**,
+and its output contract has no field for a rule. A replication inherits the
+primary's analysis by digest rather than fixing its own.
+
+**Evaluation is ordinary Python** (`portfolio/analysis.py`). A missing
+observable, a missing field, an undefined reduction (empty selection, zero
+denominator, a regression the design does not identify) or unmet support is
+`INSUFFICIENT`; `on_missing` has no other value. With an uncertainty,
+`SUPPORTS` requires the whole interval to satisfy the success predicate.
+Unmet support is the co-design defence checked against what was *measured*:
+a grid that collapses the variable a statistic depends on reads
+`INSUFFICIENT`, whatever number it would have produced.
+
+**Immutability is the database's.** A trigger refuses any change to a
+contract's analysis half after insert, to its design half once written, a
+return to `ANALYSIS_FROZEN`, a change to `FROZEN` other than `SUPERSEDED`,
+and a direct delete; a second trigger freezes what an experiment
+preregistered (spec digest, rule, preregistration artifact, contract). The
+application re-verifies every digest against the stored artifacts before
+anything runs and before anything is read (`scicontract.verify`,
+`empirical._verified_contract`), including that the specification about to
+run realises the frozen design's argv, outputs, composed inputs and seeds.
+
+**A post-result rule change is a new object.** A second preregistered
+contract for the same idea version is refused by a partial unique index;
+`empirical.amend_contract` creates an `EXPLORATORY` contract naming its
+parent, and `empirical.reanalyse` re-reads the parent's stored outputs under
+it, writing an artifact marked `confirmatory: false` and **no evidence row**.
+
+**An implementation repair cannot touch the science.**
+`empirical.repair_implementation` may change only
+`scicontract.IMPLEMENTATION_FIELDS` (time limit, scheduler resources); it
+re-executes the same contract as a new experiment and is refused if the new
+specification does not realise the frozen design. The one repair made
+automatically is a run that timed out under a tighter limit than is now
+permitted, bounded by `MAX_IMPLEMENTATION_REPAIRS`.
+
+**An undeclared capability is refused and kept.** When no declared command
+can produce the analysis's observables, the contract becomes
+`BLOCKED_CAPABILITY` with a capability request (from the designer, or derived
+by code from the analysis when the project declares no command at all), the
+analysis stays frozen, and asking again while `experiments.yaml` is unchanged
+costs no model call.
+
+**Provider neutrality.** No digest covers a provider, model, call id or
+prompt identity; those are provenance recorded beside the digests.
+
+Tests: `tests/test_portfolio_scientific_contract.py`; the mutation evidence
+is in the closure report.
