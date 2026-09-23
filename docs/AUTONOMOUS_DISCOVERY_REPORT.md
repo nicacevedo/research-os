@@ -3451,3 +3451,193 @@ That is not a defect surface converging. The verdict stays
 
 What this run adds to §Z.4 rather than subtracts: the cheapest remaining
 item is now a committed plan file, not a new command.
+
+## AB. Composed experiment inputs, and what four reviews found in them
+
+2026-09-23, continuing from §AA. §AA.5 ended on a bottleneck: a real
+portfolio blocked on a *file*. This section is the mechanism built to remove
+it, the one real traversal it produced, the four independent reviews of it,
+and the reason the verdict still does not move.
+
+### AB.1 The bottleneck, stated exactly
+
+A `path` parameter is listed to the designer as the tracked files it may
+name. So a genuinely new experimental design inside an **already-approved
+capability** required a person to author and commit a plan. That is a human
+*operating* ordinary research progression rather than governing it, and it
+is the thing this release set out to remove:
+
+```text
+human governed  !=  human operated
+```
+
+### AB.2 What was built
+
+`ParameterType.GENERATED`, `research_os/experiment/generated.py`, and one
+new field on `ExecutionSpec`. The researcher declares, in `experiments.yaml`
+and therefore outside every worktree, that a parameter takes a composed
+document, what shape it may have (`input_schema`) and how large it may be
+(`max_bytes`). A plan then composes the document; Research OS validates,
+canonicalises, bounds, hashes it, and **chooses where it lands**.
+
+```text
+design      the model returns the document itself, never a path
+freeze      schema-checked, canonicalised, bounded, hashed
+place       .research-os/experiment-inputs/<param>-<sha16>.json, chosen here
+preregister (path, sha256) enters ExecutionSpec.inputs, the specification
+            digest and the variation digest; the record names the digest
+materialise written from the content-addressed store into the disposable
+            worktree, rehashed on the way in, 0o444, directory read-only
+            inside the sandbox
+```
+
+No technology and no dependency was added. `jsonschema` is not installed
+and this project keeps two core dependencies deliberately, so the checker
+honours a closed keyword subset and **refuses a schema it cannot honour**.
+
+**Compatibility was treated as a hard requirement and verified against the
+real artifacts.** Both digests omit the new key when there are no composed
+inputs, so `PEXP-20260922T195752Z-4331c06a`'s stored specification still
+rebuilds to `6b0e069e...` and `e3aaca6a...`. Both are pinned by tests; the
+second was missing at first and a test audit found it.
+
+### AB.3 The traversal it produced, and the boundary it located
+
+`PIDEA-20260922T033440Z-b91e45b7`, the `(n, p) x difficulty` question.
+
+```text
+experiment   PEXP-20260923T005430Z-152cc27b
+plan         composed by experiment_designer@6, 1,287 bytes, no human hand
+             sha256 e2d67adb08b25736..., placed by Research OS
+spec digest  51d67dfc2a140eb8...
+base commit  efceadf52fcc71b51a092b915fa6ec6ea61e3722
+containment  bubblewrap, network denied, nested user namespaces disabled
+exit / wall  0 / 58.169 s
+conclusion   INSUFFICIENT
+```
+
+The mechanism worked. The result did not settle the idea, and **the reason
+is the finding**: the designer declined to fix a decision rule at all --
+
+> The falsifier depends on whether the size main effect and the
+> size×difficulty interaction are significant in a regression across 12
+> factorial cells. The sweep reduction does not fit that model.
+
+So two gaps that §AA.5 had merged are now separated, and only one of them
+has moved:
+
+```text
+a missing DESIGN    -> now autonomous
+a missing ANALYSIS  -> still human-owned
+```
+
+### AB.4 Four reviews, barely overlapping, two findings that mattered
+
+**A metric read out of the repository.** The workspace is a checkout of the
+base commit, so every tracked file is already at its path -- and the
+documented way to show a designer an output's schema is to commit a
+specimen at exactly that path. A command exiting 0 without writing left the
+specimen there and the preregistered rule read it. On this machine
+`results/2026/sweep.json` is committed holding `portability.R = 0.216`,
+which under the rule shape §AA actually used reads as a **refutation**: an
+idea recorded as killed by a number committed to Git weeks earlier, wearing
+a job id, a specification digest, a preregistration and a containment
+record. Closed by refusing a rule output byte-identical to the base
+commit's blob.
+
+**The feature's entire production wiring could be deleted and the suite
+could not tell.** A test audit no-op'd `_materialise_inputs` and stripped
+`inputs=` from `build_spec`, and ran everything: 4,488 passed,
+byte-identical to the baseline. The 29 tests shipped with the feature
+covered a pure module; nothing covered the bridge into the portfolio. This
+is the same shape as §V.1 -- twelve roles with no router entry, invisible
+to a green suite -- reproduced by this author eight commits after writing
+about it. Closed by two end-to-end tests that both of those mutations turn
+red.
+
+Eleven more, each from one of the four and none from the others: closure
+implied by `if properties:` (found twice, independently, and it made
+`SECURITY.md` false); a malformed document classified as a *refusal*, so
+one bad enum value wedged an idea until a person returned; a `generated`
+declaration silently removing the command from `researchctl experiment run`
+and from the objective cycle; the preregistration inlining the model's raw
+serialisation beside a digest over the canonical bytes; `0o444` presented
+as an integrity control it is not; a `PermissionError` wedging every retry;
+a replication bound to *some changed byte* rather than to the same metric;
+`OverflowError` and `RecursionError` escaping unclassified; a metric-path
+listing silently truncated and described as complete; a fourth hand-built
+`TrackSnapshot`; and every list bound still enforced and unstated.
+
+### AB.5 The one finding recorded rather than fixed
+
+The same model call now composes the plan **and** fixes the threshold.
+Preregistration only ever defended against *post-hoc* fitting, and §19.9's
+"the conclusion does not move" was too strong. A reviewer demonstrated it
+arithmetically: with `lambda_ratios: [0.5, 0.5]` the denominator of the
+live capability's statistic is 1.0 by construction, so `R` reduces to a
+ratio the instance choice already fixes, and a "preregistered" SUPPORTS is
+reachable by choosing the grid.
+
+There is no general check for "this design does not determine its own
+metric", and inventing one would be a guess. What was done instead is to
+make the fact **travel**: the composed inputs are in the analysis artifact
+and the evidence row says in words that the design was model-composed, so
+the three reviewers who read that row can object -- which is the mechanism
+this layer already has for exactly this kind of doubt.
+`DESIGN_INVARIANTS.md` is narrowed from "what a composed one may contain"
+to "what *shape* it may have", which is what the subset actually bounds.
+
+### AB.6 The soak
+
+Four segments, both projects, ~920 work items at 96% success, 462 stage
+actions, 121 new ideas, $35.69 -- against ceilings of $100 and $50 that a
+person set and that nothing here raised. Across all of it: **0 leases
+reclaimed, 0 runs abandoned, 0 interpretations abandoned, 0 reservations
+leaked, 0 capsule changes.** One real provider outage (an OAuth refresh
+collision with this author's own session, the coupling `SECURITY.md`
+documents) produced four `provider_unavailable` stage failures at $0.00,
+sent the ideas to `BLOCKED_PROVIDER` rather than `BLOCKED_EXTERNAL`, wrote
+no evidence, and cleared itself -- §17 working on real work.
+
+**What the soak does not establish**: §Z.4 item 4 asks for an unattended
+run *on code that does not change during it*, and this author edited the
+tree throughout the first three segments. Only the fourth ran against a
+committed tree. The operational figures are real; the item is not met.
+
+### AB.7 Phases that did not complete, and why that is structural
+
+`meta_review`, `replicate` and `branch` remain unexercised, `max_depth` is
+still 0 across 254 ideas, and nothing reached `VALIDATED`.
+
+Two structural reasons, both measured rather than assumed:
+
+- **Every adjudicated idea on both projects is `empirical`.** The one
+  mixed case is `{empirical, novelty_or_literature}`, and the union rule
+  means a second type *adds* requirements. So the literature route -- the
+  only one needing no experiment capability -- is closed, replicating §19's
+  finding on fresh ideas.
+- **`max_depth > 0` is reachable only through `BRANCH`**, whose only
+  producer is `create_idea(parent_idea_id=...)`, and `select_stage` places
+  `BRANCH` after `REPLICATE`. Recursive discovery is therefore strictly
+  downstream of meta-review and replication and cannot be demonstrated
+  independently. Any other way of producing a child would be manufacturing
+  coverage.
+
+`ccao` additionally declares **zero** experiment commands, so its empirical
+ideas refuse deterministically at $0.00 before any model call. Recorded as
+a limitation rather than answered by declaring a capability.
+
+### AB.8 Verdict: `AUTONOMOUS_DISCOVERY_BETA`
+
+One of §Z.4's six items moved: plan authoring no longer requires a human.
+Item 2 (one idea end to end) did not, item 3 (a second provider family) is
+unchanged, item 4 was run on a tree that changed under it, and item 6 -- a
+review that finds only refinements -- came back with two CRITICALs and a
+green-suite blind spot in code written this session.
+
+That last one decides it. **Thirteen defects in one session on one
+feature**, four of them found by an author who had just spent the session
+writing about this exact failure mode, and the most serious found only
+because four reviewers were pointed at it from four directions. The defect
+surface is not exhausted, and the honest reading of a review round that
+productive is that a fifth would also find something.
