@@ -190,6 +190,33 @@ class ModelRole(StrEnum):
     precede the design rather than accompany it.
     """
 
+    FOLLOW_UP_EXPLORER = "follow_up_explorer"
+    """Turns one recorded event into the new questions it raises.
+
+    Its own role because provenance must say which question was asked:
+    "an explorer proposed this" and "this was raised by a refutation, an
+    objection or a literature contradiction" are different claims about why
+    an idea exists, and the frontier is built on the difference. It proposes
+    children; it has no way to revise the idea whose event it reads.
+    """
+
+    LITERATURE_EXPLORER = "literature_explorer"
+    """Proposes directions from verified claims about the published record.
+
+    Shown claims, each tied to the retrieved works it rests on, and nothing
+    of the portfolio's own bank -- so what it proposes comes from the
+    external frontier, and every candidate cites the claims it came from.
+    """
+
+    LITERATURE_READER = "literature_reader"
+    """Answers one idea's precise question from retrieved sources alone.
+
+    Distinct from the scout, whose output is a novelty matrix a gate reads:
+    this one returns claims, disagreements and gaps, each citing the works
+    it rests on, and every citation and quotation is checked against the
+    packet before anything is kept.
+    """
+
     NOMINATOR = "nominator"
     """Judges whether one project's finding is candidate knowledge for others.
 

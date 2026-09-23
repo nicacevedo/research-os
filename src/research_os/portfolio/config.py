@@ -113,6 +113,11 @@ class Bounds(BaseModel):
     #: The budget does stop it, eventually, and "you have spent your ceiling"
     #: is the wrong diagnosis for "this project's idea space is exhausted".
     max_barren_explorations: int = Field(default=6, ge=1, le=100)
+    #: The deepest a lineage may grow through follow-up requests. A request
+    #: raised by an idea already this deep is recorded and declined: the
+    #: question is kept, and recursion stops. Depth grows only through
+    #: recorded events, so this bounds a chain of events rather than a loop.
+    max_lineage_depth: int = Field(default=6, ge=1, le=50)
 
 
 class Thresholds(BaseModel):

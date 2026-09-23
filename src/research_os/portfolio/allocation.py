@@ -41,6 +41,12 @@ ADVANCE_IDEA = "portfolio_advance_idea"
 EXPLORE = "portfolio_explore"
 CURATE = "portfolio_curate"
 DIGEST = "portfolio_digest"
+#: One open frontier request turned into the new ideas it raises. Same
+#: string as `research_os.portfolio.frontier.FOLLOW_UP`.
+FOLLOW_UP = "portfolio_follow_up"
+#: One open literature request answered from retrieved sources. Same string
+#: as `research_os.portfolio.litintel.LITERATURE_REQUEST`.
+LITERATURE_REQUEST = "portfolio_literature"
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,6 +150,14 @@ class Allocation:
                 f"{self.kind}:{self.idea_id}:{self.stage}:"
                 f"v{self.idea_version}:{self.failed_attempts}"
             )
+        if self.kind in {FOLLOW_UP, LITERATURE_REQUEST}:
+            # The request and how many times it has been attempted: one item
+            # per attempt, for the reason the failure count is in an idea
+            # advance's key -- a spent key would refuse the retry silently.
+            return (
+                f"{self.kind}:{self.payload.get('request_id', '')}:"
+                f"{self.payload.get('attempts', 0)}"
+            )
         return f"{self.kind}:{self.explorer or ''}:{self.payload.get('bucket', '')}"
 
 
@@ -236,6 +250,7 @@ def choose_explorer(
     pending_seeds: int,
     origin_counts: Mapping[IdeaOrigin, int],
     minable_failures: int,
+    frontier_claims: int = 0,
 ) -> tuple[str, str]:
     """Which explorer to run next, and why. Deterministic and rotating.
 
@@ -259,6 +274,12 @@ def choose_explorer(
             f"{minable_failures} failure(s) to mine and only {mined} idea(s) came "
             f"from mining"
         )
+    read = origin_counts.get(IdeaOrigin.LITERATURE_EXPLORER, 0)
+    if frontier_claims and read * 2 <= blind:
+        return "literature_explorer", (
+            f"{frontier_claims} verified gap(s) or disagreement(s) in the literature "
+            f"and only {read} idea(s) came from reading it"
+        )
     return "blind_explorer", "keep generating directions that have not seen the bank"
 
 
@@ -274,6 +295,11 @@ def plan(
     minable_failures: int,
     tick_bucket: str,
     explorers_in_flight: int = 0,
+    open_requests: Sequence[tuple[str, int, str]] = (),
+    follow_ups_in_flight: int = 0,
+    literature_requests: Sequence[tuple[str, int, str]] = (),
+    literature_in_flight: int = 0,
+    frontier_claims: int = 0,
 ) -> tuple[Allocation, ...]:
     """The ordered, bounded list of work this tick buys.
 
@@ -285,6 +311,35 @@ def plan(
     allocations: list[Allocation] = []
     remaining = max(0, free_slots)
 
+    # A recorded question first, one at a time. It is the cheapest unit of
+    # genuinely new science the portfolio can buy -- one call, about one
+    # event that already happened -- and putting it behind idea work would
+    # let a busy portfolio starve its own recursion: every question raised by
+    # a result would wait for a free slot that deepening never leaves.
+    # `open_requests` is ``(request_id, attempts, basis)``, oldest first.
+    if remaining and open_requests and follow_ups_in_flight == 0:
+        request_id, attempts, basis = open_requests[0]
+        allocations.append(
+            Allocation(
+                kind=FOLLOW_UP,
+                reason=f"an open {basis} request owes the frontier new ideas",
+                payload={"request_id": request_id, "attempts": attempts},
+            )
+        )
+        remaining -= 1
+    # And a question put to the literature, the same way and for the same
+    # reason: it is the cheapest thing that can unblock an idea waiting on it.
+    if remaining and literature_requests and literature_in_flight == 0:
+        request_id, attempts, basis = literature_requests[0]
+        allocations.append(
+            Allocation(
+                kind=LITERATURE_REQUEST,
+                reason=f"an open {basis} question for the literature",
+                payload={"request_id": request_id, "attempts": attempts},
+            )
+        )
+        remaining -= 1
+
     if (
         remaining
         and candidate_pool < config.bounds.candidate_pool_floor
@@ -294,6 +349,7 @@ def plan(
             pending_seeds=pending_seeds,
             origin_counts=origin_counts,
             minable_failures=minable_failures,
+            frontier_claims=frontier_claims,
         )
         allocations.append(
             Allocation(
@@ -383,6 +439,7 @@ def plan(
             pending_seeds=pending_seeds,
             origin_counts=origin_counts,
             minable_failures=minable_failures,
+            frontier_claims=frontier_claims,
         )
         if not any(item.kind == EXPLORE for item in allocations):
             allocations.append(

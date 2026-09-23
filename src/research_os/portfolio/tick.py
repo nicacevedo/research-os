@@ -37,6 +37,8 @@ from research_os.portfolio.models import (
     IdeaStatus,
     OperationalState,
     PortfolioStatus,
+    RequestKind,
+    RequestState,
 )
 from research_os.portfolio.stages import select_stage, snapshot_for
 from research_os.portfolio.store import PortfolioStore
@@ -65,6 +67,9 @@ class TickReport:
     candidate_pool: int = 0
     stale_actions_reclaimed: int = 0
     blocks_cleared: int = 0
+    #: Ideas with nothing left to run that this pass gave an explicit state.
+    settled: int = 0
+    open_requests: int = 0
     allocations: tuple[allocation.Allocation, ...] = ()
     work_enqueued: int = 0
     #: Allocations the queue already had an item for, so nothing was enqueued.
@@ -87,6 +92,8 @@ class TickReport:
             "candidate_pool": self.candidate_pool,
             "stale_actions_reclaimed": self.stale_actions_reclaimed,
             "blocks_cleared": self.blocks_cleared,
+            "settled": self.settled,
+            "open_requests": self.open_requests,
             "work_enqueued": self.work_enqueued,
             "work_refused": self.work_refused,
             "uncurated": self.uncurated,
@@ -144,6 +151,19 @@ def tick(
     report.candidate_pool = counts.get(IdeaStatus.CANDIDATE, 0)
 
     pending_seeds = len(store.pending_seeds(project_id=project_id))
+    requests = store.list_requests(
+        project_id=project_id,
+        states=(RequestState.OPEN,),
+        kinds=(RequestKind.FOLLOW_UP,),
+        limit=50,
+    )
+    literature_requests = store.list_requests(
+        project_id=project_id,
+        states=(RequestState.OPEN,),
+        kinds=(RequestKind.LITERATURE,),
+        limit=50,
+    )
+    report.open_requests = len(requests) + len(literature_requests)
 
     # --- the four reasons a portfolio may stop ---------------------------
     # Read the project and system ceilings directly rather than through
@@ -178,7 +198,14 @@ def tick(
     # which worked, and reported the wrong cause. A new seed clears the pause,
     # because a seed is exactly the information the count says is missing.
     barren = store.barren_explorations(project_id=project_id)
-    if barren >= config.bounds.max_barren_explorations and not pending_seeds:
+    # An open request is information the explorers did not have, exactly as
+    # a seed is, so it holds off the pause for the same reason.
+    if (
+        barren >= config.bounds.max_barren_explorations
+        and not pending_seeds
+        and not requests
+        and not literature_requests
+    ):
         return _pause(
             store,
             report,
@@ -188,7 +215,7 @@ def tick(
             f"here. `researchctl seed add` gives them somewhere else to look.",
         )
 
-    candidates = _candidates(store, project_id, config, moment)
+    candidates, report.settled = _candidates(store, project_id, config, moment)
     ideas = store.list_ideas(project_id=project_id, limit=500)
     blocked_externally = [
         item
@@ -216,6 +243,24 @@ def tick(
         + counts.get(IdeaStatus.PARKED, 0),
         tick_bucket=moment.strftime("%Y%m%dT%H%M"),
         explorers_in_flight=in_flight,
+        open_requests=[
+            (item.request_id, item.attempts, str(item.basis)) for item in requests
+        ],
+        follow_ups_in_flight=store.work_in_flight(
+            project_id=project_id, kind=allocation.FOLLOW_UP
+        ),
+        literature_requests=[
+            (item.request_id, item.attempts, str(item.basis))
+            for item in literature_requests
+        ],
+        literature_in_flight=store.work_in_flight(
+            project_id=project_id, kind=allocation.LITERATURE_REQUEST
+        ),
+        frontier_claims=len(
+            store.list_literature_claims(
+                project_id=project_id, frontier_only=True, limit=50
+            )
+        ),
     )
     report.allocations = allocations
 
@@ -244,6 +289,10 @@ def tick(
     ]
     if (
         not idea_allocations
+        and not any(
+            item.kind in {allocation.FOLLOW_UP, allocation.LITERATURE_REQUEST}
+            for item in allocations
+        )
         and report.active_tracks == 0
         and live
         and blocked_externally
@@ -279,6 +328,12 @@ def tick(
                 "explorer": item.explorer,
                 "reason": item.reason,
                 "utility": str(item.utility),
+                **(
+                    {"request_id": item.payload.get("request_id")}
+                    if item.kind
+                    in {allocation.FOLLOW_UP, allocation.LITERATURE_REQUEST}
+                    else {}
+                ),
             },
             dedup_key=item.dedup_key,
             priority=100,
@@ -424,7 +479,7 @@ def _candidates(
     project_id: str,
     config: PortfolioConfig,
     moment: datetime,
-) -> tuple[allocation.Candidate, ...]:
+) -> tuple[tuple[allocation.Candidate, ...], int]:
     """Every idea the allocator may choose from, with its next stage.
 
     The next stage is computed here rather than by the handler, because an
@@ -432,7 +487,10 @@ def _candidates(
     would enqueue an item that does nothing.
     """
 
+    from research_os.portfolio import frontier
+
     found: list[allocation.Candidate] = []
+    settled = 0
     failures = store.stage_failures(project_id)
     for idea in store.list_ideas(project_id=project_id, limit=500):
         if not allocation.allocatable(idea):
@@ -452,6 +510,13 @@ def _candidates(
         version = snapshot.version
         stage, reason = select_stage(snapshot, config)
         if stage is None:
+            # Nothing left to run and not settled: give it an explicit state
+            # rather than leaving it unallocatable in limbo. The track does
+            # this when a stage ends it; this catches an idea that reached
+            # the same place any other way -- including every one a build
+            # before `frontier.settle` existed left there.
+            if frontier.settle(store, idea, snapshot, config):
+                settled += 1
             continue
         failed_attempts, recent_failures, refusals = failures.get(
             (idea.idea_id, str(stage), str(version.version)), (0, 0, 0)
@@ -502,7 +567,7 @@ def _candidates(
                 failed_attempts=failed_attempts,
             )
         )
-    return tuple(found)
+    return tuple(found), settled
 
 
 def ensure_schedule(

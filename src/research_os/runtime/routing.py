@@ -224,6 +224,11 @@ _ADAPTER_ROLE: dict[ModelRole, AutomationRole] = {
     # pool that authors the grid it will be applied to. On a one-family host
     # both are the same family anyway, and that is recorded, not hidden.
     ModelRole.ANALYSIS_DESIGNER: AutomationRole.ANALYST,
+    # Generators, like the explorers: what they produce is attacked later.
+    ModelRole.FOLLOW_UP_EXPLORER: AutomationRole.ANALYST,
+    # Work over retrieved sources is what LITERATURE means here.
+    ModelRole.LITERATURE_EXPLORER: AutomationRole.LITERATURE,
+    ModelRole.LITERATURE_READER: AutomationRole.LITERATURE,
 }
 
 

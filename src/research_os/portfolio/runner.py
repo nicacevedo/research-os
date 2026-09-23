@@ -52,14 +52,17 @@ from research_os.portfolio.models import (
     ContextClass,
     Disposition,
     EdgeKind,
+    EmpiricalConclusion,
     EvidenceKind,
     EvidenceStrength,
     ExperimentRole,
     IdeaOrigin,
     IdeaStatus,
     ObjectionTarget,
+    ProvenanceBasis,
     QualityDimensions,
     QualityTier,
+    RequestBasis,
     ReviewerRole,
     ReviewVerdict,
     Severity,
@@ -296,6 +299,11 @@ _STAGE_FOR_TEMPLATE: dict[str, Stage] = {
     "meta_reviewer": Stage.META_REVIEW,
     "replicator": Stage.REPLICATE,
     "brancher": Stage.BRANCH,
+    # A follow-up opens children from one recorded event, which is what a
+    # branch is; it is charged at the branch ceiling.
+    "follow_up_explorer": Stage.BRANCH,
+    # Reading retrieved sources for one idea is the audit's kind of work.
+    "literature_reader": Stage.LITERATURE_AUDIT,
 }
 
 
@@ -461,6 +469,18 @@ def _record_duplicate(
         kind=kind,
         detail=detail,
     )
+    # Why the duplicate existed is a reason the survivor exists too: two
+    # routes arriving at one direction is information, and deduplication is
+    # where it used to be lost.
+    for reason in store.provenance_of(context.idea_id):
+        store.record_provenance(
+            idea_id=survivor,
+            basis=ProvenanceBasis.CONVERGENCE,
+            source_ref=context.idea_id,
+            request_id=reason.request_id,
+            call_id=reason.call_id,
+            detail=f"{context.idea_id} ({reason.basis}) was the same direction: {detail}",
+        )
     store.set_status(
         idea_id=context.idea_id,
         status=IdeaStatus.SUPERSEDED,
@@ -619,7 +639,8 @@ def run_falsify(context: TrackContext, snapshot: stages.TrackSnapshot) -> StageO
         severity=result.worst,
         summary=result.summary,
         objections=[
-            (item.severity, item.target, item.summary) for item in result.objections
+            (item.severity, item.target, item.summary, item.follow_up_question)
+            for item in result.objections
         ],
     )
     if result.worst is Severity.FATAL:
@@ -1029,6 +1050,7 @@ def _run_experiment_stage(
             cost_usd=Decimal(step.cost_usd),
             model_calls=step.model_calls,
         )
+    _raise_from_measurement(context, snapshot, step, role=role)
     return StageOutcome.succeeded(
         step.detail,
         disposition=Disposition.CONTINUE,
@@ -1042,6 +1064,88 @@ def _run_experiment_stage(
             "evidence_id": step.evidence_id,
         },
     )
+
+
+def _raise_from_measurement(
+    context: TrackContext,
+    snapshot: stages.TrackSnapshot,
+    step: Any,
+    *,
+    role: ExperimentRole,
+) -> None:
+    """Record the question a measurement left open, where the measurement is read.
+
+    Three events and no others, each decided from a stored conclusion rather
+    than from anybody's opinion of it:
+
+    - a primary measurement that was ``INSUFFICIENT`` -- the question could not
+      be answered this way, and asking what *could* answer it is new work;
+    - a primary measurement that was ``INCONCLUSIVE`` -- the value fell between
+      the prespecified conditions, an anomaly with respect to the prediction;
+    - a replication whose conclusion differs from the primary's.
+
+    A ``SUPPORTS`` or ``CONTRADICTS`` primary raises nothing here: the idea's
+    track continues to review, and reviewers' criticisms raise their own
+    questions through ``_record_review``.
+    """
+
+    from research_os.portfolio import frontier
+
+    experiment = step.experiment
+    conclusion = step.conclusion
+    if experiment is None or conclusion is None:
+        return
+    version = snapshot.version
+    if role is ExperimentRole.PRIMARY and conclusion in {
+        EmpiricalConclusion.INSUFFICIENT,
+        EmpiricalConclusion.INCONCLUSIVE,
+    }:
+        basis = (
+            RequestBasis.INSUFFICIENT
+            if conclusion is EmpiricalConclusion.INSUFFICIENT
+            else RequestBasis.ANOMALY
+        )
+        frontier.raise_request(
+            context.portfolio,
+            project_id=context.project_id,
+            basis=basis,
+            source_ref=experiment.experiment_id,
+            source_idea_id=context.idea_id,
+            source_version=version.version,
+            question=(
+                f"The measurement of '{version.research_question}' came back "
+                f"{conclusion}. What new question does that outcome raise -- "
+                f"one a measurement could actually settle, or one about why "
+                f"this one could not?"
+            ),
+            detail=step.detail,
+        )
+        return
+    if role is ExperimentRole.REPLICATION:
+        primary = context.portfolio.get_experiment(
+            idea_id=context.idea_id,
+            idea_version=version.version,
+            role=ExperimentRole.PRIMARY,
+        )
+        if (
+            primary is not None
+            and primary.conclusion is not None
+            and primary.conclusion is not conclusion
+        ):
+            frontier.raise_request(
+                context.portfolio,
+                project_id=context.project_id,
+                basis=RequestBasis.REPLICATION,
+                source_ref=experiment.experiment_id,
+                source_idea_id=context.idea_id,
+                source_version=version.version,
+                question=(
+                    f"The primary measurement concluded {primary.conclusion} and "
+                    f"its replication {conclusion}. What explains the "
+                    f"disagreement, and what would settle it?"
+                ),
+                detail=step.detail,
+            )
 
 
 def run_one_review(
@@ -1134,7 +1238,8 @@ def run_one_review(
         severity=review.severity,
         summary=review.summary,
         objections=[
-            (item.severity, item.target, item.summary) for item in review.objections
+            (item.severity, item.target, item.summary, item.follow_up_question)
+            for item in review.objections
         ],
         packet_digest=packet.digest,
     )
@@ -1303,6 +1408,7 @@ def run_meta_review(
     result = _evaluate(context)
     allowed = gates.permit(meta.recommendation, result)
     _apply_disposition(context, allowed, result)
+    _continue_after_meta_review(context, snapshot, meta, allowed)
     detail = f"recommended {meta.recommendation}; the gate permits {allowed}"
     if allowed is not meta.recommendation:
         detail += f". Unmet: {'; '.join(result.unmet[:3])}"
@@ -1318,6 +1424,64 @@ def run_meta_review(
             "board_independence": result.board_independence,
         },
     )
+
+
+def _continue_after_meta_review(
+    context: TrackContext,
+    snapshot: stages.TrackSnapshot,
+    meta: MetaReviewOutput,
+    allowed: Disposition,
+) -> None:
+    """What happens to the idea when the synthesis is not a promotion.
+
+    The gated recommendations are `_apply_disposition`'s. This is the rest,
+    which used to do nothing at all: a meta-reviewer recommending REJECT
+    left the idea exactly where it was, and one recommending BRANCH opened
+    nothing. Killing and pausing need no gate -- that asymmetry is the design
+    -- and branching is a *request*, so the new ideas are made by the
+    frontier's own bounded route with the parent untouched.
+    """
+
+    from research_os.portfolio import frontier
+
+    store = context.portfolio
+    idea = store.require_idea(context.idea_id)
+    if allowed is Disposition.REJECT and idea.status not in {
+        IdeaStatus.REJECTED,
+        IdeaStatus.SUPERSEDED,
+    }:
+        store.set_status(
+            idea_id=context.idea_id,
+            status=IdeaStatus.REJECTED,
+            retire_reason=f"the synthesis of the reviews rejected it: {meta.summary}",
+        )
+    elif allowed is Disposition.PARK and idea.status not in {
+        IdeaStatus.REJECTED,
+        IdeaStatus.SUPERSEDED,
+        IdeaStatus.PARKED,
+    }:
+        store.set_status(
+            idea_id=context.idea_id,
+            status=IdeaStatus.PARKED,
+            retire_reason=f"the synthesis of the reviews parked it: {meta.summary}",
+            revisit_if=(
+                "; ".join(meta.unresolved_disagreements)[:1_000]
+                or "a reviewer's objection is answered"
+            ),
+        )
+    for index, question in enumerate(meta.follow_up_questions):
+        frontier.raise_request(
+            store,
+            project_id=context.project_id,
+            basis=RequestBasis.RESULT
+            if allowed in {Disposition.BRANCH, Disposition.DEEPEN}
+            else RequestBasis.REVIEWER_CRITICISM,
+            source_ref=f"meta:{context.idea_id}:v{snapshot.version.version}:{index}",
+            source_idea_id=context.idea_id,
+            source_version=snapshot.version.version,
+            question=question,
+            detail=f"raised by the meta-review ({meta.recommendation}): {meta.summary}",
+        )
 
 
 def run_replicate(
@@ -1413,7 +1577,8 @@ def run_replicate(
         severity=review.severity,
         summary=review.summary,
         objections=[
-            (item.severity, item.target, item.summary) for item in review.objections
+            (item.severity, item.target, item.summary, item.follow_up_question)
+            for item in review.objections
         ],
         packet_digest=packet.digest,
     )
@@ -1514,6 +1679,7 @@ def run_branch(context: TrackContext, snapshot: stages.TrackSnapshot) -> StageOu
             origin_role=str(PORTFOLIO_TEMPLATES["brancher"].role),
             origin_stage=str(Stage.BRANCH),
             dimensions=child.dimensions,
+            provenance=(ProvenanceBasis.BRANCH, context.idea_id, None),
         )
         opened.append(created.idea_id)
     return StageOutcome.succeeded(
@@ -1556,6 +1722,10 @@ EXPLORERS: dict[str, tuple[str, IdeaOrigin]] = {
     "failure_mining_explorer": (
         "portfolio_failure_mining_explorer",
         IdeaOrigin.FAILURE_MINING_EXPLORER,
+    ),
+    "literature_explorer": (
+        "portfolio_literature_explorer",
+        IdeaOrigin.LITERATURE_EXPLORER,
     ),
 }
 
@@ -1613,6 +1783,35 @@ def run_explorer(context: ExplorerContext, explorer: str) -> StageOutcome:
             model_calls=1,
         )
 
+    # What each candidate may cite as its source, per explorer. The blind
+    # explorer was shown nothing it could derive from, so it may cite
+    # nothing -- an identifier in its answer is one it was not given.
+    supplied = set(_supplied_sources(context, explorer))
+    invented = sorted(
+        {
+            item
+            for candidate in result.candidates
+            for item in candidate.derived_from
+            if item not in supplied
+        }
+    )
+    if invented:
+        return StageOutcome.failed(
+            f"{explorer} derived candidates from {', '.join(invented[:3])}, which it "
+            f"was not shown. A source nobody supplied is not a source.",
+            failure_class=FailureClass.MODEL_OUTPUT_INVALID,
+            cost_usd=_cost(response),
+            model_calls=1,
+        )
+    basis = _EXPLORER_BASIS[explorer]
+    seeds = (
+        [
+            item.seed_id
+            for item in context.portfolio.pending_seeds(project_id=context.project_id)
+        ]
+        if explorer == "seeded_explorer"
+        else []
+    )
     created: list[str] = []
     duplicates = 0
     for candidate in result.candidates:
@@ -1623,17 +1822,48 @@ def run_explorer(context: ExplorerContext, explorer: str) -> StageOutcome:
             fields=fields_for,
             config=context.config,
         )
+        source_ref = (
+            ",".join(candidate.derived_from)
+            if candidate.derived_from
+            else ",".join(seeds) or None
+        )
         if outcome.is_duplicate:
             duplicates += 1
+            if outcome.match_idea_id:
+                context.portfolio.record_provenance(
+                    idea_id=outcome.match_idea_id,
+                    basis=ProvenanceBasis.CONVERGENCE,
+                    source_ref=source_ref,
+                    call_id=response.call_id,
+                    detail=(
+                        f"{explorer} ({basis}) proposed this direction "
+                        f"independently: {outcome.detail}"
+                    ),
+                )
             continue
+        # A failure-mined candidate that names the rejected idea it grew out
+        # of is that idea's child: lineage and provenance both say so, and
+        # the depth is real rather than decorative. Any other explorer's
+        # candidate starts a lineage of its own.
+        parent = next(
+            (
+                item
+                for item in candidate.derived_from
+                if explorer == "failure_mining_explorer" and item.startswith("PIDEA-")
+            ),
+            None,
+        )
         idea, _version = context.portfolio.create_idea(
             project_id=context.project_id,
             origin=origin,
             fields=fields_for,
+            parent_idea_id=parent,
+            edge_detail=f"mined from the failure of {parent}" if parent else "",
             origin_call_id=response.call_id,
             origin_role=str(template.role),
             origin_stage="explore",
             dimensions=candidate.dimensions,
+            provenance=(basis, source_ref, None),
         )
         created.append(idea.idea_id)
 
@@ -1650,6 +1880,70 @@ def run_explorer(context: ExplorerContext, explorer: str) -> StageOutcome:
         model_calls=1,
         data={"created": created, "duplicates": duplicates},
     )
+
+
+#: Why an explorer's idea exists, by explorer.
+_EXPLORER_BASIS: dict[str, ProvenanceBasis] = {
+    "blind_explorer": ProvenanceBasis.BLIND_EXPLORATION,
+    "seeded_explorer": ProvenanceBasis.SEEDED_EXPLORATION,
+    "failure_mining_explorer": ProvenanceBasis.FAILURE_MINING,
+    "literature_explorer": ProvenanceBasis.LITERATURE,
+}
+
+
+def _supplied_sources(context: ExplorerContext, explorer: str) -> list[str]:
+    """The identifiers an explorer was shown and may therefore cite."""
+
+    store = context.portfolio
+    if explorer == "failure_mining_explorer":
+        return [
+            idea.idea_id
+            for idea in store.list_ideas(
+                project_id=context.project_id,
+                statuses=[IdeaStatus.REJECTED, IdeaStatus.PARKED],
+                limit=12,
+            )
+        ] + [
+            item.experiment_id
+            for item in _failed_experiments(store, context.project_id)
+        ]
+    if explorer == "seeded_explorer":
+        return [
+            item.seed_id for item in store.pending_seeds(project_id=context.project_id)
+        ] + [
+            idea.idea_id
+            for idea in store.list_ideas(project_id=context.project_id, limit=40)
+        ]
+    if explorer == "literature_explorer":
+        return [item.claim_id for item in _literature_claims(context)]
+    return []
+
+
+def _failed_experiments(store: PortfolioStore, project_id: str) -> list[Any]:
+    """Measurements that did not settle their idea, newest first, bounded."""
+
+    from research_os.portfolio.models import EmpiricalConclusion as Conclusion
+
+    found = []
+    for idea in store.list_ideas(project_id=project_id, limit=60):
+        for item in store.list_experiments(idea_id=idea.idea_id):
+            if item.conclusion in {
+                Conclusion.INSUFFICIENT,
+                Conclusion.INCONCLUSIVE,
+                Conclusion.CONTRADICTS,
+            }:
+                found.append(item)
+    found.sort(key=lambda item: (item.updated_at, item.experiment_id), reverse=True)
+    return found[:12]
+
+
+def _literature_claims(context: ExplorerContext) -> list[Any]:
+    """Verified claims that point at the edge of the published record."""
+
+    lister = getattr(context.portfolio, "list_literature_claims", None)
+    if lister is None:
+        return []
+    return list(lister(project_id=context.project_id, frontier_only=True, limit=24))
 
 
 def _explorer_inputs(
@@ -1703,6 +1997,28 @@ def _explorer_inputs(
             for idea in store.list_ideas(project_id=context.project_id, limit=40)
             for item in store.open_objections(idea_id=idea.idea_id)
         ][:20]
+        # The two blocks the template always declared and nothing filled:
+        # measurements that did not settle their idea, and the ones whose
+        # value landed between the prespecified conditions.
+        failed = _failed_experiments(store, context.project_id)
+        blocks["failed_work"] = [
+            f"experiment id: {item.experiment_id} (idea {item.idea_id}): "
+            f"{item.conclusion}: {(item.detail or '')[:600]}"
+            for item in failed
+            if item.conclusion is not None and str(item.conclusion) != "INCONCLUSIVE"
+        ]
+        blocks["unexpected_results"] = [
+            f"experiment id: {item.experiment_id} (idea {item.idea_id}): "
+            f"{(item.detail or '')[:600]}"
+            for item in failed
+            if str(item.conclusion) == "INCONCLUSIVE"
+        ]
+    elif explorer == "literature_explorer":
+        blocks["literature_claims"] = [
+            f"claim id: {item.claim_id} [{item.kind}] {item.statement} "
+            f"(sources: {', '.join(item.work_keys)})"
+            for item in _literature_claims(context)
+        ]
     return fields, blocks
 
 
@@ -1763,7 +2079,7 @@ def _record_review(
     verdict: ReviewVerdict,
     severity: Severity,
     summary: str,
-    objections: Sequence[tuple[Severity, ObjectionTarget, str]],
+    objections: Sequence[tuple[Any, ...]],
     recommendation: Disposition | None = None,
     packet_digest: str | None = None,
 ) -> str:
@@ -1823,8 +2139,17 @@ def _record_review(
         independence_note=response.independence_note,
         call_id=response.call_id,
     )
-    for objection_severity, objection_target, objection_summary in objections:
-        context.portfolio.raise_objection(
+    from research_os.portfolio import frontier
+
+    basis = {
+        ReviewerRole.FALSIFIER: RequestBasis.FALSIFIER_OBJECTION,
+        ReviewerRole.REPLICATOR: RequestBasis.REPLICATION,
+    }.get(role, RequestBasis.REVIEWER_CRITICISM)
+    asked: list[tuple[str, str, str]] = []
+    for entry in objections:
+        objection_severity, objection_target, objection_summary = entry[:3]
+        question = str(entry[3]) if len(entry) > 3 else ""
+        objection, _created = context.portfolio.raise_objection(
             idea_id=context.idea_id,
             review_id=review.review_id,
             raised_at_version=snapshot.version.version,
@@ -1832,6 +2157,19 @@ def _record_review(
             target=objection_target,
             summary=objection_summary,
         )
+        if question:
+            asked.append((objection.objection_id, objection_summary, question))
+    # A criticism that is also a question becomes somebody else's new idea.
+    # Recorded here, where the objection is, so no later stage has to
+    # remember to look for it.
+    frontier.requests_from_objections(
+        context.portfolio,
+        project_id=context.project_id,
+        idea_id=context.idea_id,
+        version=snapshot.version.version,
+        basis=basis,
+        objections=asked,
+    )
     return review.review_id
 
 

@@ -187,11 +187,24 @@ class CandidateIdea(_Contract):
     )
     next_best_action: str = _shown(MAX_STATEMENT_CHARS, default="")
     dimensions: QualityDimensions = QualityDimensions()
+    #: The identifiers of the records this direction was derived from --
+    #: a rejected idea a failure-mining explorer was shown, a literature
+    #: claim a literature explorer was shown. Checked by ordinary code
+    #: against what was actually supplied, fail-closed, exactly as a
+    #: citation is: an identifier nobody showed the model is not a source.
+    derived_from: tuple[str, ...] = _shown_list(items=64, count=3, default=())
 
     @field_validator("title")
     @classmethod
     def _title(cls, value: str) -> str:
         return _bounded(value, MAX_TITLE_CHARS, "title")
+
+    @field_validator("derived_from")
+    @classmethod
+    def _derived(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(value) > 3:
+            raise ValueError("at most 3 derived_from identifiers")
+        return tuple(_bounded(item, 64, "a derived_from identifier") for item in value)
 
     @field_validator("research_question", "core_idea")
     @classmethod
@@ -312,11 +325,32 @@ class Objection(_Contract):
     #: objecting to the idea, which is the reading that kills -- erring
     #: towards the cheap outcome rather than towards keeping work alive.
     target: ObjectionTarget = ObjectionTarget.CLAIM
+    #: A new research question this objection raises, when it raises one --
+    #: "the argmin sits at the grid edge for every design" raises "is the
+    #: cold-start protocol monotone in lambda?". Optional, and never a
+    #: rewrite of the idea under review: it becomes a *new* idea, with its
+    #: own contract, through a frontier request.
+    follow_up_question: str = _shown(
+        MAX_STATEMENT_CHARS,
+        default="",
+        description=(
+            "Optional. A NEW research question this objection raises, worth "
+            "pursuing as its own idea. Not a revision of the idea under review."
+        ),
+    )
 
     @field_validator("summary")
     @classmethod
     def _summary(cls, value: str) -> str:
         return _bounded(value, MAX_SUMMARY_CHARS, "an objection")
+
+    @field_validator("follow_up_question")
+    @classmethod
+    def _follow_up(cls, value: str) -> str:
+        stripped = value.strip()
+        if len(stripped) > MAX_STATEMENT_CHARS:
+            raise ValueError(f"at most {MAX_STATEMENT_CHARS} characters")
+        return stripped
 
     @field_validator("severity")
     @classmethod
@@ -1671,11 +1705,25 @@ class MetaReviewOutput(_Contract):
     unresolved_disagreements: tuple[str, ...] = _shown_list(
         items=MAX_SUMMARY_CHARS, count=MAX_LIST_ITEMS, default=()
     )
+    #: New questions the reviews raise, each pursued as its own idea when the
+    #: recommendation is BRANCH or DEEPEN -- or recorded on any other.
+    follow_up_questions: tuple[str, ...] = _shown_list(
+        items=MAX_STATEMENT_CHARS, count=3, default=()
+    )
 
     @field_validator("summary")
     @classmethod
     def _summary(cls, value: str) -> str:
         return _bounded(value, MAX_SUMMARY_CHARS, "the meta-review summary")
+
+    @field_validator("follow_up_questions")
+    @classmethod
+    def _follow_ups(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(value) > 3:
+            raise ValueError("at most 3 follow-up questions")
+        return tuple(
+            _bounded(item, MAX_STATEMENT_CHARS, "a question") for item in value
+        )
 
     @field_validator("unresolved_disagreements")
     @classmethod
@@ -1770,6 +1818,145 @@ class BranchOutput(_Contract):
             raise ContractError("every child must name how it relates to its parent")
 
 
+class LiteratureStatement(_Contract):
+    """One statement about the published record, and the works it rests on."""
+
+    statement: str = _shown(MAX_STATEMENT_CHARS)
+    work_keys: tuple[str, ...] = _shown_list(items=128, count=6)
+    #: A verbatim quotation from one of those works' title or abstract, when
+    #: the statement rests on specific words. Checked against the stored
+    #: text before anything is kept; a quotation not found there invalidates
+    #: the whole reading.
+    excerpt: str = _shown(600, default="")
+
+    @field_validator("statement")
+    @classmethod
+    def _statement(cls, value: str) -> str:
+        return _bounded(value, MAX_STATEMENT_CHARS, "a statement")
+
+    @field_validator("work_keys")
+    @classmethod
+    def _keys(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if not value:
+            raise ValueError(
+                "a statement about the literature must cite the retrieved works "
+                "it rests on"
+            )
+        if len(value) > 6:
+            raise ValueError("at most 6 works per statement")
+        return tuple(_bounded(item, 128, "a work key") for item in value)
+
+    @field_validator("excerpt")
+    @classmethod
+    def _excerpt(cls, value: str) -> str:
+        stripped = value.strip()
+        if len(stripped) > 600:
+            raise ValueError("an excerpt is at most 600 characters")
+        return stripped
+
+
+class LiteratureClaimOut(LiteratureStatement):
+    kind: Literal["FINDING", "METHOD", "DATASET", "LIMITATION", "OPEN_QUESTION"]
+    #: What the statement does to the idea that asked, if one did.
+    relation_to_idea: Literal["SUPPORTS", "CONTRADICTS", "CONSISTENT_WITH", "NONE"] = (
+        "NONE"
+    )
+
+
+class LiteratureAnswer(_Contract):
+    """What the literature reader returns for one targeted question."""
+
+    answer: str = _shown(MAX_SUMMARY_CHARS)
+    claims: tuple[LiteratureClaimOut, ...] = ()
+    disagreements: tuple[LiteratureStatement, ...] = ()
+    gaps: tuple[LiteratureStatement, ...] = ()
+
+    @field_validator("answer")
+    @classmethod
+    def _answer(cls, value: str) -> str:
+        return _bounded(value, MAX_SUMMARY_CHARS, "the answer")
+
+    @field_validator("claims")
+    @classmethod
+    def _bounded_claims(
+        cls, value: tuple[LiteratureClaimOut, ...]
+    ) -> tuple[LiteratureClaimOut, ...]:
+        if len(value) > MAX_MATRIX_ROWS:
+            raise ValueError(f"at most {MAX_MATRIX_ROWS} claims")
+        return value
+
+    @field_validator("disagreements", "gaps")
+    @classmethod
+    def _bounded_statements(
+        cls, value: tuple[LiteratureStatement, ...]
+    ) -> tuple[LiteratureStatement, ...]:
+        if len(value) > MAX_OBJECTIONS:
+            raise ValueError(f"at most {MAX_OBJECTIONS}")
+        return value
+
+
+class FollowUpOutput(_Contract):
+    """What the follow-up explorer returns for one frontier request.
+
+    Children and how each relates to the idea whose event raised them. There
+    is no field for the parent -- no revised statement, no new falsifier, no
+    changed threshold -- because a follow-up is a new question and the
+    parent's frozen record is not this role's to touch.
+    """
+
+    children: tuple[CandidateIdea, ...] = ()
+    relations: tuple[str, ...] = _shown_list(
+        count=MAX_CANDIDATES,
+        choices=("DERIVED_FROM", "GENERALIZES", "SPECIALIZES"),
+        default=(),
+    )
+    nothing_to_propose: str = _shown(MAX_STATEMENT_CHARS, default="")
+
+    @field_validator("children")
+    @classmethod
+    def _bounded_children(
+        cls, value: tuple[CandidateIdea, ...]
+    ) -> tuple[CandidateIdea, ...]:
+        if len(value) > MAX_CANDIDATES:
+            raise ValueError(f"at most {MAX_CANDIDATES} children")
+        return value
+
+    @field_validator("relations")
+    @classmethod
+    def _lineage_only(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(value) > MAX_CANDIDATES:
+            raise ValueError(f"at most {MAX_CANDIDATES} relations")
+        bad = [
+            item
+            for item in value
+            if item not in {"DERIVED_FROM", "GENERALIZES", "SPECIALIZES"}
+        ]
+        if bad:
+            raise ValueError(f"not lineage relations: {bad}")
+        return value
+
+    @field_validator("nothing_to_propose")
+    @classmethod
+    def _nothing(cls, value: str) -> str:
+        stripped = value.strip()
+        if len(stripped) > MAX_STATEMENT_CHARS:
+            raise ValueError(f"at most {MAX_STATEMENT_CHARS} characters")
+        return stripped
+
+    def check(self, *, maximum: int) -> None:
+        if len(self.children) > maximum:
+            raise ContractError(
+                f"the bound is {maximum} children and {len(self.children)} were "
+                f"proposed"
+            )
+        if len(self.relations) != len(self.children):
+            raise ContractError("every child must name how it relates to its parent")
+        if not self.children and not self.nothing_to_propose:
+            raise ContractError(
+                "proposing nothing is a legitimate answer and must say why"
+            )
+
+
 def parse[ContractModel: BaseModel](
     model: type[ContractModel],
     *,
@@ -1860,4 +2047,7 @@ CONTRACTS: dict[str, type[BaseModel]] = {
     "replicator": ReviewOutput,
     "meta_reviewer": MetaReviewOutput,
     "brancher": BranchOutput,
+    "follow_up_explorer": FollowUpOutput,
+    "literature_reader": LiteratureAnswer,
+    "literature_explorer": ExplorerOutput,
 }

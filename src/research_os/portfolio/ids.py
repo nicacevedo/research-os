@@ -29,6 +29,9 @@ OBJECTION_ID_RE = re.compile(r"^IOBJ-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$")
 PORTFOLIO_DIGEST_ID_RE = re.compile(r"^PDIG-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$")
 SEED_ID_RE = re.compile(r"^SEED-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$")
 CONTRACT_ID_RE = re.compile(r"^PCON-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$")
+REQUEST_ID_RE = re.compile(r"^PFRQ-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$")
+PROVENANCE_ID_RE = re.compile(r"^IPRV-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$")
+CLAIM_ID_RE = re.compile(r"^PLCL-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$")
 
 #: Every id pattern this package mints, so a test can assert none of them can
 #: match a capsule id and none can match another runtime id.
@@ -42,6 +45,9 @@ ID_PATTERNS: dict[str, re.Pattern[str]] = {
     "portfolio_digest": PORTFOLIO_DIGEST_ID_RE,
     "seed": SEED_ID_RE,
     "contract": CONTRACT_ID_RE,
+    "frontier_request": REQUEST_ID_RE,
+    "idea_provenance": PROVENANCE_ID_RE,
+    "literature_claim": CLAIM_ID_RE,
 }
 
 
@@ -96,6 +102,18 @@ def new_contract_id(*, moment: datetime | None = None) -> str:
     """
 
     return new_id("PCON", moment=moment)
+
+
+def new_request_id(*, moment: datetime | None = None) -> str:
+    return new_id("PFRQ", moment=moment)
+
+
+def new_claim_id(*, moment: datetime | None = None) -> str:
+    return new_id("PLCL", moment=moment)
+
+
+def new_provenance_id(*, moment: datetime | None = None) -> str:
+    return new_id("IPRV", moment=moment)
 
 
 def track_thread_id(run_id: str) -> str:

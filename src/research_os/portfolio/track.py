@@ -229,6 +229,20 @@ def conclude(
         promoted = runner.promote_if_earned(runtime.context)
         if promoted:
             notes.append(f"the rows now support {promoted}")
+        # An idea whose track has nothing left to run gets an explicit
+        # state and its reason, here, rather than sitting unallocatable in
+        # the state it happened to be in. See `frontier.settle`.
+        from research_os.portfolio import frontier
+
+        context = runtime.context
+        settled = frontier.settle(
+            context.portfolio,
+            context.portfolio.require_idea(context.idea_id),
+            runner.build_snapshot(context),
+            context.config,
+        )
+        if settled:
+            notes.append(f"nothing further to run; settled as {settled}")
     return {"notes": notes}
 
 

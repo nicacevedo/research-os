@@ -573,6 +573,12 @@ ROLE_PERMISSIONS: dict[ModelRole, frozenset[Permission]] = {
     # because an analysis of an observable nothing writes analyses nothing.
     # Writes nothing and runs nothing: it fixes a rule ordinary code applies.
     ModelRole.ANALYSIS_DESIGNER: frozenset({Permission.READ_REPO}),
+    # Nothing: each is handed the record it reads, and a repository would
+    # give it somewhere to go.
+    ModelRole.FOLLOW_UP_EXPLORER: frozenset(),
+    ModelRole.LITERATURE_EXPLORER: frozenset(),
+    # Reads a packet it is handed; retrieval is the runtime's, not its own.
+    ModelRole.LITERATURE_READER: frozenset(),
 }
 
 #: What the runtime may hold at each configured autonomy setting. The *setting*

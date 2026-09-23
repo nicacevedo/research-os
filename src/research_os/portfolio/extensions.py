@@ -270,6 +270,178 @@ def run_explore(context: WorkContext) -> dict[str, Any]:
     }
 
 
+def run_follow_up(context: WorkContext) -> dict[str, Any]:
+    """One frontier request turned into the new ideas it raises."""
+
+    from research_os.portfolio import frontier
+    from research_os.runtime.artifacts import FilesystemArtifactStore
+
+    request_id = str(context.item.payload.get("request_id") or "")
+    if not request_id:
+        raise ValueError(f"{context.item.work_id}: a follow-up with no request")
+    store = PortfolioStore(context.db)
+    runtime = RuntimeStore(context.db)
+    run = runtime.create_run(
+        project_id=context.item.project_id,
+        objective=f"portfolio-follow-up:{request_id}",
+        autonomy=Autonomy(context.config.autonomy),
+        run_kind=RunKind.IDEA_TRACK,
+    )
+    runtime.set_run_status(run.run_id, RunStatus.RUNNING)
+    result = frontier.run_follow_up(
+        frontier.FrontierContext(
+            config=_config(context),
+            portfolio=store,
+            runtime=runtime,
+            models=context.models(
+                run.run_id, context.item.project_id, context.item.work_id
+            ),
+            artifacts=FilesystemArtifactStore(
+                context.config.artifacts_root, store=runtime
+            ),
+            project_id=context.item.project_id,
+            run_id=run.run_id,
+        ),
+        request_id,
+    )
+    runtime.set_run_status(
+        run.run_id,
+        RunStatus.SUCCEEDED if result.ok else RunStatus.FAILED,
+        terminal_state=(
+            TerminalState.DONE_FOR_NOW
+            if result.ok
+            else TerminalState.WAITING_FOR_EXTERNAL_DEPENDENCY
+        ),
+        detail=result.detail[:500],
+    )
+    if not result.ok and result.failure_class is not None:
+        raise _as_error(result.failure_class, result.detail)
+    return {
+        "request_id": request_id,
+        "created": list(result.created),
+        "converged": list(result.converged),
+        "detail": result.detail,
+        "cost_usd": str(result.cost_usd),
+    }
+
+
+class _ProviderRetriever:
+    """Discovery through the providers, into the shared index.
+
+    `LiteratureService.retrieve` -- the existing A0 retrieval the objective
+    cycle already uses -- behind the one-method protocol
+    `litintel.LiteratureRetriever` declares, so the portfolio never imports a
+    provider adapter and a deployment without one reports a capability
+    rather than crashing.
+    """
+
+    def retrieve(self, query: str) -> dict[str, Any]:
+        from research_os.literature.config import load_config as load_literature
+        from research_os.literature.service import LiteratureService
+        from research_os.literature.store import LiteratureStore
+
+        store = LiteratureStore.open()
+        try:
+            report = LiteratureService(store=store, config=load_literature()).retrieve(
+                query, limit=12
+            )
+        finally:
+            store.close()
+        return {
+            "ingested": len(getattr(report, "keys", ()) or ()),
+            "reached": list(getattr(report, "reached", ())),
+        }
+
+
+def _retriever() -> Any | None:
+    """Provider discovery when literature is configured here, else nothing."""
+
+    try:
+        from research_os.literature.config import load_config as load_literature
+
+        config = load_literature()
+    except Exception:  # noqa: BLE001 - absent configuration is an answer
+        return None
+    if not any(
+        getattr(item, "enabled", False)
+        for item in getattr(config, "sources", {}).values()
+    ):
+        return None
+    return _ProviderRetriever()
+
+
+def run_literature_request(context: WorkContext) -> dict[str, Any]:
+    """One idea's question answered from retrieved, verified sources."""
+
+    from research_os.portfolio import frontier, litintel
+    from research_os.runtime.artifacts import FilesystemArtifactStore
+
+    request_id = str(context.item.payload.get("request_id") or "")
+    if not request_id:
+        raise ValueError(f"{context.item.work_id}: a literature request with no id")
+    store = PortfolioStore(context.db)
+    runtime = RuntimeStore(context.db)
+    run = runtime.create_run(
+        project_id=context.item.project_id,
+        objective=f"portfolio-literature:{request_id}",
+        autonomy=Autonomy(context.config.autonomy),
+        run_kind=RunKind.IDEA_TRACK,
+    )
+    runtime.set_run_status(run.run_id, RunStatus.RUNNING)
+    result = litintel.answer_request(
+        frontier.FrontierContext(
+            config=_config(context),
+            portfolio=store,
+            runtime=runtime,
+            models=context.models(
+                run.run_id, context.item.project_id, context.item.work_id
+            ),
+            artifacts=FilesystemArtifactStore(
+                context.config.artifacts_root, store=runtime
+            ),
+            project_id=context.item.project_id,
+            run_id=run.run_id,
+        ),
+        request_id,
+        literature=_literature(),
+        retriever=_retriever(),
+    )
+    runtime.set_run_status(
+        run.run_id,
+        RunStatus.SUCCEEDED if result.ok else RunStatus.FAILED,
+        terminal_state=(
+            TerminalState.DONE_FOR_NOW
+            if result.ok
+            else TerminalState.WAITING_FOR_EXTERNAL_DEPENDENCY
+        ),
+        detail=result.detail[:500],
+    )
+    if not result.ok and result.failure_class is not None:
+        raise _as_error(result.failure_class, result.detail)
+    return {
+        "request_id": request_id,
+        "claims": list(result.claims),
+        "evidence": list(result.evidence),
+        "raised": list(result.raised),
+        "detail": result.detail,
+    }
+
+
+def run_literature_watch(context: WorkContext) -> dict[str, Any]:
+    """A scheduled pass: targeted questions for the liveliest ideas. No model."""
+
+    from datetime import UTC, datetime
+
+    from research_os.portfolio import litintel
+
+    raised = litintel.watch(
+        PortfolioStore(context.db),
+        project_id=context.item.project_id,
+        bucket=datetime.now(UTC).strftime("%Y%m%d"),
+    )
+    return {"raised": raised}
+
+
 def run_curate(context: WorkContext) -> dict[str, Any]:
     """Write the bank to the project's autonomous branch."""
 
@@ -366,6 +538,13 @@ def register() -> None:
     register_work(PORTFOLIO_TICK, run_tick, from_event=TICK_EVENT)
     register_work(allocation.ADVANCE_IDEA, run_advance_idea)
     register_work(allocation.EXPLORE, run_explore)
+    register_work(allocation.FOLLOW_UP, run_follow_up)
+    register_work(allocation.LITERATURE_REQUEST, run_literature_request)
+    register_work(
+        "portfolio_literature_watch",
+        run_literature_watch,
+        from_event="LITERATURE_WATCH_DUE",
+    )
     register_work(allocation.CURATE, run_curate)
     register_work(allocation.DIGEST, run_digest)
 

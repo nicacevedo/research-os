@@ -1639,3 +1639,94 @@ prompt identity; those are provenance recorded beside the digests.
 
 Tests: `tests/test_portfolio_scientific_contract.py`; the mutation evidence
 is in the closure report.
+
+---
+
+## 20. The research frontier: recorded events become new science
+
+§AB.7 of the report measured why recursive discovery never happened on real
+work: `max_depth` was 0 across 254 ideas, because the only producer of a
+child was `BRANCH`, which `select_stage` reaches after meta-review and
+replication. The frontier (`portfolio/frontier.py`, migration `0032`) makes a
+child reachable from every event that raises a question.
+
+**Frontier requests** (`frontier_requests`). An event is recorded where it
+happens, by ordinary code reading a stored field, as one request with a
+`basis`: `INSUFFICIENT` or `ANOMALY` (a primary measurement that could not
+settle, or landed between the predicates), `REPLICATION` (a replication whose
+conclusion differs from its primary's), `FALSIFIER_OBJECTION`,
+`REVIEWER_CRITICISM` (an objection whose author wrote a `follow_up_question`;
+a meta-review's `follow_up_questions`), `RESULT` (a meta-review recommending
+`BRANCH`/`DEEPEN`), `LITERATURE` (a verified gap or disagreement, §21),
+`REFEREE_FINDING` and `EVIDENCE_GAP` (§22). A unique index on
+`(project, kind, basis, source_ref)` makes one event one request however
+often it is replayed.
+
+**The follow-up explorer** (`follow_up_explorer@1`, its own role). The tick
+buys one per open request, one in flight at a time, *ahead of* idea work so a
+busy portfolio cannot starve its own recursion. It is shown the parent idea,
+the event and the parent's evidence, and returns children with their lineage
+relation -- its contract has no field for the parent, so it cannot revise it.
+Children pass deterministic deduplication; a duplicate is recorded as
+`CONVERGENCE` on the existing idea. Bounds: `max_children_per_branch`, the
+lineage's active ceiling, `max_lineage_depth` (default 6; deeper requests are
+declined at $0), and a request failing `max_stage_failures` times is declined.
+
+**A child never edits its parent.** It is a new idea -- new versions, new
+contract, a lineage edge, provenance naming the request -- and the parent's
+frozen hypothesis and contract are byte-identical afterwards
+(`tests/test_portfolio_frontier.py`).
+
+**Provenance** (`idea_provenance`, append-only by trigger). Every idea is
+created with at least one reason (`BLIND_EXPLORATION`, `SEEDED_EXPLORATION`
+naming the seeds, `FAILURE_MINING` naming the failure, `LITERATURE` naming
+claims, each request basis naming the request, `BRANCH`, `REVIVAL`); the
+migration backfills existing ideas from `origin`. Deduplication appends
+`CONVERGENCE` to the survivor instead of discarding why the duplicate
+existed.
+
+**Explicit continuation.** `frontier.settle` gives an idea whose track has
+nothing left to run an explicit state: `REJECTED` when a fatal objection to
+its claim stands, otherwise `PARKED` with the reason and a revisit condition
+-- except the thin-novelty dead end, which first asks the literature (§21)
+and waits (`BLOCKED_DEPENDENCY`, an operational state). It runs at the end of
+every stage and in the tick, so ideas left in limbo by earlier builds settle
+too. A meta-review recommending `REJECT` or `PARK` now does so; `VALIDATED`
+ideas with nothing left to run are closed for synthesis (§22).
+
+**Explorer boundaries.** The blind explorer is shown the charter and nothing
+from the bank, seeds or capsule hypotheses, and may cite nothing
+(`derived_from` must be empty). The failure-mining explorer (v2) is shown
+rejected ideas, standing objections, and the failed and inconclusive
+measurements; a candidate naming a rejected idea becomes its child. Every
+cited source is checked against what was supplied, fail-closed.
+
+## 21. Literature intelligence
+
+`portfolio/litintel.py`, migration `0033`. The shared index keeps *works*;
+`literature_claims` keeps what they *say* for this project's questions:
+`FINDING`, `METHOD`, `DATASET`, `LIMITATION`, `DISAGREEMENT`, `GAP`,
+`OPEN_QUESTION`, each with the work keys it rests on (a check constraint
+refuses none), a verification level (`CITED`; `QUOTED` when a verbatim excerpt
+was found in the cited source's stored text) and immutability by trigger.
+
+- **Targeted requests.** An idea asks a precise question (`litintel.ask`, a
+  frontier request of kind `LITERATURE`). The tick buys an answer:
+  discovery first when providers are configured (`LiteratureService.retrieve`,
+  the existing A0 retrieval, behind an injected retriever), then an index
+  search, then `literature_reader@1` answers from the packet alone. Ordinary
+  code verifies every citation and quotation before anything is stored;
+  one invented key or misquotation invalidates the whole reading. Claims
+  bearing on the idea become `LITERATURE` evidence rows bound to its version.
+- **Literature-driven discovery.** A verified gap or disagreement raises a
+  `LITERATURE` follow-up request against the asking idea; and
+  `literature_explorer@1`, shown only frontier claims and the charter,
+  proposes depth-0 ideas that must cite the claims they grew from.
+- **Novelty challenge.** Unchanged (§5, §9), plus: an audit that found too few
+  sources asks the literature before the idea is parked.
+- **Watching.** `litintel.ensure_watch` puts a `LITERATURE_WATCH_DUE`
+  schedule on the existing table; its work raises targeted requests for the
+  liveliest ideas, idempotent per day. Not enabled by default.
+
+Deterministic tests use a fixture corpus and need no credentials
+(`tests/test_portfolio_literature_intel.py`).

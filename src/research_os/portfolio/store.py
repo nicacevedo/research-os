@@ -43,12 +43,16 @@ from research_os.portfolio.ids import (
     new_idea_review_id,
     new_objection_id,
     new_portfolio_digest_id,
+    new_provenance_id,
+    new_request_id,
     new_seed_id,
 )
 from research_os.portfolio.models import (
     BLOCKED_STATES,
     CLOSED_IDEA_STATUSES,
+    FRONTIER_CLAIM_KINDS,
     OPEN_EXPERIMENT_STATES,
+    PROVENANCE_FOR_ORIGIN,
     TERMINAL_IDEA_STATUSES,
     TIER_ORDER,
     ActionStatus,
@@ -62,15 +66,18 @@ from research_os.portfolio.models import (
     EvidenceStrength,
     ExperimentRole,
     ExperimentState,
+    FrontierRequest,
     IdeaAction,
     IdeaEdge,
     IdeaEvidence,
     IdeaExperiment,
     IdeaObjection,
     IdeaOrigin,
+    IdeaProvenance,
     IdeaReview,
     IdeaStatus,
     IdeaVersion,
+    LiteratureClaim,
     ObjectionTarget,
     OperationalState,
     PortfolioDigestRecord,
@@ -78,8 +85,12 @@ from research_os.portfolio.models import (
     PortfolioSeed,
     PortfolioState,
     PortfolioStatus,
+    ProvenanceBasis,
     QualityDimensions,
     QualityTier,
+    RequestBasis,
+    RequestKind,
+    RequestState,
     ReviewerRole,
     ReviewVerdict,
     ScientificContract,
@@ -150,6 +161,18 @@ STATE_COLUMNS = (
     "updated_at"
 )
 SEED_COLUMNS = "seed_id, project_id, text, note, consumed_at, consumed_by, created_at"
+REQUEST_COLUMNS = (
+    "request_id, project_id, kind, basis, source_idea_id, source_version, "
+    "source_ref, question, detail, state, attempts, resolution, resolved_by, "
+    "created_at, updated_at"
+)
+CLAIM_COLUMNS = (
+    "claim_id, project_id, kind, statement, work_keys, excerpt, verification, "
+    "query, request_id, idea_id, source_call_id, artifact_id, digest, created_at"
+)
+PROVENANCE_COLUMNS = (
+    "provenance_id, idea_id, basis, source_ref, request_id, call_id, detail, created_at"
+)
 
 #: How much of a stage's own account of itself is kept.
 #:
@@ -322,8 +345,14 @@ class PortfolioStore:
         origin_role: str = "",
         origin_stage: str | None = None,
         dimensions: QualityDimensions | None = None,
+        provenance: tuple[ProvenanceBasis, str | None, str | None] | None = None,
     ) -> tuple[PortfolioIdea, IdeaVersion]:
         """Mint one candidate direction and its first, immutable version.
+
+        ``provenance`` is ``(basis, source_ref, request_id)``: why this idea
+        exists. When omitted it is what the origin implies, with the parent
+        as its source. Written in the same transaction as the idea, so no
+        idea can exist without a reason recorded for it.
 
         ``parent_idea_id`` sets lineage: the child's depth is the parent's plus
         one and its lineage root is the parent's, so the depth rule on
@@ -395,6 +424,21 @@ class PortfolioStore:
                     kind=edge_kind,
                     detail=edge_detail,
                 )
+            basis, source_ref, request_id = provenance or (
+                PROVENANCE_FOR_ORIGIN[str(origin)],
+                parent_idea_id,
+                None,
+            )
+            self._insert_provenance(
+                conn,
+                idea_id=idea_id,
+                basis=basis,
+                source_ref=source_ref,
+                request_id=request_id,
+                call_id=origin_call_id,
+                detail=f"created by {origin_role or origin}"
+                + (f" at {origin_stage}" if origin_stage else ""),
+            )
         return (
             PortfolioIdea.model_validate(idea_row),
             IdeaVersion.model_validate(version_row),
@@ -1292,6 +1336,306 @@ class PortfolioStore:
                 },
             ).fetchall()
         return len(rows)
+
+    # ----------------------------------------------------------- provenance --
+    @staticmethod
+    def _insert_provenance(
+        conn: Any,
+        *,
+        idea_id: str,
+        basis: ProvenanceBasis,
+        source_ref: str | None,
+        request_id: str | None,
+        call_id: str | None,
+        detail: str,
+    ) -> Any:
+        return conn.execute(
+            f"""
+            insert into idea_provenance
+                (provenance_id, idea_id, basis, source_ref, request_id, call_id, detail)
+            values (%s, %s, %s, %s, %s, %s, %s)
+            returning {PROVENANCE_COLUMNS}
+            """,
+            (
+                new_provenance_id(),
+                idea_id,
+                str(basis),
+                source_ref,
+                request_id,
+                call_id,
+                detail[:2_000],
+            ),
+        ).fetchone()
+
+    def record_provenance(
+        self,
+        *,
+        idea_id: str,
+        basis: ProvenanceBasis,
+        source_ref: str | None = None,
+        request_id: str | None = None,
+        call_id: str | None = None,
+        detail: str = "",
+    ) -> IdeaProvenance:
+        """Record one more reason an idea exists. Append-only, by trigger."""
+
+        with self._db.tx() as conn:
+            row = self._insert_provenance(
+                conn,
+                idea_id=idea_id,
+                basis=basis,
+                source_ref=source_ref,
+                request_id=request_id,
+                call_id=call_id,
+                detail=detail,
+            )
+        return IdeaProvenance.model_validate(row)
+
+    def provenance_of(self, idea_id: str) -> tuple[IdeaProvenance, ...]:
+        with self._db.tx() as conn:
+            rows = conn.execute(
+                f"select {PROVENANCE_COLUMNS} from idea_provenance where idea_id = %s "
+                "order by created_at, provenance_id",
+                (idea_id,),
+            ).fetchall()
+        return tuple(IdeaProvenance.model_validate(row) for row in rows)
+
+    # ----------------------------------------------------- literature claims --
+    def record_literature_claim(
+        self,
+        *,
+        project_id: str,
+        kind: str,
+        statement: str,
+        work_keys: Sequence[str],
+        excerpt: str,
+        verification: str,
+        query: str,
+        digest: str,
+        request_id: str | None = None,
+        idea_id: str | None = None,
+        source_call_id: str | None = None,
+        artifact_id: str | None = None,
+    ) -> LiteratureClaim:
+        """Store one verified claim. Idempotent on its content digest.
+
+        The caller has already verified it -- every key supplied, every
+        quotation found -- and the database refuses one with no key at all.
+        The same statement about the same works read twice is one claim.
+        """
+
+        from research_os.portfolio.ids import new_claim_id
+
+        with self._db.tx() as conn:
+            row = conn.execute(
+                f"""
+                insert into literature_claims
+                    (claim_id, project_id, kind, statement, work_keys, excerpt,
+                     verification, query, request_id, idea_id, source_call_id,
+                     artifact_id, digest)
+                values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                on conflict (project_id, digest) do nothing
+                returning {CLAIM_COLUMNS}
+                """,
+                (
+                    new_claim_id(),
+                    project_id,
+                    kind,
+                    statement[:4_000],
+                    list(work_keys),
+                    excerpt,
+                    verification,
+                    query[:2_000],
+                    request_id,
+                    idea_id,
+                    source_call_id,
+                    artifact_id,
+                    digest,
+                ),
+            ).fetchone()
+            if row is None:
+                row = conn.execute(
+                    f"select {CLAIM_COLUMNS} from literature_claims "
+                    "where project_id = %s and digest = %s",
+                    (project_id, digest),
+                ).fetchone()
+        return LiteratureClaim.model_validate(row)
+
+    def list_literature_claims(
+        self,
+        *,
+        project_id: str,
+        idea_id: str | None = None,
+        frontier_only: bool = False,
+        limit: int = 200,
+    ) -> tuple[LiteratureClaim, ...]:
+        clauses = ["project_id = %(project_id)s"]
+        params: dict[str, Any] = {"project_id": project_id, "limit": limit}
+        if idea_id is not None:
+            clauses.append("idea_id = %(idea_id)s")
+            params["idea_id"] = idea_id
+        if frontier_only:
+            clauses.append("kind = any(%(kinds)s)")
+            params["kinds"] = sorted(str(item) for item in FRONTIER_CLAIM_KINDS)
+        with self._db.tx() as conn:
+            rows = conn.execute(
+                f"select {CLAIM_COLUMNS} from literature_claims "
+                f"where {' and '.join(clauses)} "
+                "order by created_at desc, claim_id limit %(limit)s",
+                params,
+            ).fetchall()
+        return tuple(LiteratureClaim.model_validate(row) for row in rows)
+
+    def get_literature_claim(self, claim_id: str) -> LiteratureClaim | None:
+        with self._db.tx() as conn:
+            row = conn.execute(
+                f"select {CLAIM_COLUMNS} from literature_claims where claim_id = %s",
+                (claim_id,),
+            ).fetchone()
+        return LiteratureClaim.model_validate(row) if row else None
+
+    # ----------------------------------------------------- frontier requests --
+    def open_request(
+        self,
+        *,
+        project_id: str,
+        kind: RequestKind,
+        basis: RequestBasis,
+        source_ref: str,
+        question: str,
+        source_idea_id: str | None = None,
+        source_version: int | None = None,
+        detail: str = "",
+    ) -> FrontierRequest:
+        """Record one question owed to the frontier. Idempotent per raising event.
+
+        The unique index on ``(project, kind, basis, source_ref)`` makes a
+        replayed stage find the row instead of writing a second one, so the
+        number of follow-ups is bounded by the number of *events*, not by the
+        number of retries.
+        """
+
+        with self._db.tx() as conn:
+            row = conn.execute(
+                f"""
+                insert into frontier_requests
+                    (request_id, project_id, kind, basis, source_idea_id,
+                     source_version, source_ref, question, detail)
+                values (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                on conflict (project_id, kind, basis, source_ref) do nothing
+                returning {REQUEST_COLUMNS}
+                """,
+                (
+                    new_request_id(),
+                    project_id,
+                    str(kind),
+                    str(basis),
+                    source_idea_id,
+                    source_version,
+                    source_ref,
+                    question,
+                    detail or None,
+                ),
+            ).fetchone()
+            if row is None:
+                row = conn.execute(
+                    f"select {REQUEST_COLUMNS} from frontier_requests "
+                    "where project_id = %s and kind = %s and basis = %s "
+                    "and source_ref = %s",
+                    (project_id, str(kind), str(basis), source_ref),
+                ).fetchone()
+        return FrontierRequest.model_validate(row)
+
+    def get_request(self, request_id: str) -> FrontierRequest | None:
+        with self._db.tx() as conn:
+            row = conn.execute(
+                f"select {REQUEST_COLUMNS} from frontier_requests where request_id = %s",
+                (request_id,),
+            ).fetchone()
+        return FrontierRequest.model_validate(row) if row else None
+
+    def require_request(self, request_id: str) -> FrontierRequest:
+        found = self.get_request(request_id)
+        if found is None:
+            raise PortfolioStateError(f"no such frontier request: {request_id}")
+        return found
+
+    def list_requests(
+        self,
+        *,
+        project_id: str,
+        states: Sequence[RequestState] | None = None,
+        kinds: Sequence[RequestKind] | None = None,
+        source_idea_id: str | None = None,
+        limit: int = 500,
+    ) -> tuple[FrontierRequest, ...]:
+        clauses = ["project_id = %(project_id)s"]
+        params: dict[str, Any] = {"project_id": project_id, "limit": limit}
+        if states:
+            clauses.append("state = any(%(states)s)")
+            params["states"] = [str(item) for item in states]
+        if kinds:
+            clauses.append("kind = any(%(kinds)s)")
+            params["kinds"] = [str(item) for item in kinds]
+        if source_idea_id is not None:
+            clauses.append("source_idea_id = %(source)s")
+            params["source"] = source_idea_id
+        with self._db.tx() as conn:
+            rows = conn.execute(
+                f"select {REQUEST_COLUMNS} from frontier_requests "
+                f"where {' and '.join(clauses)} "
+                "order by created_at, request_id limit %(limit)s",
+                params,
+            ).fetchall()
+        return tuple(FrontierRequest.model_validate(row) for row in rows)
+
+    def close_request(
+        self,
+        request_id: str,
+        *,
+        state: RequestState,
+        resolution: str,
+        resolved_by: str | None = None,
+    ) -> FrontierRequest:
+        if state is RequestState.OPEN:
+            raise PortfolioStateError("closing a request needs a closed state")
+        with self._db.tx() as conn:
+            row = conn.execute(
+                f"""
+                update frontier_requests
+                   set state = %s, resolution = %s, resolved_by = %s,
+                       updated_at = now()
+                 where request_id = %s and state = 'OPEN'
+                returning {REQUEST_COLUMNS}
+                """,
+                (str(state), resolution[:4_000] or "closed", resolved_by, request_id),
+            ).fetchone()
+        if row is None:
+            return self.require_request(request_id)
+        return FrontierRequest.model_validate(row)
+
+    def count_request_attempt(self, request_id: str) -> int:
+        with self._db.tx() as conn:
+            row = conn.execute(
+                "update frontier_requests set attempts = attempts + 1, "
+                "updated_at = now() where request_id = %s returning attempts",
+                (request_id,),
+            ).fetchone()
+        return int(row["attempts"]) if row else 0
+
+    def work_in_flight(self, *, project_id: str, kind: str) -> int:
+        """Queued or running work of one kind for this project."""
+
+        with self._db.tx() as conn:
+            row = conn.execute(
+                """
+                select count(*) as n from work_items w
+                 where w.project_id = %(project_id)s and w.kind = %(kind)s
+                   and w.status in ('PENDING', 'LEASED', 'WAITING')
+                """,
+                {"project_id": project_id, "kind": kind},
+            ).fetchone()
+        return int(row["n"]) if row else 0
 
     # ----------------------------------------------------------- contracts --
     def create_contract(

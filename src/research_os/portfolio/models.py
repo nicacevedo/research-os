@@ -117,6 +117,12 @@ class IdeaOrigin(StrEnum):
     BRANCH = "BRANCH"
     REVIVAL = "REVIVAL"
     MERGE = "MERGE"
+    #: A new idea raised by a frontier request -- a result, an objection, a
+    #: replication, a literature contradiction, a referee's finding.
+    FOLLOW_UP = "FOLLOW_UP"
+    #: A new idea the literature explorer derived from verified claims about
+    #: the published record, citing them.
+    LITERATURE_EXPLORER = "LITERATURE_EXPLORER"
 
 
 class EdgeKind(StrEnum):
@@ -459,6 +465,76 @@ class ContractState(StrEnum):
     """No longer the contract being asked for -- its idea version was
     revised, or it was designed by a prompt this build has retired before
     anything was measured. Kept as the record."""
+
+
+class RequestKind(StrEnum):
+    """What a frontier request asks the portfolio for."""
+
+    FOLLOW_UP = "FOLLOW_UP"
+    """New ideas: the question this event raised, pursued as a new object."""
+
+    LITERATURE = "LITERATURE"
+    """Sources: retrieval and reading of the published record for one idea."""
+
+
+class RequestBasis(StrEnum):
+    """Which kind of event raised a frontier request. Recorded, never inferred."""
+
+    RESULT = "RESULT"
+    INSUFFICIENT = "INSUFFICIENT"
+    ANOMALY = "ANOMALY"
+    FALSIFIER_OBJECTION = "FALSIFIER_OBJECTION"
+    REVIEWER_CRITICISM = "REVIEWER_CRITICISM"
+    REPLICATION = "REPLICATION"
+    LITERATURE = "LITERATURE"
+    REFEREE_FINDING = "REFEREE_FINDING"
+    EVIDENCE_GAP = "EVIDENCE_GAP"
+
+
+class RequestState(StrEnum):
+    OPEN = "OPEN"
+    CONSUMED = "CONSUMED"
+    DECLINED = "DECLINED"
+
+
+class ProvenanceBasis(StrEnum):
+    """Why an idea exists. One row per reason, append-only.
+
+    Every :class:`RequestBasis` is here, because a request is one reason an
+    idea can exist; so are the generators, and ``CONVERGENCE`` -- a second
+    route independently arriving at a direction that already existed.
+    """
+
+    HUMAN_SEED = "HUMAN_SEED"
+    BLIND_EXPLORATION = "BLIND_EXPLORATION"
+    SEEDED_EXPLORATION = "SEEDED_EXPLORATION"
+    FAILURE_MINING = "FAILURE_MINING"
+    LITERATURE = "LITERATURE"
+    RESULT = "RESULT"
+    INSUFFICIENT = "INSUFFICIENT"
+    ANOMALY = "ANOMALY"
+    FALSIFIER_OBJECTION = "FALSIFIER_OBJECTION"
+    REVIEWER_CRITICISM = "REVIEWER_CRITICISM"
+    REPLICATION = "REPLICATION"
+    REFEREE_FINDING = "REFEREE_FINDING"
+    EVIDENCE_GAP = "EVIDENCE_GAP"
+    BRANCH = "BRANCH"
+    REVIVAL = "REVIVAL"
+    CONVERGENCE = "CONVERGENCE"
+
+
+#: The provenance an origin implies when nothing more specific is known.
+PROVENANCE_FOR_ORIGIN: dict[str, ProvenanceBasis] = {
+    "BLIND_EXPLORER": ProvenanceBasis.BLIND_EXPLORATION,
+    "SEEDED_EXPLORER": ProvenanceBasis.SEEDED_EXPLORATION,
+    "FAILURE_MINING_EXPLORER": ProvenanceBasis.FAILURE_MINING,
+    "RESEARCHER_SEED": ProvenanceBasis.HUMAN_SEED,
+    "BRANCH": ProvenanceBasis.BRANCH,
+    "REVIVAL": ProvenanceBasis.REVIVAL,
+    "MERGE": ProvenanceBasis.BRANCH,
+    "FOLLOW_UP": ProvenanceBasis.RESULT,
+    "LITERATURE_EXPLORER": ProvenanceBasis.LITERATURE,
+}
 
 
 class ActionStatus(StrEnum):
@@ -817,6 +893,85 @@ class ScientificContract(_Record):
         return self.state is ContractState.FROZEN
 
 
+class FrontierRequest(_Record):
+    """One question the portfolio owes an idea. See ``sql/0032``."""
+
+    request_id: str
+    project_id: str
+    kind: RequestKind
+    basis: RequestBasis
+    source_idea_id: str | None = None
+    source_version: int | None = None
+    source_ref: str
+    question: str
+    detail: str | None = None
+    state: RequestState
+    attempts: int = 0
+    resolution: str | None = None
+    resolved_by: str | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class IdeaProvenance(_Record):
+    """One reason an idea exists."""
+
+    provenance_id: str
+    idea_id: str
+    basis: ProvenanceBasis
+    source_ref: str | None = None
+    request_id: str | None = None
+    call_id: str | None = None
+    detail: str = ""
+    created_at: datetime
+
+
+class LiteratureClaimKind(StrEnum):
+    FINDING = "FINDING"
+    METHOD = "METHOD"
+    DATASET = "DATASET"
+    LIMITATION = "LIMITATION"
+    DISAGREEMENT = "DISAGREEMENT"
+    GAP = "GAP"
+    OPEN_QUESTION = "OPEN_QUESTION"
+
+
+#: The kinds that point at the edge of the published record: what the
+#: literature explorer reads to propose directions.
+FRONTIER_CLAIM_KINDS: frozenset[LiteratureClaimKind] = frozenset(
+    {
+        LiteratureClaimKind.LIMITATION,
+        LiteratureClaimKind.DISAGREEMENT,
+        LiteratureClaimKind.GAP,
+        LiteratureClaimKind.OPEN_QUESTION,
+    }
+)
+
+
+class ClaimVerification(StrEnum):
+    CITED = "CITED"
+    QUOTED = "QUOTED"
+
+
+class LiteratureClaim(_Record):
+    """One verified statement about the published record. See ``sql/0033``."""
+
+    claim_id: str
+    project_id: str
+    kind: LiteratureClaimKind
+    statement: str
+    work_keys: tuple[str, ...]
+    excerpt: str = ""
+    verification: ClaimVerification
+    query: str
+    request_id: str | None = None
+    idea_id: str | None = None
+    source_call_id: str | None = None
+    artifact_id: str | None = None
+    digest: str
+    created_at: datetime
+
+
 class IdeaAction(_Record):
     action_id: str
     idea_id: str
@@ -919,6 +1074,12 @@ ENUM_CONSTRAINTS: dict[str, frozenset[str]] = {
     "scientific_contracts_role_ck": frozenset(s.value for s in ExperimentRole),
     "scientific_contracts_kind_ck": frozenset(s.value for s in ContractKind),
     "scientific_contracts_state_ck": frozenset(s.value for s in ContractState),
+    "frontier_requests_kind_ck": frozenset(s.value for s in RequestKind),
+    "frontier_requests_basis_ck": frozenset(s.value for s in RequestBasis),
+    "frontier_requests_state_ck": frozenset(s.value for s in RequestState),
+    "idea_provenance_basis_ck": frozenset(s.value for s in ProvenanceBasis),
+    "literature_claims_kind_ck": frozenset(s.value for s in LiteratureClaimKind),
+    "literature_claims_verification_ck": frozenset(s.value for s in ClaimVerification),
     "idea_actions_status_ck": frozenset(s.value for s in ActionStatus),
     "idea_actions_stage_ck": frozenset(s.value for s in Stage),
     "idea_actions_disposition_ck": frozenset(s.value for s in Disposition),
