@@ -38,7 +38,7 @@ from research_os.portfolio.models import (
     OperationalState,
     PortfolioStatus,
 )
-from research_os.portfolio.stages import TrackSnapshot, select_stage
+from research_os.portfolio.stages import select_stage, snapshot_for
 from research_os.portfolio.store import PortfolioStore
 from research_os.runtime.budgets import BudgetLedger, Dimension
 from research_os.runtime.config import RuntimeConfig
@@ -437,34 +437,19 @@ def _candidates(
     for idea in store.list_ideas(project_id=project_id, limit=500):
         if not allocation.allocatable(idea):
             continue
-        version = store.get_version(idea.idea_id)
-        if version is None:
-            continue
-        snapshot = TrackSnapshot(
-            status=idea.status,
-            version=version,
-            succeeded_stages=store.succeeded_stages_for_version(
-                idea_id=idea.idea_id, idea_version=version.version
-            ),
-            evidence=store.list_evidence(
-                idea_id=idea.idea_id, idea_version=version.version
-            ),
-            live_reviews=store.live_reviews(idea_id=idea.idea_id),
-            open_objections=store.open_objections(idea_id=idea.idea_id),
-            revision_count=store.revision_count(idea.idea_id),
-            review_count=store.review_count(idea.idea_id),
-            lineage_active=store.lineage_active_counts(project_id).get(
-                idea.lineage_root, 0
-            ),
-            depth_without_evidence=store.depth_without_evidence(idea.idea_id),
-            # The allocator's snapshot and the track's must agree about what
-            # runs next: the tick decides what to buy and `advance_idea`
-            # decides what to do, and a field present in one and absent from
-            # the other is two stage machines wearing one name.
-            experiments=store.list_experiments(
-                idea_id=idea.idea_id, idea_version=version.version
-            ),
+        # The allocator's snapshot, `advance_idea`'s and `ideas show`'s must
+        # agree about what runs next, and the only way to be sure of that is
+        # for there to be one of them. A field present in one and absent from
+        # another is two stage machines wearing one name -- which is exactly
+        # what `ideas show` turned out to be until `snapshot_for` existed.
+        snapshot = snapshot_for(
+            store,
+            idea,
+            max_review_age_seconds=config.thresholds.review_max_age_seconds,
         )
+        if snapshot is None:
+            continue
+        version = snapshot.version
         stage, reason = select_stage(snapshot, config)
         if stage is None:
             continue

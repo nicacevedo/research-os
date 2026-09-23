@@ -47,7 +47,7 @@ from research_os.portfolio.models import (
     PortfolioIdea,
     PortfolioStatus,
 )
-from research_os.portfolio.stages import TrackSnapshot, select_stage
+from research_os.portfolio.stages import select_stage, snapshot_for
 from research_os.portfolio.store import PortfolioStore
 from research_os.portfolio.tick import ensure_schedule
 from research_os.registry import list_projects
@@ -617,24 +617,20 @@ def _show(args: argparse.Namespace) -> int:
             _print(f"{args.idea_id} is not an idea in any portfolio on this machine")
             return EXIT_ERROR
         version = store.require_version(idea.idea_id)
-        reviews = store.live_reviews(idea_id=idea.idea_id)
-        objections = store.open_objections(idea_id=idea.idea_id)
-        evidence = store.list_evidence(
-            idea_id=idea.idea_id, idea_version=version.version
-        )
-        snapshot = TrackSnapshot(
-            status=idea.status,
+        config = load_config()
+        snapshot = snapshot_for(
+            store,
+            idea,
             version=version,
-            succeeded_stages=store.succeeded_stages_for_version(
-                idea_id=idea.idea_id, idea_version=version.version
-            ),
-            evidence=evidence,
-            live_reviews=reviews,
-            open_objections=objections,
-            revision_count=store.revision_count(idea.idea_id),
-            review_count=store.review_count(idea.idea_id),
+            max_review_age_seconds=config.thresholds.review_max_age_seconds,
         )
-        stage, why = select_stage(snapshot, load_config())
+        assert snapshot is not None  # `version` was resolved above
+        # Read off the one snapshot rather than queried a second time, so the
+        # reviews and objections printed are the ones `select_stage` decided
+        # on. Two reads of a live database can legitimately disagree.
+        reviews = snapshot.live_reviews
+        objections = snapshot.open_objections
+        stage, why = select_stage(snapshot, config)
         if getattr(args, "as_json", False):
             _print(
                 json.dumps(

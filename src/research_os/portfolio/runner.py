@@ -32,7 +32,6 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from research_os.portfolio import dedup as pdedup
-from research_os.portfolio import digests as pdigests
 from research_os.portfolio import gates, packets, stages
 from research_os.portfolio.config import PortfolioConfig
 from research_os.portfolio.contracts import (
@@ -217,58 +216,23 @@ class StageOutcome:
 
 # ------------------------------------------------------------- snapshots --
 def build_snapshot(context: TrackContext) -> stages.TrackSnapshot:
-    """Assemble everything :func:`select_stage` reads, from the store."""
+    """Assemble everything :func:`select_stage` reads, from the store.
+
+    One builder for all three readers -- the allocator, this runner and
+    `researchctl ideas show`. Three existed, they disagreed about which
+    fields the stage machine may see, and every disagreement was a place
+    where what the portfolio *bought* and what it then *did* came apart.
+    """
 
     store = context.portfolio
-    idea = store.require_idea(context.idea_id)
-    version = store.require_version(context.idea_id)
-    evidence = store.list_evidence(
-        idea_id=context.idea_id, idea_version=version.version
+    snapshot = stages.snapshot_for(
+        store,
+        store.require_idea(context.idea_id),
+        version=store.require_version(context.idea_id),
+        max_review_age_seconds=context.config.thresholds.review_max_age_seconds,
     )
-    # One definition of "live", used by both the basis digest and the stage
-    # selector. This call took the sentinel defaults, which resolve
-    # `max_age_seconds` from the process-global `load_config()`, while the
-    # one below passes `context.config`. Two definitions of liveness in one
-    # function is the exact livelock `live_reviews`' docstring records an
-    # independent test audit finding: the basis counted a stale review that
-    # `select_stage` counted missing, so the track re-ran a stage whose
-    # result it then refused to see. The sentinel fix closed it for six
-    # callers; this call site had quietly reintroduced it.
-    live = store.live_reviews(
-        idea_id=context.idea_id,
-        current_prompt_versions=CURRENT_REVIEW_PROMPTS,
-        max_age_seconds=context.config.thresholds.review_max_age_seconds,
-    )
-    basis = pdigests.basis_digest(
-        content=version.content_digest,
-        evidence_ids=[item.evidence_id for item in evidence],
-        review_ids=[item.review_id for item in live],
-        stage_inputs={"stage": str(Stage.META_REVIEW)},
-    )
-    return stages.TrackSnapshot(
-        status=idea.status,
-        version=version,
-        succeeded_stages=store.succeeded_stages_for_version(
-            idea_id=context.idea_id, idea_version=version.version
-        ),
-        basis_stages=store.completed_stages(
-            idea_id=context.idea_id,
-            idea_version=version.version,
-            basis_digest=basis,
-        ),
-        evidence=evidence,
-        live_reviews=live,
-        open_objections=store.open_objections(idea_id=context.idea_id),
-        revision_count=store.revision_count(context.idea_id),
-        review_count=store.review_count(context.idea_id),
-        lineage_active=store.lineage_active_counts(context.project_id).get(
-            idea.lineage_root, 0
-        ),
-        depth_without_evidence=store.depth_without_evidence(context.idea_id),
-        experiments=store.list_experiments(
-            idea_id=context.idea_id, idea_version=version.version
-        ),
-    )
+    assert snapshot is not None  # `require_version` raises rather than returning None
+    return snapshot
 
 
 # ------------------------------------------------------------ model call --

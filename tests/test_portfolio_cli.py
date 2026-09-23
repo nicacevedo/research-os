@@ -21,14 +21,19 @@ import pytest
 from research_os.cli import main
 from research_os.portfolio.models import (
     ActionStatus,
+    EmpiricalConclusion,
     EvidenceKind,
     EvidenceStrength,
+    ExperimentRole,
+    ExperimentState,
     IdeaStatus,
     OperationalState,
     ReviewerRole,
     Stage,
 )
+from research_os.portfolio.stages import snapshot_for
 from research_os.portfolio.store import PortfolioStore
+from research_os.runtime.artifacts import FilesystemArtifactStore
 from research_os.runtime.config import DSN_ENV
 from research_os.runtime.db import Database
 from research_os.runtime.failures import FailureClass
@@ -678,3 +683,72 @@ def test_show_still_reports_a_stage_that_is_still_failing(
     out = capsys.readouterr().out
     assert "last attempt at discover failed" in out
     assert "the sharpened title was 201 characters" in out
+
+
+def test_the_one_snapshot_sees_the_measurement_and_the_meta_review_basis(
+    cli: str,
+    portfolio: PortfolioStore,
+    runtime_db: Database,
+    tmp_path: Path,
+) -> None:
+    """Both fields the second and third builders were missing, read live.
+
+    `ideas show` built a `TrackSnapshot` of its own without `experiments`,
+    so `settled_measurement` was always None there and the view reported
+    `next: evidence` for an idea whose composed experiment had run, been
+    read and concluded INSUFFICIENT -- while the allocator had correctly
+    ended the track. The allocator's own builder, in turn, never set
+    `basis_stages`, so `Stage.META_REVIEW not in frozenset()` was always
+    true and it would re-buy a meta-review that had already run on this
+    basis, every tick, to the review ceiling.
+
+    Both are gone because the builders are gone: `stages.snapshot_for` is
+    the only one. This asserts what it reads from a real store; the AST
+    guard in `test_portfolio_stages.py` asserts that it keeps reading all
+    of it.
+    """
+
+    idea, version = seed_idea(portfolio, cli)
+    runtime = RuntimeStore(runtime_db)
+    job = runtime.create_external_job(
+        project_id=cli,
+        executor="local",
+        spec_digest="a" * 64,
+        run_dir=str(tmp_path / "run"),
+    )
+    analysis = FilesystemArtifactStore(tmp_path / "artifacts", store=runtime).put_text(
+        '{"conclusion": "INSUFFICIENT"}', media_type="application/json"
+    )
+    portfolio.create_experiment(
+        idea_id=idea.idea_id,
+        idea_version=version.version,
+        project_id=cli,
+        role=ExperimentRole.PRIMARY,
+        command="sweep-lambda-support",
+        spec_digest="a" * 64,
+        variation_digest="b" * 64,
+        workspace_path=str(tmp_path / "workspace"),
+        decision_rule=None,
+        no_rule_reason="the reduction does not fit the model the falsifier needs",
+    )
+    live = portfolio.get_experiment(idea_id=idea.idea_id, idea_version=version.version)
+    assert live is not None
+    portfolio.update_experiment(
+        live.experiment_id, state=ExperimentState.RUNNING, job_id=job.job_id
+    )
+    portfolio.update_experiment(
+        live.experiment_id,
+        state=ExperimentState.INTERPRETED,
+        conclusion=EmpiricalConclusion.INSUFFICIENT,
+        analysis_artifact_id=analysis.artifact_id,
+    )
+
+    snapshot = snapshot_for(portfolio, portfolio.require_idea(idea.idea_id))
+    assert snapshot is not None
+    settled = snapshot.settled_measurement
+    assert settled is not None, "the snapshot did not see the interpreted experiment"
+    assert settled.conclusion is EmpiricalConclusion.INSUFFICIENT
+    # Empty is the right answer here -- no meta-review has run on this basis
+    # -- but it must be an answer the store gave, not a default nobody filled.
+    assert snapshot.basis_stages == frozenset()
+    assert snapshot.experiments != ()

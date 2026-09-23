@@ -745,3 +745,46 @@ def test_a_fatal_test_objection_never_reaches_an_expensive_stage() -> None:
                 f"a fatal objection to the test reached {stage} at "
                 f"revision_count={revisions}, status={status}"
             )
+
+
+def test_the_snapshot_builder_reads_every_field_the_stage_machine_has() -> None:
+    """One builder, and it must fill the whole snapshot.
+
+    `ideas show` used to assemble a `TrackSnapshot` of its own and left out
+    `experiments`, `lineage_active` and `depth_without_evidence`. Because
+    `settled_measurement` reads `experiments`, the view reported
+    `next: evidence -- get the evidence this kind of idea would be settled
+    by` for an idea whose composed experiment had already run, been read and
+    concluded INSUFFICIENT, while the allocator had correctly ended the
+    track. Measured on 2026-09-23.
+
+    Asserted by parsing `snapshot_for` rather than by calling it, for the
+    reason `tests/test_portfolio_authority.py` gives about the authority
+    boundary: a property of the code should be checked as one, so adding a
+    field to `TrackSnapshot` and forgetting to read it fails here rather
+    than in a view somebody is reading months later.
+
+    `notes` is exempt: it is annotation a caller may add, not state the
+    machine decides from.
+    """
+
+    import ast
+    import inspect
+    from dataclasses import fields
+
+    from research_os.portfolio.stages import snapshot_for
+
+    tree = ast.parse(inspect.getsource(snapshot_for))
+    assigned = {
+        keyword.arg
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "TrackSnapshot"
+        for keyword in node.keywords
+        if keyword.arg is not None
+    }
+    expected = {item.name for item in fields(TrackSnapshot)} - {"notes"}
+    assert expected - assigned == set(), "snapshot_for does not read: " + ", ".join(
+        sorted(expected - assigned)
+    )

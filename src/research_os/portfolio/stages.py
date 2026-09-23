@@ -26,6 +26,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from typing import Any
 
 from research_os.portfolio.config import STAGE_MINIMUM_STATUS, PortfolioConfig
 from research_os.portfolio.gates import EVIDENCE_RULES, _executed, _substantive
@@ -201,6 +202,96 @@ class TrackSnapshot:
             for item in self.evidence
             if item.kind is EvidenceKind.LITERATURE and item.literature_key
         }
+
+
+def snapshot_for(
+    store: Any,
+    idea: Any,
+    *,
+    version: IdeaVersion | None = None,
+    max_review_age_seconds: int | None = None,
+) -> TrackSnapshot | None:
+    """Read everything :func:`select_stage` needs for one idea, in one place.
+
+    **One builder, because two were one too many.** The allocator assembled
+    this inline and `researchctl ideas show` assembled it again, and the
+    second copy omitted ``experiments``, ``lineage_active`` and
+    ``depth_without_evidence``. The consequence was measured on 2026-09-23:
+    an idea whose composed experiment had run, been read and concluded
+    ``INSUFFICIENT`` was shown as ``next: evidence -- get the evidence this
+    kind of idea would be settled by``, while the allocator had correctly
+    ended its track. A reader would have waited for work that had already
+    happened.
+
+    The allocator's own comment already named the hazard -- "a field present
+    in one and absent from the other is two stage machines wearing one name"
+    -- and the fix it implies is not a third field on the copy. It is that
+    there is no copy.
+
+    Returns ``None`` when the idea has no current version, which is the one
+    state in which there is nothing to decide.
+    """
+
+    from research_os.portfolio import digests as pdigests
+
+    current = version or store.get_version(idea.idea_id)
+    if current is None:
+        return None
+    # `live_reviews`' prompt-version rule is this build's and is never
+    # passed. Its *age* is the caller's, because the sentinel default
+    # resolves it from the process-global `load_config()` while a track
+    # carries its own -- and two definitions of liveness in one function is
+    # the livelock `live_reviews`' own docstring records an independent
+    # audit finding: the basis counted a stale review that `select_stage`
+    # counted missing, so a track re-ran a stage whose result it refused to
+    # see. Passed through, so the basis below and the selector above it
+    # cannot disagree.
+    reviews = (
+        store.live_reviews(idea_id=idea.idea_id)
+        if max_review_age_seconds is None
+        else store.live_reviews(
+            idea_id=idea.idea_id, max_age_seconds=max_review_age_seconds
+        )
+    )
+    evidence = store.list_evidence(idea_id=idea.idea_id, idea_version=current.version)
+    # The meta-review's basis, and the only stage `select_stage` reads
+    # `basis_stages` for. Computed exactly as `runner` computed it, because
+    # it *was* computed there and nowhere else: the allocator's snapshot had
+    # no `basis_stages` at all, so `Stage.META_REVIEW not in frozenset()` was
+    # always true and the tick would re-buy a meta-review that had already
+    # run on this basis, every tick, until the review ceiling. The runner
+    # then chose something else, which is the two-stage-machines problem in
+    # its most expensive form.
+    basis = pdigests.basis_digest(
+        content=current.content_digest,
+        evidence_ids=[item.evidence_id for item in evidence],
+        review_ids=[item.review_id for item in reviews],
+        stage_inputs={"stage": str(Stage.META_REVIEW)},
+    )
+    return TrackSnapshot(
+        status=idea.status,
+        version=current,
+        succeeded_stages=store.succeeded_stages_for_version(
+            idea_id=idea.idea_id, idea_version=current.version
+        ),
+        basis_stages=store.completed_stages(
+            idea_id=idea.idea_id,
+            idea_version=current.version,
+            basis_digest=basis,
+        ),
+        evidence=evidence,
+        live_reviews=reviews,
+        open_objections=store.open_objections(idea_id=idea.idea_id),
+        revision_count=store.revision_count(idea.idea_id),
+        review_count=store.review_count(idea.idea_id),
+        lineage_active=store.lineage_active_counts(idea.project_id).get(
+            idea.lineage_root, 0
+        ),
+        depth_without_evidence=store.depth_without_evidence(idea.idea_id),
+        experiments=store.list_experiments(
+            idea_id=idea.idea_id, idea_version=current.version
+        ),
+    )
 
 
 def _concrete_types(version: IdeaVersion) -> tuple[AdjudicationType, ...]:
