@@ -217,6 +217,15 @@ class ModelRole(StrEnum):
     packet before anything is kept.
     """
 
+    SYNTHESIZER = "synthesizer"
+    """Writes what the portfolio's reviewed evidence establishes, citing it.
+
+    Not AUTHOR, which drafts manuscript files from the capsule in a
+    worktree: this one returns structured statements over operational
+    evidence, every citation and number of which is checked by code. The
+    critique of what it writes comes from REFEREE, a different pool.
+    """
+
     NOMINATOR = "nominator"
     """Judges whether one project's finding is candidate knowledge for others.
 

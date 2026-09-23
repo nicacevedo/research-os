@@ -1895,6 +1895,161 @@ class LiteratureAnswer(_Contract):
         return value
 
 
+_ID = r"^(IEVD|PLCL|PIDEA)-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$"
+
+
+class SynthesisStatement(_Contract):
+    """One statement of a synthesis, and exactly what it rests on."""
+
+    statement_id: str = Field(pattern=r"^S[0-9]{1,3}$")
+    kind: Literal["FINDING", "INTERPRETATION", "NOVELTY", "LIMITATION", "OPEN_QUESTION"]
+    text: str = _shown(MAX_STATEMENT_CHARS)
+    #: Evidence ids (IEVD-...) and literature claim ids (PLCL-...) this rests on.
+    cites: tuple[str, ...] = _shown_list(items=40, count=8, default=())
+    #: The ideas (PIDEA-...) the statement is about.
+    ideas: tuple[str, ...] = _shown_list(items=40, count=4, default=())
+
+    @field_validator("text")
+    @classmethod
+    def _text(cls, value: str) -> str:
+        return _bounded(value, MAX_STATEMENT_CHARS, "a statement")
+
+    @field_validator("cites", "ideas")
+    @classmethod
+    def _ids(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(value) > 8:
+            raise ValueError("at most 8 identifiers")
+        for item in value:
+            if not re.fullmatch(_ID, item):
+                raise ValueError(f"{item!r} is not an evidence, claim or idea id")
+        return value
+
+
+class EvidenceRequestOut(_Contract):
+    """A gap the writer found: what would have to be measured or read."""
+
+    idea_id: str = Field(pattern=r"^PIDEA-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$")
+    kind: Literal["measurement", "literature"]
+    question: str = _shown(MAX_STATEMENT_CHARS)
+    reason: str = _shown(MAX_STATEMENT_CHARS, default="")
+
+    @field_validator("question")
+    @classmethod
+    def _question(cls, value: str) -> str:
+        return _bounded(value, MAX_STATEMENT_CHARS, "a question")
+
+    @field_validator("reason")
+    @classmethod
+    def _reason(cls, value: str) -> str:
+        stripped = value.strip()
+        if len(stripped) > MAX_STATEMENT_CHARS:
+            raise ValueError(f"at most {MAX_STATEMENT_CHARS} characters")
+        return stripped
+
+
+class SynthesisDraft(_Contract):
+    """What the synthesis writer returns. Every statement cites the record."""
+
+    title: str = _shown(MAX_TITLE_CHARS)
+    statements: tuple[SynthesisStatement, ...] = ()
+    evidence_requests: tuple[EvidenceRequestOut, ...] = ()
+
+    @field_validator("title")
+    @classmethod
+    def _title(cls, value: str) -> str:
+        return _bounded(value, MAX_TITLE_CHARS, "the title")
+
+    @field_validator("statements")
+    @classmethod
+    def _bounded_statements(
+        cls, value: tuple[SynthesisStatement, ...]
+    ) -> tuple[SynthesisStatement, ...]:
+        if len(value) > MAX_MATRIX_ROWS:
+            raise ValueError(f"at most {MAX_MATRIX_ROWS} statements")
+        ids = [item.statement_id for item in value]
+        if len(set(ids)) != len(ids):
+            raise ValueError("statement ids must not repeat")
+        return value
+
+    @field_validator("evidence_requests")
+    @classmethod
+    def _bounded_requests(
+        cls, value: tuple[EvidenceRequestOut, ...]
+    ) -> tuple[EvidenceRequestOut, ...]:
+        if len(value) > MAX_OBJECTIONS:
+            raise ValueError(f"at most {MAX_OBJECTIONS} evidence requests")
+        return value
+
+
+class RefereeFinding(_Contract):
+    """One thing the referee found wrong with a synthesis."""
+
+    finding_id: str = Field(pattern=r"^F[0-9]{1,3}$")
+    kind: Literal[
+        "UNSUPPORTED_CLAIM",
+        "MISSING_CONTROL",
+        "OVERINTERPRETATION",
+        "NOVELTY",
+        "MISSING_LITERATURE",
+        "REPRODUCIBILITY",
+        "METHODOLOGY",
+        "INCONSISTENCY",
+    ]
+    severity: Literal["MINOR", "MAJOR", "CRITICAL"]
+    statement_ids: tuple[str, ...] = _shown_list(items=4, count=8, default=())
+    idea_id: str = Field(
+        default="", pattern=r"^(PIDEA-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8})?$"
+    )
+    summary: str = _shown(MAX_SUMMARY_CHARS)
+    #: A new question this finding raises, pursued as its own idea.
+    follow_up_question: str = _shown(MAX_STATEMENT_CHARS, default="")
+
+    @field_validator("statement_ids")
+    @classmethod
+    def _statement_ids(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(value) > 8:
+            raise ValueError("at most 8 statements")
+        for item in value:
+            if not re.fullmatch(r"^S[0-9]{1,3}$", item):
+                raise ValueError(f"{item!r} is not a statement id")
+        return value
+
+    @field_validator("summary")
+    @classmethod
+    def _summary(cls, value: str) -> str:
+        return _bounded(value, MAX_SUMMARY_CHARS, "a finding")
+
+    @field_validator("follow_up_question")
+    @classmethod
+    def _follow_up(cls, value: str) -> str:
+        stripped = value.strip()
+        if len(stripped) > MAX_STATEMENT_CHARS:
+            raise ValueError(f"at most {MAX_STATEMENT_CHARS} characters")
+        return stripped
+
+
+class RefereeReport(_Contract):
+    """The referee's challenge. Advisory: there is no field that approves."""
+
+    verdict: Literal["SOUND", "MAJOR_REVISION", "UNSOUND"]
+    summary: str = _shown(MAX_SUMMARY_CHARS)
+    findings: tuple[RefereeFinding, ...] = ()
+
+    @field_validator("summary")
+    @classmethod
+    def _summary(cls, value: str) -> str:
+        return _bounded(value, MAX_SUMMARY_CHARS, "the referee's summary")
+
+    @field_validator("findings")
+    @classmethod
+    def _bounded_findings(
+        cls, value: tuple[RefereeFinding, ...]
+    ) -> tuple[RefereeFinding, ...]:
+        if len(value) > MAX_MATRIX_ROWS:
+            raise ValueError(f"at most {MAX_MATRIX_ROWS} findings")
+        return value
+
+
 class FollowUpOutput(_Contract):
     """What the follow-up explorer returns for one frontier request.
 
@@ -2049,5 +2204,7 @@ CONTRACTS: dict[str, type[BaseModel]] = {
     "brancher": BranchOutput,
     "follow_up_explorer": FollowUpOutput,
     "literature_reader": LiteratureAnswer,
+    "synthesis_writer": SynthesisDraft,
+    "synthesis_referee": RefereeReport,
     "literature_explorer": ExplorerOutput,
 }

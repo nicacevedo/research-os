@@ -1730,3 +1730,31 @@ was found in the cited source's stored text) and immutability by trigger.
 
 Deterministic tests use a fixture corpus and need no credentials
 (`tests/test_portfolio_literature_intel.py`).
+
+## 22. Evidence synthesis and the referee
+
+`portfolio/synthesis.py`, migration `0034`. When the portfolio's reviewed
+evidence changes -- the ideas its own gates raised to `VALIDATED` or
+`HUMAN_READY`, their current evidence and linked verified claims, hashed as a
+basis digest -- the tick buys one synthesis, once per basis.
+
+- **The writer** (`synthesis_writer@1`, role `synthesizer`) is given rows
+  with identifiers and nothing else -- no chat history, no model's account of
+  the evidence. Ordinary code refuses the whole draft unless every citation
+  was supplied, every FINDING cites evidence that SUPPORTS or CONTRADICTS,
+  every NOVELTY statement cites the literature, and every number in a
+  FINDING or INTERPRETATION appears in what it cites. Missing evidence is
+  returned as structured `evidence_requests`, which become `EVIDENCE_GAP`
+  frontier requests (a measurement) or literature requests.
+- **The referee** (`synthesis_referee@1`, role `referee`, a different pool,
+  sharing an independence group with the writer so the router prefers a
+  different family) sees the packet and the statements, not the writer's
+  reasoning, and returns typed findings (unsupported claim, missing control,
+  over-interpretation, novelty, missing literature, reproducibility,
+  methodology, inconsistency). A finding with a follow-up question becomes a
+  `REFEREE_FINDING` request; missing literature becomes a literature request.
+- **The referee approves nothing.** A synthesis is at most `REFEREED`; its
+  verdict is advisory; no idea status, capsule object or Review is touched.
+  Accepting a claim remains a person's act (`researchctl review`).
+
+Tests: `tests/test_portfolio_synthesis.py`.

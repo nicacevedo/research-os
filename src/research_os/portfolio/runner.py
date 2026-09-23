@@ -304,6 +304,9 @@ _STAGE_FOR_TEMPLATE: dict[str, Stage] = {
     "follow_up_explorer": Stage.BRANCH,
     # Reading retrieved sources for one idea is the audit's kind of work.
     "literature_reader": Stage.LITERATURE_AUDIT,
+    # Writing from, and refereeing, reviewed evidence: a board's kind of work.
+    "synthesis_writer": Stage.REVIEW_BOARD,
+    "synthesis_referee": Stage.REVIEW_BOARD,
 }
 
 

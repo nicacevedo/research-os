@@ -442,6 +442,55 @@ def run_literature_watch(context: WorkContext) -> dict[str, Any]:
     return {"raised": raised}
 
 
+def run_synthesize(context: WorkContext) -> dict[str, Any]:
+    """Write and referee one synthesis of the reviewed evidence."""
+
+    from research_os.portfolio import frontier, synthesis
+    from research_os.runtime.artifacts import FilesystemArtifactStore
+
+    store = PortfolioStore(context.db)
+    runtime = RuntimeStore(context.db)
+    run = runtime.create_run(
+        project_id=context.item.project_id,
+        objective="portfolio-synthesize",
+        autonomy=Autonomy(context.config.autonomy),
+        run_kind=RunKind.IDEA_TRACK,
+    )
+    runtime.set_run_status(run.run_id, RunStatus.RUNNING)
+    result = synthesis.synthesize(
+        frontier.FrontierContext(
+            config=_config(context),
+            portfolio=store,
+            runtime=runtime,
+            models=context.models(
+                run.run_id, context.item.project_id, context.item.work_id
+            ),
+            artifacts=FilesystemArtifactStore(
+                context.config.artifacts_root, store=runtime
+            ),
+            project_id=context.item.project_id,
+            run_id=run.run_id,
+        )
+    )
+    runtime.set_run_status(
+        run.run_id,
+        RunStatus.SUCCEEDED if result.ok else RunStatus.FAILED,
+        terminal_state=(
+            TerminalState.DONE_FOR_NOW
+            if result.ok
+            else TerminalState.WAITING_FOR_EXTERNAL_DEPENDENCY
+        ),
+        detail=result.detail[:500],
+    )
+    if not result.ok and result.failure_class is not None:
+        raise _as_error(result.failure_class, result.detail)
+    return {
+        "synthesis_id": result.synthesis_id,
+        "raised": list(result.raised),
+        "detail": result.detail,
+    }
+
+
 def run_curate(context: WorkContext) -> dict[str, Any]:
     """Write the bank to the project's autonomous branch."""
 
@@ -545,6 +594,7 @@ def register() -> None:
         run_literature_watch,
         from_event="LITERATURE_WATCH_DUE",
     )
+    register_work(allocation.SYNTHESIZE, run_synthesize)
     register_work(allocation.CURATE, run_curate)
     register_work(allocation.DIGEST, run_digest)
 

@@ -96,6 +96,7 @@ from research_os.portfolio.models import (
     ScientificContract,
     Severity,
     Stage,
+    Synthesis,
 )
 from research_os.runtime.db import Database, RuntimeDatabaseError, jsonb
 from research_os.runtime.failures import FailureClass
@@ -165,6 +166,11 @@ REQUEST_COLUMNS = (
     "request_id, project_id, kind, basis, source_idea_id, source_version, "
     "source_ref, question, detail, state, attempts, resolution, resolved_by, "
     "created_at, updated_at"
+)
+SYNTHESIS_COLUMNS = (
+    "synthesis_id, project_id, state, basis_digest, document_artifact_id, "
+    "referee_artifact_id, writer_call_id, referee_call_id, statements, findings, "
+    "referee_verdict, detail, created_at, updated_at"
 )
 CLAIM_COLUMNS = (
     "claim_id, project_id, kind, statement, work_keys, excerpt, verification, "
@@ -1399,6 +1405,101 @@ class PortfolioStore:
                 (idea_id,),
             ).fetchall()
         return tuple(IdeaProvenance.model_validate(row) for row in rows)
+
+    # ------------------------------------------------------------ syntheses --
+    def create_synthesis(
+        self,
+        *,
+        project_id: str,
+        basis_digest: str,
+        document_artifact_id: str,
+        writer_call_id: str | None,
+        statements: int,
+    ) -> Synthesis:
+        from research_os.portfolio.ids import new_synthesis_id
+
+        with self._db.tx() as conn:
+            row = conn.execute(
+                f"""
+                insert into syntheses
+                    (synthesis_id, project_id, basis_digest, document_artifact_id,
+                     writer_call_id, statements)
+                values (%s, %s, %s, %s, %s, %s)
+                on conflict (project_id, basis_digest) do nothing
+                returning {SYNTHESIS_COLUMNS}
+                """,
+                (
+                    new_synthesis_id(),
+                    project_id,
+                    basis_digest,
+                    document_artifact_id,
+                    writer_call_id,
+                    statements,
+                ),
+            ).fetchone()
+            if row is None:
+                row = conn.execute(
+                    f"select {SYNTHESIS_COLUMNS} from syntheses "
+                    "where project_id = %s and basis_digest = %s",
+                    (project_id, basis_digest),
+                ).fetchone()
+            # A newer basis supersedes every older synthesis of the project.
+            conn.execute(
+                "update syntheses set state = 'SUPERSEDED', updated_at = now() "
+                "where project_id = %s and basis_digest <> %s and state <> 'SUPERSEDED'",
+                (project_id, basis_digest),
+            )
+        return Synthesis.model_validate(row)
+
+    def synthesis_for_basis(
+        self, *, project_id: str, basis_digest: str
+    ) -> Synthesis | None:
+        with self._db.tx() as conn:
+            row = conn.execute(
+                f"select {SYNTHESIS_COLUMNS} from syntheses "
+                "where project_id = %s and basis_digest = %s",
+                (project_id, basis_digest),
+            ).fetchone()
+        return Synthesis.model_validate(row) if row else None
+
+    def referee_synthesis(
+        self,
+        synthesis_id: str,
+        *,
+        referee_artifact_id: str,
+        referee_call_id: str | None,
+        verdict: str,
+        findings: int,
+    ) -> Synthesis:
+        with self._db.tx() as conn:
+            row = conn.execute(
+                f"""
+                update syntheses
+                   set state = 'REFEREED', referee_artifact_id = %s,
+                       referee_call_id = %s, referee_verdict = %s, findings = %s,
+                       updated_at = now()
+                 where synthesis_id = %s and state = 'DRAFTED'
+                returning {SYNTHESIS_COLUMNS}
+                """,
+                (referee_artifact_id, referee_call_id, verdict, findings, synthesis_id),
+            ).fetchone()
+            if row is None:
+                row = conn.execute(
+                    f"select {SYNTHESIS_COLUMNS} from syntheses where synthesis_id = %s",
+                    (synthesis_id,),
+                ).fetchone()
+        return Synthesis.model_validate(row)
+
+    def list_syntheses(
+        self, *, project_id: str, limit: int = 20
+    ) -> tuple[Synthesis, ...]:
+        with self._db.tx() as conn:
+            rows = conn.execute(
+                f"select {SYNTHESIS_COLUMNS} from syntheses where project_id = %s "
+                "order by created_at desc, synthesis_id limit %s",
+                (project_id, limit),
+            ).fetchall()
+        return tuple(Synthesis.model_validate(row) for row in rows)
 
     # ----------------------------------------------------- literature claims --
     def record_literature_claim(

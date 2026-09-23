@@ -972,6 +972,37 @@ class LiteratureClaim(_Record):
     created_at: datetime
 
 
+class SynthesisState(StrEnum):
+    """How far a synthesis has got. Never further than REFEREED.
+
+    There is deliberately no ACCEPTED: the referee grants nothing, and
+    accepting a claim is a person's act on a capsule object.
+    """
+
+    DRAFTED = "DRAFTED"
+    REFEREED = "REFEREED"
+    SUPERSEDED = "SUPERSEDED"
+
+
+class Synthesis(_Record):
+    """One evidence synthesis and its referee. See ``sql/0034``."""
+
+    synthesis_id: str
+    project_id: str
+    state: SynthesisState
+    basis_digest: str
+    document_artifact_id: str
+    referee_artifact_id: str | None = None
+    writer_call_id: str | None = None
+    referee_call_id: str | None = None
+    statements: int = 0
+    findings: int = 0
+    referee_verdict: str | None = None
+    detail: str | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
 class IdeaAction(_Record):
     action_id: str
     idea_id: str
@@ -1079,6 +1110,8 @@ ENUM_CONSTRAINTS: dict[str, frozenset[str]] = {
     "frontier_requests_state_ck": frozenset(s.value for s in RequestState),
     "idea_provenance_basis_ck": frozenset(s.value for s in ProvenanceBasis),
     "literature_claims_kind_ck": frozenset(s.value for s in LiteratureClaimKind),
+    "syntheses_state_ck": frozenset(s.value for s in SynthesisState),
+    "syntheses_verdict_ck": frozenset({"SOUND", "MAJOR_REVISION", "UNSOUND"}),
     "literature_claims_verification_ck": frozenset(s.value for s in ClaimVerification),
     "idea_actions_status_ck": frozenset(s.value for s in ActionStatus),
     "idea_actions_stage_ck": frozenset(s.value for s in Stage),

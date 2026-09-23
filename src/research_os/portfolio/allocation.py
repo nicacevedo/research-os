@@ -47,6 +47,9 @@ FOLLOW_UP = "portfolio_follow_up"
 #: One open literature request answered from retrieved sources. Same string
 #: as `research_os.portfolio.litintel.LITERATURE_REQUEST`.
 LITERATURE_REQUEST = "portfolio_literature"
+#: One synthesis of the reviewed evidence, written and refereed. Same string
+#: as `research_os.portfolio.synthesis.SYNTHESIZE`.
+SYNTHESIZE = "portfolio_synthesize"
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,6 +153,8 @@ class Allocation:
                 f"{self.kind}:{self.idea_id}:{self.stage}:"
                 f"v{self.idea_version}:{self.failed_attempts}"
             )
+        if self.kind == SYNTHESIZE:
+            return f"{self.kind}:{self.payload.get('basis', '')}"
         if self.kind in {FOLLOW_UP, LITERATURE_REQUEST}:
             # The request and how many times it has been attempted: one item
             # per attempt, for the reason the failure count is in an idea
@@ -300,6 +305,8 @@ def plan(
     literature_requests: Sequence[tuple[str, int, str]] = (),
     literature_in_flight: int = 0,
     frontier_claims: int = 0,
+    synthesis_basis: str | None = None,
+    syntheses_in_flight: int = 0,
 ) -> tuple[Allocation, ...]:
     """The ordered, bounded list of work this tick buys.
 
@@ -324,6 +331,18 @@ def plan(
                 kind=FOLLOW_UP,
                 reason=f"an open {basis} request owes the frontier new ideas",
                 payload={"request_id": request_id, "attempts": attempts},
+            )
+        )
+        remaining -= 1
+    # A synthesis, when the reviewed evidence changed. Its referee's findings
+    # are what return the writing to the frontier, so it is bought as readily
+    # as a question is -- one at a time, once per basis.
+    if remaining and synthesis_basis and syntheses_in_flight == 0:
+        allocations.append(
+            Allocation(
+                kind=SYNTHESIZE,
+                reason="the reviewed evidence changed since the last synthesis",
+                payload={"basis": synthesis_basis},
             )
         )
         remaining -= 1

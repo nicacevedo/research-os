@@ -229,6 +229,8 @@ _ADAPTER_ROLE: dict[ModelRole, AutomationRole] = {
     # Work over retrieved sources is what LITERATURE means here.
     ModelRole.LITERATURE_EXPLORER: AutomationRole.LITERATURE,
     ModelRole.LITERATURE_READER: AutomationRole.LITERATURE,
+    # Produced work, attacked later by REFEREE (REVIEWER pool).
+    ModelRole.SYNTHESIZER: AutomationRole.ANALYST,
 }
 
 

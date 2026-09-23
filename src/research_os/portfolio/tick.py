@@ -265,6 +265,10 @@ def tick(
                 project_id=project_id, frontier_only=True, limit=50
             )
         ),
+        synthesis_basis=_synthesis_due(store, project_id),
+        syntheses_in_flight=store.work_in_flight(
+            project_id=project_id, kind=allocation.SYNTHESIZE
+        ),
     )
     report.allocations = allocations
 
@@ -294,7 +298,12 @@ def tick(
     if (
         not idea_allocations
         and not any(
-            item.kind in {allocation.FOLLOW_UP, allocation.LITERATURE_REQUEST}
+            item.kind
+            in {
+                allocation.FOLLOW_UP,
+                allocation.LITERATURE_REQUEST,
+                allocation.SYNTHESIZE,
+            }
             for item in allocations
         )
         and report.active_tracks == 0
@@ -336,6 +345,8 @@ def tick(
                     {"request_id": item.payload.get("request_id")}
                     if item.kind
                     in {allocation.FOLLOW_UP, allocation.LITERATURE_REQUEST}
+                    else {"basis": item.payload.get("basis")}
+                    if item.kind == allocation.SYNTHESIZE
                     else {}
                 ),
             },
@@ -469,6 +480,12 @@ def _clear_blocks(store: PortfolioStore, runtime: RuntimeStore, project_id: str)
         store.set_operational_state(idea_id=idea.idea_id, state=OperationalState.IDLE)
         cleared += 1
     return cleared
+
+
+def _synthesis_due(store: PortfolioStore, project_id: str) -> str | None:
+    from research_os.portfolio import synthesis
+
+    return synthesis.due(store, project_id)
 
 
 def _observe_capability(store: PortfolioStore, report: TickReport, state: Any) -> int:

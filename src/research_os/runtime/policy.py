@@ -640,6 +640,8 @@ ROLE_PERMISSIONS: dict[ModelRole, frozenset[Permission]] = {
     ModelRole.LITERATURE_EXPLORER: frozenset(),
     # Reads a packet it is handed; retrieval is the runtime's, not its own.
     ModelRole.LITERATURE_READER: frozenset(),
+    # Handed the record it writes about; reaches nothing.
+    ModelRole.SYNTHESIZER: frozenset(),
 }
 
 #: What the runtime may hold at each configured autonomy setting. The *setting*
