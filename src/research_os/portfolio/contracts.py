@@ -126,6 +126,37 @@ def _shown(chars: int, **field: Any) -> Any:
     return Field(json_schema_extra={"maxLength": chars}, **field)
 
 
+def _shown_list(
+    *, count: int, items: int | None = None, choices: tuple[str, ...] = (), **field: Any
+) -> Any:
+    """The same disclosure for a bounded list of strings.
+
+    `_shown` covered scalars and an architecture review pointed out that the
+    module docstring then claimed the job was done while every *list* bound
+    stayed enforced and unstated -- so a thirteenth `assumptions` entry, or
+    a 2,001-character one, still discards the whole response and still tells
+    the model nothing. The incident `_shown` records is reachable through
+    exactly that door.
+
+    A callable rather than a dict, because a dict `json_schema_extra`
+    replaces `items` wholesale and would erase the type Pydantic generated
+    for the element.
+    """
+
+    def annotate(schema: dict[str, Any]) -> None:
+        schema["maxItems"] = count
+        element = schema.get("items")
+        if not isinstance(element, dict):
+            return
+        if choices:
+            # A closed set says strictly more than a length does.
+            element["enum"] = list(choices)
+        elif items is not None:
+            element["maxLength"] = items
+
+    return Field(json_schema_extra=annotate, **field)
+
+
 class CandidateIdea(_Contract):
     """One proposed direction, as an explorer or a brancher returns it.
 
@@ -143,9 +174,15 @@ class CandidateIdea(_Contract):
     falsifier: str = _shown(MAX_STATEMENT_CHARS, default="")
     closest_prior_work: str = _shown(MAX_STATEMENT_CHARS, default="")
     claimed_difference: str = _shown(MAX_STATEMENT_CHARS, default="")
-    assumptions: tuple[str, ...] = ()
-    alternative_explanations: tuple[str, ...] = ()
-    open_uncertainties: tuple[str, ...] = ()
+    assumptions: tuple[str, ...] = _shown_list(
+        items=MAX_STATEMENT_CHARS, count=MAX_LIST_ITEMS, default=()
+    )
+    alternative_explanations: tuple[str, ...] = _shown_list(
+        items=MAX_STATEMENT_CHARS, count=MAX_LIST_ITEMS, default=()
+    )
+    open_uncertainties: tuple[str, ...] = _shown_list(
+        items=MAX_STATEMENT_CHARS, count=MAX_LIST_ITEMS, default=()
+    )
     next_best_action: str = _shown(MAX_STATEMENT_CHARS, default="")
     dimensions: QualityDimensions = QualityDimensions()
 
@@ -302,7 +339,9 @@ class FalsifierOutput(_Contract):
     #: What, specifically, was searched for and not found. Distinguishes "I
     #: looked for a counterexample and there isn't an obvious one" from "I did
     #: not look".
-    attempted: tuple[str, ...] = ()
+    attempted: tuple[str, ...] = _shown_list(
+        items=MAX_STATEMENT_CHARS, count=MAX_LIST_ITEMS, default=()
+    )
 
     @field_validator("summary")
     @classmethod
@@ -405,7 +444,9 @@ class NoveltyAuditOutput(_Contract):
     """
 
     rows: tuple[NoveltyRow, ...] = ()
-    queries: tuple[str, ...] = ()
+    queries: tuple[str, ...] = _shown_list(
+        items=MAX_TITLE_CHARS, count=MAX_LIST_ITEMS, default=()
+    )
     summary: str = _shown(MAX_SUMMARY_CHARS, default="")
 
     @field_validator("queries")
@@ -581,7 +622,9 @@ class ExperimentDesign(_Contract):
     seeds: tuple[int, ...] = ()
     resources: dict[str, str] = Field(default_factory=dict)
     primary_endpoint: str = _shown(MAX_STATEMENT_CHARS, default="")
-    secondary_endpoints: tuple[str, ...] = ()
+    secondary_endpoints: tuple[str, ...] = _shown_list(
+        items=MAX_STATEMENT_CHARS, count=MAX_LIST_ITEMS, default=()
+    )
     dataset_identity: str = _shown(MAX_STATEMENT_CHARS, default="")
     #: Which prediction of the idea this measurement would falsify. Quoted
     #: from the idea's own falsifier by the model, so a design that tests
@@ -824,7 +867,9 @@ class MetaReviewOutput(_Contract):
 
     recommendation: Disposition
     summary: str = _shown(MAX_SUMMARY_CHARS)
-    unresolved_disagreements: tuple[str, ...] = ()
+    unresolved_disagreements: tuple[str, ...] = _shown_list(
+        items=MAX_SUMMARY_CHARS, count=MAX_LIST_ITEMS, default=()
+    )
 
     @field_validator("summary")
     @classmethod
@@ -886,7 +931,11 @@ class BranchOutput(_Contract):
     """
 
     children: tuple[CandidateIdea, ...] = ()
-    relations: tuple[str, ...] = ()
+    relations: tuple[str, ...] = _shown_list(
+        count=MAX_CANDIDATES,
+        choices=("DERIVED_FROM", "GENERALIZES", "SPECIALIZES"),
+        default=(),
+    )
 
     @field_validator("children")
     @classmethod

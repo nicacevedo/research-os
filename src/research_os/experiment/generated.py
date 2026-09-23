@@ -4,8 +4,9 @@ The one parameter kind whose value is *content* rather than a choice among
 what the repository already holds, and the reason it exists is a measured
 bottleneck rather than a convenience.
 
-A ``path`` parameter may only name a **tracked** file. That is the right rule
-and it had a consequence nobody designed: a genuinely new experimental design
+A ``path`` parameter is *listed* to the designer as the tracked files it may
+name, and naming anything else fails when the command runs. That convention
+had a consequence nobody designed: a genuinely new experimental design
 inside an already-approved capability required a person to author and commit
 a plan file. On 2026-09-22 a real portfolio was blocked on exactly that --
 ``sweep-lambda-support`` could execute the ``(n, p) x difficulty`` question
@@ -144,7 +145,16 @@ def _assert_schema(schema: Any, *, where: str, depth: int) -> None:
             f"is accepted and not enforced is worse than one that is refused"
         )
     declared = schema.get("type")
-    if declared is not None and str(declared) not in SCHEMA_TYPES:
+    if declared is None:
+        # Required at every node, because `_check` dispatches on the *value's*
+        # runtime type: a schema that says `properties` and `required` but not
+        # `type` enforces neither against a scalar, and the document
+        # `"i am not an object"` satisfies it.
+        raise ValueError(
+            f"{where}: every schema node must declare `type`, or it enforces "
+            f"nothing against a value of the wrong kind"
+        )
+    if str(declared) not in SCHEMA_TYPES:
         raise ValueError(
             f"{where}: type {declared!r} is not one of "
             f"{', '.join(sorted(SCHEMA_TYPES))}"
@@ -155,6 +165,19 @@ def _assert_schema(schema: Any, *, where: str, depth: int) -> None:
             f"{where}: additionalProperties must be false where it appears. A "
             f"generated document is composed by a model for a program the "
             f"researcher trusts, and an unlisted key is what should not pass"
+        )
+    if str(declared) == "object" and not schema.get("properties"):
+        # An object with no declared properties admits nothing, which is never
+        # what somebody meant to write -- and before this it admitted
+        # *everything*, because closure was implied by `if properties:`.
+        raise ValueError(
+            f"{where}: an object must declare `properties`. A node with none "
+            f"cannot be closed, and an open subtree is the whole surface this "
+            f"checker exists to remove"
+        )
+    if str(declared) == "array" and "items" not in schema:
+        raise ValueError(
+            f"{where}: an array must declare `items`, or its elements are unchecked"
         )
     for name, child in dict(schema.get("properties") or {}).items():
         _assert_schema(child, where=f"{where}.{name}", depth=depth + 1)
@@ -180,11 +203,32 @@ def canonical_bytes(document: Any, *, where: str) -> bytes:
             ensure_ascii=False,
             allow_nan=False,
         )
-    except (TypeError, ValueError) as exc:
+        return text.encode("utf-8")
+    except (TypeError, ValueError, RecursionError) as exc:
+        # `UnicodeEncodeError` is a `ValueError` and is model-reachable: a
+        # lone surrogate survives `json.loads` and dies on `encode`. The
+        # encode was outside this handler, so it escaped unclassified, was
+        # recorded as CODE_EXCEPTION and requeued -- letting a model turn its
+        # own invalid document into a paid retry loop.
         raise ExperimentSpecError(
             f"{where} is not a JSON document this can freeze: {exc}"
         ) from None
-    return text.encode("utf-8")
+
+
+def _same_value(value: Any, allowed: Any) -> bool:
+    """Equality that does not conflate ``True`` with ``1`` or ``1`` with ``1.0``.
+
+    Python says ``True == 1`` and ``1.0 == 1``, so a document could satisfy
+    ``{"enum": [1, 2, 3]}`` with ``true`` and be written as ``true`` into a
+    file the researcher's program parses. Type confusion reaching a trusted
+    program is worth four lines.
+    """
+
+    if isinstance(value, bool) != isinstance(allowed, bool):
+        return False
+    if isinstance(value, int | float) and isinstance(allowed, int | float):
+        return type(value) is type(allowed) and value == allowed
+    return bool(value == allowed)
 
 
 def validate_document(document: Any, schema: Mapping[str, Any], *, where: str) -> None:
@@ -197,11 +241,11 @@ def _check(value: Any, schema: Mapping[str, Any], *, where: str, depth: int) -> 
     if depth > MAX_DOCUMENT_DEPTH:
         raise ExperimentSpecError(f"{where} nests deeper than {MAX_DOCUMENT_DEPTH}")
 
-    if "const" in schema and value != schema["const"]:
+    if "const" in schema and not _same_value(value, schema["const"]):
         raise ExperimentSpecError(f"{where} must be {schema['const']!r}")
     if "enum" in schema:
         allowed = list(schema["enum"])
-        if value not in allowed:
+        if not any(_same_value(value, item) for item in allowed):
             raise ExperimentSpecError(
                 f"{where} must be one of "
                 f"{', '.join(repr(item) for item in allowed)}, not {value!r}"
@@ -248,16 +292,19 @@ def _check_object(
     for name in schema.get("required") or ():
         if str(name) not in value:
             raise ExperimentSpecError(f"{where} is missing required {name!r}")
-    if properties:
-        # Closed by default, which is the opposite of JSON Schema's default
-        # and is deliberate: this document reaches a program the researcher
-        # trusts, and a key nobody declared is the one that should not.
-        unknown = sorted(set(map(str, value)) - set(map(str, properties)))
-        if unknown:
-            raise ExperimentSpecError(
-                f"{where} has undeclared key(s) {', '.join(unknown)}; the "
-                f"declaration lists {', '.join(sorted(properties)) or '(none)'}"
-            )
+    # Closed, unconditionally. This used to be `if properties:`, so a node
+    # with none was wholly open -- including one a researcher had closed
+    # explicitly with `additionalProperties: false`, which was accepted at
+    # configuration time and then never read. The architecture review and the
+    # security review of 2026-09-23 found it independently, and both were
+    # right that it made this module's own promise false: a keyword accepted
+    # and not honoured is the defect it was written to prevent.
+    unknown = sorted(set(map(str, value)) - set(map(str, properties)))
+    if unknown:
+        raise ExperimentSpecError(
+            f"{where} has undeclared key(s) {', '.join(unknown)}; the "
+            f"declaration lists {', '.join(sorted(properties)) or '(none)'}"
+        )
     for name, child in value.items():
         sub = properties.get(str(name))
         if sub is not None:

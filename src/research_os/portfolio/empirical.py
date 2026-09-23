@@ -365,7 +365,8 @@ def output_schema_lines(
                 )
             except (OSError, ValueError, UnicodeDecodeError):
                 continue
-            paths = numeric_paths(document)[:MAX_SCHEMA_PATHS]
+            every = numeric_paths(document)
+            paths = every[:MAX_SCHEMA_PATHS]
             if not paths:
                 continue
             lines.append(
@@ -375,6 +376,29 @@ def output_schema_lines(
                 f"a result that already exists is not a preregistration):"
             )
             lines.extend(f"    {item}" for item in paths)
+            if len(every) > len(paths):
+                # Said, rather than silently dropped. The real document on
+                # this machine has 45 such paths against a limit of 40, and
+                # the line above called the listing complete -- a bound
+                # enforced and never stated, which is the shape this
+                # codebase has paid for repeatedly.
+                lines.append(
+                    f"    ... and {len(every) - len(paths)} more, not shown: "
+                    f"this listing stops at {MAX_SCHEMA_PATHS}"
+                )
+            # And the caveat that matters more than the truncation: these
+            # keys describe whichever run the project happened to commit,
+            # which for a command taking a composed plan is a *different*
+            # design from the one being proposed. Paths under a
+            # design-specific key will not exist for a plan that changes the
+            # designs, and a rule addressing one evaluates to nothing.
+            lines.append(
+                "    NOTE: these paths come from whatever run was committed, "
+                "not from the design you are proposing. If your plan changes "
+                "the instances or designs, keys naming the old ones will not "
+                "exist in your output -- choose a metric path your own design "
+                "will actually produce."
+            )
     return lines
 
 
@@ -517,9 +541,22 @@ def build_spec(
     try:
         frozen_inputs = _freeze_generated(design, spec=spec, command=chosen)
     except ResearchOSError as exc:
+        # `MODEL_OUTPUT_INVALID`, not `POLICY_REFUSED`, and the distinction
+        # is the difference between a retry and a wedged idea.
+        # `POLICY_REFUSED` is in `REFUSAL_CLASSES`, and one refusal takes an
+        # idea to BLOCKED_EXTERNAL until a person runs `portfolio resume` --
+        # justified because "the system said no and will say no again". That
+        # is true of "no declared command can test this" and false here: the
+        # next call composes a *different* document, so one enum value the
+        # model failed to copy would have blocked the idea on a mistake it
+        # would very likely not repeat. It is also what the designer's own
+        # prompt promises -- "a design that does not fit costs a stage rather
+        # than an execution". Found by an independent test audit, which
+        # identified it as the `_shown` incident reintroduced through a much
+        # larger surface.
         raise EmpiricalError(
             f"the design's composed input does not fit {chosen}: {exc}",
-            failure_class=FailureClass.POLICY_REFUSED,
+            failure_class=FailureClass.MODEL_OUTPUT_INVALID,
         ) from None
     supplied = {
         name: value
@@ -702,6 +739,17 @@ class Analysis:
             "variation_digest": experiment.variation_digest,
             "argv": list(spec.argv),
             "seeds": list(spec.seeds),
+            # **Who authored the measurement.** A composed plan is chosen by
+            # the same call that fixes the threshold, so whether a person
+            # wrote the design or a model did is the most load-bearing fact
+            # about the number beside it -- and it was written into the
+            # preregistration and read by nothing. An independent
+            # scientific-workflow review found that the analysis document,
+            # the evidence row and the review packet all omitted it, which
+            # left no reader able to tell the two apart.
+            "composed_inputs": [
+                {"path": path, "sha256": digest} for path, digest in spec.inputs
+            ],
             "workspace": experiment.workspace_path,
             "containment": contained,
             "exit_code": exit_code,
@@ -758,7 +806,15 @@ def metric_from(document: Any, path: str) -> float | None:
         return None
     if isinstance(current, bool) or not isinstance(current, int | float):
         return None
-    value = float(current)
+    try:
+        value = float(current)
+    except OverflowError:
+        # A JSON integer with four hundred digits parses to a Python `int`
+        # and overflows on the way to `float`. `OverflowError` is not a
+        # `ValueError`, so it escaped every guard here, failed the stage as
+        # FATAL_INFRASTRUCTURE_ERROR and re-crashed on each retry -- while
+        # every other unreadable metric correctly reads INSUFFICIENT.
+        return None
     if not math.isfinite(value):
         # NaN and the infinities are floats to Python and not numbers to a
         # decision rule. An independent review found what that costs: with
@@ -859,6 +915,36 @@ def analyse(
         )
 
     target = workspace / rule.output_path
+    stale = _was_already_in_the_checkout(workspace, rule.output_path)
+    if stale is not None:
+        # **The run did not produce the number.** The workspace is a checkout
+        # of the base commit, so every *tracked* file is already sitting at
+        # its path before the command starts -- and the documented way to
+        # make a command's outputs visible to the designer is to commit a
+        # specimen at exactly the declared output path. So a command that
+        # exits 0 without writing leaves the committed specimen there, and
+        # the rule reads it: on this machine `results/2026/sweep.json` is
+        # committed holding `portability.R = 0.216`, which under a rule of
+        # the shape actually used (`supports > 3.0`, `contradicts < 1/3`)
+        # reads as a **refutation** -- an idea recorded as killed by a number
+        # committed to Git weeks earlier, wearing a job id, a specification
+        # digest, a preregistration and a containment record.
+        #
+        # Conservative on purpose. A deterministic command that legitimately
+        # reproduces the committed bytes exactly is reported INSUFFICIENT
+        # rather than read, because refusing to conclude costs a re-run and
+        # concluding from the repository costs the scientific record.
+        return Analysis(
+            conclusion=EmpiricalConclusion.INSUFFICIENT,
+            summary=(
+                f"the run exited {exit_code} and {rule.output_path} is still "
+                f"byte-identical to the copy committed at {stale[:12]}, so "
+                f"the preregistered metric would have been read out of the "
+                f"repository rather than out of this measurement"
+            ),
+            outputs=outputs,
+            notes=(*notes, f"{rule.output_path} was not written by this run"),
+        )
     try:
         if target.stat().st_size > MAX_METRIC_DOCUMENT_BYTES:
             return Analysis(
@@ -918,6 +1004,43 @@ def analyse(
         outputs=outputs,
         notes=tuple(notes),
     )
+
+
+def _was_already_in_the_checkout(workspace: Path, relative: str) -> str | None:
+    """The base commit, when ``relative`` there is byte-identical to the committed copy.
+
+    ``None`` means the run wrote something the checkout did not already have,
+    which is the only case in which a declared output is a *measurement*.
+
+    Compared through Git's own object ids rather than by reading bytes:
+    ``hash-object`` hashes the working file exactly as Git would and
+    ``rev-parse HEAD:<path>`` names what was committed, so the comparison is
+    binary-exact and needs no decoding. Asked of Git rather than of a
+    timestamp because it needs no state carried from submission to reading --
+    the workspace is a worktree at the base commit, so Git is the
+    authoritative answer to "was this the committed copy". A file Git does
+    not know is never stale.
+    """
+
+    from research_os.automation.gitutil import git
+
+    try:
+        committed = git(
+            ["rev-parse", f"HEAD:{relative}"], cwd=workspace, check=False
+        ).stdout.strip()
+        if not committed:
+            return None
+        current = git(
+            ["hash-object", "--", str(workspace / relative)],
+            cwd=workspace,
+            check=False,
+        ).stdout.strip()
+        head = git(["rev-parse", "HEAD"], cwd=workspace, check=False).stdout.strip()
+    except ResearchOSError:  # pragma: no cover - a workspace with no git
+        return None
+    if not current or current != committed:
+        return None
+    return head or committed
 
 
 def _collect(
@@ -1097,6 +1220,7 @@ def design(
     if replication and previous is not None:
         try:
             assert_varies(replication=variation, primary=previous.variation_digest)
+            assert_measures_the_same_thing(rule, previous)
         except EmpiricalError as exc:
             return ExperimentStep(
                 ok=False,
@@ -1214,8 +1338,24 @@ def spec_parameters(spec: ExecutionSpec, design: ExperimentDesign) -> Mapping[st
     would be a second implementation of substitution.
     """
 
-    del spec
-    return dict(design.command_parameters)
+    composed = {
+        path.rsplit("/", 1)[-1].rsplit("-", 1)[0]: digest
+        for path, digest in spec.inputs
+    }
+    recorded: dict[str, Any] = {}
+    for name, value in dict(design.command_parameters).items():
+        if name in composed:
+            # The digest, never the document. Inlining it wrote the model's
+            # *raw* serialisation beside a digest taken over the *canonical*
+            # bytes, so a reader reconstructing the plan from the
+            # preregistration could get bytes that do not hash to the digest
+            # the same record preregisters -- two answers to "what was
+            # frozen" in one artifact. The bytes themselves are in the
+            # content-addressed store under exactly this digest.
+            recorded[name] = {"composed_sha256": composed[name]}
+            continue
+        recorded[name] = value
+    return recorded
 
 
 def _reserve_id() -> str:
@@ -1781,6 +1921,48 @@ def submit(context: Any, experiment: IdeaExperiment) -> ExperimentStep:
     )
 
 
+def assert_measures_the_same_thing(
+    rule: DecisionRule | None, previous: IdeaExperiment
+) -> None:
+    """A replication must answer the primary's question, not a nearby one.
+
+    ``assert_varies`` compares ``variation_digest`` and nothing else, so it
+    asks "did any hashed byte change" -- which a different seed already
+    satisfied, and which a composed plan satisfies by moving one lambda by
+    1e-9. Nothing compared the two *rules*. A replication could therefore
+    address a different metric in a different file under a different
+    threshold, come back SUPPORTS, and satisfy the HUMAN_READY requirement
+    described as "a second execution ... differing in seed or
+    implementation".
+
+    Found by an independent scientific-workflow review. Two measurements of
+    two different quantities are two experiments, not a replication, and the
+    gate note that says "the replication did not agree with the primary"
+    would otherwise be comparing the strengths of unrelated numbers.
+
+    Only ``metric_path`` is compared, and the narrowness is deliberate. The
+    *thresholds* may legitimately be sharpened, and the *output file* is
+    just where the number lands -- a replication runs in its own disposable
+    worktree and may name its own file. What may not move is the quantity.
+    """
+
+    before = previous.decision_rule or {}
+    if rule is None or not before:
+        # One of the two has no machine-checkable rule, so neither can be
+        # confirmed by the other and `INSUFFICIENT` already caps what the
+        # pair can claim. Nothing to compare.
+        return
+    first, second = str(before.get("metric_path", "")), str(rule.metric_path)
+    if first and first != second:
+        raise EmpiricalError(
+            f"a replication must measure what the primary measured: the "
+            f"primary's metric is {first!r} and this design reads {second!r}. "
+            f"Measuring a different quantity is a second experiment, not a "
+            f"replication of the first.",
+            failure_class=FailureClass.POLICY_REFUSED,
+        )
+
+
 def _preregistered(
     context: Any, experiment: IdeaExperiment
 ) -> tuple[ExecutionSpec, DecisionRule | None]:
@@ -2054,7 +2236,7 @@ def interpret(context: Any, experiment: IdeaExperiment) -> ExperimentStep:
             idea_version=experiment.idea_version,
             kind=kind,
             strength=strength,
-            summary=_evidence_summary(experiment, analysis),
+            summary=_evidence_summary(experiment, analysis, composed=spec.inputs),
             artifact_id=ref.artifact_id,
             job_id=job.job_id,
             # The *design* call, so a replication can be shown to be
@@ -2095,10 +2277,14 @@ def _materialise_inputs(context: Any, spec: ExecutionSpec, *, workspace: Path) -
     - the bytes are rehashed after reading and before writing, so a
       corrupted or substituted blob stops the submission instead of being
       measured;
-    - the file is written ``0o444``. A command cannot rewrite its own
-      preregistered input and then be measured against it, which is the
-      file-level form of "a model may not revise a plan after seeing
-      results".
+    - the file is written ``0o444`` and its directory is in the sandbox's
+      ``protected`` set. The mode alone is *not* an integrity control and
+      the docstring used to claim it was: the owner of a ``0444`` file can
+      chmod it back, and an unlink-and-recreate in a writable parent works
+      regardless. What actually defends the bytes is that
+      ``.research-os`` is bound read-only inside the sandbox, alongside
+      ``.git`` and ``.research``. A security review found the overstatement
+      and the missing bind together.
     """
 
     if not spec.inputs:
@@ -2127,9 +2313,24 @@ def _materialise_inputs(context: Any, spec: ExecutionSpec, *, workspace: Path) -
                 f"the preregistration says {digest[:12]}",
                 failure_class=FailureClass.ARTIFACT_MISSING,
             )
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes(payload)
-        destination.chmod(0o444)
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            # Replaced rather than written over. A retry after a crash
+            # re-enters this with the previous attempt's `0o444` file
+            # already there, and `write_bytes` on it raises
+            # `PermissionError` -- which is not a `ResearchOSError`, so no
+            # handler converted it, the row never reached
+            # OPERATIONALLY_FAILED, the workspace was never released and
+            # every retry failed identically. Found by a security review.
+            destination.unlink(missing_ok=True)
+            destination.write_bytes(payload)
+            destination.chmod(0o444)
+        except OSError as exc:
+            raise EmpiricalError(
+                f"the composed input {relative} could not be written into "
+                f"the workspace: {exc}",
+                failure_class=FailureClass.EXECUTOR_FAILED,
+            ) from None
 
 
 def _workspace_commit(workspace: Path) -> str:
@@ -2180,7 +2381,12 @@ def _evidence_kind(context: Any, experiment: IdeaExperiment) -> EvidenceKind:
     return EvidenceKind.EXPERIMENT
 
 
-def _evidence_summary(experiment: IdeaExperiment, analysis: Analysis) -> str:
+def _evidence_summary(
+    experiment: IdeaExperiment,
+    analysis: Analysis,
+    *,
+    composed: tuple[tuple[str, str], ...] = (),
+) -> str:
     """What a reviewer reads. Facts, and the rule that was fixed beforehand.
 
     Invariant 12 of the empirical brief in one function: a reviewer sees what
@@ -2195,6 +2401,16 @@ def _evidence_summary(experiment: IdeaExperiment, analysis: Analysis) -> str:
         f"{analysis.conclusion}"
     )
     parts = [headline, analysis.summary]
+    if composed:
+        # Said in the evidence row itself, because this is the sentence a
+        # reviewer needs in order to ask the right question: the plan this
+        # number came from was written by the same call that chose the
+        # threshold it is compared against.
+        parts.append(
+            "the measurement's own design was composed by the model, not "
+            "authored by the researcher: "
+            + ", ".join(f"{path} sha256:{digest[:12]}" for path, digest in composed)
+        )
     if analysis.outputs:
         parts.append(
             "outputs: "

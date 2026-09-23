@@ -24,6 +24,7 @@ like this quietly starts manufacturing results:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 from dataclasses import replace
@@ -82,6 +83,17 @@ out.write_text(json.dumps({"summary": {"overlap": 0.9 - 0.1 * (seed % 9)}}))
 print("measured")
 """
 
+SWEEP_SCRIPT = """\
+import json, pathlib, sys
+plan = json.loads(pathlib.Path(sys.argv[sys.argv.index("--plan") + 1]).read_text())
+out = pathlib.Path(sys.argv[sys.argv.index("--out") + 1])
+out.parent.mkdir(parents=True, exist_ok=True)
+# The number is a pure function of the composed plan, so a test can change
+# the plan and watch the measurement change with it.
+out.write_text(json.dumps({"summary": {"spread": max(plan["ratios"]) - min(plan["ratios"])}}))
+print("swept")
+"""
+
 CRASHING_SCRIPT = """\
 import sys
 print("the node fell over", file=sys.stderr)
@@ -116,6 +128,29 @@ projects:
         outputs: []
         timeout_seconds: 120
         checks: ["outputs_exist"]
+
+      sweep:
+        name: sweep
+        description: Run a composed plan and write the number it implies.
+        argv: ["python3", "sweep.py", "--plan", "{{plan}}", "--out", "results/sweep.json"]
+        parameters:
+          - name: plan
+            type: generated
+            required: true
+            max_bytes: 4096
+            input_schema:
+              type: object
+              additionalProperties: false
+              required: ["ratios"]
+              properties:
+                ratios:
+                  type: array
+                  minItems: 1
+                  maxItems: 4
+                  items: {{type: number, minimum: 0.0, maximum: 1.0}}
+        outputs: ["results/sweep.json"]
+        timeout_seconds: 120
+        checks: []
 """
 
 
@@ -127,6 +162,7 @@ def _git_project(path: Path, *, script: str) -> Path:
     )
     subprocess.run(["git", "config", "user.name", "tests"], cwd=path, check=True)
     (path / "measure.py").write_text(script, encoding="utf-8")
+    (path / "sweep.py").write_text(SWEEP_SCRIPT, encoding="utf-8")
     # A capsule, so "nothing wrote under .research/" is a claim with something
     # behind it rather than a statement about an absent directory.
     capsule = path / ".research"
@@ -2846,4 +2882,309 @@ def test_a_revision_does_not_leave_a_worktree_in_the_repository(
     assert not Path(step.experiment.workspace_path).exists()
     assert canonical_fingerprint(project_repo) == before, (
         "a superseded measurement left a ref in the researcher's repository"
+    )
+
+
+def test_a_metric_read_out_of_the_repository_is_not_a_measurement(
+    tmp_path: Path,
+) -> None:
+    """The committed specimen sitting in every fresh worktree is not a result.
+
+    The workspace is a checkout of the base commit, so every *tracked* file
+    is already at its path before the command starts -- and the documented
+    way to make a command's output schema visible to the designer is to
+    commit a specimen at exactly the declared output path. So a command that
+    exits 0 without writing leaves that specimen there and the preregistered
+    rule reads it.
+
+    On this machine that is not hypothetical: `results/2026/sweep.json` is
+    committed holding `portability.R = 0.216`, and under a rule of the shape
+    actually used in the traversal of 2026-09-22 -- supports above 3.0,
+    contradicts below a third -- 0.216 reads as a **refutation**. An idea
+    recorded as killed by a number committed to Git weeks earlier, carrying
+    a job id, a specification digest, a preregistration and a containment
+    record. Found by an independent scientific-workflow review.
+    """
+
+    from research_os.automation.gitutil import git
+    from research_os.portfolio import empirical as bridge
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    git(["init", "-q"], cwd=workspace)
+    git(["config", "user.email", "t@example.invalid"], cwd=workspace)
+    git(["config", "user.name", "t"], cwd=workspace)
+    committed = workspace / "results.json"
+    committed.write_text('{"portability": {"R": 0.216}}', encoding="utf-8")
+    git(["add", "results.json"], cwd=workspace)
+    git(["commit", "-qm", "a specimen output, committed"], cwd=workspace)
+
+    rule = DecisionRule(
+        metric_path="portability.R",
+        output_path="results.json",
+        success=DecisionPredicate(comparator=">", threshold=3.0),
+        failure=DecisionPredicate(comparator="<", threshold=0.3333333333),
+    )
+    stale = bridge.analyse(
+        experiment=SimpleNamespace(no_rule_reason=""),
+        rule=rule,
+        workspace=workspace,
+        spec=SimpleNamespace(outputs=("results.json",)),
+        exit_code=0,
+    )
+    assert stale.conclusion is EmpiricalConclusion.INSUFFICIENT
+    assert stale.conclusion is not EmpiricalConclusion.CONTRADICTS
+    assert "rather than out of this measurement" in stale.summary
+
+    # And the control: once the run actually writes it, it is read normally.
+    committed.write_text('{"portability": {"R": 4.0}}', encoding="utf-8")
+    measured = bridge.analyse(
+        experiment=SimpleNamespace(no_rule_reason=""),
+        rule=rule,
+        workspace=workspace,
+        spec=SimpleNamespace(outputs=("results.json",)),
+        exit_code=0,
+    )
+    assert measured.conclusion is EmpiricalConclusion.SUPPORTS
+    assert measured.observed == 4.0
+
+
+def test_a_replication_must_measure_the_quantity_the_primary_measured() -> None:
+    """`assert_varies` asks "did any hashed byte change". That is not enough.
+
+    A different seed already satisfied it, and a composed plan satisfies it
+    by moving one lambda by 1e-9. Nothing compared the two *rules*, so a
+    replication could address a different metric under a different
+    threshold, come back SUPPORTS, and satisfy the HUMAN_READY requirement
+    described as "a second execution ... differing in seed or
+    implementation" -- after which the gate note "the replication did not
+    agree with the primary" would be comparing unrelated numbers. Found by
+    an independent scientific-workflow review.
+
+    Deliberately narrow: thresholds may be sharpened and the output file may
+    be renamed. The quantity may not change.
+    """
+
+    from research_os.portfolio.empirical import (
+        EmpiricalError,
+        assert_measures_the_same_thing,
+    )
+
+    primary = SimpleNamespace(
+        decision_rule={
+            "metric_path": "portability.R",
+            "output_path": "results/2026/sweep.json",
+        }
+    )
+    same = DecisionRule(
+        metric_path="portability.R",
+        output_path="results/2026/replication.json",
+        success=DecisionPredicate(comparator=">", threshold=4.0),
+        failure=DecisionPredicate(comparator="<", threshold=0.25),
+    )
+    assert_measures_the_same_thing(same, primary)  # renamed file, sharper rule
+
+    elsewhere = DecisionRule(
+        metric_path="portability_wall_clock.R",
+        output_path="results/2026/sweep.json",
+        success=DecisionPredicate(comparator=">", threshold=3.0),
+        failure=DecisionPredicate(comparator="<", threshold=0.3333333333),
+    )
+    with pytest.raises(EmpiricalError, match="must measure what the primary"):
+        assert_measures_the_same_thing(elsewhere, primary)
+
+    # And when either side has no machine-checkable rule there is nothing to
+    # compare: INSUFFICIENT already caps what the pair can claim.
+    assert_measures_the_same_thing(None, primary)
+    assert_measures_the_same_thing(same, SimpleNamespace(decision_rule=None))
+
+
+def test_a_composed_plan_is_frozen_stored_written_and_measured(
+    portfolio: PortfolioStore,
+    runtime_db: Database,
+    runtime_project: str,
+    project_repo: Path,
+    tmp_path: Path,
+) -> None:
+    """The whole bridge, end to end, because deleting it stayed green.
+
+    An independent test audit no-op'd `_materialise_inputs` **and** stripped
+    `inputs=` from the specification `build_spec` returns -- so the composed
+    document never reached the digest, the preregistration or the workspace
+    -- and ran the suite: 4,488 passed, byte-identical to the baseline. The
+    29 tests written with the feature covered `experiment/generated.py`, a
+    pure module, and `resolve_command`. Nothing covered the bridge from
+    there into the portfolio.
+
+    This drives the real route: the designer composes a plan, `build_spec`
+    freezes it, `design` stores the bytes content-addressed, `submit`
+    materialises them into the disposable worktree, the declared command
+    reads the file, and the preregistered rule reads the number the *plan*
+    determined. Every link is load-bearing here -- break any one and the
+    measurement is not the one that was preregistered.
+    """
+
+    idea_id = _idea(portfolio, runtime_project)
+    plan = {"ratios": [0.2, 0.9]}
+    design = design_answer(command="sweep", out="results/sweep.json")
+    design["command_parameters"] = {"plan": plan}
+    design["decision_rule"] = {
+        "output_path": "results/sweep.json",
+        "metric_path": "summary.spread",
+        "success": {"comparator": ">", "threshold": 0.5},
+        "failure": {"comparator": "<", "threshold": 0.1},
+    }
+    context = _context(
+        portfolio=portfolio,
+        runtime_db=runtime_db,
+        tmp_path=tmp_path,
+        project_id=runtime_project,
+        idea_id=idea_id,
+        router=_router(runtime_db, design=design),
+        repo=project_repo,
+    )
+
+    step = _advance(context)
+    assert step.ok, step.detail
+
+    experiment = portfolio.require_experiment(step.experiment.experiment_id)
+    assert experiment.state is ExperimentState.INTERPRETED
+    # max(0.2, 0.9) - min(...) = 0.7, which the plan alone determines.
+    assert experiment.conclusion is EmpiricalConclusion.SUPPORTS
+
+    from research_os.portfolio.empirical import spec_from_record
+
+    spec = spec_from_record(
+        json.loads(context.artifacts.get_text(experiment.preregistration_artifact_id))[
+            "spec"
+        ]
+    )
+    # The composed document is *in* the specification, so it is in the digest.
+    assert len(spec.inputs) == 1
+    path, digest = spec.inputs[0]
+    assert path.startswith(".research-os/experiment-inputs/plan-")
+    assert path in " ".join(spec.argv)
+
+    # The exact bytes are recoverable from the content-addressed store, and
+    # they are the canonical form rather than the model's serialisation.
+    stored = context.artifacts.get_bytes(digest)
+    assert json.loads(stored) == plan
+    assert hashlib.sha256(stored).hexdigest() == digest
+
+    # And the preregistration names the digest rather than inlining the
+    # document, so there is one answer to "what was frozen".
+    record = json.loads(
+        context.artifacts.get_text(experiment.preregistration_artifact_id)
+    )
+    assert record["command_parameters"]["plan"] == {"composed_sha256": digest}
+    assert record["generated_inputs"][0]["sha256"] == digest
+
+    # The analysis carries who authored the measurement, and so does the row
+    # a reviewer reads.
+    analysis = json.loads(context.artifacts.get_text(experiment.analysis_artifact_id))
+    assert analysis["composed_inputs"] == [{"path": path, "sha256": digest}]
+    evidence = portfolio.list_evidence(idea_id=idea_id, idea_version=1)
+    assert any("composed by the model" in item.summary for item in evidence)
+
+
+def test_a_different_composed_plan_is_a_different_measurement(
+    portfolio: PortfolioStore,
+    runtime_db: Database,
+    runtime_project: str,
+    project_repo: Path,
+    tmp_path: Path,
+) -> None:
+    """Two plans, two specification digests, two numbers. Through the real route.
+
+    The companion test in `test_experiment_generated_input.py` builds the
+    `ExecutionSpec` by hand, so it proves `spec_digest` is sensitive to
+    `inputs` and *not* that `build_spec` puts anything there. This one runs
+    the route.
+    """
+
+    digests: list[str] = []
+    for ratios, expected in (
+        ([0.2, 0.9], EmpiricalConclusion.SUPPORTS),
+        ([0.40, 0.45], EmpiricalConclusion.CONTRADICTS),
+    ):
+        idea_id = _idea(portfolio, runtime_project)
+        design = design_answer(command="sweep", out="results/sweep.json")
+        design["command_parameters"] = {"plan": {"ratios": ratios}}
+        design["decision_rule"] = {
+            "output_path": "results/sweep.json",
+            "metric_path": "summary.spread",
+            "success": {"comparator": ">", "threshold": 0.5},
+            "failure": {"comparator": "<", "threshold": 0.1},
+        }
+        context = _context(
+            portfolio=portfolio,
+            runtime_db=runtime_db,
+            tmp_path=tmp_path,
+            project_id=runtime_project,
+            idea_id=idea_id,
+            router=_router(runtime_db, design=design),
+            repo=project_repo,
+        )
+        step = _advance(context)
+        assert step.ok, step.detail
+        experiment = portfolio.require_experiment(step.experiment.experiment_id)
+        assert experiment.conclusion is expected, ratios
+        digests.append(experiment.spec_digest)
+
+    assert digests[0] != digests[1]
+
+
+def test_a_plan_that_does_not_fit_its_schema_is_retryable_not_terminal(
+    portfolio: PortfolioStore,
+    runtime_db: Database,
+    runtime_project: str,
+    project_repo: Path,
+    tmp_path: Path,
+) -> None:
+    """One malformed document must not wedge the idea until a person returns.
+
+    `build_spec` classified every freeze failure as `POLICY_REFUSED`, which
+    is in `REFUSAL_CLASSES`, and one refusal takes an idea to
+    `BLOCKED_EXTERNAL` until somebody runs `portfolio resume`. That rule is
+    right for "no declared command can test this", whose answer really is
+    the same next time. It is wrong here: the next call composes a
+    *different* document, so one enum value the model failed to copy would
+    have blocked the idea on a mistake it would probably not repeat -- and
+    the designer's own prompt promises the opposite, that a design which
+    does not fit "costs a stage rather than an execution".
+
+    A test audit identified it as the incident behind `_shown` reappearing
+    through a much larger surface: a whole nested document against a
+    sixty-line schema.
+    """
+
+    idea_id = _idea(portfolio, runtime_project)
+    design = design_answer(command="sweep", out="results/sweep.json")
+    # `ratios` must be numbers in [0, 1]; 7.5 is outside the declared bound.
+    design["command_parameters"] = {"plan": {"ratios": [7.5]}}
+    design["decision_rule"] = {
+        "output_path": "results/sweep.json",
+        "metric_path": "summary.spread",
+        "success": {"comparator": ">", "threshold": 0.5},
+        "failure": {"comparator": "<", "threshold": 0.1},
+    }
+    context = _context(
+        portfolio=portfolio,
+        runtime_db=runtime_db,
+        tmp_path=tmp_path,
+        project_id=runtime_project,
+        idea_id=idea_id,
+        router=_router(runtime_db, design=design),
+        repo=project_repo,
+    )
+
+    from research_os.portfolio.store import REFUSAL_CLASSES
+
+    step = _advance(context)
+    assert not step.ok
+    assert "must be at most 1" in step.detail
+    assert step.failure_class is FailureClass.MODEL_OUTPUT_INVALID
+    assert step.failure_class not in REFUSAL_CLASSES, (
+        "a document the model can simply rewrite is not a refusal, and a "
+        "refusal blocks the idea after one occurrence"
     )

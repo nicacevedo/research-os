@@ -526,6 +526,91 @@ def test_every_length_checked_string_says_so_in_the_schema() -> None:
     )
 
 
+def test_every_bounded_list_states_its_length_and_its_items_length() -> None:
+    """`_shown` covered scalars, and the docstring then claimed the job done.
+
+    Every list bound stayed enforced and unstated, so a thirteenth
+    `assumptions` entry -- or a 2,001-character one -- still discarded the
+    whole response and still told the model nothing. An architecture review
+    pointed out that the incident `_shown` exists to prevent is reachable
+    through exactly that door.
+    """
+
+    unstated: list[str] = []
+    for model in _contract_models():
+        schema = model.model_json_schema()
+        bounded = {
+            field
+            for decorator in model.__pydantic_decorators__.field_validators.values()
+            for field in decorator.info.fields
+        }
+        for name, field in model.model_fields.items():
+            if field.annotation != tuple[str, ...] or name not in bounded:
+                continue
+            rendered = schema["properties"][name]
+            if "maxItems" not in rendered:
+                unstated.append(f"{model.__name__}.{name} (maxItems)")
+            element = rendered.get("items")
+            # `enum` says strictly more than a length bound, so either is a
+            # statement of what an element may be.
+            if isinstance(element, dict) and not (
+                "maxLength" in element or "enum" in element
+            ):
+                unstated.append(f"{model.__name__}.{name} (items bound)")
+    assert unstated == [], (
+        "these lists are length-checked and the emitted schema does not say "
+        f"so: {', '.join(unstated)}"
+    )
+
+
+def test_the_advertised_bound_is_the_bound_that_is_enforced() -> None:
+    """Presence is not correctness, and the guard only checked presence.
+
+    `_shown(MAX_TITLE_CHARS)` on a field whose validator enforces
+    `MAX_SUMMARY_CHARS` passes a presence check and tells the model the
+    wrong number -- the same incident one step sideways. A test audit
+    probed all the validator-covered string fields and found no mismatch
+    today, and observed that the guard could not have held the property
+    anyway.
+
+    Checked by running each validator at the advertised limit and one
+    character past it: at the limit it must be accepted, past it either
+    refused or clipped. Both are honest; silently keeping an over-long
+    value while advertising a limit is not.
+    """
+
+    wrong: list[str] = []
+    for model in _contract_models():
+        schema = model.model_json_schema()
+        validators = {
+            field: decorator.func
+            for decorator in model.__pydantic_decorators__.field_validators.values()
+            for field in decorator.info.fields
+        }
+        for name, field in model.model_fields.items():
+            if field.annotation is not str or name not in validators:
+                continue
+            advertised = schema["properties"][name].get("maxLength")
+            if advertised is None:
+                continue
+            run = validators[name].__get__(model, type(model))
+            try:
+                run("x" * advertised)
+            except ValueError:
+                wrong.append(f"{model.__name__}.{name} refuses its own limit")
+                continue
+            try:
+                kept = run("x" * (advertised + 1))
+            except ValueError:
+                continue  # refused past the limit: honest
+            if len(kept) > advertised:
+                wrong.append(
+                    f"{model.__name__}.{name} advertises {advertised} and keeps "
+                    f"{len(kept)}"
+                )
+    assert wrong == [], "; ".join(wrong)
+
+
 def test_the_two_fields_a_real_traversal_broke_state_their_own_limits() -> None:
     """The specific reproduction, kept alongside the general rule.
 

@@ -156,6 +156,12 @@ def prepare_run_dir(spec: ExecutionSpec, *, job_id: str) -> Path:
         "timeout_seconds": spec.timeout_seconds,
         "outputs": list(spec.outputs),
         "seeds": list(spec.seeds),
+        # The composed inputs this run was given, by content. The docstring
+        # promises a reader of `manifest.json` knows exactly what was run,
+        # and without these they know the argv -- which merely happens to
+        # embed the digest in a filename -- and not what those bytes were.
+        # Not hashed into anything, so adding it moves no digest.
+        "inputs": [list(item) for item in spec.inputs],
     }
     _atomic_write(
         target / "manifest.json",
@@ -308,7 +314,18 @@ class LocalExecutor:
                 # a `post-checkout` hook produced zero drift from
                 # `canonical_fingerprint`, and the next `git worktree add` ran
                 # it on the host.
-                protected=(workdir / ".git", workdir / ".research"),
+                # `.research-os` joins them: it is where a *composed*
+                # experiment input is materialised, and the preregistration
+                # is the claim that the run was performed against exactly
+                # those bytes. Writing the file `0o444` does not defend it --
+                # the owner can chmod it back, and the parent directory is
+                # writable, so unlink-and-recreate works. A security review
+                # found the claim overstated and the directory unprotected.
+                protected=(
+                    workdir / ".git",
+                    workdir / ".research",
+                    workdir / ".research-os",
+                ),
                 network=False,
                 wall_seconds=spec.timeout_seconds,
                 # Only the seeds the spec froze, plus the tool settings the

@@ -163,8 +163,14 @@ in `experiments.yaml` -- the researcher's file, outside every worktree -- takes
 a JSON document rather than a path. Research OS validates it against the
 `input_schema` that declaration carries, refuses any key the schema does not
 list, bounds its canonical bytes, hashes it, and **chooses where it lands**
-inside the disposable workspace; the file is written `0o444` and rehashed
-against the preregistered digest on the way in. The caller never supplies a
+inside the disposable workspace; the file is rehashed against the
+preregistered digest on the way in, written `0o444`, and its directory is
+bound read-only inside the sandbox alongside `.git` and `.research`. The
+mode on its own is not an integrity control and an earlier version of this
+paragraph implied it was: the owner of a `0444` file can restore write
+permission, and unlink-and-recreate works in a writable parent. What
+defends the bytes against the command being measured is the read-only
+bind. The caller never supplies a
 destination, and one that tries to is refused. What a composed document can do
 is be read by a program the researcher already declared; what it cannot do is
 become an argument, a flag, a second command, or a file anywhere else.

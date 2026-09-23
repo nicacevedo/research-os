@@ -1211,22 +1211,18 @@ def _refresh(
     """
 
     store = context.portfolio
-    return stages.TrackSnapshot(
-        status=store.require_idea(context.idea_id).status,
-        version=snapshot.version,
-        succeeded_stages=snapshot.succeeded_stages,
-        evidence=snapshot.evidence,
-        live_reviews=store.live_reviews(
-            idea_id=context.idea_id,
-            current_prompt_versions=CURRENT_REVIEW_PROMPTS,
-            max_age_seconds=context.config.thresholds.review_max_age_seconds,
-        ),
-        open_objections=store.open_objections(idea_id=context.idea_id),
-        revision_count=snapshot.revision_count,
-        review_count=store.review_count(context.idea_id),
-        lineage_active=snapshot.lineage_active,
-        depth_without_evidence=snapshot.depth_without_evidence,
+    # Through the one builder, with the version pinned to the caller's:
+    # nothing in a review board changes the version, and re-reading it would
+    # make this depend on a concurrent revision. This was the fourth
+    # hand-built snapshot and it omitted `basis_stages`, `experiments` and
+    # `notes` -- harmless only because its single reader re-queries
+    # everything, which is exactly the latent shape an architecture review
+    # said the guard would not catch.
+    snapshot = stages.snapshot_for(
+        store, store.require_idea(context.idea_id), version=snapshot.version
     )
+    assert snapshot is not None  # `require_idea` raises rather than returning None
+    return snapshot
 
 
 def run_meta_review(

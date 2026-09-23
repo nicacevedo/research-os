@@ -259,9 +259,29 @@ def resolve_command(
     for parameter in spec.parameters:
         if parameter.type is ParameterType.GENERATED:
             if parameter.name not in placed:
+                # Two different situations, and saying "none was frozen" to
+                # both of them cost a human their command line. Only the
+                # portfolio's empirical route freezes documents; the
+                # objective cycle and `researchctl experiment run` call this
+                # with no `generated=` at all. Converting a declared
+                # parameter to `generated` therefore takes the command away
+                # from those two routes, and before this they reported it as
+                # if a design had forgotten something.
                 raise ExperimentSpecError(
-                    f"command {spec.name!r} requires a composed document for "
-                    f"{parameter.name!r} and none was frozen"
+                    (
+                        f"command {spec.name!r} takes a composed document for "
+                        f"{parameter.name!r}, and this caller cannot compose "
+                        f"one. Composed documents are supported on the "
+                        f"autonomous portfolio's experiment route; declare the "
+                        f"parameter as a `path` if it must also be runnable "
+                        f"from `researchctl experiment run` or from an "
+                        f"objective cycle."
+                    )
+                    if generated is None
+                    else (
+                        f"command {spec.name!r} requires a composed document "
+                        f"for {parameter.name!r} and none was frozen"
+                    )
                 )
             # The same containment rule a `path` value faces, applied to a
             # path this system chose. Not because it is suspected -- because

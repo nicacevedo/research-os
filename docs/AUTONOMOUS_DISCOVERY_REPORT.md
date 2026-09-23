@@ -3404,7 +3404,7 @@ One of them is smaller than it was recorded as being, and the first draft of
 this paragraph got it half wrong. The (n, p) factorial needs no new
 executable command for its **design**: `sweep-lambda-support` takes any plan,
 and what blocked it was that a designer may only name a *tracked* file. That
-half is right and §AB acts on it.
+half is right, and the composed-input route in §19.9 acts on it.
 
 What the first draft missed is the other half. That idea's falsifier asks for
 `iteration_count ~ size + difficulty + size:difficulty` and reads the size

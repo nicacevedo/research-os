@@ -164,8 +164,6 @@ def test_a_plan_inside_the_declaration_is_accepted_and_placed() -> None:
     assert item.sha256 == hashlib.sha256(item.canonical).hexdigest()
     assert json.loads(item.canonical) == GOOD_PLAN
 
-    with pytest.MonkeyPatch.context():
-        pass
     resolved = resolve_command(
         sweep_command(), {}, worktree=Path("/tmp"), generated={"plan": item.path}
     )
@@ -306,9 +304,25 @@ def test_a_caller_may_not_name_where_its_document_lands() -> None:
             )
 
 
-def test_a_generated_parameter_with_nothing_frozen_is_refused() -> None:
-    with pytest.raises(ExperimentSpecError, match="none was frozen"):
+def test_a_caller_that_cannot_compose_is_told_so_rather_than_blamed() -> None:
+    """Two situations, and one message for both cost a human their CLI.
+
+    Only the portfolio's empirical route freezes documents. The objective
+    cycle and `researchctl experiment run` call `resolve_command` with no
+    `generated=` at all, so converting a declared parameter to `generated`
+    silently removes the command from both -- and they reported it as if a
+    design had forgotten to supply something. An architecture review found
+    it by reading the call sites; it was then reproduced on the real
+    `sweep-lambda-support` declaration.
+    """
+
+    with pytest.raises(ExperimentSpecError, match="this caller cannot compose"):
         resolve_command(sweep_command(), {}, worktree=Path("/tmp"))
+
+    # A caller that *can* compose and simply did not is a different fault,
+    # and still says so.
+    with pytest.raises(ExperimentSpecError, match="none was frozen"):
+        resolve_command(sweep_command(), {}, worktree=Path("/tmp"), generated={})
 
 
 def test_nothing_may_place_a_file_for_an_ordinary_parameter() -> None:
@@ -429,6 +443,50 @@ def test_a_specification_with_no_composed_input_hashes_exactly_as_before() -> No
     assert _spec_record(spec) == stored
 
 
+def test_the_variation_digest_also_did_not_move(mock_free: None = None) -> None:
+    """The commit claimed two pins and shipped one.
+
+    `spec_digest`'s compatibility is pinned against the real stored
+    preregistration; `variation_digest`'s was only asserted in prose, so
+    making its `inputs` key unconditional would silently re-hash every
+    stored variation digest with nothing going red. A test audit found the
+    missing half.
+    """
+
+    from research_os.portfolio.empirical import variation_digest
+
+    spec = ExecutionSpec(
+        name="idea-experiment-sweep-lambda-support",
+        argv=(
+            "uv",
+            "run",
+            "--frozen",
+            "--extra",
+            "conic",
+            "--extra",
+            "baselines",
+            "python",
+            "scripts/run_sweep.py",
+            "--plan",
+            "experiments/EXP-0002-lambda-support-sweep-plan.json",
+            "--out",
+            "results/2026/sweep.json",
+        ),
+        cwd="/anything: the variation digest removes the workspace",
+        environment={"kind": "uv", "workspace": "disposable-worktree"},
+        resources={"cpus": "1", "time_limit": "01:30:00"},
+        env={"RESEARCH_OS_SEED_0": "20260915"},
+        timeout_seconds=3600,
+        outputs=("results/2026/sweep.json",),
+        seeds=(20260915,),
+    )
+    assert spec.inputs == ()
+    assert (
+        variation_digest(spec)
+        == "e3aaca6a1f3985c6e4684b630c723b141b7487b188eb980bd062cea330d6d118"
+    )
+
+
 def test_canonical_bytes_refuse_what_json_cannot_represent() -> None:
     for bad in (float("nan"), float("inf")):
         with pytest.raises(ExperimentSpecError, match="not a JSON document"):
@@ -437,4 +495,138 @@ def test_canonical_bytes_refuse_what_json_cannot_represent() -> None:
 
 def test_the_schema_checker_refuses_a_schema_that_is_not_an_object() -> None:
     with pytest.raises(ValueError, match="must be an object"):
-        assert_schema_supported({"properties": {"a": "nope"}}, where="w")  # type: ignore[dict-item]
+        assert_schema_supported(
+            {"type": "object", "properties": {"a": "nope"}},  # type: ignore[dict-item]
+            where="w",
+        )
+
+
+@pytest.mark.parametrize(
+    ("schema", "expected"),
+    [
+        ({"type": "object"}, "must declare `properties`"),
+        (
+            {"type": "object", "additionalProperties": False},
+            "must declare `properties`",
+        ),
+        ({"properties": {"a": {"type": "integer"}}}, "must declare `type`"),
+        ({"type": "array"}, "must declare `items`"),
+        (
+            {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {"o": {"type": "object"}},
+            },
+            "must declare `properties`",
+        ),
+    ],
+    ids=[
+        "open-object",
+        "object-closed-but-empty",
+        "no-type",
+        "array-without-items",
+        "open-nested-object",
+    ],
+)
+def test_a_schema_with_an_unclosable_node_is_refused_at_configuration_time(
+    schema: dict[str, object], expected: str
+) -> None:
+    """Closure has to be real, and it was not.
+
+    `_check_object` implied closure with `if properties:`, so any node with
+    none was wholly open -- including one a researcher had closed explicitly
+    with `additionalProperties: false`, which was accepted at configuration
+    time and then never read. An architecture review and a security review on
+    2026-09-23 found it independently and both were right that it made the
+    module's own promise false, and `SECURITY.md`'s "refuses any key the
+    schema does not list" false with it.
+
+    Refused where the mistake is -- in the declaration -- rather than
+    silently admitting everything underneath it.
+    """
+
+    with pytest.raises(ValueError, match=expected):
+        assert_schema_supported(schema, where="w")
+
+
+def test_an_explicitly_closed_object_really_is_closed() -> None:
+    """The reviewers' own reproduction, kept as the behavioural half."""
+
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["solver"],
+        "properties": {
+            "solver": {"type": "string", "enum": ["cg_hist"]},
+            "options": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {"tolerance": {"type": "number"}},
+            },
+        },
+    }
+    assert_schema_supported(schema, where="w")
+    with pytest.raises(ExperimentSpecError, match="undeclared key"):
+        freeze(
+            parameter="plan",
+            document={"solver": "cg_hist", "options": {"--config": "/etc/passwd"}},
+            schema=schema,
+            max_bytes=65_536,
+            command="sweep",
+        )
+
+
+@pytest.mark.parametrize(
+    ("document", "schema"),
+    [
+        (True, {"type": "integer", "enum": [1, 2]}),
+        (1.0, {"type": "number", "const": 1}),
+        (
+            "not an object",
+            {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {"a": {"type": "integer"}},
+                "required": ["a"],
+            },
+        ),
+    ],
+    ids=[
+        "bool-satisfying-an-int-enum",
+        "float-satisfying-an-int-const",
+        "scalar-for-object",
+    ],
+)
+def test_a_value_of_the_wrong_kind_does_not_satisfy_a_declaration(
+    document: object, schema: dict[str, object]
+) -> None:
+    """`True == 1` and `1.0 == 1` in Python, and neither is true of JSON.
+
+    Without this the written file carries `true` where the declaration listed
+    `1`, and the researcher's program parses it. Type confusion reaching a
+    trusted program.
+    """
+
+    with pytest.raises(ExperimentSpecError):
+        freeze(
+            parameter="plan",
+            document=document,
+            schema=schema,
+            max_bytes=65_536,
+            command="sweep",
+        )
+
+
+def test_a_lone_surrogate_is_refused_as_a_contract_failure_not_a_crash() -> None:
+    """It is a `ValueError`, and it was escaping unclassified.
+
+    `json.loads` accepts a lone surrogate and `str.encode` rejects it. The
+    encode sat outside `canonical_bytes`' handler, so the exception escaped
+    as `CODE_EXCEPTION` -- "the code is broken, retry" -- letting a model
+    turn its own invalid document into a paid retry loop instead of a
+    refusal.
+    """
+
+    document = json.loads('{"a": "\ud800"}')
+    with pytest.raises(ExperimentSpecError, match="not a JSON document"):
+        canonical_bytes(document, where="w")
