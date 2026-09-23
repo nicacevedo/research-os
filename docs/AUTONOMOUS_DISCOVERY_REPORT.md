@@ -3400,10 +3400,22 @@ a warm-start on/off toggle (twice), a hardware-generation selector, a
 factorial over (n, p) crossed with difficulty, and a document search of the
 thesis. So six of §Y.2's seven remain.
 
-One of them is smaller than it was recorded as being. The (n, p) factorial
-does **not** need a new command: `sweep-lambda-support` takes any plan file,
-and what blocks it is that a designer may only name a *tracked* file and no
-such plan is committed. That gap closes with a committed plan, not with code.
+One of them is smaller than it was recorded as being, and the first draft of
+this paragraph got it half wrong. The (n, p) factorial needs no new
+executable command for its **design**: `sweep-lambda-support` takes any plan,
+and what blocked it was that a designer may only name a *tracked* file. That
+half is right and §AB acts on it.
+
+What the first draft missed is the other half. That idea's falsifier asks for
+`iteration_count ~ size + difficulty + size:difficulty` and reads the size
+main effect and the interaction; `run_sweep.py` reduces a sweep to fast
+windows and a portability ratio, and no regression coefficient appears
+anywhere in `sweep.json`. So the plan was never the only thing missing, and
+the sentence "that gap closes with a committed plan, not with code" was an
+over-claim made by reading the refusal's first paragraph and not its last.
+Corrected rather than deleted: the distinction it exposes -- a missing
+*design* is now autonomous and a missing *analysis* is still human-owned --
+is the more useful of the two facts.
 
 Also observed, and a tuning property rather than a defect: `evidence` is the
 most expensive stage in the utility function (0.4 × $2.50), so an idea
