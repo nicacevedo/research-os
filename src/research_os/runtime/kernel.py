@@ -34,6 +34,7 @@ shortcut past them.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -47,6 +48,7 @@ from research_os.capsule import (
 )
 from research_os.digests import subject_digest
 from research_os.errors import CapsuleError, ResearchOSError
+from research_os.ids import PROJECT_ID_RE
 from research_os.models import (
     Claim,
     ClaimStatus,
@@ -361,3 +363,39 @@ class ScientificKernelAdapter:
             f"decision; it does not record it. Run `researchctl review` (interactive) "
             f"or answer the pending approval with `researchctl runtime approve`."
         )
+
+
+def resolve_project_argument(
+    value: str, *, known: Callable[[str], Path | None]
+) -> tuple[str, Path] | None:
+    """Read a project argument as an id or as a path, by one rule.
+
+    **A project id this machine knows is that project**, and only an argument
+    that is not one is read as a path. ``known`` says what "knows" means to
+    the caller -- the operational table, and for the portfolio's commands the
+    registry after it -- and returns the repository it has on record.
+
+    The order is the whole point, and the first version of the portfolio's
+    single resolver had it backwards: it asked the filesystem first, so an id
+    that happened to name something in the working directory was read as a
+    path and resolved to *whatever repository enclosed it*. Standing in
+    project A with a file called ``b-study``, ``portfolio pause b-study``
+    paused A; standing next to an old clone called ``delta-study``, ``enable
+    delta-study`` moved the project onto the clone. An independent review
+    found both. A path cannot be mistaken for an id the other way round --
+    ids have no ``/`` and no ``.`` -- so ``./b-study`` still means the
+    directory.
+
+    Returns ``None`` for an argument that is neither, so each caller refuses
+    in its own words.
+    """
+
+    if PROJECT_ID_RE.fullmatch(value):
+        repository = known(value)
+        if repository is not None:
+            return value, repository
+    candidate = Path(value).expanduser()
+    if candidate.exists():
+        git_root, project = ScientificKernelAdapter(candidate).identity()
+        return str(project.id), Path(git_root)
+    return None

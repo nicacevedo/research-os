@@ -30,6 +30,7 @@ from decimal import Decimal
 from typing import Any
 
 from research_os.errors import ResearchOSError
+from research_os.ids import validate_project_id
 from research_os.runtime.db import Database, RuntimeDatabaseError, jsonb
 from research_os.runtime.findings import FindingKind, FindingRefKind, RuntimeFinding
 from research_os.runtime.ids import (
@@ -207,6 +208,12 @@ class RuntimeStore:
     def upsert_project(
         self, *, project_id: str, repo_path: str, title: str | None = None
     ) -> Project:
+        # Every other `project_id` column references this one, so this is the
+        # single gate between "what a researcher typed" and "a project id".
+        # Checked with the pattern the capsule enforces on `project.yaml`, so
+        # the two cannot disagree -- and a filesystem path, which is what the
+        # first live qualification nearly wrote, fails it on its first `/`.
+        validate_project_id(project_id)
         with self._db.tx() as conn:
             row = conn.execute(
                 """

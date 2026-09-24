@@ -273,30 +273,33 @@ def _database(config: RuntimeConfig) -> Database:
     return Database(config.require_dsn())
 
 
-def _resolve_project(value: str) -> tuple[str, Path]:
+def _resolve_project(value: str, db: Database) -> tuple[str, Path]:
     """Resolve a project id or path to ``(project_id, repo_path)``.
 
-    A path is read through the kernel adapter, which is the only thing that
-    knows what a capsule is. An id is looked up in the operational projects
-    table -- not the global registry, which the architecture calls disposable.
+    By :func:`~research_os.runtime.kernel.resolve_project_argument`, the rule
+    `researchctl portfolio` uses too: an id the operational projects table
+    knows is that project -- not the global registry, which the architecture
+    calls disposable -- and anything else is a path read through the kernel
+    adapter, which is the only thing that knows what a capsule is.
+
+    Id first, and it was path first: standing in project A with a file named
+    ``b-study``, ``runtime budget b-study --max-cost-usd ...`` set A's
+    ceiling. Takes the caller's database so the lookup runs after `migrate`.
     """
 
-    from research_os.runtime.kernel import ScientificKernelAdapter
+    from research_os.runtime.kernel import resolve_project_argument
 
-    candidate = Path(value).expanduser()
-    if candidate.exists():
-        adapter = ScientificKernelAdapter(candidate)
-        git_root, project = adapter.identity()
-        return str(project.id), Path(git_root)
-    config = load_config()
-    with _database(config) as db:
-        stored = RuntimeStore(db).get_project(value)
-    if stored is None:
+    def known(project_id: str) -> Path | None:
+        stored = RuntimeStore(db).get_project(project_id)
+        return Path(stored.repo_path) if stored is not None else None
+
+    resolved = resolve_project_argument(value, known=known)
+    if resolved is None:
         raise ResearchOSError(
             f"{value!r} is neither a path nor a project this runtime knows. "
             f"Start it once with a path: `researchctl runtime start <path> --objective ...`"
         )
-    return stored.project_id, Path(stored.repo_path)
+    return resolved
 
 
 # ------------------------------------------------------------------- verbs --
@@ -314,10 +317,9 @@ def _start(args: argparse.Namespace) -> int:
             autonomy=str(args.autonomy),
             source=config.source,
         )
-    project_id, repo_path = _resolve_project(args.project)
-
     with _database(config) as db:
         migrate(db)
+        project_id, repo_path = _resolve_project(args.project, db)
         ensure_tables(config.require_dsn())
         store = RuntimeStore(db)
         store.upsert_project(project_id=project_id, repo_path=str(repo_path))
@@ -1079,7 +1081,7 @@ def _budget(args: argparse.Namespace) -> int:
     config = load_config()
     with _database(config) as db:
         migrate(db)
-        project_id, _repo = _resolve_project(args.project)
+        project_id, _repo = _resolve_project(args.project, db)
         ledger = BudgetLedger(db)
         current = ledger.get(
             scope=BudgetScope.PROJECT,

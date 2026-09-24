@@ -158,11 +158,11 @@ def test_a_leased_row_must_have_an_owner_and_a_deadline(runtime_db: Database) ->
 
     from research_os.runtime.store import RuntimeStore
 
-    RuntimeStore(runtime_db).upsert_project(project_id="p", repo_path="/tmp/p")
+    RuntimeStore(runtime_db).upsert_project(project_id="pp", repo_path="/tmp/p")
     with pytest.raises(RuntimeDatabaseError), runtime_db.tx() as conn:
         conn.execute(
             "insert into work_items (work_id, project_id, kind, status) "
-            "values ('WORK-20260101T000000Z-aaaaaaaa', 'p', 'k', 'LEASED')"
+            "values ('WORK-20260101T000000Z-aaaaaaaa', 'pp', 'k', 'LEASED')"
         )
 
 

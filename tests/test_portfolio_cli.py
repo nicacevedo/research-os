@@ -423,6 +423,7 @@ def test_a_seed_on_a_portfolio_nothing_ticks_says_so(
 def test_a_seed_before_the_portfolio_exists_says_what_to_run(
     runtime_db: Database,
     pg_dsn: str,
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -442,14 +443,24 @@ def test_a_seed_before_the_portfolio_exists_says_what_to_run(
     """
 
     monkeypatch.setenv(DSN_ENV, pg_dsn)
-    code = run_cli(monkeypatch, "seed", "add", "unregistered", "--text", "a direction")
+    # The order the dogfood followed: registered, and never enabled. An id
+    # nobody registered is refused earlier, by the resolver, and the advice
+    # below would be wrong for it -- `portfolio enable <id>` needs a project
+    # this machine knows.
+    repo = make_capsule(tmp_path / "project", project_id="registered-only")
+    assert run_cli(monkeypatch, "register-project", str(repo)) == 0
+    capsys.readouterr()
+    code = run_cli(
+        monkeypatch, "seed", "add", "registered-only", "--text", "a direction"
+    )
     out = capsys.readouterr().out
 
     assert code != 0
     assert "foreign key" not in out
-    assert "portfolio enable unregistered" in out
+    assert "portfolio enable registered-only" in out
     # And it must not have started anything on the way to explaining itself.
-    assert PortfolioStore(runtime_db).get_state("unregistered") is None
+    assert PortfolioStore(runtime_db).get_state("registered-only") is None
+    assert RuntimeStore(runtime_db).get_project("registered-only") is None
 
 
 def test_status_does_not_call_a_portfolio_whose_work_is_failing_healthy(

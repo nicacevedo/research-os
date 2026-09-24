@@ -185,59 +185,92 @@ def _database() -> Database:
     return Database(config.require_dsn())
 
 
-def _project(value: str | None) -> str:
-    """Resolve a project id or a repository path to a project id.
+def _resolve_project(value: str | None, db: Database) -> tuple[str, Path]:
+    """Resolve what a researcher typed to ``(project_id, repo_path)``.
 
-    A path as well as an id, because a researcher standing in their project
-    should not have to look up what the registry calls it.
+    The one resolver every command here uses, and there were two. ``enable``
+    read the capsule; every other command looked the argument up in the
+    global registry and, when the registry did not list that path, carried on
+    with the path itself as the project id. The first live qualification hit
+    it on 2026-09-24: the data home's registry listed the project at an older
+    clone, ``portfolio enable <repository>`` worked, ``portfolio status
+    <repository>`` said there was no portfolio, and ``portfolio pause
+    <repository>`` wrote the filesystem path into ``portfolio_state`` and was
+    stopped only by the foreign key.
+
+    The rule is :func:`~research_os.runtime.kernel.resolve_project_argument`,
+    shared with `researchctl runtime`: a known id is that project, and
+    anything else that exists is a path read through the kernel adapter --
+    the only thing that knows what a capsule is -- so the registry is never
+    asked what a path means. An id is known to the operational table first
+    and the registry second: the registry is disposable (`ARCHITECTURE.md`),
+    and it is consulted at all because a researcher who ran
+    `register-project` reasonably expects the id it printed to be usable.
+    Anything else is refused, so nothing a researcher mistyped can become
+    somebody's project id.
     """
+
+    from research_os.runtime.kernel import (
+        ScientificKernelAdapter,
+        resolve_project_argument,
+    )
 
     if value is None:
+        # A researcher standing in their project should not have to name it:
+        # the capsule they are standing in is the project. It was the sole
+        # registry entry instead, whatever the working directory -- so with
+        # the live qualification's stale registry, a bare `portfolio enable`
+        # typed inside the canonical checkout enabled the dogfood's older
+        # clone. An independent review found it.
+        try:
+            git_root, here = ScientificKernelAdapter(Path.cwd()).identity()
+        except ResearchOSError:
+            pass  # not standing in a capsule; fall back to the registry
+        else:
+            return str(here.id), Path(git_root)
+        # Standing nowhere in particular, one registered project is the
+        # obvious default and several are not.
         entries = list_projects()
-        if len(entries) == 1:
-            return entries[0].project_id
-        raise ResearchOSError(
-            "name a project: this machine has "
-            f"{len(entries)} registered, and there is no sensible default."
-        )
-    candidate = Path(value).expanduser()
-    if candidate.exists():
+        if len(entries) != 1:
+            raise ResearchOSError(
+                "name a project: this machine has "
+                f"{len(entries)} registered, and there is no sensible default."
+            )
+        value = entries[0].project_id
+
+    def known(project_id: str) -> Path | None:
+        stored = RuntimeStore(db).get_project(project_id)
+        if stored is not None:
+            return Path(stored.repo_path)
         for entry in list_projects():
-            if Path(entry.path).resolve() == candidate.resolve():
-                return entry.project_id
-    return value
+            if entry.project_id == project_id:
+                return Path(entry.path)
+        return None
+
+    resolved = resolve_project_argument(value, known=known)
+    if resolved is None:
+        raise ResearchOSError(
+            f"{value!r} is neither a path nor a project this machine knows. "
+            f"Give the path instead: `researchctl portfolio enable <path>`."
+        )
+    return resolved
 
 
-def _project_and_repo(value: str | None, db: Database) -> tuple[str, Path]:
-    """Resolve to ``(project_id, repo_path)``, from whichever source knows.
+def _has_operational_row(db: Database, project: str) -> bool:
+    """Whether the ``projects`` row every portfolio row hangs from exists.
 
-    Three sources, in the order that a researcher would expect them to be
-    consulted: a path they typed, the operational table, and the global
-    registry. The registry is last because `ARCHITECTURE.md` calls it
-    disposable; it is consulted at all because deleting it must never stop a
-    project working, and a researcher who ran `register-project` reasonably
-    expects the id it printed to be usable.
+    Only `portfolio enable` and `runtime start` create it. A project the
+    registry knows and the runtime does not has nothing to pause, resume or
+    digest, and saying so is better than a foreign-key violation.
     """
 
-    from research_os.runtime.kernel import ScientificKernelAdapter
-
-    if value is not None:
-        candidate = Path(value).expanduser()
-        if candidate.exists():
-            git_root, project = ScientificKernelAdapter(candidate).identity()
-            return str(project.id), Path(git_root)
-
-    project = _project(value)
-    stored = RuntimeStore(db).get_project(project)
-    if stored is not None:
-        return stored.project_id, Path(stored.repo_path)
-    for entry in list_projects():
-        if entry.project_id == project:
-            return project, Path(entry.path)
-    raise ResearchOSError(
-        f"{project!r} is neither a path nor a project this machine knows. "
-        f"Give the path instead: `researchctl portfolio enable <path>`."
+    if RuntimeStore(db).get_project(project) is not None:
+        return True
+    _print(
+        f"{project} has no portfolio yet. "
+        f"`researchctl portfolio enable {project}` starts one."
     )
+    return False
 
 
 def _print(text: str) -> None:
@@ -340,16 +373,36 @@ def _enable(args: argparse.Namespace) -> int:
     returns the existing schedule rather than creating a second one.
     """
 
+    from research_os.runtime.kernel import ScientificKernelAdapter
+
     config = load_config()
     with _database() as db:
-        project, repo_path = _project_and_repo(args.project, db)
+        project, repo_path = _resolve_project(args.project, db)
+        # `enable` is the one command here that writes a repository path, and
+        # everything the portfolio does afterwards -- the Curator's commits,
+        # every contained experiment, every capsule read -- happens in the
+        # repository it wrote. So the repository is read before it is written,
+        # whichever source named it: a registry entry whose checkout has since
+        # been replaced by another project's, or a stored path that now holds
+        # something else, would otherwise attribute that project's work to
+        # this id.
+        git_root, found = ScientificKernelAdapter(repo_path).identity()
+        if str(found.id) != project:
+            raise ResearchOSError(
+                f"{repo_path} holds the capsule of {found.id!s}, not {project}. "
+                f"Give the path of {project}'s repository: "
+                f"`researchctl portfolio enable <path>`."
+            )
+        repo_path = Path(git_root)
+        runtime = RuntimeStore(db)
+        previous = runtime.get_project(project)
         # The operational `projects` row, which `portfolio_state` has a foreign
         # key to, is created by `runtime start` and by nothing else -- so
         # enabling a portfolio on a project that has never had an R5 objective
         # failed on that constraint. Creating it here is the fix, and it is the
         # right one: the portfolio exists precisely to run when no objective
         # is running, so requiring one first inverts the dependency.
-        RuntimeStore(db).upsert_project(project_id=project, repo_path=str(repo_path))
+        runtime.upsert_project(project_id=project, repo_path=str(repo_path))
         store = PortfolioStore(db)
         store.upsert_state(project_id=project)
         state = store.get_state(project)
@@ -369,6 +422,13 @@ def _enable(args: argparse.Namespace) -> int:
         schedule_id = ensure_schedule(db=db, project_id=project, config=config)
     minutes = config.cadence.tick_seconds / 60
     _print(f"portfolio enabled for {project} ({schedule_id})")
+    _print(f"repository {repo_path}")
+    if previous is not None and Path(previous.repo_path) != repo_path:
+        # Moving a project to another checkout is legitimate -- a re-clone,
+        # a moved directory, the canonical repository after a trial clone --
+        # and it moves everything the portfolio does with it. It is not done
+        # silently.
+        _print(f"           re-pointed from {previous.repo_path}")
     _print(
         f"`researchd` will tick it every {minutes:.0f} min and spend up to "
         f"{config.bounds.max_active_tracks} tracks' worth of model calls "
@@ -379,8 +439,8 @@ def _enable(args: argparse.Namespace) -> int:
 
 
 def _status(args: argparse.Namespace) -> int:
-    project = _project(args.project)
     with _database() as db:
+        project, _repo = _resolve_project(args.project, db)
         store = PortfolioStore(db)
         state = store.get_state(project)
         if state is None:
@@ -481,8 +541,11 @@ def _status(args: argparse.Namespace) -> int:
 
 
 def _top(args: argparse.Namespace) -> int:
-    project = _project(args.project)
     with _database() as db:
+        project, _repo = _resolve_project(args.project, db)
+        # `produce` records a digest, which is a write.
+        if not _has_operational_row(db, project):
+            return EXIT_OK
         record = digest_module.produce(db=db, project_id=project, config=load_config())
         entries = record.payload.get("top_ideas", [])[: args.limit]
         _print(KIND_BANNER)
@@ -503,8 +566,10 @@ def _top(args: argparse.Namespace) -> int:
 
 
 def _pause(args: argparse.Namespace) -> int:
-    project = _project(args.project)
     with _database() as db:
+        project, _repo = _resolve_project(args.project, db)
+        if not _has_operational_row(db, project):
+            return EXIT_ERROR
         store = PortfolioStore(db)
         store.upsert_state(project_id=project)
         store.set_portfolio_status(
@@ -518,8 +583,10 @@ def _pause(args: argparse.Namespace) -> int:
 
 
 def _resume(args: argparse.Namespace) -> int:
-    project = _project(args.project)
     with _database() as db:
+        project, _repo = _resolve_project(args.project, db)
+        if not _has_operational_row(db, project):
+            return EXIT_ERROR
         store = PortfolioStore(db)
         store.upsert_state(project_id=project)
         store.set_portfolio_status(
@@ -549,9 +616,9 @@ def _resume(args: argparse.Namespace) -> int:
 
 
 def _digest(args: argparse.Namespace) -> int:
-    project = _project(args.project)
     which = str(args.which)
     with _database() as db:
+        project, _repo = _resolve_project(args.project, db)
         store = PortfolioStore(db)
         if which == "list":
             records = store.list_digests(project_id=project)
@@ -583,8 +650,8 @@ def _digest(args: argparse.Namespace) -> int:
 
 
 def _list(args: argparse.Namespace, statuses: list[IdeaStatus] | None) -> int:
-    project = _project(args.project)
     with _database() as db:
+        project, _repo = _resolve_project(args.project, db)
         store = PortfolioStore(db)
         ideas = store.list_ideas(
             project_id=project, statuses=statuses, limit=args.limit
@@ -738,8 +805,8 @@ def _lineage(args: argparse.Namespace) -> int:
 
 
 def _seed_add(args: argparse.Namespace) -> int:
-    project = _project(args.project)
     with _database() as db:
+        project, _repo = _resolve_project(args.project, db)
         store = PortfolioStore(db)
         # `portfolio_state` has a foreign key to the operational `projects`
         # row, and `portfolio enable` is the only thing in this layer that
@@ -786,8 +853,8 @@ def _seed_add(args: argparse.Namespace) -> int:
 
 
 def _seed_list(args: argparse.Namespace) -> int:
-    project = _project(args.project)
     with _database() as db:
+        project, _repo = _resolve_project(args.project, db)
         store = PortfolioStore(db)
         seeds = store.list_seeds(project_id=project)
         if not seeds:
