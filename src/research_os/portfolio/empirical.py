@@ -48,7 +48,7 @@ import logging
 import math
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -106,6 +106,13 @@ LOG = logging.getLogger("research_os.portfolio.empirical")
 #: is an experiment nobody can rerun, and this is the same constant
 #: ``runtime.actions.experiments`` uses for the same reason.
 DEFAULT_SEED = 20260915
+
+#: The environment identity every portfolio execution runs in. Frozen into a
+#: contract's design, and compared against the specification before it runs.
+WORKSPACE_ENVIRONMENT: Mapping[str, str] = {
+    "kind": "uv",
+    "workspace": "disposable-worktree",
+}
 
 #: The largest declared output this bridge will read a metric out of.
 #:
@@ -631,7 +638,7 @@ def build_spec(
         name=f"idea-experiment-{chosen}",
         argv=tuple(str(token) for token in resolved.argv),
         cwd=str(workspace),
-        environment={"kind": "uv", "workspace": "disposable-worktree"},
+        environment=dict(WORKSPACE_ENVIRONMENT),
         resources=resources,
         env={
             f"RESEARCH_OS_SEED_{index}": str(seed) for index, seed in enumerate(seeds)
@@ -700,6 +707,30 @@ def _paths_this_command_writes(spec: Any, resolved: Any) -> set[str]:
         if supplied:
             written.add(str(supplied))
     return written
+
+
+def scientific_variation(spec: ExecutionSpec) -> str:
+    """:func:`variation_digest` without the fields a repair may change.
+
+    ``variation_digest`` includes ``resources``, and so a replication that
+    asked for more memory and nothing else passed :func:`assert_varies` --
+    while ``scicontract.IMPLEMENTATION_FIELDS`` declares resources not part
+    of the science at all. What a replication must vary is what the
+    measurement *is*: the argument vector, the seeds the program reads, the
+    composed inputs, the outputs. Kept separate from the stored digest so no
+    recorded digest moves.
+    """
+
+    payload: dict[str, Any] = {
+        "argv": list(spec.argv),
+        "env": dict(sorted(spec.env.items())),
+        "outputs": sorted(spec.outputs),
+        "seeds": list(spec.seeds),
+        "inputs": [list(item) for item in spec.inputs],
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
 
 
 def assert_varies(*, replication: str, primary: str) -> None:
@@ -1053,9 +1084,18 @@ def analyse_contract(
 
     from research_os.portfolio import analysis as engine
 
-    outputs = _collect(workspace, spec.outputs)
+    # The analysis's sources are collected first, so the collection bound
+    # can never drop a file the conclusion rests on -- and a source that is
+    # still not among the hashed outputs is *unavailable* to the analysis. A
+    # conclusion must rest on bytes the record names by content hash; an
+    # independent provenance review found the first version reading a 33rd
+    # output straight from the workspace and recording SUPPORTS over bytes
+    # nothing had hashed.
+    sources = verified.analysis.sources()
+    ordered = [*sources, *(item for item in spec.outputs if item not in sources)]
+    outputs = _collect(workspace, ordered)
     produced = {path for path, _digest, _size in outputs}
-    absent = [item for item in spec.outputs if item not in produced]
+    absent = [item for item in ordered if item not in produced]
     missing = [item for item in absent if not (workspace / item).exists()]
     unrecorded = [item for item in absent if (workspace / item).exists()]
     notes: list[str] = []
@@ -1068,7 +1108,13 @@ def analyse_contract(
             f"{MAX_COLLECTED_BYTES // (1024 * 1024)}MB each: " + ", ".join(unrecorded)
         )
     documents: dict[str, Any] = {}
-    for source in verified.analysis.sources():
+    for source in sources:
+        if source not in produced:
+            documents[source] = engine.Unavailable(
+                f"{source} was not written, or was not collected and hashed, so "
+                f"no conclusion may rest on it"
+            )
+            continue
         stale = _was_already_in_the_checkout(workspace, source)
         if stale is not None:
             documents[source] = engine.Unavailable(
@@ -1190,9 +1236,17 @@ def _contract_is_stale(context: Any, contract: ScientificContract) -> bool:
 
     if contract.state is ContractState.SUPERSEDED:
         return False
+    # "Read" is anything a reading left behind -- the state, the evidence or
+    # the analysis artifact -- not the state alone. The database refuses to
+    # supersede a contract in any of the three cases, and this has to agree
+    # with it or the retirement below would fail half-way.
     if any(
         item.contract_id == contract.contract_id
-        and item.state is ExperimentState.INTERPRETED
+        and (
+            item.state is ExperimentState.INTERPRETED
+            or item.evidence_id is not None
+            or item.analysis_artifact_id is not None
+        )
         for item in context.portfolio.list_experiments(idea_id=contract.idea_id)
     ):
         return False
@@ -1490,7 +1544,14 @@ def _retire_contract(
     """Supersede a contract and every open execution of it, workspaces included."""
 
     for item in context.portfolio.list_experiments(idea_id=contract.idea_id):
-        if item.contract_id != contract.contract_id or not item.open:
+        # An operationally failed execution is not "open", and it is not a
+        # reading either: it is a live row that holds the version's unique
+        # slot. Left behind, the successor contract's execution met
+        # `DuplicateExperimentError` after two paid design calls, and every
+        # later attempt met the superseded contract -- a permanent dead end.
+        if item.contract_id != contract.contract_id or not (
+            item.open or item.state is ExperimentState.OPERATIONALLY_FAILED
+        ):
             continue
         context.portfolio.update_experiment(
             item.experiment_id, state=ExperimentState.SUPERSEDED, detail=detail
@@ -1622,7 +1683,9 @@ def design(
 
     template = designer_for(role)
     blocks: dict[str, Sequence[str]] = {
-        "idea": _idea_block(version),
+        # The idea with its bar redacted: the falsifier usually states the
+        # threshold the analysis froze from it.
+        "idea": scicontract.withhold_thresholds(_idea_block(version), analysis),
         "analysis_requirements": scicontract.requirements_block(analysis),
         "declared_commands": command_catalogue(
             commands,
@@ -1750,6 +1813,13 @@ def design(
     if replication and previous is not None:
         try:
             assert_varies(replication=variation, primary=previous.variation_digest)
+            # And on the science alone: a replication that differs from its
+            # primary only in resources or its time limit is the same
+            # measurement with a bigger allocation.
+            assert_varies(
+                replication=scientific_variation(spec),
+                primary=scientific_variation(_preregistered(context, previous)[0]),
+            )
         except EmpiricalError as exc:
             return ExperimentStep(
                 ok=False,
@@ -3027,6 +3097,19 @@ def _assert_realises(
     verified: scicontract.VerifiedContract, spec: ExecutionSpec
 ) -> None:
     design = dict(verified.design or {})
+    # A design frozen before `env` and `environment` were part of it implied
+    # both: the seeds' variables, and the disposable worktree. Compared
+    # against what it implied rather than skipped, so the absence of the key
+    # is not a way around the check.
+    implied_env = {
+        f"RESEARCH_OS_SEED_{index}": str(seed)
+        for index, seed in enumerate(design.get("seeds") or ())
+    }
+    expected = {
+        **design,
+        "env": design.get("env", implied_env),
+        "environment": design.get("environment", dict(WORKSPACE_ENVIRONMENT)),
+    }
     moved = [
         name
         for name, value in (
@@ -3034,8 +3117,10 @@ def _assert_realises(
             ("outputs", sorted(spec.outputs)),
             ("inputs", [list(item) for item in spec.inputs]),
             ("seeds", list(spec.seeds)),
+            ("env", dict(spec.env)),
+            ("environment", dict(spec.environment)),
         )
-        if design.get(name) != value
+        if expected.get(name) != value
     ]
     if moved:
         raise EmpiricalError(
@@ -3204,6 +3289,25 @@ def interpret(context: Any, experiment: IdeaExperiment) -> ExperimentStep:
             spec=spec,
             exit_code=job.exit_code,
         )
+    if (
+        experiment.role is ExperimentRole.REPLICATION
+        and analysis.conclusion in _READ_CONCLUSIONS
+        and (twin := _byte_identical_primary(context, experiment, analysis, verified))
+    ):
+        # The variation did not reach the measurement: every file the analysis
+        # read is byte-for-byte what the primary produced. A command that
+        # ignores its seeds replicates perfectly and establishes nothing.
+        analysis = replace(
+            analysis,
+            conclusion=EmpiricalConclusion.INSUFFICIENT,
+            summary=(
+                f"the replication's outputs are byte-identical to the primary "
+                f"{twin}'s in every source the analysis reads, so the variation "
+                f"did not reach the measurement; an identical reading is not an "
+                f"independent one. (Read as: {analysis.summary})"
+            ),
+            notes=(*analysis.notes, f"byte-identical to {twin}"),
+        )
     stored = _store_outputs(context, experiment, workspace=workspace, analysis=analysis)
     document = analysis.record(
         experiment=experiment,
@@ -3262,39 +3366,35 @@ def interpret(context: Any, experiment: IdeaExperiment) -> ExperimentStep:
         run_id=context.run_id,
     )
 
-    current = context.portfolio.require_experiment(experiment.experiment_id)
-    evidence_id = current.evidence_id
-    if evidence_id is None:
-        strength = EVIDENCE_STRENGTH_FOR_CONCLUSION[analysis.conclusion]
-        kind = _evidence_kind(context, experiment)
-        evidence = context.portfolio.add_evidence(
-            idea_id=experiment.idea_id,
-            idea_version=experiment.idea_version,
-            kind=kind,
-            strength=strength,
-            summary=_evidence_summary(
+    # The evidence row and the INTERPRETED state in one transaction: a
+    # reading that exists is never on an experiment that looks unread, which
+    # is what `_contract_is_stale` and the database both rely on.
+    updated, evidence_id = context.portfolio.record_reading(
+        experiment.experiment_id,
+        evidence={
+            "idea_id": experiment.idea_id,
+            "idea_version": experiment.idea_version,
+            "kind": _evidence_kind(context, experiment),
+            "strength": EVIDENCE_STRENGTH_FOR_CONCLUSION[analysis.conclusion],
+            "summary": _evidence_summary(
                 experiment,
                 analysis,
                 composed=spec.inputs,
                 contract=verified,
                 result=contract_result,
+                attempts=experiment.attempts,
+                prior=_prior_readings(context, experiment, verified),
             ),
-            artifact_id=ref.artifact_id,
-            job_id=job.job_id,
+            "artifact_id": ref.artifact_id,
+            "job_id": job.job_id,
             # The *design* call, so a replication can be shown to be
             # independent of the work it replicates. The analysis itself had
             # no model in it, which is the point; what a call id records here
             # is whose question this measurement answers.
-            source_call_id=experiment.origin_call_id,
-        )
-        evidence_id = evidence.evidence_id
-
-    updated = context.portfolio.update_experiment(
-        experiment.experiment_id,
-        state=ExperimentState.INTERPRETED,
+            "source_call_id": experiment.origin_call_id,
+        },
         analysis_artifact_id=ref.artifact_id,
         conclusion=analysis.conclusion,
-        evidence_id=evidence_id,
         detail=analysis.summary[:2000],
     )
     release_workspace(updated, repository=Path(context.repo_path))
@@ -3423,6 +3523,95 @@ def _evidence_kind(context: Any, experiment: IdeaExperiment) -> EvidenceKind:
     return EvidenceKind.EXPERIMENT
 
 
+#: Conclusions that are a reading of the data, as opposed to a refusal to read.
+_READ_CONCLUSIONS: frozenset[EmpiricalConclusion] = frozenset(
+    {
+        EmpiricalConclusion.SUPPORTS,
+        EmpiricalConclusion.CONTRADICTS,
+        EmpiricalConclusion.INCONCLUSIVE,
+    }
+)
+
+
+def _byte_identical_primary(
+    context: Any,
+    experiment: IdeaExperiment,
+    analysis: Analysis,
+    verified: scicontract.VerifiedContract | None,
+) -> str | None:
+    """The primary this replication's read outputs are identical to, or nothing."""
+
+    primary = context.portfolio.get_experiment(
+        idea_id=experiment.idea_id,
+        idea_version=experiment.idea_version,
+        role=ExperimentRole.PRIMARY,
+    )
+    if primary is None or primary.analysis_artifact_id is None:
+        return None
+    try:
+        document = json.loads(context.artifacts.get_text(primary.analysis_artifact_id))
+    except (ResearchOSError, ValueError):
+        return None
+    theirs = {
+        str(item.get("path")): str(item.get("sha256"))
+        for item in document.get("outputs") or ()
+        if isinstance(item, Mapping)
+    }
+    mine = {path: digest for path, digest, _size in analysis.outputs}
+    read = (
+        sorted({item.source for item in verified.analysis.observables})
+        if verified is not None
+        else sorted(mine)
+    )
+    if not read or any(path not in mine or path not in theirs for path in read):
+        return None
+    if all(mine[path] == theirs[path] for path in read):
+        return primary.experiment_id
+    return None
+
+
+def _prior_readings(
+    context: Any,
+    experiment: IdeaExperiment,
+    verified: scicontract.VerifiedContract | None,
+) -> tuple[str, ...]:
+    """Measurements of this question that were read before this contract froze.
+
+    A revision and a follow-up child each get a fresh PREREGISTERED contract,
+    and both can be written after their author saw a result: the reviser
+    through objections that quote the statistic, the follow-up explorer
+    through the parent's evidence, thresholds included. With a deterministic
+    command the "new" measurement is then the same data under a rule chosen
+    knowing it. The route is not closed here -- a revision is how an idea
+    answers its critics -- but it is *disclosed*: every earlier version's and
+    every ancestor's reading that existed when this contract froze is named
+    in the evidence a reviewer reads, so "preregistered" never silently means
+    "preregistered after the answer was known".
+    """
+
+    store = context.portfolio
+    frozen_at = verified.contract.frozen_at if verified is not None else None
+    found: list[str] = []
+    ideas = (experiment.idea_id, *store.ancestors(experiment.idea_id))
+    for idea_id in ideas:
+        for item in store.list_experiments(idea_id=idea_id):
+            if item.experiment_id == experiment.experiment_id:
+                continue
+            if item.state is not ExperimentState.INTERPRETED or item.conclusion is None:
+                continue
+            if idea_id == experiment.idea_id and (
+                item.idea_version >= experiment.idea_version
+            ):
+                continue
+            if frozen_at is not None and item.updated_at > frozen_at:
+                continue
+            found.append(
+                f"{item.experiment_id} ({item.idea_id} v{item.idea_version}, "
+                f"{item.role}): {item.conclusion}"
+            )
+    return tuple(found)
+
+
 def _evidence_summary(
     experiment: IdeaExperiment,
     analysis: Analysis,
@@ -3430,6 +3619,8 @@ def _evidence_summary(
     composed: tuple[tuple[str, str], ...] = (),
     contract: scicontract.VerifiedContract | None = None,
     result: Any = None,
+    attempts: int = 0,
+    prior: Sequence[str] = (),
 ) -> str:
     """What a reviewer reads. Facts, and the rule that was fixed beforehand.
 
@@ -3456,6 +3647,39 @@ def _evidence_summary(
             f"was frozen before the design existed, by a separate role; "
             f"{contract.analysis.rendered_decision()}"
         )
+        if prior:
+            # First among the qualifications, because it changes what
+            # "preregistered" means for this row. See `_prior_readings`.
+            parts.append(
+                f"frozen after {len(prior)} earlier reading(s) of this question "
+                f"in its lineage were known: " + "; ".join(prior[:4])
+            )
+        # The frozen analysis in full -- estimand, observables, every
+        # reduction with its selection, the support it demanded -- because a
+        # reviewer shown only the verdict sentence cannot see that a count
+        # was taken over a subset, or which records it left out.
+        parts.append(
+            "frozen analysis: "
+            + "; ".join(
+                line for line in scicontract.analysis_lines(contract.analysis) if line
+            )
+        )
+        falsification = str(
+            (contract.design or {}).get("falsification_criterion") or ""
+        )
+        if falsification:
+            parts.append(f"design falsification criterion: {falsification}")
+        if result is not None and result.records:
+            parts.append(
+                "records: "
+                + "; ".join(
+                    f"{name} "
+                    + ", ".join(
+                        f"{key} {value}" for key, value in sorted(counts.items())
+                    )
+                    for name, counts in sorted(result.records.items())
+                )
+            )
         if result is not None and result.support:
             parts.append(
                 "support: "
@@ -3477,6 +3701,14 @@ def _evidence_summary(
             "the measurement's own design was composed by the model, not "
             "authored by the researcher: "
             + ", ".join(f"{path} sha256:{digest[:12]}" for path, digest in composed)
+        )
+    if attempts > 1:
+        # A run that failed operationally and was resubmitted is disclosed:
+        # with a command whose exit status depends on its result, "retry
+        # until it runs" can become "retry until it passes".
+        parts.append(
+            f"executed {attempts} time(s); the earlier attempt(s) failed "
+            f"operationally and produced no reading"
         )
     if analysis.outputs:
         parts.append(
@@ -3786,19 +4018,7 @@ def repair_implementation(
     context.artifacts.link(
         ref, role=f"idea_preregistration:{digest}", run_id=context.run_id
     )
-    context.portfolio.update_experiment(
-        experiment.experiment_id,
-        state=ExperimentState.SUPERSEDED,
-        failure_class=experiment.failure_class,
-        detail=(
-            f"implementation repaired as {new_id}: time limit "
-            f"{spec.timeout_seconds}s -> {timeout}s under the unchanged contract "
-            f"{verified.contract.contract_id}"
-        ),
-    )
-    if context.repo_path is not None:
-        release_workspace(experiment, repository=Path(context.repo_path))
-    return context.portfolio.create_experiment(
+    repaired_row = context.portfolio.create_experiment(
         idea_id=experiment.idea_id,
         idea_version=experiment.idea_version,
         project_id=experiment.project_id,
@@ -3814,7 +4034,18 @@ def repair_implementation(
         experiment_id=new_id,
         prompt_version=experiment.prompt_version,
         contract_id=experiment.contract_id,
+        supersedes=(
+            experiment.experiment_id,
+            (
+                f"implementation repaired as {new_id}: time limit "
+                f"{spec.timeout_seconds}s -> {timeout}s under the unchanged "
+                f"contract {verified.contract.contract_id}"
+            ),
+        ),
     )
+    if context.repo_path is not None:
+        release_workspace(experiment, repository=Path(context.repo_path))
+    return repaired_row
 
 
 def _is_stale(experiment: IdeaExperiment, *, role: ExperimentRole) -> bool:

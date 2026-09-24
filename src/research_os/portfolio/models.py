@@ -520,6 +520,7 @@ class ProvenanceBasis(StrEnum):
     EVIDENCE_GAP = "EVIDENCE_GAP"
     BRANCH = "BRANCH"
     REVIVAL = "REVIVAL"
+    MERGE = "MERGE"
     CONVERGENCE = "CONVERGENCE"
 
 
@@ -531,7 +532,7 @@ PROVENANCE_FOR_ORIGIN: dict[str, ProvenanceBasis] = {
     "RESEARCHER_SEED": ProvenanceBasis.HUMAN_SEED,
     "BRANCH": ProvenanceBasis.BRANCH,
     "REVIVAL": ProvenanceBasis.REVIVAL,
-    "MERGE": ProvenanceBasis.BRANCH,
+    "MERGE": ProvenanceBasis.MERGE,
     "FOLLOW_UP": ProvenanceBasis.RESULT,
     "LITERATURE_EXPLORER": ProvenanceBasis.LITERATURE,
 }
@@ -726,6 +727,8 @@ class IdeaEvidence(_Record):
     job_id: str | None = None
     literature_key: str | None = None
     source_call_id: str | None = None
+    #: The verified literature claim this row rests on, when it rests on one.
+    claim_id: str | None = None
     created_at: datetime
 
 

@@ -114,19 +114,32 @@ def normalised(text: str) -> str:
     return re.sub(r"\s+", " ", folded).strip()
 
 
-def source_texts(packet: Any) -> dict[str, str]:
-    """Each supplied work's stored text, by key: title, abstract, excerpt."""
+#: The shortest quotation that counts as quoting anything. A match on "the"
+#: verifies nothing, and a claim stored as QUOTED on it would say more than
+#: the check established.
+MIN_QUOTE_CHARS = 20
+MIN_QUOTE_WORDS = 4
 
-    found: dict[str, str] = {}
+
+def source_texts(packet: Any) -> dict[str, tuple[str, ...]]:
+    """Each supplied work's stored text fields, by key: title, abstract, excerpt.
+
+    Kept as separate fields, so a quotation must lie inside one of them -- a
+    match spanning the end of a title and the start of an abstract is a
+    string the source never contained.
+    """
+
+    found: dict[str, tuple[str, ...]] = {}
     for entry in getattr(packet, "entries", ()):
         work = entry.work
-        found[str(work.key)] = " ".join(
-            str(part or "")
+        found[str(work.key)] = tuple(
+            str(part)
             for part in (
                 getattr(work, "title", ""),
                 getattr(work, "abstract", ""),
                 getattr(entry, "excerpt", ""),
             )
+            if part
         )
     return found
 
@@ -150,8 +163,19 @@ def verify(answer: LiteratureAnswer, packet: Any) -> list[str]:
             )
             continue
         excerpt = getattr(item, "excerpt", "")
-        if excerpt and not any(
-            normalised(excerpt) in normalised(texts[key]) for key in item.work_keys
+        if not excerpt:
+            continue
+        quoted = normalised(excerpt)
+        if len(quoted) < MIN_QUOTE_CHARS or len(quoted.split()) < MIN_QUOTE_WORDS:
+            problems.append(
+                f"quotes {excerpt[:80]!r}, which is too short to verify anything "
+                f"(at least {MIN_QUOTE_WORDS} words and {MIN_QUOTE_CHARS} characters)"
+            )
+            continue
+        if not any(
+            quoted in normalised(field)
+            for key in item.work_keys
+            for field in texts[key]
         ):
             problems.append(
                 f"quotes {excerpt[:80]!r}, which does not appear in "
@@ -161,14 +185,29 @@ def verify(answer: LiteratureAnswer, packet: Any) -> list[str]:
 
 
 def claim_digest(
-    project_id: str, kind: str, statement: str, keys: Sequence[str]
+    project_id: str,
+    kind: str,
+    statement: str,
+    keys: Sequence[str],
+    *,
+    reading: str | None = None,
 ) -> str:
+    """A claim's identity: this statement, on these works, from this reading.
+
+    ``reading`` (the request that produced it) is part of the identity. A
+    claim is tied to the idea and the request that asked for it, and the
+    same statement read for a second idea is that idea's claim -- an
+    independent provenance review found the version without it handing the
+    second idea's reading, its artifact and its gap to the first.
+    """
+
     payload = json.dumps(
         {
             "project": project_id,
             "kind": kind,
             "statement": normalised(statement),
             "keys": sorted(set(keys)),
+            "reading": reading,
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -314,7 +353,6 @@ def answer_request(
         role="literature_answer",
         producer=template.identity,
     )
-    texts = source_texts(packet)
     claims: list[str] = []
     evidence: list[str] = []
     raised: list[str] = []
@@ -336,7 +374,11 @@ def answer_request(
             source_call_id=response.call_id,
             artifact_id=artifact.artifact_id,
             digest=claim_digest(
-                context.project_id, str(kind), item.statement, item.work_keys
+                context.project_id,
+                str(kind),
+                item.statement,
+                item.work_keys,
+                reading=request_id,
             ),
         )
         claims.append(claim.claim_id)
@@ -347,9 +389,21 @@ def answer_request(
                 kind=EvidenceKind.LITERATURE,
                 strength=_STRENGTH[relation],
                 summary=f"claim {claim.claim_id} [{kind}]: {item.statement}"[:4_000],
-                literature_key=item.work_keys[0],
+                # A source key -- which is what the novelty exit and the
+                # gates count -- only for the answer to this idea's own
+                # novelty question. A reading raised by a reviewer or a
+                # watch bears on whether the claim is *true*, and letting
+                # its sources satisfy "enough retrieved prior work to judge
+                # novelty" would pass the audit's bar with rows that never
+                # asked the audit's question. The claim is linked either way.
+                literature_key=(
+                    item.work_keys[0]
+                    if request.source_ref.startswith("novelty:")
+                    else None
+                ),
                 artifact_id=artifact.artifact_id,
                 source_call_id=response.call_id,
+                claim_id=claim.claim_id,
             )
             evidence.append(row.evidence_id)
         if kind in {"DISAGREEMENT", "GAP"}:
@@ -370,7 +424,6 @@ def answer_request(
                 detail=f"sources: {', '.join(item.work_keys)}",
             )
             raised.append(request_row.request_id)
-    del texts
     _release(store, idea)
     store.close_request(
         request_id,
@@ -393,7 +446,21 @@ def answer_request(
 
 
 def _open(idea: Any) -> bool:
-    return idea.status not in {IdeaStatus.REJECTED, IdeaStatus.SUPERSEDED}
+    """Whether a reading may still add evidence to this idea.
+
+    Not to a closed idea, and not to a ``VALIDATED`` or ``HUMAN_READY`` one
+    either: those were reviewed on a fixed evidence set, and a row appended
+    by a later reading would make every one of their reviews stale without
+    anyone having asked for the idea to be looked at again. The claims are
+    still recorded, and a disagreement or a gap still raises its request.
+    """
+
+    return idea.status not in {
+        IdeaStatus.REJECTED,
+        IdeaStatus.SUPERSEDED,
+        IdeaStatus.VALIDATED,
+        IdeaStatus.HUMAN_READY,
+    }
 
 
 def _release(store: Any, idea: Any | None) -> None:
@@ -401,9 +468,11 @@ def _release(store: Any, idea: Any | None) -> None:
 
     if idea is None:
         return
-    current = store.require_idea(idea.idea_id)
-    if current.operational_state is OperationalState.BLOCKED_DEPENDENCY:
-        store.set_operational_state(idea_id=idea.idea_id, state=OperationalState.IDLE)
+    store.set_operational_state(
+        idea_id=idea.idea_id,
+        state=OperationalState.IDLE,
+        expected=OperationalState.BLOCKED_DEPENDENCY,
+    )
 
 
 def ask(
@@ -430,8 +499,13 @@ def ask(
         source_version=version,
     )
     if wait and request.state is RequestState.OPEN:
+        # Only from IDLE: an idea a worker picked up since this was decided
+        # is ACTIVE, and overwriting that would free its capacity slot while
+        # its stage still runs.
         store.set_operational_state(
-            idea_id=idea_id, state=OperationalState.BLOCKED_DEPENDENCY
+            idea_id=idea_id,
+            state=OperationalState.BLOCKED_DEPENDENCY,
+            expected=OperationalState.IDLE,
         )
     return request
 

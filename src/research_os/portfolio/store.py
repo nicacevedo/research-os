@@ -121,7 +121,7 @@ EDGE_COLUMNS = (
 )
 EVIDENCE_COLUMNS = (
     "evidence_id, idea_id, idea_version, kind, strength, summary, artifact_id, "
-    "finding_id, job_id, literature_key, source_call_id, created_at"
+    "finding_id, job_id, literature_key, source_call_id, claim_id, created_at"
 )
 REVIEW_COLUMNS = (
     "review_id, idea_id, idea_version, reviewer_role, verdict, severity, summary, "
@@ -540,7 +540,8 @@ class PortfolioStore:
                    and not exists (
                        select 1 from idea_experiments e
                         where e.contract_id = c.contract_id
-                          and e.state = 'INTERPRETED')
+                          and (e.state = 'INTERPRETED' or e.evidence_id is not null
+                               or e.analysis_artifact_id is not null))
                 """,
                 {"idea_id": idea_id, "version": version},
             )
@@ -693,7 +694,10 @@ class PortfolioStore:
         status: IdeaStatus,
         retire_reason: str | None = None,
         revisit_if: str | None = None,
-    ) -> PortfolioIdea:
+        expected_status: IdeaStatus | None = None,
+        require_idle: bool = False,
+        clear_retirement: bool = False,
+    ) -> PortfolioIdea | None:
         """Move an idea's scientific status, and raise its tier high-water mark.
 
         ``quality_tier`` is a ``greatest``: it records how far this idea ever
@@ -701,6 +705,12 @@ class PortfolioStore:
         rejection as a candidate. The database will not accept a retirement
         without a reason, which is deliberate -- see
         ``sql/0019_portfolio_ideas.sql``.
+
+        ``expected_status`` and ``require_idle`` make it a compare-and-set,
+        for a caller deciding from a snapshot: the tick settles an idea it
+        read a moment ago, and a worker may have finished a stage on it in
+        between. When the row no longer matches, nothing changes and this
+        returns ``None`` -- the decision was about a state that is gone.
         """
 
         tier = {
@@ -710,11 +720,17 @@ class PortfolioStore:
         }.get(status)
         with self._db.tx() as conn:
             current = conn.execute(
-                "select status, quality_tier from ideas where idea_id = %s for update",
+                "select status, quality_tier, operational_state from ideas "
+                "where idea_id = %s for update",
                 (idea_id,),
             ).fetchone()
             if current is None:
                 raise PortfolioStateError(f"{idea_id} is not an idea in this portfolio")
+            if expected_status is not None and (
+                IdeaStatus(str(current["status"])) is not expected_status
+                or (require_idle and str(current["operational_state"]) != "IDLE")
+            ):
+                return None
             if IdeaStatus(str(current["status"])) in CLOSED_IDEA_STATUSES:
                 raise PortfolioStateError(
                     f"{idea_id} is {current['status']}; a closed idea does not move. "
@@ -728,8 +744,10 @@ class PortfolioStore:
                 update ideas
                    set status = %(status)s,
                        quality_tier = %(tier)s,
-                       retire_reason = coalesce(%(reason)s, retire_reason),
-                       revisit_if = coalesce(%(revisit)s, revisit_if),
+                       retire_reason = case when %(clear)s then null
+                                            else coalesce(%(reason)s, retire_reason) end,
+                       revisit_if = case when %(clear)s then null
+                                         else coalesce(%(revisit)s, revisit_if) end,
                        updated_at = now()
                  where idea_id = %(idea_id)s
                 returning {IDEA_COLUMNS}
@@ -740,20 +758,42 @@ class PortfolioStore:
                     "tier": str(existing_tier),
                     "reason": retire_reason,
                     "revisit": revisit_if,
+                    "clear": clear_retirement,
                 },
             ).fetchone()
         return PortfolioIdea.model_validate(row)
 
     def set_operational_state(
-        self, *, idea_id: str, state: OperationalState
-    ) -> PortfolioIdea:
+        self,
+        *,
+        idea_id: str,
+        state: OperationalState,
+        expected: OperationalState | None = None,
+    ) -> PortfolioIdea | None:
+        """Set what an idea is doing. With ``expected``, only from that state.
+
+        The compare-and-set form is for a decision made from a read: blocking
+        an idea on a literature answer must not overwrite ``ACTIVE`` on an
+        idea a worker picked up in between, which would free its capacity
+        slot while the stage is still running. Returns ``None`` when the
+        expectation no longer holds.
+        """
+
         with self._db.tx() as conn:
             row = conn.execute(
                 f"update ideas set operational_state = %s, updated_at = now() "
-                f"where idea_id = %s returning {IDEA_COLUMNS}",
-                (str(state), idea_id),
+                f"where idea_id = %s and (%s::text is null or operational_state = %s) "
+                f"returning {IDEA_COLUMNS}",
+                (
+                    str(state),
+                    idea_id,
+                    str(expected) if expected else None,
+                    str(expected) if expected else None,
+                ),
             ).fetchone()
         if row is None:
+            if expected is not None and self.get_idea(idea_id) is not None:
+                return None
             raise PortfolioStateError(f"{idea_id} is not an idea in this portfolio")
         return PortfolioIdea.model_validate(row)
 
@@ -1043,6 +1083,7 @@ class PortfolioStore:
         job_id: str | None = None,
         literature_key: str | None = None,
         source_call_id: str | None = None,
+        claim_id: str | None = None,
     ) -> IdeaEvidence:
         """Link one piece of evidence to one idea version.
 
@@ -1054,33 +1095,133 @@ class PortfolioStore:
         integrity error rather than a row.
         """
 
-        evidence_id = new_idea_evidence_id()
         with self._db.tx() as conn:
+            row = self._insert_evidence(
+                conn,
+                idea_id=idea_id,
+                idea_version=idea_version,
+                kind=kind,
+                strength=strength,
+                summary=summary,
+                artifact_id=artifact_id,
+                finding_id=finding_id,
+                job_id=job_id,
+                literature_key=literature_key,
+                source_call_id=source_call_id,
+                claim_id=claim_id,
+            )
+        return IdeaEvidence.model_validate(row)
+
+    @staticmethod
+    def _insert_evidence(
+        conn: Any,
+        *,
+        idea_id: str,
+        idea_version: int,
+        kind: EvidenceKind,
+        strength: EvidenceStrength,
+        summary: str,
+        artifact_id: str | None = None,
+        finding_id: str | None = None,
+        job_id: str | None = None,
+        literature_key: str | None = None,
+        source_call_id: str | None = None,
+        claim_id: str | None = None,
+    ) -> Any:
+        evidence_id = new_idea_evidence_id()
+        row = conn.execute(
+            f"""
+            insert into idea_evidence
+                (evidence_id, idea_id, idea_version, kind, strength, summary,
+                 artifact_id, finding_id, job_id, literature_key, source_call_id,
+                 claim_id)
+            values (%(evidence_id)s, %(idea_id)s, %(version)s, %(kind)s,
+                    %(strength)s, %(summary)s, %(artifact_id)s, %(finding_id)s,
+                    %(job_id)s, %(literature_key)s, %(call_id)s, %(claim_id)s)
+            on conflict (idea_id, idea_version, claim_id)
+                where claim_id is not null do nothing
+            returning {EVIDENCE_COLUMNS}
+            """,
+            {
+                "evidence_id": evidence_id,
+                "idea_id": idea_id,
+                "version": idea_version,
+                "kind": str(kind),
+                "strength": str(strength),
+                "summary": summary,
+                "artifact_id": artifact_id,
+                "finding_id": finding_id,
+                "job_id": job_id,
+                "literature_key": literature_key,
+                "call_id": source_call_id,
+                "claim_id": claim_id,
+            },
+        ).fetchone()
+        if row is None:
+            # The same claim on the same version: a replay. The row that is
+            # already there is the answer.
+            row = conn.execute(
+                f"select {EVIDENCE_COLUMNS} from idea_evidence "
+                "where idea_id = %s and idea_version = %s and claim_id = %s",
+                (idea_id, idea_version, claim_id),
+            ).fetchone()
+        return row
+
+    def record_reading(
+        self,
+        experiment_id: str,
+        *,
+        evidence: Mapping[str, Any],
+        analysis_artifact_id: str,
+        conclusion: EmpiricalConclusion,
+        detail: str,
+    ) -> tuple[IdeaExperiment, str]:
+        """The evidence row and ``INTERPRETED``, in one transaction.
+
+        They were two, and the gap between them was a hole: a crash after the
+        evidence row and before the state left an experiment that had been
+        *read* looking unread, and a prompt bump in that window retired its
+        contract and froze a second preregistration of the same question on
+        the same version -- which was then measured and read too. One
+        transaction, with the experiment locked, so either both happened or
+        neither did; and an experiment that already names evidence keeps it.
+        """
+
+        with self._db.tx() as conn:
+            current = conn.execute(
+                f"select {EXPERIMENT_COLUMNS} from idea_experiments "
+                "where experiment_id = %s for update",
+                (experiment_id,),
+            ).fetchone()
+            if current is None:
+                raise PortfolioStateError(f"no such experiment: {experiment_id}")
+            evidence_id = current["evidence_id"]
+            if evidence_id is None:
+                evidence_id = self._insert_evidence(conn, **dict(evidence))[
+                    "evidence_id"
+                ]
             row = conn.execute(
                 f"""
-                insert into idea_evidence
-                    (evidence_id, idea_id, idea_version, kind, strength, summary,
-                     artifact_id, finding_id, job_id, literature_key, source_call_id)
-                values (%(evidence_id)s, %(idea_id)s, %(version)s, %(kind)s,
-                        %(strength)s, %(summary)s, %(artifact_id)s, %(finding_id)s,
-                        %(job_id)s, %(literature_key)s, %(call_id)s)
-                returning {EVIDENCE_COLUMNS}
+                update idea_experiments
+                   set state = 'INTERPRETED',
+                       analysis_artifact_id = coalesce(analysis_artifact_id, %(analysis)s),
+                       conclusion = coalesce(conclusion, %(conclusion)s),
+                       evidence_id = %(evidence_id)s,
+                       failure_class = null,
+                       detail = %(detail)s,
+                       updated_at = now()
+                 where experiment_id = %(experiment_id)s
+                returning {EXPERIMENT_COLUMNS}
                 """,
                 {
+                    "experiment_id": experiment_id,
+                    "analysis": analysis_artifact_id,
+                    "conclusion": str(conclusion),
                     "evidence_id": evidence_id,
-                    "idea_id": idea_id,
-                    "version": idea_version,
-                    "kind": str(kind),
-                    "strength": str(strength),
-                    "summary": summary,
-                    "artifact_id": artifact_id,
-                    "finding_id": finding_id,
-                    "job_id": job_id,
-                    "literature_key": literature_key,
-                    "call_id": source_call_id,
+                    "detail": clipped_detail(detail),
                 },
             ).fetchone()
-        return IdeaEvidence.model_validate(row)
+        return IdeaExperiment.model_validate(row), str(evidence_id)
 
     def list_evidence(
         self, *, idea_id: str, idea_version: int | None = None
@@ -1128,8 +1269,13 @@ class PortfolioStore:
         experiment_id: str | None = None,
         prompt_version: str = "",
         contract_id: str | None = None,
+        supersedes: tuple[str, str] | None = None,
     ) -> IdeaExperiment:
         """Record the one experiment this idea version asks for in this role.
+
+        ``supersedes`` -- ``(experiment_id, detail)`` -- retires an
+        operationally failed execution in the same transaction, which is how
+        an implementation repair replaces one.
 
         ``experiment_id`` is supplied by the caller when the id is already
         load-bearing, and for the empirical bridge it is: the disposable
@@ -1150,6 +1296,26 @@ class PortfolioStore:
         experiment_id = experiment_id or new_idea_experiment_id()
         try:
             with self._db.tx() as conn:
+                if supersedes is not None:
+                    # The repair's two writes as one: retiring the failed
+                    # execution and recording its successor. Apart, a crash
+                    # between them left a frozen contract whose only
+                    # execution was SUPERSEDED -- which `design` then refused
+                    # to redesign, permanently.
+                    retired = conn.execute(
+                        """
+                        update idea_experiments
+                           set state = 'SUPERSEDED', detail = %s, updated_at = now()
+                         where experiment_id = %s and state = 'OPERATIONALLY_FAILED'
+                        returning experiment_id
+                        """,
+                        (clipped_detail(supersedes[1]), supersedes[0]),
+                    ).fetchone()
+                    if retired is None:
+                        raise PortfolioStateError(
+                            f"{supersedes[0]} is not an operationally failed "
+                            f"execution; there is nothing to repair"
+                        )
                 row = conn.execute(
                     f"""
                     insert into idea_experiments
@@ -1358,18 +1524,20 @@ class PortfolioStore:
         return conn.execute(
             f"""
             insert into idea_provenance
-                (provenance_id, idea_id, basis, source_ref, request_id, call_id, detail)
-            values (%s, %s, %s, %s, %s, %s, %s)
+                (provenance_id, project_id, idea_id, basis, source_ref, request_id,
+                 call_id, detail)
+            select %s, i.project_id, i.idea_id, %s, %s, %s, %s, %s
+              from ideas i where i.idea_id = %s
             returning {PROVENANCE_COLUMNS}
             """,
             (
                 new_provenance_id(),
-                idea_id,
                 str(basis),
                 source_ref,
                 request_id,
                 call_id,
                 detail[:2_000],
+                idea_id,
             ),
         ).fetchone()
 
@@ -1723,6 +1891,75 @@ class PortfolioStore:
                 (request_id,),
             ).fetchone()
         return int(row["attempts"]) if row else 0
+
+    def request_generations(
+        self, *, project_id: str, kind: str
+    ) -> dict[str, tuple[int, int]]:
+        """``(finished, failed)`` work items of one kind, per request.
+
+        The generation a request's next work item is keyed on, read from the
+        queue rather than from a column every handler must remember to bump.
+        ``work_items.dedup_key`` is permanently unique, so a key built from a
+        count that did not move -- a provider outage, a spent budget, a
+        crash, a deferral -- is a retry ``enqueue`` refuses silently, and
+        because the allocator serves the oldest request first, one spent key
+        wedged every later request of that kind. ``finished`` counts every
+        terminal item and names the generation; ``failed`` is what the
+        ceiling reads.
+        """
+
+        with self._db.tx() as conn:
+            rows = conn.execute(
+                """
+                select w.payload->>'request_id' as request_id,
+                       count(*) filter (
+                           where w.status in ('SUCCEEDED','FAILED','CANCELLED')) as finished,
+                       count(*) filter (where w.status = 'FAILED') as failed
+                  from work_items w
+                 where w.project_id = %(project_id)s and w.kind = %(kind)s
+                   and w.payload->>'request_id' is not null
+                 group by 1
+                """,
+                {"project_id": project_id, "kind": kind},
+            ).fetchall()
+        return {
+            str(row["request_id"]): (int(row["finished"]), int(row["failed"]))
+            for row in rows
+        }
+
+    def synthesis_generations(self, *, project_id: str) -> dict[str, int]:
+        """Finished synthesis work items per basis: a generation and a ceiling.
+
+        A synthesis that succeeds makes its basis no longer due, so every
+        finished item on a basis that is still due was a failure or a refusal
+        -- which is what the ceiling counts.
+        """
+
+        with self._db.tx() as conn:
+            rows = conn.execute(
+                """
+                select w.payload->>'basis' as basis, count(*) as n
+                  from work_items w
+                 where w.project_id = %(project_id)s
+                   and w.kind = 'portfolio_synthesize'
+                   and w.status in ('SUCCEEDED','FAILED','CANCELLED')
+                   and w.payload->>'basis' is not null
+                 group by 1
+                """,
+                {"project_id": project_id},
+            ).fetchall()
+        return {str(row["basis"]): int(row["n"]) for row in rows}
+
+    def provenance_for_request(self, request_id: str) -> tuple[IdeaProvenance, ...]:
+        """Every provenance row that names this request: what it already made."""
+
+        with self._db.tx() as conn:
+            rows = conn.execute(
+                f"select {PROVENANCE_COLUMNS} from idea_provenance "
+                "where request_id = %s order by created_at, provenance_id",
+                (request_id,),
+            ).fetchall()
+        return tuple(IdeaProvenance.model_validate(row) for row in rows)
 
     def work_in_flight(self, *, project_id: str, kind: str) -> int:
         """Queued or running work of one kind for this project."""
@@ -3269,12 +3506,21 @@ class PortfolioStore:
         return int(row["n"])
 
     def lineage_active_counts(self, project_id: str) -> dict[str, int]:
+        """Ideas still in progress, per lineage: what the lineage ceiling bounds.
+
+        A ``VALIDATED`` idea counts only while a stage is running on it. Idle,
+        it is closed for synthesis and waits on nothing the lineage does, and
+        counting it held the lineage's slots forever: every follow-up raised
+        from a validated idea's own replication met a full lineage.
+        """
+
         with self._db.tx() as conn:
             rows = conn.execute(
                 """
                 select lineage_root, count(*) as n from ideas
                  where project_id = %s
-                   and status not in ('REJECTED','SUPERSEDED','PARKED','HUMAN_READY')
+                   and (status in ('CANDIDATE','PROMISING','INVESTIGATING','REVIEW')
+                        or (status = 'VALIDATED' and operational_state = 'ACTIVE'))
                  group by lineage_root
                 """,
                 (project_id,),

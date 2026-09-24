@@ -33,7 +33,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Mapping
+import re
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -170,6 +171,13 @@ def design_payload(
         "argv": list(spec.argv),
         "outputs": sorted(spec.outputs),
         "inputs": [list(item) for item in spec.inputs],
+        # The environment the program reads, and the environment it runs in.
+        # The seeds reach the program through `env` (`RESEARCH_OS_SEED_i`),
+        # so a design that froze `seeds` and not `env` froze a list the
+        # program never reads: an independent mutation review ran a job with
+        # a different seed under an unchanged, verifying contract.
+        "env": dict(sorted(dict(spec.env).items())),
+        "environment": dict(sorted(dict(spec.environment).items())),
     }
 
 
@@ -461,14 +469,58 @@ def requirements_block(spec: AnalysisSpec) -> list[str]:
         )
     if spec.uncertainty is not None:
         lines.append(
-            "the primary statistic's uncertainty is a bootstrap over the analysed "
-            "records, so the design must produce enough of them to resample"
+            "the primary statistic's uncertainty is computed over the analysed "
+            f"records ({spec.uncertainty.method}), so the design must produce "
+            "enough of them for an interval to mean something"
         )
     lines.append(
         "(the thresholds that decide the conclusion were fixed with this analysis "
         "and are deliberately not shown to you)"
     )
     return lines
+
+
+#: What a withheld threshold is replaced by in text the designer reads.
+WITHHELD = "[threshold withheld]"
+
+
+def withhold_thresholds(lines: Sequence[str], spec: AnalysisSpec) -> list[str]:
+    """The same lines with every number equal to a decision threshold removed.
+
+    For the idea itself, which the experiment designer must see: its
+    falsifier is the sentence in which the bar is usually written ("the
+    interaction exceeds 0.25"), and the analysis designer read that sentence
+    and froze the bar from it. The analysis's own free text is refused at
+    freeze time when it restates a threshold; the idea's text is not the
+    analysis's to refuse, so here it is redacted instead. 0 and 1 are left,
+    for the reason they are exempt there. Direction stays visible -- the
+    designer has to know what the idea claims -- and that residue is stated
+    in `docs/AUTONOMOUS_DISCOVERY_ARCHITECTURE.md`, not hidden.
+    """
+
+    if not spec.analysable or spec.success is None or spec.failure is None:
+        return list(lines)
+    thresholds = {
+        item.threshold
+        for item in (spec.success, spec.failure)
+        if item.threshold not in {0.0, 1.0}
+    }
+    if not thresholds:
+        return list(lines)
+
+    def redact(match: re.Match[str]) -> str:
+        try:
+            value = float(match.group(0))
+        except ValueError:  # pragma: no cover - the pattern is numeric
+            return match.group(0)
+        return (
+            WITHHELD if value in thresholds or -value in thresholds else match.group(0)
+        )
+
+    return [
+        re.sub(r"(?<![\w.])-?\d+(?:\.\d+)?(?:[eE]-?\d+)?(?![\w.])", redact, line)
+        for line in lines
+    ]
 
 
 def _rendered_reduction(reduction: Any) -> str:

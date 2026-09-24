@@ -655,7 +655,13 @@ def test_a_missing_observable_on_the_production_path_is_insufficient(
 
 # ============================================================ immutability --
 def _frozen(
-    portfolio: PortfolioStore, runtime_db: Database, tmp: Path, project: str, repo: Path
+    portfolio: PortfolioStore,
+    runtime_db: Database,
+    tmp: Path,
+    project: str,
+    repo: Path,
+    *,
+    run: bool = True,
 ) -> tuple[Any, Any]:
     idea = _idea(portfolio, project)
     context = _context(
@@ -671,7 +677,11 @@ def _frozen(
         ),
         repo,
     )
-    step = _advance(context)
+    step = (
+        _advance(context)
+        if run
+        else empirical.design(context, portfolio.require_version(idea))
+    )
     assert step.ok, step.detail
     return context, portfolio.require_contract(step.experiment.contract_id)
 
@@ -1094,8 +1104,10 @@ def test_an_execution_that_moved_under_its_contract_does_not_run(
 
     from research_os.runtime.executors import spec_digest
 
+    # Designed, not yet run: once something has been read under the
+    # experiment, the database refuses to retire it at all.
     context, contract = _frozen(
-        portfolio, runtime_db, tmp_path, runtime_project, grid_repo
+        portfolio, runtime_db, tmp_path, runtime_project, grid_repo, run=False
     )
     original = portfolio.get_experiment(idea_id=contract.idea_id, idea_version=1)
     assert original is not None

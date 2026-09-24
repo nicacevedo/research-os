@@ -51,14 +51,23 @@ create index if not exists literature_claims_idea_idx on literature_claims(idea_
 
 -- Immutable: a claim that could be edited after something cited it would
 -- make the citation worthless, the rule `runtime_findings` already follows.
+-- The one change permitted is a nullable reference going to NULL because the
+-- row it named was removed by a cascade; re-pointing a claim at another idea,
+-- request or call is refused. A delete is refused while the project exists --
+-- only deleting the project itself (an operator act on operational state)
+-- removes claims, and by then the project row is already gone.
 create or replace function literature_claims_immutable() returns trigger
 language plpgsql as $$
 begin
-    if tg_op = 'DELETE' and pg_trigger_depth() >= 2 then
+    if tg_op = 'DELETE' then
+        if exists (select 1 from projects where project_id = old.project_id) then
+            raise exception 'literature claim % is a cited record and is never deleted',
+                old.claim_id
+                using errcode = 'check_violation';
+        end if;
         return old;
     end if;
-    if tg_op = 'UPDATE'
-       and new.claim_id = old.claim_id
+    if new.claim_id = old.claim_id
        and new.project_id = old.project_id
        and new.kind = old.kind
        and new.statement = old.statement
@@ -66,9 +75,13 @@ begin
        and new.excerpt = old.excerpt
        and new.verification = old.verification
        and new.query = old.query
-       and new.digest = old.digest then
-        -- Only the nullable references may change, and only because a
-        -- referenced row was deleted by a cascade elsewhere.
+       and new.digest = old.digest
+       and new.created_at = old.created_at
+       and new.source_call_id is not distinct from old.source_call_id
+       and (new.idea_id is not distinct from old.idea_id or new.idea_id is null)
+       and (new.request_id is not distinct from old.request_id or new.request_id is null)
+       and (new.artifact_id is not distinct from old.artifact_id or new.artifact_id is null)
+    then
         return new;
     end if;
     raise exception 'literature claim % is immutable', old.claim_id
@@ -79,3 +92,15 @@ drop trigger if exists literature_claims_immutable_trg on literature_claims;
 create trigger literature_claims_immutable_trg
     before update or delete on literature_claims
     for each row execute function literature_claims_immutable();
+
+-- An evidence row that rests on a claim names it, by column. Before this the
+-- only link from an idea's literature evidence to the claim behind it was the
+-- claim id written into a summary sentence, which a join cannot follow.
+alter table idea_evidence
+    add column if not exists claim_id text references literature_claims(claim_id);
+-- And names it once: a reading replayed after a crash re-finds its claims
+-- by digest, and must re-find its evidence the same way rather than append a
+-- second row -- which would change the evidence digest and make every review
+-- of the idea stale over nothing new.
+create unique index if not exists idea_evidence_claim_idx
+    on idea_evidence(idea_id, idea_version, claim_id) where claim_id is not null;

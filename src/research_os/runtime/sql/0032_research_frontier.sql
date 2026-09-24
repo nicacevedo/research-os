@@ -65,11 +65,17 @@ create index if not exists frontier_requests_open_idx
 
 create table if not exists idea_provenance (
     provenance_id   text        primary key,
+    -- Carried so the append-only trigger can tell a project being deleted
+    -- (allowed) from an idea being deleted under it (refused).
+    project_id      text        not null references projects(project_id) on delete cascade,
     idea_id         text        not null references ideas(idea_id) on delete cascade,
     basis           text        not null,
     -- A seed, a request, a literature claim, a parent idea, a candidate call.
     source_ref      text,
-    request_id      text        references frontier_requests(request_id) on delete set null,
+    -- Cascade rather than set null: a request cited by provenance can only
+    -- disappear with its project, and a set-null would be an update the
+    -- append-only trigger refuses.
+    request_id      text        references frontier_requests(request_id) on delete cascade,
     call_id         text,
     detail          text        not null default '',
     created_at      timestamptz not null default now(),
@@ -77,7 +83,7 @@ create table if not exists idea_provenance (
         'HUMAN_SEED','BLIND_EXPLORATION','SEEDED_EXPLORATION','FAILURE_MINING',
         'LITERATURE','RESULT','INSUFFICIENT','ANOMALY','FALSIFIER_OBJECTION',
         'REVIEWER_CRITICISM','REPLICATION','REFEREE_FINDING','EVIDENCE_GAP',
-        'BRANCH','REVIVAL','CONVERGENCE'))
+        'BRANCH','REVIVAL','MERGE','CONVERGENCE'))
 );
 create index if not exists idea_provenance_idea_idx on idea_provenance(idea_id, created_at);
 create index if not exists idea_provenance_request_idx on idea_provenance(request_id);
@@ -87,8 +93,9 @@ create index if not exists idea_provenance_request_idx on idea_provenance(reques
 create or replace function idea_provenance_append_only() returns trigger
 language plpgsql as $$
 begin
-    if tg_op = 'DELETE' and pg_trigger_depth() >= 2 then
-        return old;  -- a cascade from deleting the idea's project
+    if tg_op = 'DELETE'
+       and not exists (select 1 from projects where project_id = old.project_id) then
+        return old;  -- the project itself is being deleted
     end if;
     raise exception 'idea provenance % is append-only', old.provenance_id
         using errcode = 'check_violation';
@@ -99,6 +106,47 @@ create trigger idea_provenance_append_only_trg
     before update or delete on idea_provenance
     for each row execute function idea_provenance_append_only();
 
+-- A request is the record of an event. What raised it, what it asked and
+-- where it came from never change after it is written; only its state
+-- moves, once, from OPEN to closed, with its resolution. It is removed only
+-- with its project.
+create or replace function frontier_requests_immutable() returns trigger
+language plpgsql as $$
+begin
+    if tg_op = 'DELETE' then
+        if exists (select 1 from projects where project_id = old.project_id) then
+            raise exception 'frontier request % is a record and is never deleted',
+                old.request_id
+                using errcode = 'check_violation';
+        end if;
+        return old;
+    end if;
+    if new.request_id <> old.request_id
+       or new.project_id <> old.project_id
+       or new.kind <> old.kind
+       or new.basis <> old.basis
+       or new.source_ref <> old.source_ref
+       or new.question <> old.question
+       or new.detail is distinct from old.detail
+       or new.source_idea_id is distinct from old.source_idea_id
+       or new.source_version is distinct from old.source_version
+       or new.created_at <> old.created_at
+       or (old.state <> 'OPEN' and (
+               new.state <> old.state
+               or new.resolution is distinct from old.resolution
+               or new.resolved_by is distinct from old.resolved_by)) then
+        raise exception 'frontier request % is a record of an event and is not rewritten',
+            old.request_id
+            using errcode = 'check_violation';
+    end if;
+    return new;
+end;
+$$;
+drop trigger if exists frontier_requests_immutable_trg on frontier_requests;
+create trigger frontier_requests_immutable_trg
+    before update or delete on frontier_requests
+    for each row execute function frontier_requests_immutable();
+
 -- Two new origins, for the two generators this release adds.
 alter table ideas drop constraint if exists ideas_origin_ck;
 alter table ideas add constraint ideas_origin_ck check (origin in (
@@ -108,10 +156,12 @@ alter table ideas add constraint ideas_origin_ck check (origin in (
 -- Every existing idea gets the provenance its origin already implies, so the
 -- invariant "every idea has at least one provenance row" holds on an
 -- upgraded database as it does on a new one. Derived, and said to be.
-insert into idea_provenance (provenance_id, idea_id, basis, source_ref, detail, created_at)
+insert into idea_provenance
+    (provenance_id, project_id, idea_id, basis, source_ref, detail, created_at)
 select
     'IPRV-' || to_char(i.created_at at time zone 'UTC', 'YYYYMMDD"T"HH24MISS"Z"')
         || '-' || substr(md5(i.idea_id), 1, 8),
+    i.project_id,
     i.idea_id,
     case i.origin
         when 'BLIND_EXPLORER' then 'BLIND_EXPLORATION'
@@ -120,6 +170,7 @@ select
         when 'RESEARCHER_SEED' then 'HUMAN_SEED'
         when 'BRANCH' then 'BRANCH'
         when 'REVIVAL' then 'REVIVAL'
+        when 'MERGE' then 'MERGE'
         else 'BRANCH'
     end,
     (select e.parent_idea_id from idea_edges e
@@ -129,3 +180,21 @@ select
     i.created_at
 from ideas i
 where not exists (select 1 from idea_provenance p where p.idea_id = i.idea_id);
+
+-- And the convergences deduplication used to discard: every DUPLICATE_OF
+-- edge says its survivor was proposed a second time.
+insert into idea_provenance
+    (provenance_id, project_id, idea_id, basis, source_ref, detail, created_at)
+select
+    'IPRV-' || to_char(e.created_at at time zone 'UTC', 'YYYYMMDD"T"HH24MISS"Z"')
+        || '-' || substr(md5(e.parent_idea_id || e.child_idea_id), 1, 8),
+    i.project_id,
+    e.parent_idea_id,
+    'CONVERGENCE',
+    e.child_idea_id,
+    'backfilled by migration 0032 from a DUPLICATE_OF edge: ' || coalesce(e.detail, ''),
+    e.created_at
+from idea_edges e
+join ideas i on i.idea_id = e.parent_idea_id
+where e.kind = 'DUPLICATE_OF'
+on conflict (provenance_id) do nothing;

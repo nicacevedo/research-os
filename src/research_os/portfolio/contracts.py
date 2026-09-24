@@ -1179,7 +1179,11 @@ class Uncertainty(_Contract):
     data and the contract rather than of when it was computed.
     """
 
-    method: Literal["bootstrap_percentile"] = "bootstrap_percentile"
+    #: ``bootstrap_percentile`` resamples the analysed records;
+    #: ``wilson_score`` is the closed-form interval for a proportion, and is
+    #: the one to use when the primary statistic is a ``fraction`` -- a
+    #: percentile bootstrap collapses to a point at 0 or 1.
+    method: Literal["bootstrap_percentile", "wilson_score"] = "bootstrap_percentile"
     level: float = Field(default=0.95, ge=0.5, le=0.999)
     resamples: int = Field(default=1000, ge=100, le=5000)
     seed: int = Field(default=20260915, ge=0, le=2**31 - 1)
@@ -1357,6 +1361,15 @@ class AnalysisSpec(_Contract):
                     "a bootstrap resamples records, and the primary statistic "
                     "reads none; drop the uncertainty or compute it from records"
                 )
+            if (
+                self.uncertainty.method == "wilson_score"
+                and defined[self.primary_statistic].op != "fraction"
+            ):
+                raise ContractError(
+                    "a Wilson score interval is the interval of a proportion; "
+                    "the primary statistic must be a fraction to use it"
+                )
+        self._check_thresholds_are_not_restated()
         for rule in self.support:
             observable = observables.get(rule.observable)
             if observable is None:
@@ -1371,6 +1384,39 @@ class AnalysisSpec(_Contract):
                     f"{rule.observable!r} is a scalar; only a records observable "
                     f"can be required to hold records or distinct values"
                 )
+
+    def _check_thresholds_are_not_restated(self) -> None:
+        """Refuse free text that repeats a threshold the designer must not see.
+
+        The designer is shown the estimand, the observables' descriptions,
+        the reductions' names and the target claim -- and an independent
+        review pointed out that an estimand reading "holds if that share is
+        at least 0.8" hands it the bar the split exists to withhold. So a
+        number in any of those equal to a threshold is refused here, before
+        anything is frozen. 0 and 1 are exempt: they are everywhere in prose.
+        """
+
+        assert self.success is not None and self.failure is not None
+        thresholds = {
+            item.threshold
+            for item in (self.success, self.failure)
+            if item.threshold not in {0.0, 1.0}
+        }
+        texts = [self.estimand, self.target_claim]
+        texts += [item.description for item in self.observables]
+        texts += [item.name.replace("_", " ") for item in self.reductions]
+        for text in texts:
+            for token in re.findall(r"-?\d+(?:\.\d+)?", text):
+                try:
+                    value = float(token)
+                except ValueError:  # pragma: no cover - the pattern is numeric
+                    continue
+                if value in thresholds:
+                    raise ContractError(
+                        f"{text[:80]!r} restates the threshold {token}; the "
+                        f"experiment designer is shown this text and must not "
+                        f"be shown the bar"
+                    )
 
     @staticmethod
     def _check_reduction(

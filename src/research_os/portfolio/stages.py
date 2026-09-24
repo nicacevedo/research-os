@@ -25,7 +25,7 @@ stage that would cost two dollars to confirm it.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from research_os.portfolio.config import STAGE_MINIMUM_STATUS, PortfolioConfig
@@ -268,8 +268,14 @@ def snapshot_for(
         review_ids=[item.review_id for item in reviews],
         stage_inputs={"stage": str(Stage.META_REVIEW)},
     )
+    # The status read now, with everything else, and not the caller's copy:
+    # the tick lists its ideas before it snapshots each one, and a worker
+    # that finished a stage in between left a snapshot that paired the old
+    # status with the new rows -- which selected a stage the idea had moved
+    # past and, with nothing permitted for the old status, parked it.
+    fresh = store.get_idea(idea.idea_id) or idea
     return TrackSnapshot(
-        status=idea.status,
+        status=fresh.status,
         version=current,
         succeeded_stages=store.succeeded_stages_for_version(
             idea_id=idea.idea_id, idea_version=current.version
@@ -544,6 +550,23 @@ def select_stage(
         return Stage.BRANCH, "open the child directions this result suggests"
 
     return None, "every stage this idea's state calls for has run"
+
+
+def waits_only_for_lineage_room(
+    snapshot: TrackSnapshot, config: PortfolioConfig
+) -> bool:
+    """Whether the one thing between this idea and its next stage is the ceiling.
+
+    Asked by construction rather than by reading the reason string: the same
+    snapshot with an empty lineage would branch. The lineage ceiling is a
+    bound on how much runs at once, not a finding about the idea, so an idea
+    it stops is owed the stage when the lineage has room again.
+    """
+
+    if snapshot.lineage_active < config.bounds.max_active_per_lineage:
+        return False
+    stage, _ = select_stage(replace(snapshot, lineage_active=0), config)
+    return stage is Stage.BRANCH
 
 
 #: The stages that may run at all, in the order :func:`select_stage` considers

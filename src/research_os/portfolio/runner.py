@@ -1103,24 +1103,12 @@ def _raise_from_measurement(
         EmpiricalConclusion.INSUFFICIENT,
         EmpiricalConclusion.INCONCLUSIVE,
     }:
-        basis = (
-            RequestBasis.INSUFFICIENT
-            if conclusion is EmpiricalConclusion.INSUFFICIENT
-            else RequestBasis.ANOMALY
-        )
-        frontier.raise_request(
+        frontier.raise_for_measurement(
             context.portfolio,
             project_id=context.project_id,
-            basis=basis,
-            source_ref=experiment.experiment_id,
-            source_idea_id=context.idea_id,
-            source_version=version.version,
-            question=(
-                f"The measurement of '{version.research_question}' came back "
-                f"{conclusion}. What new question does that outcome raise -- "
-                f"one a measurement could actually settle, or one about why "
-                f"this one could not?"
-            ),
+            version=version,
+            experiment_id=experiment.experiment_id,
+            conclusion=conclusion,
             detail=step.detail,
         )
         return
@@ -1411,7 +1399,9 @@ def run_meta_review(
     result = _evaluate(context)
     allowed = gates.permit(meta.recommendation, result)
     _apply_disposition(context, allowed, result)
-    _continue_after_meta_review(context, snapshot, meta, allowed)
+    _continue_after_meta_review(
+        context, snapshot, meta, allowed, call_id=response.call_id
+    )
     detail = f"recommended {meta.recommendation}; the gate permits {allowed}"
     if allowed is not meta.recommendation:
         detail += f". Unmet: {'; '.join(result.unmet[:3])}"
@@ -1434,6 +1424,8 @@ def _continue_after_meta_review(
     snapshot: stages.TrackSnapshot,
     meta: MetaReviewOutput,
     allowed: Disposition,
+    *,
+    call_id: str | None = None,
 ) -> None:
     """What happens to the idea when the synthesis is not a promotion.
 
@@ -1479,7 +1471,14 @@ def _continue_after_meta_review(
             basis=RequestBasis.RESULT
             if allowed in {Disposition.BRANCH, Disposition.DEEPEN}
             else RequestBasis.REVIEWER_CRITICISM,
-            source_ref=f"meta:{context.idea_id}:v{snapshot.version.version}:{index}",
+            # Named by the meta-review that asked, so it traces back to one
+            # call -- and so a second meta-review of the same version, after
+            # the evidence changed, raises its own questions instead of
+            # colliding with the first one's key and being dropped.
+            source_ref=(
+                f"meta:{call_id or context.idea_id + ':v' + str(snapshot.version.version)}"
+                f":{index}"
+            ),
             source_idea_id=context.idea_id,
             source_version=snapshot.version.version,
             question=question,
@@ -1746,7 +1745,14 @@ def run_explorer(context: ExplorerContext, explorer: str) -> StageOutcome:
 
     template_name, origin = EXPLORERS[explorer]
     template = PORTFOLIO_TEMPLATES[template_name]
-    fields, blocks = _explorer_inputs(context, explorer, template)
+    # What the explorer may cite is exactly what it is shown, recorded as the
+    # prompt is assembled -- not re-read after the call, when a seed added
+    # meanwhile would be citable (and consumed) without ever being shown.
+    shown: list[str] = []
+    shown_seeds: list[str] = []
+    fields, blocks = _explorer_inputs(
+        context, explorer, template, shown=shown, shown_seeds=shown_seeds
+    )
     try:
         request = ModelRequest(
             role=template.role,
@@ -1789,7 +1795,7 @@ def run_explorer(context: ExplorerContext, explorer: str) -> StageOutcome:
     # What each candidate may cite as its source, per explorer. The blind
     # explorer was shown nothing it could derive from, so it may cite
     # nothing -- an identifier in its answer is one it was not given.
-    supplied = set(_supplied_sources(context, explorer))
+    supplied = set(shown)
     invented = sorted(
         {
             item
@@ -1806,16 +1812,27 @@ def run_explorer(context: ExplorerContext, explorer: str) -> StageOutcome:
             cost_usd=_cost(response),
             model_calls=1,
         )
+    # An explorer that was shown sources must say which one each direction
+    # grew from. §21 says so of the literature explorer, and the same holds
+    # for the seeded and failure-mining ones: a direction that cites nothing
+    # has provenance nobody can check, and a failure-mined idea that names
+    # no failure is not failure-mined.
+    if explorer in _MUST_CITE:
+        uncited = [item.title for item in result.candidates if not item.derived_from]
+        if uncited:
+            return StageOutcome.failed(
+                f"{explorer} proposed {len(uncited)} direction(s) citing nothing it "
+                f"was shown (first: {uncited[0][:80]!r}); every one must name the "
+                f"source it grew from",
+                failure_class=FailureClass.MODEL_OUTPUT_INVALID,
+                cost_usd=_cost(response),
+                model_calls=1,
+            )
     basis = _EXPLORER_BASIS[explorer]
-    seeds = (
-        [
-            item.seed_id
-            for item in context.portfolio.pending_seeds(project_id=context.project_id)
-        ]
-        if explorer == "seeded_explorer"
-        else []
-    )
+    bounds = context.config.bounds
+    lineage = dict(context.portfolio.lineage_active_counts(context.project_id))
     created: list[str] = []
+    beyond_bounds: list[str] = []
     duplicates = 0
     for candidate in result.candidates:
         fields_for = candidate.as_fields()
@@ -1825,11 +1842,7 @@ def run_explorer(context: ExplorerContext, explorer: str) -> StageOutcome:
             fields=fields_for,
             config=context.config,
         )
-        source_ref = (
-            ",".join(candidate.derived_from)
-            if candidate.derived_from
-            else ",".join(seeds) or None
-        )
+        source_ref = ",".join(candidate.derived_from) or None
         if outcome.is_duplicate:
             duplicates += 1
             if outcome.match_idea_id:
@@ -1856,6 +1869,22 @@ def run_explorer(context: ExplorerContext, explorer: str) -> StageOutcome:
             ),
             None,
         )
+        if parent is not None:
+            # The same two bounds a follow-up child meets. A child of an idea
+            # at the depth bound, or into a lineage at its ceiling, is not
+            # created: the depth bound is what stops recursion, and a
+            # generator that could step around it would be the unbounded one.
+            parent_idea = context.portfolio.require_idea(parent)
+            if (
+                parent_idea.depth >= bounds.max_lineage_depth
+                or lineage.get(parent_idea.lineage_root, 0)
+                >= bounds.max_active_per_lineage
+            ):
+                beyond_bounds.append(parent)
+                continue
+            lineage[parent_idea.lineage_root] = (
+                lineage.get(parent_idea.lineage_root, 0) + 1
+            )
         idea, _version = context.portfolio.create_idea(
             project_id=context.project_id,
             origin=origin,
@@ -1878,12 +1907,27 @@ def run_explorer(context: ExplorerContext, explorer: str) -> StageOutcome:
         )
     return StageOutcome.succeeded(
         f"{explorer} produced {len(created)} new idea(s); {duplicates} were "
-        f"already in the portfolio",
+        f"already in the portfolio"
+        + (
+            f"; {len(beyond_bounds)} not created, their parent being at the "
+            f"depth bound or its lineage at the ceiling"
+            if beyond_bounds
+            else ""
+        ),
         cost_usd=_cost(response),
         model_calls=1,
-        data={"created": created, "duplicates": duplicates},
+        data={
+            "created": created,
+            "duplicates": duplicates,
+            "seeds_shown": list(shown_seeds),
+        },
     )
 
+
+#: Explorers that are shown sources, and so must cite one per direction.
+_MUST_CITE: frozenset[str] = frozenset(
+    {"seeded_explorer", "failure_mining_explorer", "literature_explorer"}
+)
 
 #: Why an explorer's idea exists, by explorer.
 _EXPLORER_BASIS: dict[str, ProvenanceBasis] = {
@@ -1892,34 +1936,6 @@ _EXPLORER_BASIS: dict[str, ProvenanceBasis] = {
     "failure_mining_explorer": ProvenanceBasis.FAILURE_MINING,
     "literature_explorer": ProvenanceBasis.LITERATURE,
 }
-
-
-def _supplied_sources(context: ExplorerContext, explorer: str) -> list[str]:
-    """The identifiers an explorer was shown and may therefore cite."""
-
-    store = context.portfolio
-    if explorer == "failure_mining_explorer":
-        return [
-            idea.idea_id
-            for idea in store.list_ideas(
-                project_id=context.project_id,
-                statuses=[IdeaStatus.REJECTED, IdeaStatus.PARKED],
-                limit=12,
-            )
-        ] + [
-            item.experiment_id
-            for item in _failed_experiments(store, context.project_id)
-        ]
-    if explorer == "seeded_explorer":
-        return [
-            item.seed_id for item in store.pending_seeds(project_id=context.project_id)
-        ] + [
-            idea.idea_id
-            for idea in store.list_ideas(project_id=context.project_id, limit=40)
-        ]
-    if explorer == "literature_explorer":
-        return [item.claim_id for item in _literature_claims(context)]
-    return []
 
 
 def _failed_experiments(store: PortfolioStore, project_id: str) -> list[Any]:
@@ -1950,7 +1966,12 @@ def _literature_claims(context: ExplorerContext) -> list[Any]:
 
 
 def _explorer_inputs(
-    context: ExplorerContext, explorer: str, template: PromptTemplate
+    context: ExplorerContext,
+    explorer: str,
+    template: PromptTemplate,
+    *,
+    shown: list[str] | None = None,
+    shown_seeds: list[str] | None = None,
 ) -> tuple[dict[str, str], dict[str, Sequence[str]]]:
     """What each explorer is given, and -- for the blind one -- what it is not.
 
@@ -1960,6 +1981,8 @@ def _explorer_inputs(
     """
 
     store = context.portfolio
+    shown = [] if shown is None else shown
+    shown_seeds = [] if shown_seeds is None else shown_seeds
     declared = {name for name, _fence in template.blocks}
     fields: dict[str, str] = {}
     blocks: dict[str, Sequence[str]] = {}
@@ -1973,9 +1996,15 @@ def _explorer_inputs(
             blocks[name] = value
 
     if explorer == "seeded_explorer":
+        seeds = store.pending_seeds(project_id=context.project_id)
+        # With their ids, which is what makes a seed citable at all: before
+        # this the explorer saw seed text only, and every idea it made was
+        # credited to every pending seed or to none.
         blocks["researcher_seeds"] = [
-            item.text for item in store.pending_seeds(project_id=context.project_id)
+            f"seed id: {item.seed_id}\n{item.text}" for item in seeds
         ]
+        shown_seeds.extend(item.seed_id for item in seeds)
+        shown.extend(item.seed_id for item in seeds)
         blocks["current_ideas"] = _idea_lines(
             store,
             project_id=context.project_id,
@@ -1984,6 +2013,7 @@ def _explorer_inputs(
                 IdeaStatus.INVESTIGATING,
                 IdeaStatus.VALIDATED,
             ),
+            shown=shown,
         )
         blocks["negative_findings"] = _idea_lines(
             store, project_id=context.project_id, statuses=(IdeaStatus.REJECTED,)
@@ -1994,6 +2024,7 @@ def _explorer_inputs(
             project_id=context.project_id,
             statuses=(IdeaStatus.REJECTED, IdeaStatus.PARKED),
             with_reason=True,
+            shown=shown,
         )
         blocks["standing_objections"] = [
             f"[{item.severity}] {item.summary}"
@@ -2016,12 +2047,15 @@ def _explorer_inputs(
             for item in failed
             if str(item.conclusion) == "INCONCLUSIVE"
         ]
+        shown.extend(item.experiment_id for item in failed if item.conclusion)
     elif explorer == "literature_explorer":
+        claims = _literature_claims(context)
         blocks["literature_claims"] = [
             f"claim id: {item.claim_id} [{item.kind}] {item.statement} "
             f"(sources: {', '.join(item.work_keys)})"
-            for item in _literature_claims(context)
+            for item in claims
         ]
+        shown.extend(item.claim_id for item in claims)
     return fields, blocks
 
 
@@ -2032,6 +2066,7 @@ def _idea_lines(
     statuses: Sequence[IdeaStatus],
     with_reason: bool = False,
     limit: int = 12,
+    shown: list[str] | None = None,
 ) -> list[str]:
     lines: list[str] = []
     for idea in store.list_ideas(
@@ -2040,6 +2075,8 @@ def _idea_lines(
         version = store.get_version(idea.idea_id)
         if version is None:
             continue
+        if shown is not None:
+            shown.append(idea.idea_id)
         entry = (
             f"id: {idea.idea_id} ({idea.status})\n"
             f"question: {version.research_question}\n"

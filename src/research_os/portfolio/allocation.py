@@ -154,14 +154,20 @@ class Allocation:
                 f"v{self.idea_version}:{self.failed_attempts}"
             )
         if self.kind == SYNTHESIZE:
-            return f"{self.kind}:{self.payload.get('basis', '')}"
+            return (
+                f"{self.kind}:{self.payload.get('basis', '')}:"
+                f"{self.payload.get('generation', 0)}"
+            )
         if self.kind in {FOLLOW_UP, LITERATURE_REQUEST}:
-            # The request and how many times it has been attempted: one item
-            # per attempt, for the reason the failure count is in an idea
-            # advance's key -- a spent key would refuse the retry silently.
+            # The request and its generation -- how many of its work items
+            # already finished, read from the queue -- for the reason the
+            # failure count is in an idea advance's key. It was the request's
+            # `attempts` column, which only the handled failure paths bumped:
+            # a provider outage, a spent budget or a crash spent the key, and
+            # the oldest-first queue then refused every later request too.
             return (
                 f"{self.kind}:{self.payload.get('request_id', '')}:"
-                f"{self.payload.get('attempts', 0)}"
+                f"{self.payload.get('generation', 0)}"
             )
         return f"{self.kind}:{self.explorer or ''}:{self.payload.get('bucket', '')}"
 
@@ -305,7 +311,7 @@ def plan(
     literature_requests: Sequence[tuple[str, int, str]] = (),
     literature_in_flight: int = 0,
     frontier_claims: int = 0,
-    synthesis_basis: str | None = None,
+    synthesis_basis: tuple[str, int] | None = None,
     syntheses_in_flight: int = 0,
 ) -> tuple[Allocation, ...]:
     """The ordered, bounded list of work this tick buys.
@@ -318,46 +324,50 @@ def plan(
     allocations: list[Allocation] = []
     remaining = max(0, free_slots)
 
-    # A recorded question first, one at a time. It is the cheapest unit of
-    # genuinely new science the portfolio can buy -- one call, about one
-    # event that already happened -- and putting it behind idea work would
-    # let a busy portfolio starve its own recursion: every question raised by
-    # a result would wait for a free slot that deepening never leaves.
-    # `open_requests` is ``(request_id, attempts, basis)``, oldest first.
-    if remaining and open_requests and follow_ups_in_flight == 0:
-        request_id, attempts, basis = open_requests[0]
+    # Project-level work first, and outside the idea slots. A follow-up, a
+    # synthesis and a literature question each hold no idea's capacity --
+    # they run one at a time per project, which is their bound -- and gating
+    # them on a free idea slot did two wrong things at once: a portfolio
+    # whose every track was running an experiment starved the literature
+    # answers its blocked ideas were waiting on, and one with two free slots
+    # spent both on project work and advanced no idea at all.
+    #
+    # A recorded question is the cheapest unit of genuinely new science the
+    # portfolio can buy -- one call, about one event that already happened.
+    # `open_requests` is ``(request_id, generation, basis)``, oldest first,
+    # already filtered to the requests that may run now.
+    if open_requests and follow_ups_in_flight == 0:
+        request_id, generation, basis = open_requests[0]
         allocations.append(
             Allocation(
                 kind=FOLLOW_UP,
                 reason=f"an open {basis} request owes the frontier new ideas",
-                payload={"request_id": request_id, "attempts": attempts},
+                payload={"request_id": request_id, "generation": generation},
             )
         )
-        remaining -= 1
     # A synthesis, when the reviewed evidence changed. Its referee's findings
     # are what return the writing to the frontier, so it is bought as readily
-    # as a question is -- one at a time, once per basis.
-    if remaining and synthesis_basis and syntheses_in_flight == 0:
+    # as a question is -- one at a time, once per basis and generation.
+    if synthesis_basis and syntheses_in_flight == 0:
+        basis_digest, generation = synthesis_basis
         allocations.append(
             Allocation(
                 kind=SYNTHESIZE,
                 reason="the reviewed evidence changed since the last synthesis",
-                payload={"basis": synthesis_basis},
+                payload={"basis": basis_digest, "generation": generation},
             )
         )
-        remaining -= 1
     # And a question put to the literature, the same way and for the same
     # reason: it is the cheapest thing that can unblock an idea waiting on it.
-    if remaining and literature_requests and literature_in_flight == 0:
-        request_id, attempts, basis = literature_requests[0]
+    if literature_requests and literature_in_flight == 0:
+        request_id, generation, basis = literature_requests[0]
         allocations.append(
             Allocation(
                 kind=LITERATURE_REQUEST,
                 reason=f"an open {basis} question for the literature",
-                payload={"request_id": request_id, "attempts": attempts},
+                payload={"request_id": request_id, "generation": generation},
             )
         )
-        remaining -= 1
 
     if (
         remaining

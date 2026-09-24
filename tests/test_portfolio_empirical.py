@@ -573,6 +573,7 @@ def test_replaying_the_submission_reuses_the_job_rather_than_running_twice(
     runtime_project: str,
     project_repo: Path,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Restart and replay must not produce a second execution.
 
@@ -603,16 +604,28 @@ def test_replaying_the_submission_reuses_the_job_rather_than_running_twice(
         executors={"local": CountingExecutor()},
     )
 
-    first = _advance(context)
-    assert first.ok, first.detail
-    experiment = portfolio.require_experiment(first.experiment.experiment_id)
+    designed = empirical.design(context, portfolio.require_version(idea_id))
+    assert designed.ok, designed.detail
+    experiment = designed.experiment
 
-    # Force the row back to a state the driver will try to submit from, the
-    # way a worker that died after the executor returned and before the row
-    # was updated would leave it.
-    portfolio.update_experiment(
-        experiment.experiment_id, state=ExperimentState.PROPOSED, detail="replayed"
-    )
+    # A worker that dies after the executor returned and before the row was
+    # updated: the job exists, the ledger holds its result, and the row still
+    # says it was never submitted. (Rewinding a finished row instead is no
+    # longer possible -- the database refuses to rewrite what was read.)
+    recorded = PortfolioStore.update_experiment
+
+    def dies_on_record(self: Any, experiment_id: str, **fields: Any) -> Any:
+        if fields.get("job_id"):
+            raise RuntimeError("worker died before recording the job")
+        return recorded(self, experiment_id, **fields)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(PortfolioStore, "update_experiment", dies_on_record)
+        with pytest.raises(RuntimeError, match="worker died"):
+            empirical.submit(context, experiment)
+    assert portfolio.require_experiment(experiment.experiment_id).job_id is None
+    assert CountingExecutor.submissions == 1
+
     second = empirical.submit(
         context, portfolio.require_experiment(experiment.experiment_id)
     )
@@ -1265,7 +1278,7 @@ def test_a_replication_that_varies_the_seed_produces_its_own_execution(
             # primary's frozen analysis, and that analysis reads that path.
             answers_by_prompt=contract_prompt_answers(
                 primary=design_answer(seed=5),
-                replication=design_answer(seed=14, variation_kind="seed"),
+                replication=design_answer(seed=15, variation_kind="seed"),
             ),
             store=RuntimeStore(runtime_db),
         ),
@@ -1305,7 +1318,7 @@ def test_the_replication_designer_is_not_shown_what_the_first_one_concluded(
     router = ScriptedRouter(
         answers_by_prompt=contract_prompt_answers(
             primary=design_answer(seed=5),
-            replication=design_answer(seed=14, variation_kind="seed"),
+            replication=design_answer(seed=15, variation_kind="seed"),
         ),
         store=RuntimeStore(runtime_db),
     )
@@ -1814,7 +1827,7 @@ def _empirical_router(runtime_db: Database) -> ScriptedRouter:
         },
         answers_by_prompt=contract_prompt_answers(
             primary=design_answer(seed=5),
-            replication=design_answer(seed=14, variation_kind="seed"),
+            replication=design_answer(seed=15, variation_kind="seed"),
         ),
         store=RuntimeStore(runtime_db),
         providers={

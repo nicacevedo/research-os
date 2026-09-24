@@ -256,9 +256,11 @@ def run_explore(context: WorkContext) -> dict[str, Any]:
         detail=outcome.detail[:500],
     )
     created = list(outcome.data.get("created", []))
-    for seed in store.pending_seeds(project_id=context.item.project_id):
-        if explorer == "seeded_explorer" and created:
-            store.consume_seed(seed_id=seed.seed_id, consumed_by=run.run_id)
+    # The seeds this explorer was *shown*, and only those: a seed added while
+    # the call was in flight is still pending for the next one.
+    if explorer == "seeded_explorer" and created:
+        for seed_id in outcome.data.get("seeds_shown", []):
+            store.consume_seed(seed_id=seed_id, consumed_by=run.run_id)
     if not outcome.ok and outcome.failure_class is not None:
         raise _as_error(outcome.failure_class, outcome.detail)
     return {

@@ -26,8 +26,10 @@ synthesis, which is what the writer reads.
 Bounds, because every generator here is a way to loop (invariant 14): one
 follow-up in flight per project, one request per raising event (a unique
 index), children bounded by ``max_children_per_branch`` and by the lineage's
-active ceiling, requests from ideas at ``max_lineage_depth`` declined, and a
-request that fails ``max_stage_failures`` times declined rather than retried.
+active ceiling (a request that meets a full lineage waits for room rather than
+being declined), requests from ideas at ``max_lineage_depth`` declined, and a
+request that fails ``max_stage_failures`` times -- counted from the queue, not
+from a column a handler must remember to bump -- declined rather than retried.
 """
 
 from __future__ import annotations
@@ -107,6 +109,50 @@ def raise_request(
     )
 
 
+def raise_for_measurement(
+    store: PortfolioStore,
+    *,
+    project_id: str,
+    version: Any,
+    experiment_id: str,
+    conclusion: Any,
+    detail: str = "",
+) -> FrontierRequest | None:
+    """The request an unsettling primary measurement raises. Idempotent per event.
+
+    ``INSUFFICIENT`` asks what *could* answer the question; ``INCONCLUSIVE``
+    -- a value between the prespecified conditions -- is an anomaly with
+    respect to the prediction. Anything else raises nothing here.
+    """
+
+    from research_os.portfolio.models import EmpiricalConclusion
+
+    if conclusion not in {
+        EmpiricalConclusion.INSUFFICIENT,
+        EmpiricalConclusion.INCONCLUSIVE,
+    }:
+        return None
+    return raise_request(
+        store,
+        project_id=project_id,
+        basis=(
+            RequestBasis.INSUFFICIENT
+            if conclusion is EmpiricalConclusion.INSUFFICIENT
+            else RequestBasis.ANOMALY
+        ),
+        source_ref=experiment_id,
+        source_idea_id=version.idea_id,
+        source_version=version.version,
+        question=(
+            f"The measurement of '{version.research_question}' came back "
+            f"{conclusion}. What new question does that outcome raise -- "
+            f"one a measurement could actually settle, or one about why "
+            f"this one could not?"
+        ),
+        detail=detail,
+    )
+
+
 def requests_from_objections(
     store: PortfolioStore,
     *,
@@ -158,11 +204,26 @@ def settle(
     ``select_stage`` read and the reason is its reason.
     """
 
-    if idea.status not in _UNSETTLED:
+    if idea.status not in _UNSETTLED or snapshot.status is not idea.status:
         return None
     stage, reason = stages.select_stage(snapshot, config)
     if stage is not None:
         return None
+    if stages.waits_only_for_lineage_room(snapshot, config):
+        # A bound on how much runs at once, not a finding about the idea.
+        # Parked, because an idea that holds a slot while waiting for one is
+        # how a lineage of ideas that all want to branch deadlocks -- and
+        # parked with a condition the tick reads, so the stage is bought
+        # when the lineage has room rather than never.
+        applied = store.set_status(
+            idea_id=idea.idea_id,
+            status=IdeaStatus.PARKED,
+            retire_reason=f"waiting for its lineage to have room: {reason}",
+            revisit_if=f"{LINEAGE_ROOM}{idea.status}",
+            expected_status=snapshot.status,
+            require_idle=True,
+        )
+        return str(IdeaStatus.PARKED) if applied is not None else None
     if "retrieved source" in reason:
         # The one dead end the portfolio can do something about itself: the
         # index does not hold enough sources for this question. Ask the
@@ -199,20 +260,110 @@ def settle(
         for item in snapshot.open_objections
         if item.severity is Severity.FATAL and item.target is ObjectionTarget.CLAIM
     ]
+    # Compare-and-set, on the status the snapshot was read with and on the
+    # idea being idle: a worker that finished a stage on this idea since the
+    # snapshot was taken has made the decision below about a state that no
+    # longer exists, and must win.
     if fatal:
-        store.set_status(
+        applied = store.set_status(
             idea_id=idea.idea_id,
             status=IdeaStatus.REJECTED,
             retire_reason=f"a fatal objection to the claim stands: {fatal[0].summary}",
+            expected_status=snapshot.status,
+            require_idle=True,
         )
-        return str(IdeaStatus.REJECTED)
-    store.set_status(
+        return str(IdeaStatus.REJECTED) if applied is not None else None
+    applied = store.set_status(
         idea_id=idea.idea_id,
         status=IdeaStatus.PARKED,
         retire_reason=f"no further autonomous step: {reason}",
         revisit_if=_revisit_condition(snapshot, reason),
+        expected_status=snapshot.status,
+        require_idle=True,
     )
-    return str(IdeaStatus.PARKED)
+    settled = snapshot.settled_measurement
+    if applied is not None and settled is not None:
+        # The revisit condition says a follow-up answers what the reading
+        # left open, so the question must exist. It is raised at
+        # interpretation; this raises it -- once, by the same key -- for a
+        # reading taken before the frontier existed, which is the state the
+        # first real INSUFFICIENT measurement was migrated in: parked, with
+        # a condition nothing would ever meet.
+        raise_for_measurement(
+            store,
+            project_id=idea.project_id,
+            version=snapshot.version,
+            experiment_id=settled.experiment_id,
+            conclusion=settled.conclusion,
+            detail=settled.detail or "",
+        )
+    return str(IdeaStatus.PARKED) if applied is not None else None
+
+
+#: The revisit condition of an idea parked only because its lineage was full,
+#: followed by the status it resumes at. :func:`revive_for_lineage_room` reads
+#: it; nothing else parks with it.
+LINEAGE_ROOM = "room in its lineage to branch; resumes as "
+
+
+def revive_for_lineage_room(
+    store: PortfolioStore, project_id: str, config: PortfolioConfig
+) -> int:
+    """Return ideas parked on a full lineage once it has room for them to branch.
+
+    Room means room for the idea *and* a child: reviving into a lineage that
+    would be full again with the idea back in it would park it on the next
+    tick, forever. Deterministic, oldest first, and counted as it goes, so
+    two ideas do not both take the one free slot.
+    """
+
+    counts = dict(store.lineage_active_counts(project_id))
+    ceiling = config.bounds.max_active_per_lineage
+    revived = 0
+    parked = store.list_ideas(
+        project_id=project_id, statuses=[IdeaStatus.PARKED], limit=500
+    )
+    for idea in sorted(parked, key=lambda item: (item.updated_at, item.idea_id)):
+        condition = idea.revisit_if or ""
+        if not condition.startswith(LINEAGE_ROOM):
+            continue
+        if counts.get(idea.lineage_root, 0) + 2 > ceiling:
+            continue
+        try:
+            resume = IdeaStatus(condition[len(LINEAGE_ROOM) :].strip())
+        except ValueError:
+            continue
+        if resume not in _UNSETTLED:
+            continue
+        applied = store.set_status(
+            idea_id=idea.idea_id,
+            status=resume,
+            expected_status=IdeaStatus.PARKED,
+            clear_retirement=True,
+        )
+        if applied is not None:
+            counts[idea.lineage_root] = counts.get(idea.lineage_root, 0) + 1
+            revived += 1
+    return revived
+
+
+def decline_request(store: PortfolioStore, request: FrontierRequest, why: str) -> None:
+    """Close a request that will not be answered, and free whatever waited on it.
+
+    A literature request an idea is blocked on releases the idea: declining
+    the question is not a finding about the idea, and an idea left
+    ``BLOCKED_DEPENDENCY`` on a closed request would never be allocated again.
+    """
+
+    store.close_request(request.request_id, state=RequestState.DECLINED, resolution=why)
+    if request.kind is RequestKind.LITERATURE and request.source_idea_id:
+        from research_os.portfolio.models import OperationalState
+
+        store.set_operational_state(
+            idea_id=request.source_idea_id,
+            state=OperationalState.IDLE,
+            expected=OperationalState.BLOCKED_DEPENDENCY,
+        )
 
 
 def _revisit_condition(snapshot: stages.TrackSnapshot, reason: str) -> str:
@@ -279,6 +430,41 @@ def run_follow_up(context: FrontierContext, request_id: str) -> FollowUpResult:
         return FollowUpResult(
             ok=True, detail=f"{request_id} is already {request.state}"
         )
+    # A replay after a crash between the children and the close: what the
+    # first attempt made is already recorded against this request, so it is
+    # closed from that record rather than asked again -- which would pay
+    # twice and, from a nondeterministic model, add a second set of children.
+    made = store.provenance_for_request(request_id)
+    if made:
+        created = tuple(
+            dict.fromkeys(
+                item.idea_id
+                for item in made
+                if item.basis is not ProvenanceBasis.CONVERGENCE
+            )
+        )
+        converged = tuple(
+            dict.fromkeys(
+                item.idea_id
+                for item in made
+                if item.basis is ProvenanceBasis.CONVERGENCE
+            )
+        )
+        store.close_request(
+            request_id,
+            state=RequestState.CONSUMED,
+            resolution=(
+                f"{len(created)} new idea(s), {len(converged)} convergence(s) "
+                f"(closed on replay from what the first attempt recorded)"
+            ),
+            resolved_by=made[0].call_id,
+        )
+        return FollowUpResult(
+            ok=True,
+            detail="closed on replay from its recorded children",
+            created=created,
+            converged=converged,
+        )
     bounds = context.config.bounds
 
     parent = store.get_idea(request.source_idea_id) if request.source_idea_id else None
@@ -299,12 +485,12 @@ def run_follow_up(context: FrontierContext, request_id: str) -> FollowUpResult:
         )
         room = min(room, max(0, bounds.max_active_per_lineage - active))
     if room <= 0:
-        store.close_request(
-            request_id,
-            state=RequestState.DECLINED,
-            resolution="the lineage already holds its ceiling of live ideas",
+        # Deferred, not declined. The ceiling bounds what runs at once; a
+        # question raised while the lineage is busy is still owed an answer
+        # when it is not, and the tick does not buy it again until then.
+        return FollowUpResult(
+            ok=True, detail="deferred: the lineage holds its ceiling of live ideas"
         )
-        return FollowUpResult(ok=True, detail="declined: the lineage ceiling")
 
     template = PORTFOLIO_TEMPLATES["follow_up_explorer"]
     parent_block: list[str] = ["(this question was not raised by an existing idea)"]
@@ -458,10 +644,10 @@ def _failed(
 
     attempts = context.portfolio.count_request_attempt(request.request_id)
     if attempts >= context.config.bounds.max_stage_failures:
-        context.portfolio.close_request(
-            request.request_id,
-            state=RequestState.DECLINED,
-            resolution=f"the follow-up explorer failed {attempts} times: {why}",
+        decline_request(
+            context.portfolio,
+            request,
+            f"the follow-up explorer failed {attempts} times: {why}",
         )
         return FollowUpResult(
             ok=True,
@@ -489,10 +675,14 @@ def open_requests_summary(store: PortfolioStore, project_id: str) -> Mapping[str
 
 __all__ = [
     "FOLLOW_UP",
+    "LINEAGE_ROOM",
     "FollowUpResult",
     "FrontierContext",
+    "decline_request",
+    "raise_for_measurement",
     "raise_request",
     "requests_from_objections",
+    "revive_for_lineage_room",
     "run_follow_up",
     "settle",
 ]

@@ -29,10 +29,11 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
-from research_os.portfolio import allocation
+from research_os.portfolio import allocation, frontier
 from research_os.portfolio.config import PortfolioConfig
 from research_os.portfolio.models import (
     ActionStatus,
+    FrontierRequest,
     IdeaOrigin,
     IdeaStatus,
     OperationalState,
@@ -147,6 +148,11 @@ def tick(
     report.stale_actions_reclaimed = _reclaim_stale(store, project_id, config)
     report.blocks_cleared = _clear_blocks(store, runtime, project_id)
     report.capability_unblocked = _observe_capability(store, report, state)
+    revived = frontier.revive_for_lineage_room(store, project_id, config)
+    if revived:
+        report.notes.append(
+            f"{revived} idea(s) parked on a full lineage resumed: it has room now"
+        )
 
     # --- inspect capacity ------------------------------------------------
     report.active_tracks = store.active_count(project_id)
@@ -168,6 +174,9 @@ def tick(
         limit=50,
     )
     report.open_requests = len(requests) + len(literature_requests)
+    requests, literature_requests, request_generation = _servable_requests(
+        store, project_id, config, requests, literature_requests
+    )
 
     # --- the four reasons a portfolio may stop ---------------------------
     # Read the project and system ceilings directly rather than through
@@ -248,13 +257,14 @@ def tick(
         tick_bucket=moment.strftime("%Y%m%dT%H%M"),
         explorers_in_flight=in_flight,
         open_requests=[
-            (item.request_id, item.attempts, str(item.basis)) for item in requests
+            (item.request_id, request_generation[item.request_id], str(item.basis))
+            for item in requests
         ],
         follow_ups_in_flight=store.work_in_flight(
             project_id=project_id, kind=allocation.FOLLOW_UP
         ),
         literature_requests=[
-            (item.request_id, item.attempts, str(item.basis))
+            (item.request_id, request_generation[item.request_id], str(item.basis))
             for item in literature_requests
         ],
         literature_in_flight=store.work_in_flight(
@@ -265,7 +275,7 @@ def tick(
                 project_id=project_id, frontier_only=True, limit=50
             )
         ),
-        synthesis_basis=_synthesis_due(store, project_id),
+        synthesis_basis=_synthesis_due(store, project_id, config),
         syntheses_in_flight=store.work_in_flight(
             project_id=project_id, kind=allocation.SYNTHESIZE
         ),
@@ -482,10 +492,92 @@ def _clear_blocks(store: PortfolioStore, runtime: RuntimeStore, project_id: str)
     return cleared
 
 
-def _synthesis_due(store: PortfolioStore, project_id: str) -> str | None:
+def _synthesis_due(
+    store: PortfolioStore, project_id: str, config: PortfolioConfig
+) -> tuple[str, int] | None:
+    """The basis a synthesis is owed on, and its generation -- or nothing.
+
+    The generation is how many synthesis items on this basis already
+    finished, read from the queue: every one of them failed or was refused,
+    because a synthesis that is stored makes its basis no longer due. It is
+    in the dedup key for the reason the failure count is in every other key,
+    and it is what stops a basis the writer cannot ground being bought
+    forever.
+    """
+
     from research_os.portfolio import synthesis
 
-    return synthesis.due(store, project_id)
+    basis = synthesis.due(store, project_id)
+    if basis is None:
+        return None
+    generation = store.synthesis_generations(project_id=project_id).get(basis, 0)
+    if generation >= config.bounds.max_stage_failures:
+        return None
+    return basis, generation
+
+
+def _servable_requests(
+    store: PortfolioStore,
+    project_id: str,
+    config: PortfolioConfig,
+    requests: Sequence[FrontierRequest],
+    literature_requests: Sequence[FrontierRequest],
+) -> tuple[list[FrontierRequest], list[FrontierRequest], dict[str, int]]:
+    """Which open requests the allocator may buy now, and each one's generation.
+
+    Three things decided from rows, none of them by a handler remembering to
+    record it:
+
+    - **the generation**, the count of this request's finished work items,
+      which names the next item's dedup key. It only goes up, so no attempt
+      -- a provider outage, a spent budget, a crash, a deferral -- can spend
+      a key the next attempt needs;
+    - **the ceiling**: a request whose items failed ``max_stage_failures``
+      times (counting the malformed answers its handler recorded) is
+      declined here, with the waiting idea released, rather than holding the
+      head of its queue forever;
+    - **room**: a follow-up whose lineage is at its ceiling is skipped, not
+      declined, so the oldest request cannot starve the rest while it waits.
+    """
+
+    from research_os.portfolio import frontier
+
+    generation: dict[str, int] = {}
+    kept: dict[str, list[FrontierRequest]] = {}
+    lineage = store.lineage_active_counts(project_id)
+    ceiling = config.bounds.max_stage_failures
+    for kind, rows in (
+        (allocation.FOLLOW_UP, requests),
+        (allocation.LITERATURE_REQUEST, literature_requests),
+    ):
+        counts = store.request_generations(project_id=project_id, kind=kind)
+        kept[kind] = []
+        for item in rows:
+            finished, failed = counts.get(item.request_id, (0, 0))
+            if failed + item.attempts >= ceiling:
+                frontier.decline_request(
+                    store,
+                    item,
+                    f"its work failed {failed + item.attempts} time(s), the ceiling "
+                    f"is {ceiling}; declined rather than retried",
+                )
+                continue
+            if kind == allocation.FOLLOW_UP and item.source_idea_id:
+                source = store.get_idea(item.source_idea_id)
+                if (
+                    source is not None
+                    and source.depth < config.bounds.max_lineage_depth
+                    and lineage.get(source.lineage_root, 0)
+                    >= config.bounds.max_active_per_lineage
+                ):
+                    continue
+            generation[item.request_id] = finished
+            kept[kind].append(item)
+    return (
+        kept[allocation.FOLLOW_UP],
+        kept[allocation.LITERATURE_REQUEST],
+        generation,
+    )
 
 
 def _observe_capability(store: PortfolioStore, report: TickReport, state: Any) -> int:

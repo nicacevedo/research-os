@@ -147,7 +147,9 @@ def _context(
     )
 
 
-def _ask(portfolio: PortfolioStore, project: str) -> tuple[Any, Any]:
+def _ask(
+    portfolio: PortfolioStore, project: str, *, prefix: str = "test"
+) -> tuple[Any, Any]:
     idea, version = seed_idea(portfolio, project)
     portfolio.set_status(idea_id=idea.idea_id, status=IdeaStatus.PROMISING)
     request = litintel.ask(
@@ -156,20 +158,30 @@ def _ask(portfolio: PortfolioStore, project: str) -> tuple[Any, Any]:
         idea_id=idea.idea_id,
         version=version.version,
         question="Do screening and working-set methods share a support path?",
-        source_ref=f"test:{idea.idea_id}",
+        source_ref=f"{prefix}:{idea.idea_id}",
         wait=True,
     )
     return idea, request
 
 
 # =============================================== idea -> verified evidence --
+@pytest.mark.parametrize("prefix", ["novelty", "test"])
 def test_an_idea_asks_and_gets_verified_evidence(
     portfolio: PortfolioStore,
     runtime_db: Database,
     tmp_path: Path,
     runtime_project: str,
+    prefix: str,
 ) -> None:
-    idea, request = _ask(portfolio, runtime_project)
+    """Verified claims become evidence linked by column to the claim.
+
+    A source *key* -- what the novelty exit and the gates count -- only on
+    the answer to the idea's own novelty question; a reading asked for any
+    other reason bears on the claim's truth and must not satisfy the audit's
+    bar for prior work.
+    """
+
+    idea, request = _ask(portfolio, runtime_project, prefix=prefix)
     assert portfolio.require_idea(idea.idea_id).operational_state is (
         OperationalState.BLOCKED_DEPENDENCY
     ), "an idea waiting on its question is an operational wait, not a verdict"
@@ -200,11 +212,24 @@ def test_an_idea_asks_and_gets_verified_evidence(
     )
     assert all(item.work_keys for item in claims)
     evidence = portfolio.list_evidence(idea_id=idea.idea_id)
+    novelty = prefix == "novelty"
     assert {(item.kind, item.strength, item.literature_key) for item in evidence} == {
-        (EvidenceKind.LITERATURE, EvidenceStrength.SUPPORTS, "openalex:W11"),
-        (EvidenceKind.LITERATURE, EvidenceStrength.CONSISTENT_WITH, "openalex:W12"),
+        (
+            EvidenceKind.LITERATURE,
+            EvidenceStrength.SUPPORTS,
+            "openalex:W11" if novelty else None,
+        ),
+        (
+            EvidenceKind.LITERATURE,
+            EvidenceStrength.CONSISTENT_WITH,
+            "openalex:W12" if novelty else None,
+        ),
     }
     assert all(item.summary.startswith("claim PLCL-") for item in evidence)
+    by_id = {item.claim_id: item for item in claims}
+    assert all(item.claim_id in by_id for item in evidence), (
+        "every reading row names its claim by column"
+    )
     assert portfolio.require_request(request.request_id).state is RequestState.CONSUMED
     assert (
         portfolio.require_idea(idea.idea_id).operational_state is OperationalState.IDLE

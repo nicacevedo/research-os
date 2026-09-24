@@ -1663,14 +1663,23 @@ a meta-review's `follow_up_questions`), `RESULT` (a meta-review recommending
 often it is replayed.
 
 **The follow-up explorer** (`follow_up_explorer@1`, its own role). The tick
-buys one per open request, one in flight at a time, *ahead of* idea work so a
-busy portfolio cannot starve its own recursion. It is shown the parent idea,
+buys one per open request, one in flight at a time, *outside* the idea slots
+so a busy portfolio cannot starve its own recursion (and project-level work
+cannot consume every idea slot either). It is shown the parent idea,
 the event and the parent's evidence, and returns children with their lineage
 relation -- its contract has no field for the parent, so it cannot revise it.
 Children pass deterministic deduplication; a duplicate is recorded as
 `CONVERGENCE` on the existing idea. Bounds: `max_children_per_branch`, the
-lineage's active ceiling, `max_lineage_depth` (default 6; deeper requests are
-declined at $0), and a request failing `max_stage_failures` times is declined.
+lineage's active ceiling (a request that meets a full lineage *waits* -- it
+stays open, costs nothing, and the tick serves the next request until the
+lineage has room), `max_lineage_depth` (default 6; deeper requests are
+declined at $0), and a request whose work failed `max_stage_failures` times
+-- counted from the queue's FAILED items plus the malformed answers its
+handler recorded -- is declined, releasing any idea waiting on it. Each work
+item's dedup key carries the request's *generation* (its finished items, read
+from the queue), so no failure mode can spend the key its retry needs. A
+replay after a crash between the children and the close closes the request
+from the provenance the first attempt recorded, with no second call.
 
 **A child never edits its parent.** It is a new idea -- new versions, new
 contract, a lineage edge, provenance naming the request -- and the parent's
@@ -1689,17 +1698,27 @@ existed.
 nothing left to run an explicit state: `REJECTED` when a fatal objection to
 its claim stands, otherwise `PARKED` with the reason and a revisit condition
 -- except the thin-novelty dead end, which first asks the literature (§21)
-and waits (`BLOCKED_DEPENDENCY`, an operational state). It runs at the end of
-every stage and in the tick, so ideas left in limbo by earlier builds settle
-too. A meta-review recommending `REJECT` or `PARK` now does so; `VALIDATED`
-ideas with nothing left to run are closed for synthesis (§22).
+and waits (`BLOCKED_DEPENDENCY`, an operational state), and the lineage
+ceiling, which parks the idea with a machine-read revisit condition that the
+tick lifts once the lineage has room for the idea and a child. It runs in the
+tick, from committed rows, as a compare-and-set on the status it read and on
+the idea being idle: a worker that moved the idea in between wins. (It ran at
+the end of each stage too, while that stage's action was still ACTIVE, where
+it re-selected the stage that had just run; that call was removed.) A meta-review recommending `REJECT` or `PARK` now does so; `VALIDATED`
+ideas with nothing left to run are closed for synthesis (§22), and an idle
+`VALIDATED` idea no longer holds one of its lineage's slots.
 
 **Explorer boundaries.** The blind explorer is shown the charter and nothing
 from the bank, seeds or capsule hypotheses, and may cite nothing
-(`derived_from` must be empty). The failure-mining explorer (v2) is shown
+(`derived_from` must be empty). The failure-mining explorer (v3) is shown
 rejected ideas, standing objections, and the failed and inconclusive
-measurements; a candidate naming a rejected idea becomes its child. Every
-cited source is checked against what was supplied, fail-closed.
+measurements; a candidate naming a rejected idea becomes its child, subject
+to the same depth bound and lineage ceiling a follow-up child meets. The
+seeded explorer (v2) is shown each seed *with its id*. Every explorer that
+is shown sources -- seeded, failure-mining, literature -- must cite at least
+one per direction, and every cited id is checked against what was actually
+rendered into its prompt (recorded as the prompt is assembled, not re-read
+afterwards), fail-closed. Only the seeds shown are consumed.
 
 ## 21. Literature intelligence
 
@@ -1716,8 +1735,16 @@ was found in the cited source's stored text) and immutability by trigger.
   the existing A0 retrieval, behind an injected retriever), then an index
   search, then `literature_reader@1` answers from the packet alone. Ordinary
   code verifies every citation and quotation before anything is stored;
-  one invented key or misquotation invalidates the whole reading. Claims
-  bearing on the idea become `LITERATURE` evidence rows bound to its version.
+  one invented key or misquotation invalidates the whole reading, and a
+  quotation must be long enough to mean something and be found in the work
+  it cites. Claims bearing on the idea become `LITERATURE` evidence rows
+  bound to the asking version and linked to the claim by column
+  (`idea_evidence.claim_id`, unique per version, so a replayed reading adds
+  nothing). Only an answer to the idea's own novelty question sets a source
+  key -- what the novelty exit and the gates count; a reading raised by a
+  reviewer bears on whether the claim is true, not on prior work. No reading
+  adds evidence to a `VALIDATED` or `HUMAN_READY` idea (its reviews would go
+  stale over nothing anyone asked for); the claims are still recorded.
 - **Literature-driven discovery.** A verified gap or disagreement raises a
   `LITERATURE` follow-up request against the asking idea; and
   `literature_explorer@1`, shown only frontier claims and the charter,
@@ -1758,3 +1785,77 @@ basis digest -- the tick buys one synthesis, once per basis.
   Accepting a claim remains a person's act (`researchctl review`).
 
 Tests: `tests/test_portfolio_synthesis.py`.
+
+## 23. Integrity hardening after independent review
+
+Four independent reviews of §19.10-§22 (provenance, scientific integrity,
+the state machine, and an adversarial mutation review of the tests) found
+defects that the tests had not. Each fix below has a regression test that
+fails without it (`tests/test_portfolio_integrity_regressions.py`, and the
+mutation-killer files beside it).
+
+**The database keeps its records.** A contract's documents
+(`analysis/design/contract_artifact_id`) cannot be re-pointed; FROZEN may
+become SUPERSEDED and nothing else, and not at all once anything has been
+read under it; a SUPERSEDED contract is finished. An experiment's reading
+(`job_id` once finished, `analysis_artifact_id`, `conclusion`, `evidence_id`)
+is set once and `INTERPRETED` is terminal. Frontier requests are immutable
+apart from one OPEN-to-closed transition. Contracts, provenance and requests
+are removed only when their *project* is deleted: the old exemption ("any
+cascade") let deleting one idea erase its contracts and provenance. Literature
+claims are immutable except for the cascade-to-NULL of a deleted idea or
+request.
+
+**A reading is one fact.** The evidence row and `INTERPRETED` are written in
+one transaction (`PortfolioStore.record_reading`); a contract counts as read
+if any part of a reading exists; a repair retires the failed execution and
+records its successor in one transaction. Retiring a contract retires its
+operationally failed execution too.
+
+**The analysis engine refuses what it cannot decide.** A selection it cannot
+evaluate, a type mismatch in an equality, a count over zero analysed records
+and a support rule met only outside the selected records are INSUFFICIENT,
+never a defined number. A bootstrap needs a minimum number of records; a
+fraction may use a Wilson score interval, which does not collapse at 0 or 1.
+Every reading records the engine version that computed it. A contract's
+analysis reads only outputs that were collected and hashed.
+
+**What the designer is shown, and what the reviewer is shown.** The seeds
+the program reads arrive through the execution environment, so `env` and the
+environment identity are part of the frozen design and compared before
+anything runs. The analysis's free text may not restate a threshold, and the
+idea text shown to the experiment designer has any number equal to a
+threshold withheld. The evidence a reviewer reads now carries the frozen
+analysis in full (estimand, observables, every reduction with its selection,
+support), the record counts, the design's falsification criterion, the
+number of execution attempts, and every earlier reading of the question in
+the idea's lineage that existed when the contract froze.
+
+**Replication must be independent.** A replication that differs from its
+primary only in resources or time limit is refused; one whose outputs are
+byte-identical to the primary's in every source the analysis reads is
+INSUFFICIENT whatever it concluded.
+
+**Readings older than the frontier.** A measurement read before frontier
+requests existed raised none, so after migration its idea was parked with
+"a follow-up idea answers what the measurement left open" and nothing would
+ever meet it -- found by running the migrations and the tick on a snapshot of
+the real cg/ccao portfolio (281 ideas). Continuation now raises the request
+for the settled measurement itself, once, by the key interpretation uses.
+
+**What remains, stated rather than hidden.**
+
+- The experiment designer still sees the *direction* of the claim; it has to,
+  to design a test of it. It could choose conditions favourable to that
+  direction; the frozen support requirements and the replication rule are
+  the defences, not a guarantee.
+- A revision or a follow-up child can be preregistered after a result was
+  known. This is disclosed in the evidence, not prevented: revising is how an
+  idea answers its critics.
+- An operationally failed run is resubmitted up to the stage ceiling; a
+  command whose exit status depends on its result could turn that into
+  "retry until it passes". The attempt count is disclosed.
+- All model roles in the default configuration may resolve to one provider
+  family. Role separation is enforced by the router and by the data each role
+  is given; it is not independent-provider review, and the board's measured
+  independence is recorded as what it is.

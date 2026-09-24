@@ -108,22 +108,45 @@ create index if not exists scientific_contracts_parent_idx
 -- future keyword argument all have to pass through it.
 --
 -- The analysis half never changes after insert. The design half never
--- changes once written. SUPERSEDED is terminal, FROZEN may only become
--- SUPERSEDED, and nothing re-enters ANALYSIS_FROZEN. A direct DELETE is
--- refused; a cascade from deleting the project (an operator act on
--- operational state) is allowed, detected by trigger depth because a
--- cascaded delete arrives through the referential-integrity trigger.
+-- changes once written. SUPERSEDED is terminal and nothing about a superseded
+-- contract changes again; FROZEN may only become SUPERSEDED, and not at all
+-- once a measurement has been *read* under it -- otherwise a second
+-- preregistration of the same question could be frozen after the first
+-- result existed. Nothing re-enters ANALYSIS_FROZEN. A delete is refused
+-- while the project exists: only deleting the project itself (an operator
+-- act on operational state, by which time the project row is gone) removes
+-- a contract, and deleting an idea or a version does not.
 create or replace function scientific_contracts_immutable() returns trigger
 language plpgsql as $$
 begin
     if tg_op = 'DELETE' then
-        if pg_trigger_depth() < 2 then
+        if exists (select 1 from projects where project_id = old.project_id) then
             raise exception
                 'scientific contract % is a frozen scientific record and is never deleted',
                 old.contract_id
                 using errcode = 'check_violation';
         end if;
         return old;
+    end if;
+    if old.state = 'SUPERSEDED' and (
+           new.state <> old.state
+           or new.design_digest is distinct from old.design_digest
+           or new.contract_digest is distinct from old.contract_digest
+           or new.frozen_at is distinct from old.frozen_at
+           or new.capability_request is distinct from old.capability_request) then
+        raise exception 'scientific contract % is superseded and nothing about it changes',
+            old.contract_id
+            using errcode = 'check_violation';
+    end if;
+    if old.state = 'FROZEN' and new.state = 'SUPERSEDED' and exists (
+           select 1 from idea_experiments e
+            where e.contract_id = old.contract_id
+              and (e.state = 'INTERPRETED' or e.evidence_id is not null
+                   or e.analysis_artifact_id is not null)) then
+        raise exception
+            'scientific contract % has a measurement read under it and cannot be superseded',
+            old.contract_id
+            using errcode = 'check_violation';
     end if;
     if new.contract_id <> old.contract_id
        or new.project_id <> old.project_id
@@ -196,6 +219,23 @@ create index if not exists idea_experiments_contract_idx
 create or replace function idea_experiments_frozen() returns trigger
 language plpgsql as $$
 begin
+    -- A reading, once recorded, is the record: set once, and an INTERPRETED
+    -- experiment stays INTERPRETED. The job may change only while nothing
+    -- has been read from it -- a retry after an operational failure is a new
+    -- submission of the same preregistration, and a finished run is not.
+    if (old.job_id is not null and new.job_id is distinct from old.job_id
+           and (old.state in ('COMPLETED','INTERPRETED')
+                or old.analysis_artifact_id is not null))
+       or (old.analysis_artifact_id is not null
+           and new.analysis_artifact_id is distinct from old.analysis_artifact_id)
+       or (old.conclusion is not null and new.conclusion is distinct from old.conclusion)
+       or (old.evidence_id is not null and new.evidence_id is distinct from old.evidence_id)
+       or (old.state = 'INTERPRETED' and new.state <> 'INTERPRETED') then
+        raise exception
+            'experiment % has been read, and what was read is not rewritten',
+            old.experiment_id
+            using errcode = 'check_violation';
+    end if;
     if new.experiment_id <> old.experiment_id
        or new.idea_id <> old.idea_id
        or new.idea_version <> old.idea_version

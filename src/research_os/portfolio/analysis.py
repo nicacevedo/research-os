@@ -76,6 +76,23 @@ MIN_FINITE_RESAMPLES = 0.9
 #: How close to singular a regression's normal equations may be.
 SINGULAR_TOLERANCE = 1e-10
 
+#: The fewest analysed records a percentile bootstrap may resample. Below it
+#: the interval is an artefact of the resampling, not of the data -- an
+#: independent review measured a one-record "interval" of [1.01, 1.01]
+#: clearing a threshold -- and the conclusion is INSUFFICIENT.
+MIN_BOOTSTRAP_RECORDS = 10
+
+#: Below this many records a bootstrap distribution with no spread at all is
+#: read as insufficient rather than as certainty: five of five successes
+#: resample to p = 1 every time, and the exact interval would reach ~0.48.
+MIN_DEGENERATE_RECORDS = 30
+
+#: The evaluator's own identity, recorded with every reading. The digests
+#: bind the *specification*; this binds the semantics that read it, so a
+#: later change to how an analysis is evaluated is visible beside every
+#: conclusion reached before it.
+ENGINE_VERSION = "portfolio.analysis@1"
+
 
 @dataclass(frozen=True, slots=True)
 class Unavailable:
@@ -101,6 +118,7 @@ class AnalysisResult:
         """The part of the analysis document this module is responsible for."""
 
         return {
+            "engine": ENGINE_VERSION,
             "conclusion": str(self.conclusion),
             "primary_statistic_value": self.statistic,
             "interval": list(self.interval) if self.interval else None,
@@ -262,13 +280,25 @@ def _holds(condition: Condition, value: Any) -> bool | None:
             ">": left > right,
             ">=": left >= right,
         }[comparator]
-    left_number, right_number = _number(value), _number(wanted)
-    if left_number is not None and right_number is not None:
-        equal = left_number == right_number
-    elif isinstance(value, bool) or isinstance(wanted, bool):
+    # Equality is typed. A number equals a number, a boolean a boolean and a
+    # string a string; anything else is *undefined*, never "not equal". An
+    # independent review found the first version reading a CSV's "False"
+    # against a condition `converged == false` as a clean non-match -- so
+    # seven failed runs of ten counted as none, and a rule on the failure
+    # fraction read SUPPORTS. An undefined comparison makes the record
+    # incomplete, which the contract's own policy then decides.
+    if isinstance(value, bool) or isinstance(wanted, bool):
+        if not (isinstance(value, bool) and isinstance(wanted, bool)):
+            return None
         equal = value is wanted
     else:
-        equal = str(value) == str(wanted)
+        left_number, right_number = _number(value), _number(wanted)
+        if left_number is not None and right_number is not None:
+            equal = left_number == right_number
+        elif isinstance(value, str) and isinstance(wanted, str):
+            equal = value == wanted
+        else:
+            return None
     return equal if comparator == "==" else not equal
 
 
@@ -288,6 +318,13 @@ def _required_fields(spec: AnalysisSpec) -> dict[str, tuple[set[str], set[str]]]
             continue
         present, numeric = required[reduction.observable]
         present.update(reduction.fields_read())
+        # A field compared by an inequality anywhere must be a number in
+        # every record -- otherwise the comparison is undefined for it.
+        numeric.update(
+            condition.field
+            for condition in reduction.where
+            if condition.comparator in {"<", "<=", ">", ">="}
+        )
         if reduction.op in FIELD_OPERATIONS or reduction.op == "correlation":
             numeric.update(
                 item for item in (reduction.field, reduction.other_field) if item
@@ -302,12 +339,24 @@ def _required_fields(spec: AnalysisSpec) -> dict[str, tuple[set[str], set[str]]]
     return required
 
 
+def _selection_conditions(spec: AnalysisSpec, observable: str) -> list[Condition]:
+    """Every `where` condition any reduction applies to this observable."""
+
+    return [
+        condition
+        for reduction in spec.reductions
+        if reduction.observable == observable
+        for condition in reduction.where
+    ]
+
+
 def _records(
     observable: Observable,
     document: Any,
     *,
     present: set[str],
     numeric: set[str],
+    selections: Sequence[Condition] = (),
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     """Filter one records observable. Raises ``_Undefined`` on a hard failure."""
 
@@ -348,7 +397,14 @@ def _records(
             _holds(condition, values[condition.field])
             for condition in observable.include
         ]
-        if any(item is None for item in verdicts):
+        # A record for which some reduction's selection cannot be decided is
+        # incomplete for the whole observable, so every reduction sees the
+        # same records and a fraction's numerator and denominator agree.
+        undecidable = any(
+            _holds(condition, values[condition.field]) is None
+            for condition in selections
+        )
+        if any(item is None for item in verdicts) or undecidable:
             counts["incomplete"] += 1
             continue
         if not all(verdicts):
@@ -489,6 +545,14 @@ def _reduce(
     frame = frames[reduction.observable]
     if op == "value":
         return float(frame)
+    if not frame:
+        # A count of nothing is not zero violations. An independent review
+        # found "violations == 0" reading SUPPORTS for a run that wrote `[]`,
+        # a header-only CSV, or records every one of which was excluded.
+        raise _Undefined(
+            f"{reduction.name}: {reduction.observable} has no analysed records, so "
+            f"nothing was measured"
+        )
     rows = _selected(frame, reduction.where)
     if op == "count":
         return float(len(rows))
@@ -550,6 +614,16 @@ def _compute(
     return computed, notes
 
 
+def _chain(spec: AnalysisSpec, name: str) -> set[str]:
+    """The reductions the named one depends on, itself included."""
+
+    by_name = {item.name: item for item in spec.reductions}
+    found = {name}
+    for other in by_name[name].of:
+        found |= _chain(spec, other)
+    return found
+
+
 def _dependencies(spec: AnalysisSpec, name: str) -> set[str]:
     """The records observables the named reduction reads, transitively."""
 
@@ -586,6 +660,12 @@ def _bootstrap(
         )
     if any(not frames[name] for name in resampled):
         return None, "an observable the bootstrap resamples has no analysed records"
+    smallest = min(len(frames[name]) for name in resampled)
+    if smallest < MIN_BOOTSTRAP_RECORDS:
+        return None, (
+            f"a bootstrap over {smallest} record(s) is not an interval; at least "
+            f"{MIN_BOOTSTRAP_RECORDS} analysed records are required"
+        )
     generator = random.Random(uncertainty.seed)
     values: list[float] = []
     for _ in range(uncertainty.resamples):
@@ -604,8 +684,42 @@ def _bootstrap(
             f"only {len(values)} of {uncertainty.resamples} bootstrap resamples gave "
             f"a defined statistic, so no interval is reported"
         )
+    if min(values) == max(values) and smallest < MIN_DEGENERATE_RECORDS:
+        return None, (
+            f"every resample of {smallest} records gave the same value, which "
+            f"claims a certainty {smallest} records cannot give"
+        )
     tail = (1.0 - uncertainty.level) / 2.0
     return (_quantile(values, tail), _quantile(values, 1.0 - tail)), ""
+
+
+def _wilson(
+    spec: AnalysisSpec, frames: Mapping[str, Any]
+) -> tuple[tuple[float, float] | None, str]:
+    """The Wilson score interval for a fraction. Closed form, no resampling.
+
+    The right interval for a proportion near 0 or 1, where a percentile
+    bootstrap collapses to a point: five of five successes give [0.57, 1.0]
+    at 95%, not [1, 1].
+    """
+
+    from statistics import NormalDist
+
+    assert spec.uncertainty is not None
+    reduction = next(
+        item for item in spec.reductions if item.name == spec.primary_statistic
+    )
+    frame = frames[reduction.observable]
+    n = len(frame)
+    if n == 0:
+        return None, "there are no analysed records to take a fraction of"
+    k = len(_selected(frame, reduction.where))
+    z = NormalDist().inv_cdf(1.0 - (1.0 - spec.uncertainty.level) / 2.0)
+    p_hat = k / n
+    denominator = 1.0 + z * z / n
+    centre = (p_hat + z * z / (2 * n)) / denominator
+    half = (z / denominator) * math.sqrt(p_hat * (1 - p_hat) / n + z * z / (4 * n * n))
+    return (max(0.0, centre - half), min(1.0, centre + half)), ""
 
 
 # -------------------------------------------------------------- evaluate --
@@ -655,6 +769,8 @@ def _described(spec: AnalysisSpec, statistic: float) -> str:
         what = f"correlation of {reduction.field} and {reduction.other_field} over {reduction.observable}"
     else:
         what = f"{reduction.op} of {reduction.field} over {reduction.observable}"
+    if reduction.where:
+        what += " where " + " and ".join(item.rendered() for item in reduction.where)
     return f"{spec.primary_statistic} ({what}) = {statistic:.6g}"
 
 
@@ -699,7 +815,11 @@ def evaluate(spec: AnalysisSpec, documents: Mapping[str, Any]) -> AnalysisResult
         present, numeric = required[observable.name]
         try:
             rows, counts = _records(
-                observable, document, present=present, numeric=numeric
+                observable,
+                document,
+                present=present,
+                numeric=numeric,
+                selections=_selection_conditions(spec, observable.name),
             )
         except _Undefined as exc:
             return _insufficient(str(exc), records=records)
@@ -742,6 +862,37 @@ def evaluate(spec: AnalysisSpec, documents: Mapping[str, Any]) -> AnalysisResult
                     f"records of {rule.observable!r} and the contract requires {wanted}"
                 )
         support.append(entry)
+    # And the same requirements over every *selection* the primary statistic
+    # is computed on. A support rule stated for an observable is about the
+    # data a statistic rests on, and a reduction that computes on a subset
+    # rests on the subset: an independent review met a regression over
+    # `regime == "hard"` -- three records, two levels -- passing a rule of
+    # twelve records and five levels checked over the whole observable, which
+    # is the co-design the rule exists to stop moved one filter inward.
+    # `count` and `fraction` are exempt: their selection is what is counted.
+    rules = {}
+    for rule in spec.support:
+        rules.setdefault(rule.observable, []).append(rule)
+    by_name = {item.name: item for item in spec.reductions}
+    for name in sorted(_chain(spec, spec.primary_statistic)):
+        reduction = by_name[name]
+        if not reduction.where or reduction.op in {"count", "fraction", "value"}:
+            continue
+        subset = _selected(frames.get(reduction.observable, ()), reduction.where)
+        for rule in rules.get(reduction.observable, ()):
+            if len(subset) < rule.min_records:
+                unmet.append(
+                    f"{reduction.name} computes on {len(subset)} record(s) of "
+                    f"{rule.observable!r} and the contract requires {rule.min_records}"
+                )
+            for field_name, wanted in sorted(rule.min_distinct.items()):
+                distinct = len({_hashable(row[field_name]) for row in subset})
+                if distinct < wanted:
+                    unmet.append(
+                        f"{reduction.name} computes on records where {field_name!r} "
+                        f"takes {distinct} distinct value(s); the contract requires "
+                        f"{wanted}"
+                    )
     if unmet:
         return _insufficient(
             "the data do not support the preregistered analysis: " + "; ".join(unmet),
@@ -766,7 +917,11 @@ def evaluate(spec: AnalysisSpec, documents: Mapping[str, Any]) -> AnalysisResult
 
     interval: tuple[float, float] | None = None
     if spec.uncertainty is not None:
-        interval, why = _bootstrap(spec, frames)
+        interval, why = (
+            _wilson(spec, frames)
+            if spec.uncertainty.method == "wilson_score"
+            else _bootstrap(spec, frames)
+        )
         if interval is None:
             return _insufficient(
                 f"{spec.primary_statistic} = {statistic:.6g}, but the "
@@ -800,7 +955,10 @@ def evaluate(spec: AnalysisSpec, documents: Mapping[str, Any]) -> AnalysisResult
     if interval is not None:
         assert spec.uncertainty is not None
         shown += (
-            f" ({spec.uncertainty.level:g} bootstrap interval "
+            f" ({spec.uncertainty.level:g} Wilson score interval "
+            f"[{interval[0]:.6g}, {interval[1]:.6g}])"
+            if spec.uncertainty.method == "wilson_score"
+            else f" ({spec.uncertainty.level:g} bootstrap interval "
             f"[{interval[0]:.6g}, {interval[1]:.6g}], "
             f"{spec.uncertainty.resamples} resamples, seed {spec.uncertainty.seed})"
         )
