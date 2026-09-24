@@ -988,19 +988,22 @@ number.
 ```text
 runtime DB / artifacts
    → deterministic snapshot
-   → Curator worktree (outside the researcher's ordinary tree)
-   → research-os/autonomous branch
+   → Curator checkout, one per (project, repository), detached,
+     outside the researcher's ordinary tree
+   → research-os/autonomous branch, moved by compare-and-swap
 ```
 
 | property | mechanism |
 |---|---|
-| sole serialized writer | `repository_lock(db, repo_path)` — the *same* `LockClass.REPOSITORY_MUTATION` the coding pipeline takes for `git worktree add`, so the two serialise against each other rather than each holding a lock the other ignores |
+| sole serialized writer | `repository_lock(db, repo_path)` — the *same* `LockClass.REPOSITORY_MUTATION` the coding pipeline takes for `git worktree add`, so the two serialise against each other rather than each holding a lock the other ignores — and a kernel `flock` on the checkout, because an advisory lock in one operational database does not serialise two installations sharing a state home |
+| one checkout per repository | `checkout_path(project, repository)` is keyed on both. Keyed on the project alone, a project re-pointed at another checkout of itself met the old repository's worktree in its directory, and every way of removing it was wrong — the first live qualification failed there. A checkout of a repository the project has left is left alone |
 | does not fail concurrent coding runs | `refs/heads/research-os/autonomous` is in `runtime/refs.py::RESERVED_REF_PREFIXES` and is excluded from `canonical_fingerprint`. Without it, curating during a coding run makes that run report an escape it did not commit — the identical failure `coding.py`'s own docstring records having had once before, with a different writer |
 | the blind spot that creates is covered | the Curator records the commit it last wrote and **refuses to commit onto a tip it does not recognise**, naming the unexpected sha. The fingerprint guards refs nothing in this system writes; the one namespace this system writes guards itself |
 | deterministic ordering | every collection sorted by id before rendering; no dict iteration order reaches a file |
 | idempotent snapshot | the rendered tree's digest is computed first; a snapshot equal to the recorded one commits nothing |
-| restart recovery | the worktree is reset to the branch tip before rendering, so a crash mid-write leaves no partial state |
-| the human branch is untouched | the Curator worktree is checked out on the reserved branch and the Curator has no code path that names another ref |
+| restart recovery | the checkout is reset to the verified tip before rendering, so a crash mid-write leaves no partial state; each commit (the orphan root included) is recorded *before* it is published, so no failure leaves a Curator commit on the branch unrecorded, and a recorded commit whose one parent is the tip is read as a publish that never happened |
+| a stale checkout never wedges curation | `_clear` takes the route the checkout's state needs — registered with its directory gone, registered with its gitlink gone, locked by an interrupted `git worktree add`, or registered nowhere — and refuses, with a sentence, a lock a person set, a symbolic link, a directory holding a repository of its own, and another repository's worktree |
+| the human branch is untouched | the checkout is detached, and the Curator moves only `refs/heads/research-os/autonomous`, with `update-ref <new> <verified tip>`; it has no code path that names another ref, and the reserved branch is checked out nowhere |
 | performs no scientific reasoning | the module imports no prompt, no router and no model provider; asserted by the authority test that parses the package |
 
 ### What it writes
@@ -1151,7 +1154,7 @@ properties that must survive.
 | DB reconnect / duplicate event | two tracks for one idea | the active-track partial unique index |
 | malformed model response | prose becomes idea content | schema validation before any write; `MODEL_OUTPUT_INVALID` |
 | a reviewer fails | promotion on two reviews | the gate counts *live* reviews; two is not three |
-| Curator crash | a partial or wrong bank commit | reset-to-tip before render; digest equality before commit; the repository lock released by the server on session death |
+| Curator crash | a partial or wrong bank commit, or its own commit refused as foreign | reset-to-tip before render; digest equality before commit; record before publish; the repository lock released by the server and the checkout `flock` by the kernel on death |
 | Curator meets an unexpected tip | committing on top of something it did not write | refuses, and names the sha |
 | experiment crash | a refutation retried until it stops refuting | unchanged: `FailureClass` has no member for "the science came out negative", by construction |
 | budget exhausted | a scientific rejection | `BLOCKED_BUDGET`, status untouched |

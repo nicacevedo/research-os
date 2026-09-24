@@ -3136,6 +3136,26 @@ class PortfolioStore:
                 (commit, digest, project_id),
             )
 
+    def record_bank_intent(self, *, project_id: str, commit: str) -> None:
+        """Record the commit the Curator is about to point its branch at.
+
+        The orphan root, and then every commit, written *before* the ref
+        moves -- so the branch never holds a Curator commit this system has
+        no record of, which is the state that wedged the first live
+        qualification (the root) and that a failure between ``git commit``
+        and :meth:`record_bank_write` used to leave (every commit after it).
+        The snapshot digest is cleared rather than kept, so the next pass
+        confirms the bank rather than trusting a publish that may not have
+        happened.
+        """
+
+        with self._db.tx() as conn:
+            conn.execute(
+                "update portfolio_state set bank_commit = %s, bank_digest = null, "
+                "updated_at = now() where project_id = %s",
+                (commit, project_id),
+            )
+
     def touch_tick(self, project_id: str, *, charter_digest: str | None = None) -> None:
         with self._db.tx() as conn:
             conn.execute(

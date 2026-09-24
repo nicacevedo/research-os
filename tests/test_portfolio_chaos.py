@@ -28,7 +28,7 @@ from pathlib import Path
 import pytest
 
 from research_os.portfolio.config import load_config
-from research_os.portfolio.curator import BANK_ROOT, curate, worktree_root
+from research_os.portfolio.curator import BANK_ROOT, checkout_path, curate
 from research_os.portfolio.models import (
     ActionStatus,
     IdeaStatus,
@@ -397,7 +397,7 @@ def test_a_curator_crash_leaves_nothing_half_written(
     seed_idea(portfolio, runtime_project)
     curate(db=runtime_db, project_id=runtime_project, repository=repository)
 
-    target = worktree_root() / runtime_project
+    target = checkout_path(runtime_project, repository)
     (target / BANK_ROOT / "ideas" / "PIDEA-HALF-WRITTEN.md").write_text(
         "half a file from a worker that died\n", encoding="utf-8"
     )

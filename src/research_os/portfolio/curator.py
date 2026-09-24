@@ -45,13 +45,13 @@ import hashlib
 import json
 import logging
 import shutil
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
 
 from research_os.automation import gitutil
-from research_os.errors import ResearchOSError
+from research_os.errors import ResearchOSError, RunLockedError
 from research_os.ids import validate_project_id
 from research_os.paths import state_home
 from research_os.portfolio.gates import board_independence
@@ -62,6 +62,7 @@ from research_os.portfolio.models import (
     PortfolioIdea,
 )
 from research_os.portfolio.store import PortfolioStore
+from research_os.runlock import run_lock
 from research_os.runtime.db import Database
 from research_os.runtime.locks import RepositoryBusyError, repository_lock
 from research_os.runtime.refs import AUTONOMOUS_BANK_BRANCH
@@ -590,7 +591,15 @@ def curate(
     ideas = store.list_ideas(project_id=project_id, limit=2_000)
 
     try:
-        with repository_lock(db, str(repository)):
+        with (
+            repository_lock(db, str(repository)),
+            _checkout_lock(project_id, repository),
+        ):
+            # Read again under the locks. The copy above was read before them,
+            # so a worker that waited behind another's commit would verify the
+            # tip against a watermark that is no longer current and report
+            # the other worker's commit as a foreign write.
+            state = store.get_state(project_id) or state
             # The tip is verified *before* the "nothing changed" shortcut, not
             # after it. The shortcut is the common case on an idle portfolio,
             # and the first version returned from it without reading the
@@ -617,8 +626,11 @@ def curate(
                 project_id=project_id,
                 files=files,
                 expected_tip=state.bank_commit,
+                record=lambda intended: store.record_bank_intent(
+                    project_id=project_id, commit=intended
+                ),
             )
-    except RepositoryBusyError as exc:
+    except (RepositoryBusyError, RunLockedError) as exc:
         return CurationResult(
             project_id=project_id,
             branch=AUTONOMOUS_BANK_BRANCH,
@@ -644,35 +656,90 @@ def curate(
     )
 
 
+def checkout_path(project_id: str, repository: Path) -> Path:
+    """The Curator's checkout for one project *in one repository*.
+
+    Keyed on the repository as well as the project, and it was keyed on the
+    project alone -- which is the root of the first live qualification's
+    failure. A project re-pointed at another checkout of itself (the
+    canonical repository after a trial clone, a re-clone, a restored backup)
+    found the directory still holding the *old* repository's worktree, and
+    every way of getting it out of the way was wrong: this repository cannot
+    remove a worktree it never registered; the one that registered it may be
+    another installation's, in use; and deleting the directory leaves that
+    repository's registration pointing at whatever the Curator puts there
+    next. A path per repository makes the collision impossible instead of
+    handled. A checkout of a repository this project has moved away from is
+    left exactly as it is: a valid worktree of that repository, adopted
+    again if the project ever moves back, and nobody else's to remove.
+
+    Validated before it is joined into a path. `ids.validate_project_id`
+    enforces the same pattern the capsule does; it was enforced at capsule
+    init and not at this boundary, and this boundary is the one that makes a
+    directory.
+    """
+
+    validate_project_id(project_id)
+    key = hashlib.sha256(str(repository.resolve()).encode("utf-8")).hexdigest()[:12]
+    return worktree_root() / f"{project_id}--{key}"
+
+
+def _checkout_lock(project_id: str, repository: Path) -> Any:
+    """One writer per checkout, across every installation on this machine.
+
+    ``repository_lock`` is an advisory lock in *one* operational database, so
+    two installations sharing a state home -- which is how the first live
+    qualification was configured -- do not serialise against each other on
+    it, while both write in the same directory. A kernel ``flock`` under the
+    state home does: it is shared by everything that uses that state home,
+    and it is released when its holder dies, however it dies. Holding it is
+    also what makes a Git lock file left in this checkout provably stale.
+    """
+
+    return run_lock(
+        f"curator-{checkout_path(project_id, repository).name}",
+        action="curate the autonomous bank",
+    )
+
+
 def _write(
     *,
     repository: Path,
     project_id: str,
     files: dict[str, str],
     expected_tip: str | None,
+    record: Callable[[str], None],
 ) -> str:
-    """Materialise the bank in a worktree of its own and commit it.
+    """Materialise the bank in a checkout of its own and commit it.
 
-    The worktree lives under the state home, never inside the researcher's
+    The checkout lives under the state home, never inside the researcher's
     repository, so their ``git status`` never mentions it.
+
+    **The branch is moved by compare-and-swap, never by a checkout.** The
+    checkout is detached: it is where the tree is assembled and nothing
+    more. The commit is made with ``commit-tree`` on the tip that was just
+    verified, recorded, and only then published with ``update-ref <new>
+    <verified tip>``. Three things follow. The Curator's own commit is never
+    on the branch unrecorded -- a failure between ``git commit`` and the
+    watermark used to leave exactly that, and every later pass refused the
+    Curator's own work as a foreign write. A writer that moves the branch
+    between the check and the publish makes the publish fail rather than
+    become the new commit's parent. And the reserved branch is checked out
+    nowhere, so no stale checkout can hold it.
     """
 
-    # Validated before it is joined into a path. `ids.validate_project_id`
-    # enforces the same pattern the capsule does; it was enforced at capsule
-    # init and not at this boundary, and this boundary is the one that makes a
-    # directory.
-    validate_project_id(project_id)
-    target = worktree_root() / project_id
+    target = checkout_path(project_id, repository)
     # Verified *before* the branch is created, because `_ensure_branch` would
     # otherwise make the branch exist and the check would then refuse the
     # Curator's own first write.
     _verify_tip(repository, expected_tip=expected_tip)
-    base = _ensure_branch(repository)
+    base = _ensure_branch(repository, record=record)
     _ensure_worktree(repository=repository, target=target, base=base)
+    _clear_stale_git_locks(target)
 
-    # Reset to the tip before rendering, so a crash mid-write leaves nothing
-    # for the next pass to commit.
-    gitutil.git(["reset", "--hard", "HEAD"], cwd=target, check=False)
+    # Reset to the verified tip before rendering, whatever the checkout held,
+    # so a crash mid-write leaves nothing for the next pass to commit.
+    gitutil.git(["reset", "-q", "--hard", base], cwd=target)
     gitutil.git(["clean", "-fd", BANK_ROOT.split("/")[0]], cwd=target, check=False)
 
     for relative, body in sorted(files.items()):
@@ -681,23 +748,40 @@ def _write(
         path.write_text(body, encoding="utf-8")
 
     gitutil.git(["add", "--", BANK_ROOT.split("/")[0]], cwd=target)
-    status = gitutil.porcelain_status(target)
-    if not status:
-        return gitutil.head_commit(target)
-    gitutil.git(
+    tree = gitutil.git(["write-tree"], cwd=target).stdout.strip()
+    if (
+        tree
+        == gitutil.git(["rev-parse", f"{base}^{{tree}}"], cwd=target).stdout.strip()
+    ):
+        return base
+    commit = gitutil.git(
         [
             "-c",
             "user.name=Research OS Curator",
             "-c",
             "user.email=curator@research-os.invalid",
-            "commit",
-            "--no-verify",
+            "commit-tree",
+            tree,
+            "-p",
+            base,
             "-m",
             f"Autonomous bank: {len(files)} file(s)",
         ],
         cwd=target,
+    ).stdout.strip()
+    if not commit:
+        raise CuratorError(f"could not commit the bank in {target}")
+    record(commit)
+    gitutil.git(
+        ["update-ref", f"refs/heads/{AUTONOMOUS_BANK_BRANCH}", commit, base],
+        cwd=repository,
     )
-    return gitutil.head_commit(target)
+    # The checkout's own HEAD, so it says what it holds. Not load-bearing --
+    # the next pass resets to the verified tip regardless -- but a checkout
+    # listed at the old commit with the new tree staged misleads whoever
+    # looks at it.
+    gitutil.git(["reset", "-q", "--soft", commit], cwd=target)
+    return commit
 
 
 #: The empty tree, which every Git repository has whether or not anything
@@ -718,6 +802,13 @@ def _verify_tip(repository: Path, *, expected_tip: str | None) -> None:
       because creating a reserved ref is deliberately permitted by the coding
       pipeline's escape check. Adopting it silently would let the Curator's own
       history be rooted on somebody else's commit.
+
+    One case is not a refusal: the recorded commit is the Curator's *intended*
+    next commit, whose one parent is the tip. The watermark is written before
+    the branch moves (:func:`_write`), so that is the state a failure between
+    the two leaves -- the publish never happened, and the tip is still the
+    commit the Curator wrote before it. Only the database can put a commit in
+    the watermark, so the tip still has to be the Curator's own.
     """
 
     if not gitutil.branch_exists(repository, AUTONOMOUS_BANK_BRANCH):
@@ -732,16 +823,31 @@ def _verify_tip(repository: Path, *, expected_tip: str | None) -> None:
             f"operational database was reset, delete the branch or re-point the "
             f"watermark deliberately; if it was not, something else created it."
         )
-    if tip != expected_tip:
-        raise UnexpectedBankTipError(
-            f"{AUTONOMOUS_BANK_BRANCH} is at {tip}, and the Curator last wrote "
-            f"{expected_tip}. Something else has written to this system's "
-            f"reserved ref namespace. Refusing to commit on top of it."
-        )
+    if tip == expected_tip or _parents(repository, expected_tip) == (tip,):
+        return
+    raise UnexpectedBankTipError(
+        f"{AUTONOMOUS_BANK_BRANCH} is at {tip}, and the Curator last wrote "
+        f"{expected_tip}. Something else has written to this system's "
+        f"reserved ref namespace. Refusing to commit on top of it."
+    )
 
 
-def _ensure_branch(repository: Path) -> str:
-    """Create the autonomous branch if it does not exist, as a true orphan.
+def _parents(repository: Path, commit: str) -> tuple[str, ...] | None:
+    """A commit's parents, or ``None`` if the repository does not have it."""
+
+    listing = gitutil.git(
+        ["rev-list", "--parents", "-n", "1", commit, "--"],
+        cwd=repository,
+        check=False,
+    )
+    if listing.returncode != 0:
+        return None
+    fields = listing.stdout.split()
+    return tuple(fields[1:]) if fields and fields[0] == commit else None
+
+
+def _ensure_branch(repository: Path, *, record: Callable[[str], None]) -> str:
+    """The bank branch's tip, creating the branch as a true orphan if needed.
 
     An orphan, and the first version of this was not one -- it branched from
     ``HEAD``, which put a copy of the researcher's ``.research/`` capsule on
@@ -754,10 +860,23 @@ def _ensure_branch(repository: Path) -> str:
     Rooted on the empty tree via ``commit-tree``, so the branch shares no
     history with the science, ``git log`` on it shows only the Curator's
     commits, and it carries nothing the researcher wrote.
+
+    **The root is recorded before the ref exists**, and it was not recorded
+    at all. The branch was created here and the watermark written only after
+    the first commit, so anything that failed in between -- on 2026-09-24,
+    the worktree step -- left a branch in the researcher's repository that
+    :func:`_verify_tip` then refused, correctly, as one "this system has no
+    record of writing", on every retry. The Curator wedged itself on its own
+    root. Recorded first, the ref is never the Curator's and unrecorded: if
+    it is never created, the record names a commit no branch points at, and
+    the next pass simply roots again. Created with an empty old value, so a
+    branch somebody made in the meantime is refused rather than replaced.
     """
 
     if gitutil.branch_exists(repository, AUTONOMOUS_BANK_BRANCH):
-        return AUTONOMOUS_BANK_BRANCH
+        return gitutil.git(
+            ["rev-parse", AUTONOMOUS_BANK_BRANCH], cwd=repository
+        ).stdout.strip()
     if not gitutil.has_commits(repository):
         raise CuratorError(
             f"{repository} has no commits; the Curator will not be the first "
@@ -778,27 +897,53 @@ def _ensure_branch(repository: Path) -> str:
     ).stdout.strip()
     if not root:
         raise CuratorError(f"could not root {AUTONOMOUS_BANK_BRANCH} in {repository}")
-    gitutil.git(["branch", AUTONOMOUS_BANK_BRANCH, root], cwd=repository)
-    return AUTONOMOUS_BANK_BRANCH
+    record(root)
+    gitutil.git(
+        ["update-ref", f"refs/heads/{AUTONOMOUS_BANK_BRANCH}", root, ""],
+        cwd=repository,
+    )
+    return root
+
+
+#: The reason ``git worktree add`` writes into the lock it holds while it
+#: works, and removes when it finishes. Left behind only when ``add`` died.
+GIT_INITIALIZING_LOCK = "initializing"
 
 
 def _ensure_worktree(*, repository: Path, target: Path, base: str) -> None:
-    """Adopt the Curator's worktree, or replace it if it is not the right one.
+    """Adopt the Curator's checkout, or replace it if it is not the right one.
 
-    An existing directory with a ``.git`` entry used to be adopted on sight,
-    and the path is keyed on the project id alone. So a project re-pointed at a
-    different repository -- a re-clone, a moved checkout, a restored backup --
-    left a stale worktree of the *old* repository, which the Curator would then
-    hard-reset and commit into. The repository lock was taken on the new path,
-    so the write was serialised against nothing. An independent security review
-    found it.
+    An existing directory with a ``.git`` entry used to be adopted on sight.
+    It is adopted now only when it is a registered, working checkout of
+    *this* repository -- an independent security review found the Curator
+    hard-resetting and committing into a stale checkout of a different one.
+    What it has checked out does not matter: :func:`_write` resets it to the
+    verified tip before anything is written, and never commits through it.
 
-    Both halves are checked: that the worktree belongs to this repository, and
-    that it is on the bank branch. A sha-only check could not tell "the right
-    branch" from "a different branch that happens to be at the same commit".
+    Anything else is cleared by :func:`_clear`, where the first live
+    qualification failed: replacing a checkout is not one Git command but
+    several, depending on what is left of it.
     """
 
-    if (target / ".git").exists() and _is_worktree_of(target, repository, base):
+    if target.is_symlink():
+        # Before any Git command, because Git resolves the link. A link to
+        # this repository's main checkout or to a coding run's worktree would
+        # otherwise be "a registered worktree" to remove -- and `worktree
+        # remove` would delete the checkout it points at. The first version
+        # of the Curator did exactly that.
+        raise CuratorError(
+            f"{target} is a symbolic link. The Curator's checkout is a directory "
+            f"it creates itself; it will not follow the link or remove it. "
+            f"Remove the link and the next curation recreates the checkout."
+        )
+    block = _worktrees(repository).get(target.resolve())
+    if (
+        block is not None
+        and (target / ".git").is_file()
+        and _is_worktree_of(target, repository)
+    ):
+        if _lock_reason(block) == GIT_INITIALIZING_LOCK:
+            gitutil.git(["worktree", "unlock", str(target)], cwd=repository)
         # No fetch. An earlier version ran `git fetch --all` here, which was
         # three wrong things at once: a network call from a module whose job
         # is to render rows, made while holding REPOSITORY_MUTATION for up to
@@ -809,26 +954,209 @@ def _ensure_worktree(*, repository: Path, target: Path, base: str) -> None:
         # run failed that run as an escape. That is the exact false positive
         # `runtime/refs.py` exists to prevent.
         return
-    if target.exists():
-        gitutil.remove_worktree(repository=repository, target=target, force=True)
-        if target.exists():
-            shutil.rmtree(target, ignore_errors=True)
+    _clear(repository=repository, target=target, block=block)
     target.parent.mkdir(parents=True, exist_ok=True)
     gitutil.git(
-        ["worktree", "add", str(target), base],
+        ["worktree", "add", "--detach", str(target), base],
         cwd=repository,
     )
 
 
-def _is_worktree_of(target: Path, repository: Path, branch: str) -> bool:
+def _clear(*, repository: Path, target: Path, block: str | None) -> None:
+    """Make ``target`` absent and unregistered, by the route its state needs.
+
+    ``block`` is this repository's registration of ``target``, if it has one.
+    The old version knew one route -- ``git worktree remove --force`` -- and
+    each other state a real machine produces made it fail, and fail again on
+    every retry:
+
+    - **registered here, directory gone.** ``worktree add`` refuses the path
+      ("a missing but already registered worktree"); ``worktree remove``
+      clears the registration.
+    - **registered here, ``.git`` gone** -- an interrupted removal.
+      ``worktree remove`` refuses that ("validation failed"), so the directory
+      is deleted first and the registration cleared after.
+    - **registered here and locked by Git itself** -- an interrupted ``add``,
+      which holds its lock with the reason ``initializing`` and removes it
+      when it finishes. Under this checkout's lock nothing else can be adding
+      it, so the lock is stale and released. **Any other lock is a person's
+      decision** and is refused with a sentence, not overridden.
+    - **registered nowhere** -- a dangling gitlink, or a directory an
+      interrupted ``add`` left before writing one. Deleted, under
+      :func:`_delete_orphan`'s conditions.
+    - **registered by another repository.** With a path per repository that
+      means somebody else made a worktree in the Curator's directory, and the
+      Curator does not remove another repository's worktree.
+
+    Every route ends in the same check, so a state nobody anticipated is an
+    error naming the path rather than a worktree add that fails obscurely.
+    """
+
+    if block is not None:
+        reason = _lock_reason(block)
+        if reason == GIT_INITIALIZING_LOCK:
+            gitutil.git(["worktree", "unlock", str(target)], cwd=repository)
+        elif reason is not None:
+            raise CuratorError(
+                f"{target} is locked in {repository}"
+                + (f" ({reason})" if reason else "")
+                + ", and a lock is a person's decision the Curator does not "
+                f"override. `git -C {repository} worktree unlock {target}` "
+                f"releases it; the next curation recreates the checkout."
+            )
+        if (target / ".git").is_file():
+            gitutil.remove_worktree(repository=repository, target=target, force=True)
+        elif target.exists():
+            _delete_orphan(target, repository=repository)
+    elif target.exists():
+        owner = _foreign_owner(target, repository)
+        if owner is not None:
+            raise CuratorError(
+                f"{target} is a worktree of {owner}, not of {repository}. The "
+                f"Curator does not remove another repository's worktree; "
+                f"`git --git-dir {owner} worktree remove {target}` does, if it "
+                f"is safe to."
+            )
+        _delete_orphan(target, repository=repository)
+    if target.resolve() in _worktrees(repository):
+        # The directory is gone and this repository still lists it.
+        gitutil.remove_worktree(repository=repository, target=target, force=True)
+    if target.exists() or target.resolve() in _worktrees(repository):
+        raise CuratorError(
+            f"could not clear {target} for a fresh checkout of "
+            f"{AUTONOMOUS_BANK_BRANCH}; it is still present or still registered "
+            f"in {repository}"
+        )
+
+
+def _clear_stale_git_locks(target: Path) -> None:
+    """Remove Git lock files a killed command left in the Curator's checkout.
+
+    A ``git add`` or ``reset`` killed mid-way -- by ``subprocess.run``'s
+    timeout, the OOM killer, a power cut -- leaves ``index.lock`` (or
+    ``HEAD.lock``) in the checkout's own administrative directory, and every
+    later ``add`` then fails on it, for good. Nothing but the Curator works in
+    this checkout, and the Curator holds both the repository lock and this
+    checkout's ``flock``, so a lock file here has no living owner. Only these
+    two, and only the per-checkout ones: a lock in the repository's shared
+    directory -- a ref, ``packed-refs`` -- may belong to someone else and is
+    left for Git to report.
+    """
+
+    admin = Path(
+        gitutil.git(
+            ["rev-parse", "--path-format=absolute", "--git-dir"], cwd=target
+        ).stdout.strip()
+    )
+    for name in ("index.lock", "HEAD.lock"):
+        (admin / name).unlink(missing_ok=True)
+
+
+def _worktrees(git_dir_or_repository: Path) -> dict[Path, str]:
+    """A repository's worktree registrations, resolved, with each porcelain block.
+
+    Resolved because Git records real paths: a state home reached through a
+    symbolic link is listed under its target.
+    """
+
+    listing = gitutil.git(
+        ["worktree", "list", "--porcelain"], cwd=git_dir_or_repository
+    ).stdout
+    found: dict[Path, str] = {}
+    for block in listing.strip().split("\n\n"):
+        lines = block.splitlines()
+        if lines and lines[0].startswith("worktree "):
+            found[Path(lines[0].removeprefix("worktree ")).resolve()] = block
+    return found
+
+
+def _lock_reason(block: str) -> str | None:
+    """``None`` if unlocked, else the lock's reason (``""`` for none given)."""
+
+    for line in block.splitlines():
+        if line == "locked":
+            return ""
+        if line.startswith("locked "):
+            return line.removeprefix("locked ")
+    return None
+
+
+def _foreign_owner(target: Path, repository: Path) -> Path | None:
+    """The common Git directory of *another* repository that registers ``target``.
+
+    ``None`` unless all three hold: ``target`` has a gitlink Git can follow,
+    it leads to a repository that is not this one, and that repository lists
+    ``target`` among its worktrees. A gitlink alone is only a claim.
+    """
+
+    if not (target / ".git").is_file():
+        return None
+    try:
+        common = Path(
+            gitutil.git(
+                ["rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=target
+            ).stdout.strip()
+        ).resolve()
+    except ResearchOSError:
+        return None
+    if common.is_relative_to(repository.resolve()):
+        return None
+    try:
+        listed = _worktrees(common)
+    except ResearchOSError:
+        return None
+    return common if target.resolve() in listed else None
+
+
+def _delete_orphan(target: Path, *, repository: Path) -> None:
+    """Delete a Curator checkout nothing can use, and nothing that is not one.
+
+    Safe to delete when it is one: every pass resets the checkout to the
+    verified tip before writing, and publishes what it wrote to the branch,
+    so a checkout holds nothing that is not in the repository. The conditions
+    are what make it one, and each refuses with a sentence rather than
+    deleting:
+
+    - it is directly under ``worktree_root()``, reached without a link;
+    - it is not, does not contain, and is not inside the researcher's
+      repository;
+    - it is not a repository of its own. A ``.git`` *directory* is somebody's
+      history, and no Curator checkout has one.
+    """
+
+    root = worktree_root().resolve()
+    if target.is_symlink() or target.resolve().parent != root:
+        raise CuratorError(
+            f"refusing to delete {target}: it is not a Curator checkout under {root}"
+        )
+    resolved = target.resolve()
+    canonical = repository.resolve()
+    if (
+        resolved == canonical
+        or resolved in canonical.parents
+        or canonical in resolved.parents
+    ):
+        raise CuratorError(
+            f"refusing to delete {target}: it overlaps the repository {repository}"
+        )
+    if (target / ".git").is_dir():
+        raise CuratorError(
+            f"refusing to delete {target}: it holds a repository of its own, and no "
+            f"Curator checkout does. Move it aside and the next curation recreates "
+            f"the checkout."
+        )
+    if target.is_dir():
+        shutil.rmtree(target)
+    else:
+        target.unlink()
+
+
+def _is_worktree_of(target: Path, repository: Path) -> bool:
     try:
         common = gitutil.git(
             ["rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=target
         ).stdout.strip()
-        current = gitutil.current_branch(target)
     except ResearchOSError:
-        return False
-    if current != branch:
         return False
     try:
         return Path(common).resolve().is_relative_to(repository.resolve())
@@ -841,6 +1169,7 @@ __all__ = [
     "CurationResult",
     "CuratorError",
     "UnexpectedBankTipError",
+    "checkout_path",
     "curate",
     "snapshot",
     "snapshot_digest",

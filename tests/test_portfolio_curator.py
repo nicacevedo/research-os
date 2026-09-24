@@ -17,10 +17,10 @@ from research_os.portfolio.curator import (
     BANK_ROOT,
     HEADER_MARKER,
     UnexpectedBankTipError,
+    checkout_path,
     curate,
     snapshot,
     snapshot_digest,
-    worktree_root,
 )
 from research_os.portfolio.models import (
     ActionStatus,
@@ -106,7 +106,7 @@ def test_the_curator_worktree_is_outside_the_researchers_repository(
 
     seed_idea(portfolio, runtime_project)
     _curate(runtime_db, runtime_project, repository)
-    target = worktree_root() / runtime_project
+    target = checkout_path(runtime_project, repository)
     assert target.exists()
     assert repository not in target.parents
     assert gitutil.porcelain_status(repository) == ()
@@ -221,7 +221,11 @@ def test_the_curator_refuses_a_tip_it_did_not_write(
     seed_idea(portfolio, runtime_project)
     _curate(runtime_db, runtime_project, repository)
 
-    target = worktree_root() / runtime_project
+    # Somebody else's commit on the reserved branch. Made in the Curator's
+    # checkout because it is a convenient working tree, and published to the
+    # branch explicitly: the checkout is detached, so committing in it alone
+    # moves nothing -- which is part of what the Curator relies on.
+    target = checkout_path(runtime_project, repository)
     (target / "tampered.txt").write_text("somebody else was here\n", encoding="utf-8")
     subprocess.run(["git", "add", "-A"], cwd=target, check=True, capture_output=True)
     subprocess.run(
@@ -235,6 +239,12 @@ def test_the_curator_refuses_a_tip_it_did_not_write(
             "-m",
             "not the curator",
         ],
+        cwd=target,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "update-ref", f"refs/heads/{AUTONOMOUS_BANK_BRANCH}", "HEAD"],
         cwd=target,
         check=True,
         capture_output=True,
@@ -367,7 +377,11 @@ def test_a_tampered_bank_is_caught_even_when_nothing_changed(
     seed_idea(portfolio, runtime_project)
     _curate(runtime_db, runtime_project, repository)
 
-    target = worktree_root() / runtime_project
+    # Somebody else's commit on the reserved branch. Made in the Curator's
+    # checkout because it is a convenient working tree, and published to the
+    # branch explicitly: the checkout is detached, so committing in it alone
+    # moves nothing -- which is part of what the Curator relies on.
+    target = checkout_path(runtime_project, repository)
     (target / "planted.txt").write_text("not the curator\n", encoding="utf-8")
     subprocess.run(["git", "add", "-A"], cwd=target, check=True, capture_output=True)
     subprocess.run(
@@ -381,6 +395,12 @@ def test_a_tampered_bank_is_caught_even_when_nothing_changed(
             "-m",
             "planted",
         ],
+        cwd=target,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "update-ref", f"refs/heads/{AUTONOMOUS_BANK_BRANCH}", "HEAD"],
         cwd=target,
         check=True,
         capture_output=True,
