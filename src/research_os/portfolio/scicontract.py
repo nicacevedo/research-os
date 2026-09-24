@@ -347,7 +347,9 @@ def verify(
     is read under one. ``version``, when supplied, must be the idea version
     the contract names -- a contract is about one hypothesis, and reading a
     measurement against a revised one is reading it against a different
-    claim.
+    claim. ``parent`` must be exactly the contract the row names as its
+    parent (a replication's primary), or ``None`` when it names none: the
+    parent's digest is inside this contract's.
     """
 
     if version is not None and (
@@ -360,7 +362,33 @@ def verify(
             f"({contract.hypothesis_digest}); it cannot be used for "
             f"{version.idea_id} v{version.version} ({version.content_digest})"
         )
+    if (parent.contract_id if parent is not None else None) != (
+        contract.parent_contract_id
+    ):
+        raise ContractIntegrityError(
+            f"{contract.contract_id} names parent contract "
+            f"{contract.parent_contract_id or '(none)'} and was verified against "
+            f"{parent.contract_id if parent is not None else '(none)'}"
+        )
+    if (
+        parent is not None
+        and contract.kind is ContractKind.PREREGISTERED
+        and (
+            contract.analysis_digest != parent.analysis_digest
+            or contract.analysable is not parent.analysable
+        )
+    ):
+        raise ContractIntegrityError(
+            f"{contract.contract_id} names {parent.contract_id} as the primary it "
+            f"replicates and freezes a different analysis; a replication inherits "
+            f"its primary's analysis or it is not a replication of it"
+        )
     analysis_doc = _load(artifacts, contract.analysis_artifact_id, what="analysis")
+    if analysis_doc.get("parent_contract_id") != contract.parent_contract_id:
+        raise ContractIntegrityError(
+            f"{contract.contract_id}'s stored analysis names a different parent "
+            f"contract than its row"
+        )
     if analysis_doc.get("hypothesis_digest") != contract.hypothesis_digest:
         raise ContractIntegrityError(
             f"{contract.contract_id}'s stored analysis names a different hypothesis"
@@ -372,6 +400,11 @@ def verify(
         )
 
     document = _load(artifacts, contract.contract_artifact_id, what="contract")
+    if document.get("parent_contract_id") != contract.parent_contract_id:
+        raise ContractIntegrityError(
+            f"{contract.contract_id}'s stored contract names a different parent "
+            f"contract than its row"
+        )
     if _analysis_from(document, contract) != spec:
         raise ContractIntegrityError(  # pragma: no cover - digest equality implies it
             f"{contract.contract_id}'s two stored analyses differ"

@@ -1222,6 +1222,26 @@ def _analysis_designer() -> Any:
     return PORTFOLIO_TEMPLATES["analysis_designer"]
 
 
+def _contract_was_read(context: Any, contract: ScientificContract) -> bool:
+    """Whether anything a reading leaves behind exists under this contract.
+
+    The state, the evidence or the analysis artifact -- not the state alone.
+    The database refuses to supersede a contract in any of the three cases,
+    and every caller deciding whether to retire one has to agree with it or
+    the retirement would fail half-way.
+    """
+
+    return any(
+        item.contract_id == contract.contract_id
+        and (
+            item.state is ExperimentState.INTERPRETED
+            or item.evidence_id is not None
+            or item.analysis_artifact_id is not None
+        )
+        for item in context.portfolio.list_experiments(idea_id=contract.idea_id)
+    )
+
+
 def _contract_is_stale(context: Any, contract: ScientificContract) -> bool:
     """Whether this contract was frozen by a prompt this build has retired.
 
@@ -1236,19 +1256,7 @@ def _contract_is_stale(context: Any, contract: ScientificContract) -> bool:
 
     if contract.state is ContractState.SUPERSEDED:
         return False
-    # "Read" is anything a reading left behind -- the state, the evidence or
-    # the analysis artifact -- not the state alone. The database refuses to
-    # supersede a contract in any of the three cases, and this has to agree
-    # with it or the retirement below would fail half-way.
-    if any(
-        item.contract_id == contract.contract_id
-        and (
-            item.state is ExperimentState.INTERPRETED
-            or item.evidence_id is not None
-            or item.analysis_artifact_id is not None
-        )
-        for item in context.portfolio.list_experiments(idea_id=contract.idea_id)
-    ):
+    if _contract_was_read(context, contract):
         return False
     current = _analysis_designer().identity
     analysed_here = contract.analysis_prompt.startswith(f"{_analysis_designer().name}@")
@@ -1295,6 +1303,30 @@ def analysis_from_legacy_rule(
     )
 
 
+def _verify(
+    context: Any, contract: ScientificContract, *, version: IdeaVersion | None = None
+) -> scicontract.VerifiedContract:
+    """Re-hash a contract, with the parent contract its row names.
+
+    A replication's contract names the primary contract it inherits from,
+    and its digest commits to that contract's digest; verifying it without
+    the parent -- or with another -- fails. One place resolves the parent, so
+    no caller can forget it or supply the wrong one.
+    """
+
+    parent = None
+    if contract.parent_contract_id:
+        parent = context.portfolio.get_contract(contract.parent_contract_id)
+        if parent is None:
+            raise scicontract.ContractIntegrityError(
+                f"{contract.contract_id} names parent contract "
+                f"{contract.parent_contract_id}, which does not exist"
+            )
+    return scicontract.verify(
+        context.artifacts, contract, version=version, parent=parent
+    )
+
+
 def _freeze_analysis(
     context: Any,
     version: IdeaVersion,
@@ -1304,8 +1336,14 @@ def _freeze_analysis(
     provenance: Mapping[str, Any],
     analysis_prompt: str,
     analysis_call_id: str | None,
+    parent_contract_id: str | None = None,
 ) -> ScientificContract:
-    """Store one analysis immutably and open its contract. Raises on a race."""
+    """Store one analysis immutably and open its contract. Raises on a race.
+
+    ``parent_contract_id`` is set for a replication, and only there: the
+    primary contract whose frozen analysis it inherits, as a column the
+    database validates and never lets change.
+    """
 
     from research_os.portfolio.ids import new_contract_id
 
@@ -1318,6 +1356,7 @@ def _freeze_analysis(
         kind=ContractKind.PREREGISTERED,
         spec=spec,
         provenance=provenance,
+        parent_contract_id=parent_contract_id,
     )
     ref = context.artifacts.put_text(
         json.dumps(
@@ -1342,6 +1381,7 @@ def _freeze_analysis(
         analysis_artifact_id=ref.artifact_id,
         analysis_prompt=analysis_prompt,
         analysis_call_id=analysis_call_id,
+        parent_contract_id=parent_contract_id,
     )
 
 
@@ -1383,6 +1423,37 @@ def ensure_analysis(
                 f"frozen by {contract.analysis_prompt or 'an unrecorded prompt'}"
                 f"{' / ' + contract.design_prompt if contract.design_prompt else ''}, "
                 f"which this build has retired, before anything was measured"
+            ),
+        )
+        contract = None
+    if (
+        contract is not None
+        and role is ExperimentRole.REPLICATION
+        and contract.parent_contract_id
+        and previous is not None
+        and contract.parent_contract_id != previous.contract_id
+    ):
+        # A replication of a primary that is no longer this version's. Its
+        # parent was checked when it was created; the primary it names has
+        # since been replaced. Unread, it is retired and inherited again from
+        # the primary that is there now; read, it is not reused at all.
+        # (An empty parent is a contract frozen before the link was
+        # recorded, and is kept as it is.)
+        if _contract_was_read(context, contract):
+            return ExperimentStep(
+                ok=False,
+                detail=(
+                    f"{contract.contract_id} replicates {contract.parent_contract_id}, "
+                    f"and this version's primary is now {previous.contract_id}"
+                ),
+                failure_class=FailureClass.MISSING_SCIENTIFIC_AUTHORITY,
+            )
+        _retire_contract(
+            context,
+            contract,
+            detail=(
+                f"replicated {contract.parent_contract_id}, which is no longer "
+                f"this version's primary contract"
             ),
         )
         contract = None
@@ -1498,17 +1569,22 @@ def _inherit_analysis(
             detail="a replication is designed against the experiment it replicates",
             failure_class=FailureClass.POLICY_REFUSED,
         )
+    parent_contract_id: str | None = None
     if previous.contract_id:
         primary = context.portfolio.require_contract(previous.contract_id)
         try:
-            verified = scicontract.verify(context.artifacts, primary, version=version)
+            verified = _verify(context, primary, version=version)
         except scicontract.ContractIntegrityError as exc:
             return ExperimentStep(
                 ok=False, detail=str(exc), failure_class=exc.failure_class
             )
         spec = verified.analysis
         source = primary.contract_id
+        parent_contract_id = primary.contract_id
     else:
+        # A primary measured before contracts existed has no contract to
+        # name. The replication says what it inherited from in its document,
+        # and its parent column stays empty rather than naming a guess.
         legacy = (
             DecisionRule.model_validate(previous.decision_rule)
             if previous.decision_rule
@@ -1525,6 +1601,7 @@ def _inherit_analysis(
             provenance={"inherited_from": source},
             analysis_prompt=f"inherited:{source}",
             analysis_call_id=None,
+            parent_contract_id=parent_contract_id,
         )
     except DuplicateContractError:
         existing = context.portfolio.live_contract(
@@ -1534,6 +1611,17 @@ def _inherit_analysis(
         )
         if existing is None:  # pragma: no cover
             raise
+        if existing.parent_contract_id != parent_contract_id:
+            # A concurrent inheritance from another primary: not this one.
+            return ExperimentStep(
+                ok=False,
+                detail=(
+                    f"{existing.contract_id} replicates "
+                    f"{existing.parent_contract_id or '(an unrecorded primary)'}, "
+                    f"not {parent_contract_id or source}"
+                ),
+                failure_class=FailureClass.MISSING_SCIENTIFIC_AUTHORITY,
+            )
         return HeldContract(existing)
     return HeldContract(contract)
 
@@ -1622,7 +1710,7 @@ def design(
     contract = held.contract
     analysis_cost, analysis_calls = held.cost_usd, held.model_calls
     try:
-        verified = scicontract.verify(context.artifacts, contract, version=version)
+        verified = _verify(context, contract, version=version)
     except scicontract.ContractIntegrityError as exc:
         return ExperimentStep(
             ok=False,
@@ -1877,6 +1965,13 @@ def design(
         design_ref, role=f"idea_design:{design_hash}", run_id=context.run_id
     )
 
+    # A replication's contract commits to the exact primary contract it
+    # inherits from: the parent's digest is inside its own.
+    parent_digest = (
+        context.portfolio.require_contract(contract.parent_contract_id).contract_digest
+        if contract.parent_contract_id
+        else None
+    )
     contract_hash = scicontract.contract_digest(
         idea_id=contract.idea_id,
         idea_version=contract.idea_version,
@@ -1885,6 +1980,7 @@ def design(
         kind=contract.kind,
         analysis_digest=contract.analysis_digest,
         design_digest=design_hash,
+        parent_contract_digest=parent_digest,
     )
     rule_summary = row_rule(analysis, contract.contract_id)
     digest = spec_digest(spec)
@@ -1930,6 +2026,7 @@ def design(
             "implementation": scicontract.implementation_fields(spec),
         },
         provenance=provenance,
+        parent_contract_digest=parent_digest,
     )
     contract_ref = context.artifacts.put_text(
         json.dumps(
@@ -2041,192 +2138,6 @@ def _preregistration_record(
         "repair_of": repair_of,
         "generated_inputs": [item.record() for item in frozen_inputs],
     }
-
-
-def amend_contract(
-    context: Any,
-    parent: ScientificContract,
-    *,
-    spec: AnalysisSpec,
-    reason: str,
-) -> ScientificContract:
-    """A rule changed after a result: a new EXPLORATORY contract, never an edit.
-
-    Sometimes the right scientific move after seeing a result is to ask it a
-    different question -- a looser threshold, a different reduction, an
-    exclusion nobody anticipated. What makes that science rather than
-    fishing is that it is *labelled*: the original contract is untouched
-    (the database refuses the edit anyway), and the new one is
-    ``EXPLORATORY``, names its parent, inherits the parent's design because
-    it re-reads the parent's measurement, and carries its own digest. No gate
-    counts an exploratory reading as confirmatory; confirming it takes a new
-    idea with a preregistered contract and a new execution.
-    """
-
-    from research_os.portfolio.ids import new_contract_id
-
-    if parent.state is not ContractState.FROZEN:
-        raise EmpiricalError(
-            f"{parent.contract_id} is {parent.state}; only a frozen contract has a "
-            f"measurement to re-read",
-            failure_class=FailureClass.POLICY_REFUSED,
-        )
-    spec.check()
-    grandparent = (
-        context.portfolio.get_contract(parent.parent_contract_id)
-        if parent.parent_contract_id
-        else None
-    )
-    verified = scicontract.verify(context.artifacts, parent, parent=grandparent)
-    version = context.portfolio.require_version(parent.idea_id, parent.idea_version)
-    contract_id = new_contract_id()
-    analysis_doc = scicontract.analysis_document(
-        contract_id=contract_id,
-        project_id=parent.project_id,
-        version=version,
-        role=str(parent.role),
-        kind=ContractKind.EXPLORATORY,
-        spec=spec,
-        provenance={"amends": parent.contract_id, "reason": reason},
-        parent_contract_id=parent.contract_id,
-    )
-    analysis_ref = context.artifacts.put_text(
-        json.dumps(
-            analysis_doc, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False
-        ),
-        media_type="application/json",
-        role=f"idea_analysis:{analysis_doc['analysis_digest']}",
-        producer="portfolio.empirical.amend_contract",
-    )
-    design = dict(verified.design or {})
-    document = scicontract.contract_document(
-        identity={
-            "contract_id": contract_id,
-            "project_id": parent.project_id,
-            "idea_id": parent.idea_id,
-            "idea_version": parent.idea_version,
-            "role": str(parent.role),
-            "kind": ContractKind.EXPLORATORY,
-            "hypothesis_digest": parent.hypothesis_digest,
-            "analysis_digest": analysis_doc["analysis_digest"],
-            "parent_contract_id": parent.contract_id,
-        },
-        version=version,
-        spec=spec,
-        design=design,
-        execution={"re_reads": parent.contract_id},
-        provenance={"amends": parent.contract_id, "reason": reason},
-        parent_contract_digest=parent.contract_digest,
-    )
-    contract_ref = context.artifacts.put_text(
-        json.dumps(
-            document, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False
-        ),
-        media_type="application/json",
-        role=f"idea_contract:{document['contract_digest']}",
-        producer="portfolio.empirical.amend_contract",
-    )
-    return context.portfolio.create_contract(
-        contract_id=contract_id,
-        project_id=parent.project_id,
-        idea_id=parent.idea_id,
-        idea_version=parent.idea_version,
-        role=parent.role,
-        hypothesis_digest=parent.hypothesis_digest,
-        analysable=spec.analysable,
-        analysis_digest=analysis_doc["analysis_digest"],
-        analysis_artifact_id=analysis_ref.artifact_id,
-        analysis_prompt="exploratory",
-        kind=ContractKind.EXPLORATORY,
-        parent_contract_id=parent.contract_id,
-        design={
-            "design_digest": parent.design_digest,
-            "design_artifact_id": parent.design_artifact_id,
-            "design_prompt": parent.design_prompt,
-            "design_call_id": parent.design_call_id,
-            "contract_digest": document["contract_digest"],
-            "contract_artifact_id": contract_ref.artifact_id,
-        },
-    )
-
-
-def reanalyse(context: Any, contract: ScientificContract) -> Any:
-    """Read a parent's stored measurement under an exploratory contract.
-
-    From the content-addressed store, never from a workspace: the outputs
-    were hashed when the measurement was interpreted, and re-reading them by
-    digest is what makes the exploratory reading about the same bytes. The
-    result is recorded as an artifact that says ``confirmatory: false`` and
-    writes **no** evidence row -- a rule fixed after its result exists does
-    not get to count as a test of anything.
-    """
-
-    from research_os.portfolio import analysis as engine
-
-    if contract.kind is not ContractKind.EXPLORATORY or not contract.parent_contract_id:
-        raise EmpiricalError(
-            f"{contract.contract_id} is not an exploratory contract; a "
-            f"preregistered one is read when its own measurement is interpreted",
-            failure_class=FailureClass.POLICY_REFUSED,
-        )
-    parent = context.portfolio.require_contract(contract.parent_contract_id)
-    verified = scicontract.verify(context.artifacts, contract, parent=parent)
-    measured = [
-        item
-        for item in context.portfolio.list_experiments(idea_id=contract.idea_id)
-        if item.contract_id == parent.contract_id
-        and item.state is ExperimentState.INTERPRETED
-        and item.analysis_artifact_id
-    ]
-    if not measured:
-        raise EmpiricalError(
-            f"{parent.contract_id} has no interpreted measurement to re-read",
-            failure_class=FailureClass.ARTIFACT_MISSING,
-        )
-    source = measured[-1]
-    stored = json.loads(context.artifacts.get_text(source.analysis_artifact_id or ""))
-    by_path = {item["path"]: item for item in stored.get("stored_outputs", [])}
-    documents: dict[str, Any] = {}
-    for path in verified.analysis.sources():
-        entry = by_path.get(path)
-        if entry is None:
-            documents[path] = engine.Unavailable(
-                f"{path} was not among the outputs {source.experiment_id} stored"
-            )
-            continue
-        data = context.artifacts.get_bytes(entry["artifact_id"])
-        try:
-            text = data.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            documents[path] = engine.Unavailable(f"{path} is not text: {exc}")
-            continue
-        documents[path] = engine.parse_document(text, name=path)
-    result = engine.evaluate(verified.analysis, documents)
-    record = {
-        "schema": "portfolio-exploratory-analysis-v1",
-        "confirmatory": False,
-        "contract_id": contract.contract_id,
-        "contract_digest": contract.contract_digest,
-        "parent_contract_id": parent.contract_id,
-        "measurement": source.experiment_id,
-        "job_id": source.job_id,
-        "result": result.record(),
-        "summary": result.summary,
-    }
-    ref = context.artifacts.put_text(
-        json.dumps(
-            record, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False
-        ),
-        media_type="application/json",
-        role=f"idea_exploratory_analysis:{contract.contract_id}",
-        producer="portfolio.analysis.evaluate@1",
-    )
-    context.artifacts.link(
-        ref,
-        role=f"idea_exploratory_analysis:{contract.contract_id}",
-        run_id=context.run_id,
-    )
-    return result
 
 
 def _recover_execution(
@@ -3064,11 +2975,36 @@ def _verified_contract(
             f"under a contract that is not frozen",
             failure_class=FailureClass.MISSING_SCIENTIFIC_AUTHORITY,
         )
+    if (
+        contract.kind is not ContractKind.PREREGISTERED
+        or contract.role is not experiment.role
+    ):
+        raise EmpiricalError(
+            f"{experiment.experiment_id} is a {experiment.role} execution and "
+            f"{contract.contract_id} is a {contract.kind} {contract.role} "
+            f"contract; a measurement is read only under the preregistered "
+            f"contract of its own role",
+            failure_class=FailureClass.MISSING_SCIENTIFIC_AUTHORITY,
+        )
+    if contract.parent_contract_id and experiment.role is ExperimentRole.REPLICATION:
+        primary = context.portfolio.get_experiment(
+            idea_id=experiment.idea_id,
+            idea_version=experiment.idea_version,
+            role=ExperimentRole.PRIMARY,
+        )
+        if primary is None or primary.contract_id != contract.parent_contract_id:
+            raise EmpiricalError(
+                f"{contract.contract_id} replicates {contract.parent_contract_id}, "
+                f"which is not the contract of this version's primary measurement "
+                f"({primary.contract_id if primary else 'none'}); a replication is "
+                f"read only against the primary it replicates",
+                failure_class=FailureClass.MISSING_SCIENTIFIC_AUTHORITY,
+            )
     version = context.portfolio.require_version(
         experiment.idea_id, experiment.idea_version
     )
     try:
-        verified = scicontract.verify(context.artifacts, contract, version=version)
+        verified = _verify(context, contract, version=version)
     except scicontract.ContractIntegrityError as exc:
         raise EmpiricalError(str(exc), failure_class=exc.failure_class) from None
     if (
@@ -4048,6 +3984,27 @@ def repair_implementation(
     return repaired_row
 
 
+def _replicates_another_primary(
+    context: Any, experiment: IdeaExperiment, *, previous: IdeaExperiment | None
+) -> bool:
+    """A live, unread replication whose contract names another primary contract."""
+
+    if (
+        experiment.role is not ExperimentRole.REPLICATION
+        or previous is None
+        or not experiment.contract_id
+        or experiment.state is ExperimentState.INTERPRETED
+    ):
+        return False
+    contract = context.portfolio.get_contract(experiment.contract_id)
+    return bool(
+        contract is not None
+        and contract.parent_contract_id
+        and contract.parent_contract_id != previous.contract_id
+        and not _contract_was_read(context, contract)
+    )
+
+
 def _is_stale(experiment: IdeaExperiment, *, role: ExperimentRole) -> bool:
     """Whether this design was made by a prompt this build no longer uses.
 
@@ -4118,7 +4075,23 @@ def advance(
         existing = step.experiment
         design_cost, design_calls = step.cost_usd, step.model_calls
 
-    if _stale(context, existing, role=role):
+    if _replicates_another_primary(context, existing, previous=previous):
+        # Its contract names a primary this version no longer has. Nothing
+        # has been read under it (a read contract's primary cannot be
+        # replaced), so it is retired with its execution and designed again
+        # against the primary that is there now -- never read against the
+        # wrong one.
+        _retire_contract(
+            context,
+            context.portfolio.require_contract(existing.contract_id or ""),
+            detail="its primary contract is no longer this version's primary",
+        )
+        step = design(context, version, role=role, previous=previous)
+        if not step.ok or step.experiment is None:
+            return step
+        existing = step.experiment
+        design_cost, design_calls = step.cost_usd, step.model_calls
+    elif _stale(context, existing, role=role):
         # Designed by a prompt this build has superseded. The portfolio
         # already treats a review that way -- `PortfolioStore.live_reviews`
         # reads `CURRENT_REVIEW_PROMPTS` and calls the rest stale, because a

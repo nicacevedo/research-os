@@ -1613,11 +1613,30 @@ anything runs and before anything is read (`scicontract.verify`,
 `empirical._verified_contract`), including that the specification about to
 run realises the frozen design's argv, outputs, composed inputs and seeds.
 
-**A post-result rule change is a new object.** A second preregistered
-contract for the same idea version is refused by a partial unique index;
-`empirical.amend_contract` creates an `EXPLORATORY` contract naming its
-parent, and `empirical.reanalyse` re-reads the parent's stored outputs under
-it, writing an artifact marked `confirmatory: false` and **no evidence row**.
+**A post-result rule change is not a preregistration.** A second
+preregistered contract for the same idea version is refused by a partial
+unique index. There is no production route that re-reads a measurement
+under a later rule: `empirical.amend_contract` and `empirical.reanalyse`,
+which did so under a labelled `EXPLORATORY` contract, had no caller outside
+one test, recorded no actor and stored their reading on no row, and were
+removed (§23). The `EXPLORATORY` kind remains in the schema, where migration
+0031 fixed its meaning; nothing creates one, and one that reaches the
+database anyway can be neither bound to a measurement nor read under
+(migration 0035, `_verified_contract`). A changed question is a revision or
+a follow-up idea, with the earlier readings disclosed in its evidence.
+
+**A replication names the contract it replicates.** Its contract's
+`parent_contract_id` is the primary contract whose frozen analysis it
+inherits -- a column the database validates on insert (same project, idea
+and version; a frozen preregistered primary; only a replication inherits)
+and never lets change -- and its contract digest commits to the primary's
+digest, so it verifies only against that parent, and it must freeze exactly
+its parent's analysis. A replication is designed, run and read only against
+its version's current primary: one whose parent has been replaced is retired
+while unread and refused once read. An empty parent means the link was not
+recorded -- the primary predated contracts, or the replication's analysis
+was frozen before migration 0035 (its `analysis_prompt` says which) -- and
+0035 writes no relationship it would have to read out of document text.
 
 **An implementation repair cannot touch the science.**
 `empirical.repair_implementation` may change only
@@ -1830,6 +1849,11 @@ analysis in full (estimand, observables, every reduction with its selection,
 support), the record counts, the design's falsification criterion, the
 number of execution attempts, and every earlier reading of the question in
 the idea's lineage that existed when the contract froze.
+
+**Every reading belongs to one contract.** The database refuses to bind a
+measurement to a contract of another idea version, role or kind (0035), and
+the application refuses to run or read one under anything but the
+preregistered contract of its own role.
 
 **Replication must be independent.** A replication that differs from its
 primary only in resources or time limit is refused; one whose outputs are

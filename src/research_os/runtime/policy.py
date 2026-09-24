@@ -133,7 +133,6 @@ class ActionKind(StrEnum):
     CURATE_IDEA_BANK = "curate_idea_bank"
     # --- the research loop around the portfolio --------------------------
     FREEZE_SCIENTIFIC_CONTRACT = "freeze_scientific_contract"
-    RECORD_EXPLORATORY_READING = "record_exploratory_reading"
     OPEN_FOLLOW_UP = "open_follow_up"
     ANSWER_LITERATURE_REQUEST = "answer_literature_request"
     WATCH_LITERATURE = "watch_literature"
@@ -437,14 +436,6 @@ ACTIONS: dict[ActionKind, ActionPolicy] = {
         "it, as an immutable operational record. It changes no capsule object, "
         "and once frozen nothing in this system -- or a psql session -- can "
         "edit it; changing a preregistration stays A2.",
-        dispatch=Dispatch.PORTFOLIO,
-    ),
-    ActionKind.RECORD_EXPLORATORY_READING: ActionPolicy(
-        AutonomyLevel.A0,
-        frozenset(),
-        "Re-reads a stored measurement under a new, labelled EXPLORATORY rule "
-        "that names the contract it departs from. The preregistration is not "
-        "touched and the reading writes no evidence.",
         dispatch=Dispatch.PORTFOLIO,
     ),
     ActionKind.OPEN_FOLLOW_UP: ActionPolicy(

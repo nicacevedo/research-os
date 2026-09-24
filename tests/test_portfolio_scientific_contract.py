@@ -12,9 +12,11 @@ Three groups, each holding a property the discovery report showed was absent:
 - **the production route** (a real subprocess): the analysis designer is asked
   first, the experiment designer is not shown its thresholds, a regression
   question is settled by arithmetic, a degenerate grid is refused by its own
-  contract, a missing observable is INSUFFICIENT, a post-result rule change is
-  a new EXPLORATORY object, and an implementation repair re-executes the same
-  frozen science and cannot change it.
+  contract, a missing observable is INSUFFICIENT, a second preregistration of
+  the same question is refused, and an implementation repair re-executes the
+  same frozen science and cannot change it. (Replication lineage and the rule
+  that no later analysis is read as the primary are held in
+  ``test_portfolio_contract_lineage.py``.)
 """
 
 from __future__ import annotations
@@ -33,7 +35,6 @@ from research_os.portfolio.config import load_config
 from research_os.portfolio.contracts import AnalysisSpec, ContractError
 from research_os.portfolio.models import (
     AdjudicationType,
-    ContractKind,
     ContractState,
     EmpiricalConclusion,
     EvidenceStrength,
@@ -781,46 +782,6 @@ def test_a_second_preregistered_contract_for_the_same_question_is_refused(
             analysis_prompt="test",
             analysis_call_id=None,
         )
-
-
-def test_a_post_result_rule_change_is_a_new_exploratory_object(
-    portfolio: PortfolioStore,
-    runtime_db: Database,
-    runtime_project: str,
-    grid_repo: Path,
-    tmp_path: Path,
-) -> None:
-    """The legitimate route for a changed rule: new, labelled, parented."""
-
-    context, contract = _frozen(
-        portfolio, runtime_db, tmp_path, runtime_project, grid_repo
-    )
-    before = portfolio.require_contract(contract.contract_id)
-    exploratory = empirical.amend_contract(
-        context,
-        contract,
-        spec=AnalysisSpec.model_validate(
-            _analysis_answer(success={"comparator": ">", "threshold": 0.0})
-        ),
-        reason="after seeing the interaction, ask whether it is merely positive",
-    )
-    assert exploratory.kind is ContractKind.EXPLORATORY
-    assert exploratory.parent_contract_id == contract.contract_id
-    assert exploratory.analysis_digest != contract.analysis_digest
-    assert exploratory.contract_digest != contract.contract_digest
-    assert exploratory.state is ContractState.FROZEN
-    # The original is byte-identical and still verifies.
-    assert portfolio.require_contract(contract.contract_id) == before
-    scicontract.verify(context.artifacts, before)
-    scicontract.verify(context.artifacts, exploratory, parent=before)
-    # And the interpreted measurement still names the original contract.
-    experiment = portfolio.get_experiment(idea_id=contract.idea_id, idea_version=1)
-    assert experiment is not None and experiment.contract_id == contract.contract_id
-    # An exploratory contract re-reads the stored outputs; it writes no
-    # evidence, because a rule fixed after the result is not confirmatory.
-    reading = empirical.reanalyse(context, exploratory)
-    assert reading.conclusion is EmpiricalConclusion.SUPPORTS
-    assert len(portfolio.list_evidence(idea_id=contract.idea_id, idea_version=1)) == 1
 
 
 # ========================================================== implementation --
