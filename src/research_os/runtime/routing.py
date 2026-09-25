@@ -51,7 +51,12 @@ from research_os.automation.providers import (
 )
 from research_os.errors import ResearchOSError
 from research_os.runtime.artifacts import FilesystemArtifactStore
-from research_os.runtime.budgets import BudgetLedger, Dimension, Grant
+from research_os.runtime.budgets import (
+    BudgetExhaustedError,
+    BudgetLedger,
+    Dimension,
+    Grant,
+)
 from research_os.runtime.failures import FailureClass
 from research_os.runtime.interfaces import (
     ArtifactRef,
@@ -62,7 +67,7 @@ from research_os.runtime.interfaces import (
     ModelResponse,
     ModelRole,
 )
-from research_os.runtime.models import ModelCallStatus, ProviderHealth
+from research_os.runtime.models import BudgetScope, ModelCallStatus, ProviderHealth
 from research_os.runtime.store import RuntimeStore
 
 LOG = logging.getLogger("research_os.runtime.routing")
@@ -126,6 +131,22 @@ class CriticalCapabilityUnavailableError(ProviderCallFailedError):
     unservable on a machine whose weaker providers are healthy, and that heals
     by itself. Making it a sibling rather than a subclass would have meant
     retrying it without a cooldown deadline.
+    """
+
+
+class CallCeilingReachedError(BudgetExhaustedError):
+    """The provider stopped a call at the ceiling it was authorised for.
+
+    A :class:`BudgetExhaustedError` and not a provider failure, because that
+    is what happened: the provider was available and answering, and the call
+    needed more than the ``max_cost_usd`` reserved for it. Retrying would
+    spend the ceiling again and stop at the same place, so the failure
+    taxonomy's ``BUDGET_EXHAUSTED`` -- terminal, never retried -- is the
+    honest class, and a stage that meets it leaves its idea ``BLOCKED_BUDGET``
+    for a person rather than ``BLOCKED_PROVIDER`` for the breaker to clear.
+
+    The spend is real and is already settled at the provider's reported cost
+    when this is raised; the scope named is the call's run.
     """
 
 
@@ -610,6 +631,31 @@ class ModelRouter:
         profile = routed.profile
         adapter = self._adapters[profile.name]
 
+        # The authority this call needs, taken *before* it starts. A request
+        # that declares a ceiling reserves the whole ceiling -- against run,
+        # project, system and any scope the request names -- so a call cannot
+        # begin unless every applicable budget can cover the most it is
+        # allowed to cost, and the provider is told to stop there. It used to
+        # reserve the profile's 0.05 estimate whatever the request declared,
+        # so an explicit ceiling with 0.06 left authorised a 2.50 call, and a
+        # hostile review reproduced the overshoot.
+        #
+        # A request that declares nothing still reserves the estimate. That is
+        # not a bound and `docs/RUNTIME.md` §8a says which callers do it.
+        declared = (
+            Decimal(str(request.max_cost_usd))
+            if request.max_cost_usd is not None
+            else None
+        )
+        cost_amount = (
+            declared
+            if declared is not None
+            else Decimal(str(profile.estimated_cost_usd))
+        )
+        extra = tuple(
+            (BudgetScope(scope), scope_id) for scope, scope_id in request.budget_scopes
+        )
+
         # Reserve both dimensions or neither. The first version took them in
         # two unguarded statements, so the *expected* outcome -- the cost budget
         # refusing -- leaked up to three HELD call-budget rows with no handle on
@@ -624,13 +670,15 @@ class ModelRouter:
                 run_id=self._run_id,
                 project_id=self._project_id,
                 work_id=self._work_id,
+                extra=extra,
             )
             cost_grants = self._budgets.reserve_all(
                 dimension=Dimension.MODEL_COST_USD,
-                amount=profile.estimated_cost_usd,
+                amount=cost_amount,
                 run_id=self._run_id,
                 project_id=self._project_id,
                 work_id=self._work_id,
+                extra=extra,
             )
             prompt_ref = self._artifacts.put_text(
                 request.prompt,
@@ -672,6 +720,9 @@ class ModelRouter:
                     json_schema=dict(request.json_schema)
                     if request.json_schema
                     else None,
+                    # The same number that was reserved, so the provider stops
+                    # where the ledger's authority ends.
+                    max_budget_usd=float(declared) if declared is not None else None,
                 )
             )
         except Exception as exc:
@@ -729,6 +780,32 @@ class ModelRouter:
                 self._budgets.release_all(cost_grants)
             self._budgets.settle_all(grants)
             detail = result.error or f"exit {result.exit_code}"
+            if result.budget_exhausted:
+                # The provider stopped the call at its authorised ceiling. It
+                # answered, so the breaker is not advanced -- this is not an
+                # outage, and counting it as one would cool a healthy provider
+                # down for every other stage.
+                call_id = self._record(
+                    request,
+                    routed,
+                    status=status,
+                    prompt_ref=prompt_ref,
+                    output_ref=output_ref,
+                    latency_ms=latency,
+                    error=f"stopped at its {declared} USD ceiling: {detail}",
+                    tokens_in=result.input_tokens,
+                    tokens_out=result.output_tokens,
+                    cost=result.total_cost_usd,
+                    resolved_model=result.resolved_model,
+                )
+                raise CallCeilingReachedError(
+                    f"{request.role} needed more than the {declared} USD it was "
+                    f"authorised for; {profile.name} stopped it at "
+                    f"{result.total_cost_usd} USD (call {call_id})",
+                    dimension=Dimension.MODEL_COST_USD,
+                    scope=BudgetScope.RUN,
+                    scope_id=self._run_id,
+                )
             health = self._record_health(profile.name, ok=False, error=detail)
             call_id = self._record(
                 request,

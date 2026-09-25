@@ -221,8 +221,22 @@ class Weights(BaseModel):
 #: The shape of the numbers is the governing principle as arithmetic: explore
 #: broadly and kill cheaply are cents, deepen selectively is dollars, replicate
 #: consequentially is the most expensive thing here.
+#:
+#: **Enforced, not advisory.** The router reserves a call's ceiling against
+#: every budget before the call and the provider stops the call there
+#: (``--max-budget-usd``), so a ceiling below what a call really costs is a
+#: stage that cannot run. Until that enforcement existed nothing tested these
+#: numbers against a bill, and one of them failed: 274 real
+#: ``duplicate_adjudicator`` calls in the 2026-09 dogfood cost 0.046 on
+#: average, 0.077 at p95 and 0.112 at most -- above the 0.10 this table said.
+#: DEDUP is 0.25, about twice the largest observed. Every other ceiling was
+#: already above its role's observed maximum and is unchanged; the tightest
+#: are FALSIFY (0.40 against 0.29 over 219 calls) and the explorers (0.60
+#: against 0.37 over 117). A call that exceeds its ceiling is stopped, billed
+#: and recorded ``BUDGET_EXHAUSTED`` -- the idea waits for a person, it is
+#: not retried and it is not judged.
 DEFAULT_STAGE_COST_USD: dict[Stage, Decimal] = {
-    Stage.DEDUP: Decimal("0.10"),
+    Stage.DEDUP: Decimal("0.25"),
     Stage.NOVELTY_SCREEN: Decimal("0.25"),
     Stage.FALSIFY: Decimal("0.40"),
     Stage.DISCOVER: Decimal("0.50"),

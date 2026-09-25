@@ -696,7 +696,8 @@ def test_a_replication_frozen_before_the_link_keeps_an_empty_parent(
                     "PCON-20260101T000000Z-0000000p",
                 ),
             )
-        assert migrate(db) == ("0035",)
+        # 0035 is the migration under test; anything later is applied with it.
+        assert migrate(db)[0] == "0035"
         store = PortfolioStore(db)
         legacy = store.require_contract("PCON-20260101T000000Z-0000000r")
         odd = store.require_contract("PCON-20260101T000000Z-0000000x")

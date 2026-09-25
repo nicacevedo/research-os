@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from typing import Any
@@ -313,6 +314,18 @@ class DuplicateBasisError(PortfolioStateError):
     Also a lost race, and the whole reason ``idea_actions`` carries a basis
     digest: a replayed event must not buy the same reasoning twice.
     """
+
+
+@dataclass(frozen=True, slots=True)
+class SpendPosition:
+    """One idea's or lineage's spend: what is recorded, and what calls hold now."""
+
+    settled: Decimal = Decimal(0)
+    held: Decimal = Decimal(0)
+
+    @property
+    def committed(self) -> Decimal:
+        return self.settled + self.held
 
 
 def _fields_of(version_fields: Mapping[str, Any]) -> dict[str, Any]:
@@ -3100,6 +3113,94 @@ class PortfolioStore:
                 (lineage_root,),
             ).fetchone()
         return Decimal(str(row["total"]))
+
+    def committed_spend(
+        self, project_id: str
+    ) -> tuple[dict[str, SpendPosition], dict[str, SpendPosition]]:
+        """Every idea's and every lineage's spend, settled and held, in two reads.
+
+        ``settled`` is the ledger's recorded spend for the scope (`sql/0036`),
+        or the older ``idea_actions`` sum where that is larger -- the ledger
+        sees a failure the provider billed and the action sum does not, and
+        the action sum is all there is for spend made before the scope had a
+        row. ``held`` is what calls in flight have reserved against it right
+        now, which a sum of finished actions could never see.
+        """
+
+        with self._db.tx() as conn:
+            idea_rows = conn.execute(
+                """
+                select i.idea_id,
+                       coalesce(sum(a.cost_usd), 0) as actions,
+                       coalesce(max(b.spent), 0) as ledger,
+                       coalesce(max(b.reserved), 0) as held
+                  from ideas i
+                  left join idea_actions a on a.idea_id = i.idea_id
+                  left join budgets b
+                    on b.scope = 'idea' and b.scope_id = i.idea_id
+                   and b.dimension = 'model_cost_usd'
+                 where i.project_id = %(project_id)s
+                 group by i.idea_id
+                """,
+                {"project_id": project_id},
+            ).fetchall()
+            lineage_rows = conn.execute(
+                """
+                select l.lineage_root,
+                       coalesce((select sum(a.cost_usd)
+                                   from idea_actions a
+                                   join ideas m on m.idea_id = a.idea_id
+                                  where m.lineage_root = l.lineage_root), 0)
+                           as actions,
+                       coalesce(b.spent, 0) as ledger,
+                       coalesce(b.reserved, 0) as held
+                  from (select distinct lineage_root from ideas
+                         where project_id = %(project_id)s) l
+                  left join budgets b
+                    on b.scope = 'lineage' and b.scope_id = l.lineage_root
+                   and b.dimension = 'model_cost_usd'
+                """,
+                {"project_id": project_id},
+            ).fetchall()
+
+        def position(row: Mapping[str, Any]) -> SpendPosition:
+            return SpendPosition(
+                settled=max(Decimal(str(row["actions"])), Decimal(str(row["ledger"]))),
+                held=Decimal(str(row["held"])),
+            )
+
+        return (
+            {str(row["idea_id"]): position(row) for row in idea_rows},
+            {str(row["lineage_root"]): position(row) for row in lineage_rows},
+        )
+
+    def queued_work(
+        self, *, project_id: str, kinds: Sequence[str]
+    ) -> tuple[tuple[str, str, str], ...]:
+        """Portfolio work bought and not yet started: ``(kind, idea_id, stage)``.
+
+        What the allocator has already sold but whose first call has not
+        reserved anything yet, so neither ``held`` above nor the project's
+        ledger can see it. ``LEASED`` is not here: a running item's current
+        call is already held in the ledger.
+        """
+
+        with self._db.tx() as conn:
+            rows = conn.execute(
+                """
+                select kind,
+                       coalesce(payload->>'idea_id', '') as idea_id,
+                       coalesce(payload->>'stage', '') as stage
+                  from work_items
+                 where project_id = %(project_id)s
+                   and kind = any(%(kinds)s)
+                   and status in ('PENDING', 'WAITING')
+                """,
+                {"project_id": project_id, "kinds": list(kinds)},
+            ).fetchall()
+        return tuple(
+            (str(row["kind"]), str(row["idea_id"]), str(row["stage"])) for row in rows
+        )
 
     # ----------------------------------------------------- portfolio state --
     def upsert_state(

@@ -321,8 +321,20 @@ class ModelRequest:
     #: can record exactly which inputs produced which output.
     context_refs: tuple[ArtifactRef, ...] = ()
     json_schema: Mapping[str, Any] | None = None
+    #: The most this one call is authorised to cost. When set, the router
+    #: reserves exactly this against every applicable ceiling *before* the
+    #: call and refuses the call if any of them cannot cover it, and it asks
+    #: the provider to stop there too. ``None`` reserves the provider
+    #: profile's estimate, which is an estimate and not a bound -- see
+    #: ``docs/RUNTIME.md`` §8a for which callers still do that.
     max_cost_usd: float | None = None
     timeout_seconds: int = 600
+    #: Further budget scopes this call's spend counts against, beyond the
+    #: router's run, project and system: ``(scope, scope_id)`` pairs with
+    #: ``scope`` a :class:`~research_os.runtime.models.BudgetScope` value.
+    #: The discovery portfolio names an idea and its lineage here, which is
+    #: attribution and authority, not a model choice.
+    budget_scopes: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -484,6 +496,22 @@ class ArtifactStore(Protocol):
         producer: str | None = None,
         source: str | None = None,
     ) -> ArtifactRef: ...
+
+    def put_contained(
+        self,
+        root: Path,
+        relative: str,
+        *,
+        media_type: str | None = None,
+        role: str | None = None,
+        producer: str | None = None,
+    ) -> ArtifactRef | None:
+        """Store a file a run wrote under ``root``, or ``None`` if it is not one.
+
+        The reader for directories a contained program could write: no link at
+        any component, a regular file, and the bytes hashed are the bytes kept.
+        """
+        ...
 
     def get_bytes(self, artifact_id: str) -> bytes: ...
 

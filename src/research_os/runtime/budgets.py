@@ -126,6 +126,7 @@ class BudgetLedger:
         dimension: Dimension,
         limit_value: Decimal | float,
         explicit: bool = False,
+        opening_spent: Decimal | float = 0,
     ) -> BudgetRecord:
         """Create or raise/lower a limit, preserving what has been spent.
 
@@ -136,15 +137,22 @@ class BudgetLedger:
         Once true it stays true: a derived write over an explicit ceiling
         must not quietly demote it back, or the protection would last until
         the next time anything touched the row.
+
+        ``opening_spent`` is what the scope had already spent before it had a
+        row, and it is read only when the row is *created*. An idea or a
+        lineage that ran stages before `sql/0036` has its spend recorded on
+        `idea_actions` and nowhere in this table, and a row opening at zero
+        would hand it its whole ceiling a second time.
         """
 
         with self._db.tx() as conn:
             row = conn.execute(
                 f"""
                 insert into budgets
-                    (budget_id, scope, scope_id, dimension, limit_value, explicit)
+                    (budget_id, scope, scope_id, dimension, limit_value, explicit,
+                     spent)
                 values (%(budget_id)s, %(scope)s, %(scope_id)s, %(dimension)s,
-                        %(limit_value)s, %(explicit)s)
+                        %(limit_value)s, %(explicit)s, %(opening_spent)s)
                 on conflict (scope, scope_id, dimension) do update
                     set limit_value = excluded.limit_value,
                         explicit = budgets.explicit or excluded.explicit,
@@ -158,6 +166,7 @@ class BudgetLedger:
                     "dimension": str(dimension),
                     "limit_value": Decimal(str(limit_value)),
                     "explicit": explicit,
+                    "opening_spent": max(Decimal(str(opening_spent)), Decimal(0)),
                 },
             ).fetchone()
         return BudgetRecord.model_validate(row)
@@ -274,6 +283,7 @@ class BudgetLedger:
         run_id: str,
         project_id: str,
         work_id: str | None = None,
+        extra: tuple[tuple[BudgetScope, str], ...] = (),
     ) -> tuple[Grant, ...]:
         """Reserve against run, project and system, or reserve against none.
 
@@ -281,12 +291,19 @@ class BudgetLedger:
         held when one of them refuses. So a refusal releases whatever was
         already taken before re-raising: a half-reserved spend that never
         happens would leak capacity on every refusal until the run looked broke.
+
+        ``extra`` names further scopes the same spend counts against -- the
+        discovery portfolio's idea and lineage (`sql/0036`) -- reserved in the
+        same all-or-nothing pass, so a lineage's ceiling is checked by the
+        same ``where`` clause as a project's and cannot be oversubscribed by
+        two concurrent stages either.
         """
 
         scopes = (
             (BudgetScope.RUN, run_id),
             (BudgetScope.PROJECT, project_id),
             (BudgetScope.SYSTEM, "system"),
+            *extra,
         )
         taken: list[Grant] = []
         try:

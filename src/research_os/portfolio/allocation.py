@@ -52,6 +52,82 @@ LITERATURE_REQUEST = "portfolio_literature"
 SYNTHESIZE = "portfolio_synthesize"
 
 
+#: The work kinds that make model calls, and so need budget authority.
+MODEL_KINDS: tuple[str, ...] = (
+    ADVANCE_IDEA,
+    EXPLORE,
+    FOLLOW_UP,
+    LITERATURE_REQUEST,
+    SYNTHESIZE,
+)
+
+
+def call_ceiling(
+    kind: str, stage: Stage | str | None, config: PortfolioConfig
+) -> Decimal:
+    """The ``max_cost_usd`` one call of this work declares -- what it must reserve.
+
+    The same number each handler passes to the router, read from the same
+    configuration, so what the allocator sells and what the ledger is later
+    asked to cover are one figure. Zero for work that makes no model call.
+    """
+
+    if kind == ADVANCE_IDEA:
+        if not stage:
+            return Decimal(0)
+        return config.cost_for(Stage(stage))
+    if kind == EXPLORE:
+        return config.explorer_cost_usd
+    if kind == FOLLOW_UP:
+        return config.cost_for(Stage.BRANCH)
+    if kind == LITERATURE_REQUEST:
+        return config.cost_for(Stage.LITERATURE_AUDIT)
+    if kind == SYNTHESIZE:
+        return config.cost_for(Stage.REVIEW_BOARD)
+    return Decimal(0)
+
+
+def cheapest_call(config: PortfolioConfig) -> Decimal:
+    """The smallest positive ceiling any portfolio model call declares.
+
+    A budget with less than this left cannot authorise another call of any
+    kind, which is what ``PAUSED_BUDGET_EXHAUSTED`` means.
+    """
+
+    ceilings = [value for value in config.stage_cost_usd.values() if value > 0]
+    ceilings.append(config.explorer_cost_usd)
+    positive = [value for value in ceilings if value > 0]
+    return min(positive) if positive else Decimal(0)
+
+
+@dataclass(frozen=True, slots=True)
+class SaleAuthority:
+    """What the project's and the system's ledgers can still authorise.
+
+    Available capacity -- limit, less recorded spend, less what calls in
+    flight hold -- less one call ceiling for every item already bought and
+    not yet started, whose first call has reserved nothing yet. ``None`` in a
+    dimension means no ceiling applies there, which is what an absent budget
+    row means everywhere in the ledger.
+
+    This is how a tick avoids *selling* work the ledger will refuse. It is not
+    the boundary itself: the boundary is the ledger's reservation, taken per
+    call in the same statement as the check, and it holds whatever this
+    estimate says.
+    """
+
+    cost_usd: Decimal | None = None
+    calls: int | None = None
+
+    def covers(self, ceiling: Decimal, *, sold_cost: Decimal, sold_calls: int) -> bool:
+        if ceiling <= 0:
+            # A stage that makes no model call needs no model authority.
+            return True
+        if self.cost_usd is not None and self.cost_usd - sold_cost < ceiling:
+            return False
+        return self.calls is None or self.calls - sold_calls >= 1
+
+
 @dataclass(frozen=True, slots=True)
 class DiversityKey:
     """The coordinates an idea occupies in the portfolio's diversity space.
@@ -188,13 +264,24 @@ class Candidate:
     expected_cost: Decimal
     idle_seconds: float
     open_objections: int
+    #: What this idea has committed: recorded spend, plus what its calls in
+    #: flight hold, plus one call ceiling per item bought for it and not yet
+    #: started. Compared with its ceiling *including* the next stage's call.
     spent: Decimal
+    #: The same, for its whole lineage.
     lineage_spent: Decimal
     #: How many times this idea's next stage has already failed terminally,
     #: on this version. Carried into the allocation so the dedup key can name
     #: the generation; the ceiling that stops it growing forever is applied in
     #: ``tick._candidates``, where the idea can also be marked blocked.
     generation: int = 0
+    #: The queue already holds an unstarted item for exactly this stage.
+    #:
+    #: Re-announced rather than dropped -- the queue refuses the duplicate,
+    #: and a pass whose every decision is refused is the signal that items
+    #: are not being worked -- but not charged again: its call ceiling is
+    #: already in ``spent``, ``lineage_spent`` and the sale authority.
+    bought: bool = False
 
 
 def diversity_key(
@@ -318,16 +405,41 @@ def plan(
     frontier_claims: int = 0,
     synthesis_basis: tuple[str, int] | None = None,
     syntheses_in_flight: int = 0,
+    authority: SaleAuthority | None = None,
 ) -> tuple[Allocation, ...]:
     """The ordered, bounded list of work this tick buys.
 
     Order of business, and it is the governing principle again: keep the pool
     from emptying, then spend what is left on the highest-utility work that
     every bound permits.
+
+    **Every sale is charged against what it may cost, as it is made.** Each
+    item takes its call ceiling out of ``authority`` and, for an idea, out of
+    its own and its lineage's remaining ceiling, so the second thing a tick
+    buys is judged against a budget that already paid for the first. A tick
+    used to test every candidate against the same pre-tick sums, and a
+    lineage one cent under its ceiling was sold a stage per free slot.
     """
 
     allocations: list[Allocation] = []
     remaining = max(0, free_slots)
+    authority = authority or SaleAuthority()
+    sold_cost = Decimal(0)
+    sold_calls = 0
+
+    def affordable(kind: str, stage: Stage | None = None) -> bool:
+        return authority.covers(
+            call_ceiling(kind, stage, config),
+            sold_cost=sold_cost,
+            sold_calls=sold_calls,
+        )
+
+    def charge(kind: str, stage: Stage | None = None) -> None:
+        nonlocal sold_cost, sold_calls
+        ceiling = call_ceiling(kind, stage, config)
+        if ceiling > 0:
+            sold_cost += ceiling
+            sold_calls += 1
 
     # Project-level work first, and outside the idea slots. A follow-up, a
     # synthesis and a literature question each hold no idea's capacity --
@@ -341,8 +453,9 @@ def plan(
     # portfolio can buy -- one call, about one event that already happened.
     # `open_requests` is ``(request_id, generation, basis)``, oldest first,
     # already filtered to the requests that may run now.
-    if open_requests and follow_ups_in_flight == 0:
+    if open_requests and follow_ups_in_flight == 0 and affordable(FOLLOW_UP):
         request_id, generation, basis = open_requests[0]
+        charge(FOLLOW_UP)
         allocations.append(
             Allocation(
                 kind=FOLLOW_UP,
@@ -353,8 +466,9 @@ def plan(
     # A synthesis, when the reviewed evidence changed. Its referee's findings
     # are what return the writing to the frontier, so it is bought as readily
     # as a question is -- one at a time, once per basis and generation.
-    if synthesis_basis and syntheses_in_flight == 0:
+    if synthesis_basis and syntheses_in_flight == 0 and affordable(SYNTHESIZE):
         basis_digest, generation = synthesis_basis
+        charge(SYNTHESIZE)
         allocations.append(
             Allocation(
                 kind=SYNTHESIZE,
@@ -364,8 +478,13 @@ def plan(
         )
     # And a question put to the literature, the same way and for the same
     # reason: it is the cheapest thing that can unblock an idea waiting on it.
-    if literature_requests and literature_in_flight == 0:
+    if (
+        literature_requests
+        and literature_in_flight == 0
+        and affordable(LITERATURE_REQUEST)
+    ):
         request_id, generation, basis = literature_requests[0]
+        charge(LITERATURE_REQUEST)
         allocations.append(
             Allocation(
                 kind=LITERATURE_REQUEST,
@@ -379,6 +498,7 @@ def plan(
         and remaining
         and candidate_pool < config.bounds.candidate_pool_floor
         and explorers_in_flight == 0
+        and affordable(EXPLORE)
     ):
         explorer, why = choose_explorer(
             pending_seeds=pending_seeds,
@@ -386,6 +506,7 @@ def plan(
             minable_failures=minable_failures,
             frontier_claims=frontier_claims,
         )
+        charge(EXPLORE)
         allocations.append(
             Allocation(
                 kind=EXPLORE,
@@ -409,6 +530,8 @@ def plan(
     # here froze every full lineage -- see
     # `PortfolioStore.lineage_in_flight_counts`.
     taken_lineage = dict(lineage_in_flight)
+    #: What this plan has already charged to each lineage's ceiling.
+    sold_lineage: dict[str, Decimal] = {}
     pool = list(candidates)
     while remaining > 0 and pool:
         scored = [(utility(item, config=config, active=active), item) for item in pool]
@@ -436,10 +559,24 @@ def plan(
                 and _screened(item)
             ):
                 continue
-            if item.spent >= config.bounds.idea_spend_ceiling_usd:
-                continue
-            if item.lineage_spent >= config.bounds.lineage_spend_ceiling_usd:
-                continue
+            # The next stage's call ceiling must fit under the idea's and
+            # the lineage's ceilings *after* what is committed and what this
+            # plan already sold -- not merely "not yet at the ceiling", which
+            # sold a 2.50 stage to a lineage with a cent left.
+            if not item.bought:
+                exposure = call_ceiling(ADVANCE_IDEA, item.stage, config)
+                if item.spent + exposure > config.bounds.idea_spend_ceiling_usd:
+                    continue
+                root = item.idea.lineage_root
+                if (
+                    item.lineage_spent + sold_lineage.get(root, Decimal(0)) + exposure
+                    > config.bounds.lineage_spend_ceiling_usd
+                ):
+                    continue
+                if not affordable(ADVANCE_IDEA, item.stage):
+                    continue
+                charge(ADVANCE_IDEA, item.stage)
+                sold_lineage[root] = sold_lineage.get(root, Decimal(0)) + exposure
             chosen = item
             allocations.append(
                 Allocation(
@@ -481,7 +618,10 @@ def plan(
             minable_failures=minable_failures,
             frontier_claims=frontier_claims,
         )
-        if not any(item.kind == EXPLORE for item in allocations):
+        if not any(item.kind == EXPLORE for item in allocations) and affordable(
+            EXPLORE
+        ):
+            charge(EXPLORE)
             allocations.append(
                 Allocation(
                     kind=EXPLORE,

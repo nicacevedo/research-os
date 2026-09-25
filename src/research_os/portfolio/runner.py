@@ -79,6 +79,7 @@ from research_os.runtime.interfaces import (
     ModelRequest,
     ModelResponse,
 )
+from research_os.runtime.models import BudgetScope
 from research_os.runtime.prompts import PromptTemplate
 from research_os.runtime.routing import ProviderCallFailedError
 from research_os.runtime.store import RuntimeStore
@@ -265,8 +266,22 @@ def _ask(
         independence_group=independence_group,
         json_schema=template.output_schema,
         max_cost_usd=float(context.config.cost_for(_stage_for(template.name))),
+        # The idea's and its lineage's ceilings, reserved by the ledger with
+        # the call's own ceiling before the call starts (`sql/0036`).
+        # `track.open_stage_budgets` created both rows when the stage began.
+        budget_scopes=stage_budget_scopes(context),
     )
     return context.models.complete(request)
+
+
+def stage_budget_scopes(context: TrackContext) -> tuple[tuple[str, str], ...]:
+    """The idea and lineage budget scopes every call of this stage counts against."""
+
+    idea = context.portfolio.require_idea(context.idea_id)
+    return (
+        (str(BudgetScope.IDEA), idea.idea_id),
+        (str(BudgetScope.LINEAGE), idea.lineage_root),
+    )
 
 
 #: Which stage's ceiling each template's calls are charged against. A table

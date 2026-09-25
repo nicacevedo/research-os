@@ -18,6 +18,7 @@ import json
 import shutil
 import subprocess
 from dataclasses import dataclass, field
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -74,6 +75,15 @@ class InvocationRequest:
     access: Access | None = None
     tools: tuple[str, ...] = ()
     json_schema: dict[str, Any] | None = None
+    #: The most this invocation is authorised to spend, in USD, or ``None``.
+    #:
+    #: The runtime reserves this amount against every applicable budget before
+    #: invoking, so the provider is asked to stop at the same number. A
+    #: provider that bills after each model response can only stop *between*
+    #: responses, so the one in progress when the cap is crossed completes and
+    #: is billed: the cap bounds a call to its ceiling plus one response, not
+    #: to its ceiling. ``docs/RUNTIME.md`` §8a states that residual.
+    max_budget_usd: float | None = None
 
     def __post_init__(self) -> None:
         if self.access is None:
@@ -131,6 +141,12 @@ class InvocationResult:
     total_cost_usd: float | None = None
     permission_denials: int | None = None
     error: str | None = None
+    #: The provider stopped because the invocation reached ``max_budget_usd``.
+    #:
+    #: Distinct from every other error because the remedy is: nothing is
+    #: unavailable and nothing will change by retrying -- the call needed more
+    #: than it was authorised to spend, which is the budget working.
+    budget_exhausted: bool = False
 
     @property
     def ok(self) -> bool:
@@ -189,6 +205,11 @@ class ClaudeCodeProvider:
             "--tools",
             "--restricted",
             "--strict-mcp-config",
+            # The per-call spend cap. Required rather than optional, because
+            # the runtime passes it on every call that declares a ceiling and
+            # a CLI that did not know it would fail every such call -- better
+            # said here, by `runtime doctor`, than discovered as an outage.
+            "--max-budget-usd",
         )
         missing = [flag for flag in required if flag not in help_text]
         auth = self._auth_status(path)
@@ -262,6 +283,8 @@ class ClaudeCodeProvider:
             argv.extend(
                 ["--json-schema", json.dumps(request.json_schema, sort_keys=True)]
             )
+        if request.max_budget_usd is not None:
+            argv.extend(["--max-budget-usd", _usd(request.max_budget_usd)])
         return argv
 
     def _parse(
@@ -325,6 +348,7 @@ class ClaudeCodeProvider:
             total_cost_usd=_as_float(payload.get("total_cost_usd")),
             permission_denials=len(denials) if isinstance(denials, list) else None,
             error=error,
+            budget_exhausted=payload.get("subtype") == BUDGET_EXHAUSTED_SUBTYPE,
         )
 
     @staticmethod
@@ -462,6 +486,18 @@ def probe_registry(
 
     adapters = registry if registry is not None else default_registry()
     return {name: adapter.probe() for name, adapter in sorted(adapters.items())}
+
+
+#: The result subtype the Claude CLI writes when ``--max-budget-usd`` stopped
+#: the session. Read from the local binary, which emits it with ``is_error``
+#: and the ``total_cost_usd`` it had billed by then.
+BUDGET_EXHAUSTED_SUBTYPE = "error_max_budget_usd"
+
+
+def _usd(value: float) -> str:
+    """A dollar amount as the CLI's argument, without float noise or exponent."""
+
+    return format(Decimal(str(value)).normalize(), "f")
 
 
 def _as_int(value: object) -> int | None:

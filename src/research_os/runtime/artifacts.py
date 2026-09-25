@@ -37,8 +37,9 @@ import logging
 import mimetypes
 import os
 import tempfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
+from research_os.automation.filescope import open_contained
 from research_os.errors import ResearchOSError
 from research_os.runtime.interfaces import ArtifactRef
 
@@ -258,6 +259,71 @@ class FilesystemArtifactStore:
             role=role,
             producer=producer,
             source=source or str(target),
+        )
+        return ArtifactRef(
+            artifact_id=artifact_id, media_type=guessed, role=role, size_bytes=size
+        )
+
+    def put_contained(
+        self,
+        root: Path,
+        relative: str,
+        *,
+        media_type: str | None = None,
+        role: str | None = None,
+        producer: str | None = None,
+    ) -> ArtifactRef | None:
+        """Store ``root/relative`` if it is contained there, else ``None``.
+
+        For a directory a run could write. Opened once through
+        :func:`open_contained`, and hashed while it is copied, so the bytes
+        stored are the bytes hashed: :meth:`put_file` hashes, then reopens by
+        path to copy, and anything that swapped the file in between would be
+        stored under the first file's address.
+        """
+
+        handle = open_contained(root, relative)
+        if handle is None:
+            return None
+        incoming = self._root / "sha256"
+        try:
+            incoming.mkdir(parents=True, exist_ok=True)
+            descriptor, temporary = tempfile.mkstemp(dir=incoming, prefix=".incoming-")
+        except OSError as exc:
+            handle.close()
+            raise ArtifactError(f"could not stage {relative}: {exc}") from None
+        digest = hashlib.sha256()
+        size = 0
+        try:
+            with handle, os.fdopen(descriptor, "wb") as sink:
+                while chunk := handle.read(CHUNK_BYTES):
+                    digest.update(chunk)
+                    sink.write(chunk)
+                    size += len(chunk)
+                sink.flush()
+                os.fsync(sink.fileno())
+            artifact_id = digest.hexdigest()
+            target = self.path_for(artifact_id)
+            if target.is_file():
+                Path(temporary).unlink(missing_ok=True)
+            else:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(temporary, target)
+        except OSError as exc:
+            Path(temporary).unlink(missing_ok=True)
+            raise ArtifactError(f"could not store {relative}: {exc}") from None
+        guessed = (
+            media_type
+            or mimetypes.guess_type(PurePosixPath(relative).name)[0]
+            or "application/octet-stream"
+        )
+        self._record(
+            artifact_id,
+            size_bytes=size,
+            media_type=guessed,
+            role=role,
+            producer=producer,
+            source=str(root / relative),
         )
         return ArtifactRef(
             artifact_id=artifact_id, media_type=guessed, role=role, size_bytes=size

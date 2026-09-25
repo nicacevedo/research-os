@@ -222,10 +222,32 @@ report.
 | dimension | enforcement |
 |---|---|
 | `model_calls` | reserved before the call, settled after. A call cannot happen without capacity |
-| `model_cost_usd` | reserved at the profile's estimate, settled at the provider's reported cost |
+| `model_cost_usd` | a call that declares `max_cost_usd` reserves **that whole ceiling** against run, project, system and any scope it names (the portfolio names its idea and lineage, `sql/0036`) before it starts, is refused if any of them cannot cover it, and is capped at the same number by the provider; settled at the provider's reported cost, including a failure the provider billed. A call that declares nothing reserves the profile's estimate -- see below |
 | `external_jobs` | reserved before submission |
 | `work_items` | reserved before a local experiment |
 | `wall_clock_seconds` | **charged after the fact**, per cycle entry |
+
+**What the cost ceiling does and does not promise.** No provider quotes a
+price before it bills, so a hard monetary bound needs something that stops the
+spend. For a call that declares a ceiling there are two: the ledger will not let
+it *start* unless every applicable budget can cover the whole ceiling, and the
+Claude CLI is invoked with `--max-budget-usd` at the same number. The CLI checks
+that cap after each model response, so the response in progress when the cap is
+crossed completes and is billed -- the call ends as `error_max_budget_usd`,
+recorded at what it cost, classified `BUDGET_EXHAUSTED` (terminal; never retried,
+never counted against the provider's health). A ceiling can therefore be exceeded
+by the part of **one model response** per concurrently running call that crosses
+its own per-call cap, and that excess is recorded exactly. It is not exceeded by
+whole calls, or by a call that should never have started.
+
+Every call the discovery portfolio makes declares a ceiling (its stage's, its
+explorer's, its follow-up's). The objective cycle's graph nodes and actions do
+not: they reserve the provider profile's estimate (0.05 USD), which is an
+estimate and not a bound, and a project ceiling can be overshot by one such
+call's actual cost -- recorded, and seen by the next reservation. The delegated
+controllers (`runtime/spend.py`) reserve a ratcheting per-call ceiling and do not
+pass it to the provider, because a coding session is many turns of tool use;
+their residual is stated in that module.
 
 Wall clock is the exception and it is worth being explicit. Nothing interrupts a
 running graph on elapsed time; a cycle's duration is bounded by the per-call and

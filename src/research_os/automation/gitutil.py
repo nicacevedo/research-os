@@ -72,29 +72,10 @@ def git(
     worker has just been editing. See :data:`_NEUTRALISED_CONFIG`.
     """
 
-    environment = {
-        **os.environ,
-        # The user's and the system's config, removed. A worker cannot write
-        # either, but a command run with them is a command whose behaviour
-        # depends on the researcher's machine rather than on the repository.
-        "GIT_CONFIG_GLOBAL": os.devnull,
-        "GIT_CONFIG_SYSTEM": os.devnull,
-        "GIT_TERMINAL_PROMPT": "0",
-        "GIT_ASKPASS": "",
-        # `git` runs the ssh binary for a remote operation. Nothing here does
-        # one, and an empty command fails loudly rather than reaching the
-        # researcher's agent.
-        "GIT_SSH_COMMAND": "",
-    }
-    neutralised: list[str] = []
-    for setting in _NEUTRALISED_CONFIG:
-        neutralised.extend(["-c", setting])
-    invocation = list(args)
-    if invocation and invocation[0] in _NO_EXTERNAL_DIFF:
-        invocation.insert(1, "--no-ext-diff")
+    argv, environment = _invocation(args)
     try:
         completed = subprocess.run(
-            ["git", *neutralised, *invocation],
+            argv,
             cwd=str(cwd),
             check=False,
             capture_output=True,
@@ -115,6 +96,64 @@ def git(
             f"({completed.returncode}): {completed.stderr.strip()}"
         )
     return completed
+
+
+def git_bytes(
+    args: list[str],
+    *,
+    cwd: Path,
+    stdin: bytes = b"",
+    timeout: int = GIT_TIMEOUT_SECONDS,
+) -> bytes | None:
+    """Run one Git command as :func:`git` does, on bytes; ``None`` if it failed.
+
+    For content, where decoding would change what is compared: an object's
+    bytes, or bytes to hash. Same neutralised configuration, same environment.
+    """
+
+    argv, environment = _invocation(args)
+    try:
+        completed = subprocess.run(
+            argv,
+            cwd=str(cwd),
+            check=False,
+            capture_output=True,
+            input=stdin,
+            timeout=timeout,
+            env=environment,
+            start_new_session=True,
+        )
+    except FileNotFoundError as exc:
+        raise GitError("git is not available on PATH") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise GitError(f"git {' '.join(args)} timed out after {timeout}s") from exc
+    return completed.stdout if completed.returncode == 0 else None
+
+
+def _invocation(args: list[str]) -> tuple[list[str], dict[str, str]]:
+    """The argv and environment every command in this module runs with."""
+
+    environment = {
+        **os.environ,
+        # The user's and the system's config, removed. A worker cannot write
+        # either, but a command run with them is a command whose behaviour
+        # depends on the researcher's machine rather than on the repository.
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_SYSTEM": os.devnull,
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_ASKPASS": "",
+        # `git` runs the ssh binary for a remote operation. Nothing here does
+        # one, and an empty command fails loudly rather than reaching the
+        # researcher's agent.
+        "GIT_SSH_COMMAND": "",
+    }
+    neutralised: list[str] = []
+    for setting in _NEUTRALISED_CONFIG:
+        neutralised.extend(["-c", setting])
+    invocation = list(args)
+    if invocation and invocation[0] in _NO_EXTERNAL_DIFF:
+        invocation.insert(1, "--no-ext-diff")
+    return ["git", *neutralised, *invocation], environment
 
 
 def repository_root(path: Path) -> Path:

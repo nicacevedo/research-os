@@ -24,9 +24,10 @@ function to reach.
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any
 
 from research_os.portfolio import allocation, frontier
@@ -44,7 +45,7 @@ from research_os.portfolio.models import (
     Stage,
 )
 from research_os.portfolio.stages import select_stage, snapshot_for
-from research_os.portfolio.store import PortfolioStore
+from research_os.portfolio.store import PortfolioStore, SpendPosition
 from research_os.runtime.budgets import BudgetLedger, Dimension
 from research_os.runtime.config import RuntimeConfig
 from research_os.runtime.db import Database
@@ -185,8 +186,18 @@ def tick(
     # `exhausted_dimensions`, which takes a run id: a tick is not a run, and
     # inventing one to ask the question would put a row in `research_runs` that
     # never runs anything.
-    spent_out = [
-        (scope, dimension)
+    #
+    # "Spent" means "cannot authorise another call", not "has nothing left".
+    # Every call now reserves its whole declared ceiling, so a remainder
+    # smaller than the cheapest ceiling any portfolio call declares can never
+    # authorise one -- and a portfolio sitting on 0.03 USD reported RUNNING,
+    # bought work every tick and had every call refused. Judged on recorded
+    # spend, not on what calls in flight hold: a hold is released or settled
+    # within the call, and pausing on it would pause a portfolio that is
+    # merely busy.
+    floor = allocation.cheapest_call(config)
+    ledgers = {
+        (scope, dimension): record
         for scope, scope_id in (
             (BudgetScope.PROJECT, project_id),
             (BudgetScope.SYSTEM, "system"),
@@ -194,17 +205,31 @@ def tick(
         for dimension in (Dimension.MODEL_COST_USD, Dimension.MODEL_CALLS)
         if (record := budgets.get(scope=scope, scope_id=scope_id, dimension=dimension))
         is not None
-        and record.exhausted
+    }
+    spent_out = [
+        (scope, dimension, record)
+        for (scope, dimension), record in ledgers.items()
+        if _cannot_authorise(
+            record.limit_value - record.spent,
+            floor if dimension is Dimension.MODEL_COST_USD else Decimal(1),
+        )
     ]
     if spent_out:
+        scope, dimension, record = spent_out[0]
+        left = record.limit_value - record.spent
+        unit = "USD" if dimension is Dimension.MODEL_COST_USD else "call(s)"
         return _pause(
             store,
             report,
             PortfolioStatus.PAUSED_BUDGET_EXHAUSTED,
-            f"{spent_out[0][0]} budget for {spent_out[0][1]} is spent. Raise it "
-            f"with `researchctl runtime budget --max-cost-usd` and the next tick "
-            f"resumes; nothing here converts that into a scientific rejection.",
+            f"{scope} {dimension} budget is spent: {left} {unit} of "
+            f"{record.limit_value} remain, less than the cheapest call this "
+            f"portfolio may make ({floor} USD). Raise it with `researchctl "
+            f"runtime budget --max-cost-usd` and the next tick resumes; nothing "
+            f"here converts that into a scientific rejection.",
         )
+    queued = store.queued_work(project_id=project_id, kinds=allocation.MODEL_KINDS)
+    authority = _sale_authority(ledgers, queued, config)
 
     in_flight = store.explorations_in_flight(project_id=project_id)
 
@@ -222,7 +247,9 @@ def tick(
         and not literature_requests
     )
 
-    candidates, report.settled = _candidates(store, project_id, config, moment)
+    candidates, report.settled = _candidates(
+        store, project_id, config, moment, queued=queued
+    )
     # The pause is for a portfolio with nothing left to do, and it was taken
     # before the candidates were even read: six barren explorer runs froze
     # every idea that still had a stage to run, and told the researcher the
@@ -297,6 +324,7 @@ def tick(
         syntheses_in_flight=store.work_in_flight(
             project_id=project_id, kind=allocation.SYNTHESIZE
         ),
+        authority=authority,
     )
     report.allocations = allocations
 
@@ -658,11 +686,55 @@ def _origin_counts(ideas: Sequence[Any]) -> dict[IdeaOrigin, int]:
     return counts
 
 
+def _cannot_authorise(left: Decimal, cheapest: Decimal) -> bool:
+    """Whether a remainder can never authorise another call."""
+
+    return left <= 0 or left < cheapest
+
+
+def _sale_authority(
+    ledgers: Mapping[tuple[BudgetScope, Dimension], Any],
+    queued: Sequence[tuple[str, str, str]],
+    config: PortfolioConfig,
+) -> allocation.SaleAuthority:
+    """What the project's and system's ledgers can still authorise for new work.
+
+    The tightest of the two in each dimension, as everywhere in the ledger,
+    less one call ceiling for every item already bought and not started.
+    """
+
+    queued_cost = sum(
+        (allocation.call_ceiling(kind, stage, config) for kind, _idea, stage in queued),
+        Decimal(0),
+    )
+    queued_calls = sum(
+        1
+        for kind, _idea, stage in queued
+        if allocation.call_ceiling(kind, stage, config) > 0
+    )
+    cost = [
+        record.available - queued_cost
+        for (_scope, dimension), record in ledgers.items()
+        if dimension is Dimension.MODEL_COST_USD
+    ]
+    calls = [
+        int(record.available) - queued_calls
+        for (_scope, dimension), record in ledgers.items()
+        if dimension is Dimension.MODEL_CALLS
+    ]
+    return allocation.SaleAuthority(
+        cost_usd=min(cost) if cost else None,
+        calls=min(calls) if calls else None,
+    )
+
+
 def _candidates(
     store: PortfolioStore,
     project_id: str,
     config: PortfolioConfig,
     moment: datetime,
+    *,
+    queued: Sequence[tuple[str, str, str]] = (),
 ) -> tuple[tuple[allocation.Candidate, ...], int]:
     """Every idea the allocator may choose from, with its next stage.
 
@@ -677,6 +749,24 @@ def _candidates(
     settled = 0
     failures = store.stage_failures(project_id)
     generations = store.advance_generations(project_id)
+    idea_spend, lineage_spend = store.committed_spend(project_id)
+    # Bought and not started: nothing is held for these yet, so the ledger
+    # cannot see them, and a lineage with three queued stages is not a
+    # lineage with nothing committed.
+    queued_idea: dict[str, Decimal] = {}
+    queued_lineage: dict[str, Decimal] = {}
+    queued_stage: dict[str, set[str]] = {}
+    for kind, queued_id, stage in queued:
+        if kind != allocation.ADVANCE_IDEA or not queued_id:
+            continue
+        queued_stage.setdefault(queued_id, set()).add(stage)
+        ceiling = allocation.call_ceiling(kind, stage, config)
+        queued_idea[queued_id] = queued_idea.get(queued_id, Decimal(0)) + ceiling
+        owner = store.get_idea(queued_id)
+        if owner is not None:
+            queued_lineage[owner.lineage_root] = (
+                queued_lineage.get(owner.lineage_root, Decimal(0)) + ceiling
+            )
     for idea in store.list_ideas(project_id=project_id, limit=500):
         if not allocation.allocatable(idea):
             continue
@@ -703,7 +793,16 @@ def _candidates(
             if frontier.settle(store, idea, snapshot, config):
                 settled += 1
             continue
-        never = _never_allocatable(store, idea, version, stage, config)
+        never = _never_allocatable(
+            idea,
+            version,
+            stage,
+            config,
+            idea_settled=idea_spend.get(idea.idea_id, SpendPosition()).settled,
+            lineage_settled=lineage_spend.get(
+                idea.lineage_root, SpendPosition()
+            ).settled,
+        )
         if never is not None:
             # The allocator would skip this idea on every tick for as long as
             # the portfolio runs, silently -- and it would still count in the
@@ -770,26 +869,39 @@ def _candidates(
                 expected_cost=config.cost_for(stage),
                 idle_seconds=allocation.idle_seconds(idea, now=moment),
                 open_objections=len(snapshot.open_objections),
-                spent=store.spend_for_idea(idea.idea_id),
-                lineage_spent=store.spend_for_lineage(idea.lineage_root),
+                spent=idea_spend.get(idea.idea_id, SpendPosition()).committed
+                + queued_idea.get(idea.idea_id, Decimal(0)),
+                lineage_spent=lineage_spend.get(
+                    idea.lineage_root, SpendPosition()
+                ).committed
+                + queued_lineage.get(idea.lineage_root, Decimal(0)),
                 generation=generation,
+                bought=str(stage) in queued_stage.get(idea.idea_id, set()),
             )
         )
     return tuple(found), settled
 
 
 def _never_allocatable(
-    store: PortfolioStore,
     idea: PortfolioIdea,
     version: Any,
     stage: Stage,
     config: PortfolioConfig,
+    *,
+    idea_settled: Decimal,
+    lineage_settled: Decimal,
 ) -> tuple[str, str] | None:
     """Why :func:`allocation.plan` will skip this idea on every tick, if it will.
 
     The same three conditions the plan applies, read from the same rows, so
     the two cannot disagree: an idea is parked here exactly when the plan
     would never choose it. ``None`` for an idea the plan may still choose.
+
+    The two spend conditions read *recorded* spend only, plus the next
+    stage's call ceiling. Recorded spend only grows, so an idea whose next
+    call cannot fit under it will never fit and is parked; one that fails the
+    plan's test only because of what calls in flight hold is merely waiting,
+    and is left for the plan to skip until they settle.
     """
 
     novelty = version.dimensions.novelty
@@ -807,21 +919,22 @@ def _never_allocatable(
             ),
             "a literature audit or a revision that lifts its novelty above the floor",
         )
-    spent = store.spend_for_idea(idea.idea_id)
-    if spent >= config.bounds.idea_spend_ceiling_usd:
+    exposure = allocation.call_ceiling(allocation.ADVANCE_IDEA, stage, config)
+    if idea_settled + exposure > config.bounds.idea_spend_ceiling_usd:
         return (
             (
-                f"spent {spent} USD, at its idea ceiling of "
-                f"{config.bounds.idea_spend_ceiling_usd} USD"
+                f"spent {idea_settled} USD of its idea ceiling of "
+                f"{config.bounds.idea_spend_ceiling_usd} USD, and its next stage "
+                f"({stage}) may cost {exposure} USD a call"
             ),
             "a person raises bounds.idea_spend_ceiling_usd",
         )
-    lineage_spent = store.spend_for_lineage(idea.lineage_root)
-    if lineage_spent >= config.bounds.lineage_spend_ceiling_usd:
+    if lineage_settled + exposure > config.bounds.lineage_spend_ceiling_usd:
         return (
             (
-                f"its lineage has spent {lineage_spent} USD, at the lineage "
-                f"ceiling of {config.bounds.lineage_spend_ceiling_usd} USD"
+                f"its lineage has spent {lineage_settled} USD of the lineage "
+                f"ceiling of {config.bounds.lineage_spend_ceiling_usd} USD, and "
+                f"its next stage ({stage}) may cost {exposure} USD a call"
             ),
             "a person raises bounds.lineage_spend_ceiling_usd",
         )

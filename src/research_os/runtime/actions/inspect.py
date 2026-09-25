@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from research_os.automation import gitutil
+from research_os.automation.filescope import contained_file
 from research_os.errors import ResearchOSError
 from research_os.runtime.actions.base import ActionOutcome
 from research_os.runtime.context import CycleContext
@@ -110,14 +111,18 @@ def _scientific_documents(
     refs: list[ArtifactRef] = []
     for root_name in DOCUMENT_ROOTS:
         root = repo / root_name
-        if not root.is_dir():
+        # A linked root is refused, not followed: `reports -> /home/user`
+        # would otherwise inventory, store and cite the host's documents as
+        # the project's. `rglob` does not descend into nested links; the
+        # contained reader below refuses a link at any component anyway.
+        if root.is_symlink() or not root.is_dir():
             continue
         for path in sorted(root.rglob("*")):
-            if not path.is_file() or path.is_symlink():
-                continue
             if path.suffix.lower() not in DOCUMENT_SUFFIXES:
                 continue
             relative = path.relative_to(repo).as_posix()
+            if contained_file(repo, relative) is None:
+                continue
             size = path.stat().st_size
             entry: dict[str, Any] = {
                 "path": relative,
@@ -129,11 +134,15 @@ def _scientific_documents(
             }
             if size <= MAX_DOCUMENT_BYTES:
                 try:
-                    ref = context.artifacts.put_file(
-                        path, role="project_document", producer="inspect_repository"
+                    stored = context.artifacts.put_contained(
+                        repo,
+                        relative,
+                        role="project_document",
+                        producer="inspect_repository",
                     )
-                    entry["artifact_id"] = ref.artifact_id
-                    refs.append(ref)
+                    if stored is not None:
+                        entry["artifact_id"] = stored.artifact_id
+                        refs.append(stored)
                 except ResearchOSError as exc:
                     # A document that cannot be stored is still worth reporting.
                     LOG.warning("could not register %s: %s", relative, exc)

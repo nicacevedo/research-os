@@ -179,6 +179,12 @@ class BudgetScope(StrEnum):
     PROJECT = "project"
     RUN = "run"
     WORK_ITEM = "work_item"
+    #: A discovery-portfolio idea and its lineage family (`sql/0036`). Reserved
+    #: per call alongside run, project and system when a request names them,
+    #: so the portfolio's two ceilings are checked where the spend is taken
+    #: rather than summed after the stage that made it.
+    IDEA = "idea"
+    LINEAGE = "lineage"
 
 
 class ReservationStatus(StrEnum):

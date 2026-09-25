@@ -166,6 +166,21 @@ def load_document(path: Path) -> Any:
     return parse_document(text, name=path.name)
 
 
+def parse_bytes(data: bytes, *, name: str) -> Any:
+    """Parse one raw output already read -- by a contained reader -- as bytes.
+
+    What :func:`load_document` does after it has opened the file, for a caller
+    that opened it through ``research_os.automation.filescope.open_contained``
+    and checked the bytes against the hash the evidence records.
+    """
+
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        return Unavailable(f"{name} could not be read: {exc}")
+    return parse_document(text, name=name)
+
+
 def parse_document(text: str, *, name: str) -> Any:
     """Parse the text of one raw output by its file name's suffix."""
 
@@ -982,5 +997,6 @@ __all__ = [
     "Unavailable",
     "evaluate",
     "load_document",
+    "parse_bytes",
     "parse_document",
 ]

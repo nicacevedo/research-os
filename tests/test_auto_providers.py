@@ -320,7 +320,7 @@ def test_probing_verifies_the_flags_the_adapter_depends_on(
         elif argv[1] == "--help":
             out = (
                 "--print --output-format --json-schema --tools "
-                "--restricted --strict-mcp-config"
+                "--restricted --strict-mcp-config --max-budget-usd"
             )
         else:
             out = json.dumps({"loggedIn": True, "authMethod": "claude.ai"})

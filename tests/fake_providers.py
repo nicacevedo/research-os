@@ -33,6 +33,9 @@ class ScriptedResponse:
     total_cost_usd: float | None = 0.01
     input_tokens: int | None = 100
     output_tokens: int | None = 20
+    #: The provider stopped the call at ``--max-budget-usd`` (the CLI's
+    #: ``error_max_budget_usd``), billing ``total_cost_usd`` for what it did.
+    budget_exhausted: bool = False
 
 
 @dataclass
@@ -88,6 +91,7 @@ class FakeProvider:
             total_cost_usd=response.total_cost_usd,
             permission_denials=0,
             error=response.error,
+            budget_exhausted=response.budget_exhausted,
         )
 
     def requests_for(self, role: Role) -> list[InvocationRequest]:

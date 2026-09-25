@@ -336,3 +336,19 @@ are no composed inputs, so every preregistration and every idempotency key
 written before this release rebuilds to the same hash. An unconditional
 empty list would have been a migration wearing the clothes of a field
 addition.
+
+## Change control record: per-call budget authority and contained readers
+
+Per the change-control section above, a dedicated record. **No invariant
+changed and nothing was added to the permitted-technology list.** Two are
+enforced where they were previously described; one migration (`0036`) widens
+the budget scope constraint and adds no table.
+
+| # | invariant | what changed |
+|---|---|---|
+| 11 | experiments traceable | strengthened. Every reader of a directory a run could write -- workspace, run directory, checkout -- opens the file through `automation.filescope.open_contained`: no link at any component, walked with `O_NOFOLLOW` so the check and the read are one operation, and a conclusion reads only bytes whose hash matches the recorded output. The run's own logs, the runtime route's outputs and the designer's view of a committed output were read by `is_file()` and could be a link to any host file. A committed specimen is recognised by its Git object -- unfiltered bytes against the blob, or against checkout's rendering under HEAD's attributes -- and no longer through a clean filter, under which a CRLF specimen and `text=auto` read as a new measurement |
+| 12 | paid use has budgets | strengthened. A call that declares `max_cost_usd` reserves that whole ceiling against run, project, system, idea and lineage before it starts and the provider is capped at it; it used to reserve a 0.05 estimate whatever it declared. Idea and lineage ceilings are ledger scopes reserved per call rather than sums checked after a stage. The allocator charges each sale as it makes it. A budget whose remainder cannot cover the cheapest call pauses the portfolio as spent. The residual -- a provider stops a call after a model response, not during one -- is stated in `docs/RUNTIME.md` §8a rather than claimed away |
+
+```text
+a budget that bounds the next call  !=  a budget that bounds the call after the overrun
+```

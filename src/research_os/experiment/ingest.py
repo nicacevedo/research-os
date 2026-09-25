@@ -28,6 +28,7 @@ import json
 import mimetypes
 from pathlib import Path
 
+from research_os.automation.filescope import contained_file, read_contained
 from research_os.errors import ExperimentIngestError
 from research_os.experiment.models import (
     ArtifactRecord,
@@ -102,8 +103,12 @@ def collect_artifacts(
         if relative in seen:
             continue
         seen.add(relative)
-        target = worktree / relative
-        if target.is_symlink() or not target.is_file():
+        # The containment rule every other evidence reader applies: no link at
+        # *any* component. Asking `is_symlink()` of the file alone followed a
+        # directory link -- `results -> specimens` committed as a convenience
+        # -- and hashed a committed specimen as this run's output.
+        target = contained_file(worktree, relative)
+        if target is None:
             continue
         sha256, size = digest_file(target)
         if sha256 is None:
@@ -267,9 +272,13 @@ def _json_check(run: ExperimentRun, worktree: Path) -> CheckOutcome:
         )
     broken: list[str] = []
     for item in targets:
+        raw = read_contained(worktree, item.path, max_bytes=MAX_ARTIFACT_BYTES)
+        if raw is None:
+            broken.append(f"{item.path} (not a file this run wrote in its worktree)")
+            continue
         try:
-            json.loads((worktree / item.path).read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
+            json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as exc:
             broken.append(f"{item.path} ({exc})")
     return CheckOutcome(
         name="outputs_are_json",

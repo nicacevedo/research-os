@@ -795,13 +795,16 @@ def _collect_outputs(
         return ()
     refs = []
     for relative in (*spec.outputs, "logs/stdout.txt", "logs/stderr.txt"):
-        candidate = run_dir / relative
-        if candidate.is_file() and candidate.stat().st_size:
-            refs.append(
-                context.artifacts.put_file(
-                    candidate, role=f"result:{relative}", producer="executor"
-                )
-            )
+        # Through the containment rule the portfolio's readers use, not
+        # `is_file()`. The run directory is bound writable into the sandbox,
+        # so the program can leave a link there -- at an output, at its own
+        # log, or at `logs/` -- and a reader that followed it stored host
+        # content as the run's result, which a finding then cited.
+        ref = context.artifacts.put_contained(
+            run_dir, relative, role=f"result:{relative}", producer="executor"
+        )
+        if ref is not None and ref.size_bytes:
+            refs.append(ref)
     return tuple(refs)
 
 

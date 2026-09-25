@@ -21,6 +21,8 @@ Only two of them spend anything, and neither of them decides what to spend on.
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +34,7 @@ from typing import Any
 from research_os.portfolio import allocation
 from research_os.portfolio.config import PortfolioConfig, load_config
 from research_os.portfolio.store import PortfolioStore
+from research_os.runtime.budgets import BudgetExhaustedError
 from research_os.runtime.extensions import WorkContext, register_work
 from research_os.runtime.failures import FailureClass
 from research_os.runtime.models import Autonomy, RunKind, RunStatus, TerminalState
@@ -45,6 +48,33 @@ TICK_EVENT = "PORTFOLIO_TICK_DUE"
 
 def _config(context: WorkContext) -> PortfolioConfig:
     return load_config()
+
+
+@contextmanager
+def _closing_run(runtime: RuntimeStore, run_id: str) -> Iterator[None]:
+    """End the handler's run with a terminal state when its work raises.
+
+    An idea stage records its own ending (`track.advance_idea`); these
+    handlers did not, so anything that escaped them -- a budget refusing the
+    call before it was made, most often, now that every call reserves its
+    whole ceiling -- left a run RUNNING for ever with nothing running it,
+    and no reconciler looks at an idea-track run.
+    """
+
+    try:
+        yield
+    except BaseException as exc:
+        runtime.set_run_status(
+            run_id,
+            RunStatus.FAILED,
+            terminal_state=(
+                TerminalState.BUDGET_EXHAUSTED
+                if isinstance(exc, BudgetExhaustedError)
+                else TerminalState.FATAL_INFRASTRUCTURE_ERROR
+            ),
+            detail=f"{type(exc).__name__}: {exc}"[:500],
+        )
+        raise
 
 
 def run_tick(context: WorkContext) -> dict[str, Any]:
@@ -228,23 +258,24 @@ def run_explore(context: WorkContext) -> dict[str, Any]:
     from research_os.runtime.artifacts import FilesystemArtifactStore
 
     runtime.set_run_status(run.run_id, RunStatus.RUNNING)
-    outcome = runner.run_explorer(
-        runner.ExplorerContext(
-            config=_config(context),
-            portfolio=store,
-            runtime=runtime,
-            models=context.models(
-                run.run_id, context.item.project_id, context.item.work_id
+    with _closing_run(runtime, run.run_id):
+        outcome = runner.run_explorer(
+            runner.ExplorerContext(
+                config=_config(context),
+                portfolio=store,
+                runtime=runtime,
+                models=context.models(
+                    run.run_id, context.item.project_id, context.item.work_id
+                ),
+                artifacts=FilesystemArtifactStore(
+                    context.config.artifacts_root, store=runtime
+                ),
+                project_id=context.item.project_id,
+                run_id=run.run_id,
+                charter=_charter(context.repo_path),
             ),
-            artifacts=FilesystemArtifactStore(
-                context.config.artifacts_root, store=runtime
-            ),
-            project_id=context.item.project_id,
-            run_id=run.run_id,
-            charter=_charter(context.repo_path),
-        ),
-        explorer,
-    )
+            explorer,
+        )
     runtime.set_run_status(
         run.run_id,
         RunStatus.SUCCEEDED if outcome.ok else RunStatus.FAILED,
@@ -290,22 +321,23 @@ def run_follow_up(context: WorkContext) -> dict[str, Any]:
         run_kind=RunKind.IDEA_TRACK,
     )
     runtime.set_run_status(run.run_id, RunStatus.RUNNING)
-    result = frontier.run_follow_up(
-        frontier.FrontierContext(
-            config=_config(context),
-            portfolio=store,
-            runtime=runtime,
-            models=context.models(
-                run.run_id, context.item.project_id, context.item.work_id
+    with _closing_run(runtime, run.run_id):
+        result = frontier.run_follow_up(
+            frontier.FrontierContext(
+                config=_config(context),
+                portfolio=store,
+                runtime=runtime,
+                models=context.models(
+                    run.run_id, context.item.project_id, context.item.work_id
+                ),
+                artifacts=FilesystemArtifactStore(
+                    context.config.artifacts_root, store=runtime
+                ),
+                project_id=context.item.project_id,
+                run_id=run.run_id,
             ),
-            artifacts=FilesystemArtifactStore(
-                context.config.artifacts_root, store=runtime
-            ),
-            project_id=context.item.project_id,
-            run_id=run.run_id,
-        ),
-        request_id,
-    )
+            request_id,
+        )
     runtime.set_run_status(
         run.run_id,
         RunStatus.SUCCEEDED if result.ok else RunStatus.FAILED,
@@ -390,24 +422,25 @@ def run_literature_request(context: WorkContext) -> dict[str, Any]:
         run_kind=RunKind.IDEA_TRACK,
     )
     runtime.set_run_status(run.run_id, RunStatus.RUNNING)
-    result = litintel.answer_request(
-        frontier.FrontierContext(
-            config=_config(context),
-            portfolio=store,
-            runtime=runtime,
-            models=context.models(
-                run.run_id, context.item.project_id, context.item.work_id
+    with _closing_run(runtime, run.run_id):
+        result = litintel.answer_request(
+            frontier.FrontierContext(
+                config=_config(context),
+                portfolio=store,
+                runtime=runtime,
+                models=context.models(
+                    run.run_id, context.item.project_id, context.item.work_id
+                ),
+                artifacts=FilesystemArtifactStore(
+                    context.config.artifacts_root, store=runtime
+                ),
+                project_id=context.item.project_id,
+                run_id=run.run_id,
             ),
-            artifacts=FilesystemArtifactStore(
-                context.config.artifacts_root, store=runtime
-            ),
-            project_id=context.item.project_id,
-            run_id=run.run_id,
-        ),
-        request_id,
-        literature=_literature(),
-        retriever=_retriever(),
-    )
+            request_id,
+            literature=_literature(),
+            retriever=_retriever(),
+        )
     runtime.set_run_status(
         run.run_id,
         RunStatus.SUCCEEDED if result.ok else RunStatus.FAILED,
@@ -459,21 +492,22 @@ def run_synthesize(context: WorkContext) -> dict[str, Any]:
         run_kind=RunKind.IDEA_TRACK,
     )
     runtime.set_run_status(run.run_id, RunStatus.RUNNING)
-    result = synthesis.synthesize(
-        frontier.FrontierContext(
-            config=_config(context),
-            portfolio=store,
-            runtime=runtime,
-            models=context.models(
-                run.run_id, context.item.project_id, context.item.work_id
-            ),
-            artifacts=FilesystemArtifactStore(
-                context.config.artifacts_root, store=runtime
-            ),
-            project_id=context.item.project_id,
-            run_id=run.run_id,
+    with _closing_run(runtime, run.run_id):
+        result = synthesis.synthesize(
+            frontier.FrontierContext(
+                config=_config(context),
+                portfolio=store,
+                runtime=runtime,
+                models=context.models(
+                    run.run_id, context.item.project_id, context.item.work_id
+                ),
+                artifacts=FilesystemArtifactStore(
+                    context.config.artifacts_root, store=runtime
+                ),
+                project_id=context.item.project_id,
+                run_id=run.run_id,
+            )
         )
-    )
     runtime.set_run_status(
         run.run_id,
         RunStatus.SUCCEEDED if result.ok else RunStatus.FAILED,

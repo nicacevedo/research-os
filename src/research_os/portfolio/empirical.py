@@ -46,12 +46,18 @@ import hashlib
 import json
 import logging
 import math
+import os
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from research_os.automation.filescope import (
+    contained_file,
+    open_contained,
+    read_contained,
+)
 from research_os.errors import ExperimentSpecError, ResearchOSError
 from research_os.experiment.generated import GeneratedInput
 from research_os.portfolio import scicontract
@@ -366,14 +372,17 @@ def output_schema_lines(
         for relative in spec.outputs:
             if relative not in tracked:
                 continue
-            target = repository / relative
+            # Through the containment rule the experiment readers use. A link
+            # committed at the declared path, or a directory on it replaced by
+            # one in the working tree, passes `ls-files` -- the index still
+            # names the path -- and a reader that followed it put the keys of
+            # an arbitrary host JSON file into the designer's prompt.
+            raw = read_contained(repository, relative, max_bytes=MAX_SCHEMA_BYTES)
+            if raw is None:
+                continue
             try:
-                if not target.is_file() or target.stat().st_size > MAX_SCHEMA_BYTES:
-                    continue
-                document = json.loads(
-                    target.read_text(encoding="utf-8"), parse_constant=_not_a_number
-                )
-            except (OSError, ValueError, UnicodeDecodeError):
+                document = json.loads(raw.decode("utf-8"), parse_constant=_not_a_number)
+            except (ValueError, UnicodeDecodeError):
                 continue
             every = numeric_paths(document)
             paths = every[:MAX_SCHEMA_PATHS]
@@ -991,7 +1000,6 @@ def analyse(
             outputs=outputs,
             notes=tuple(notes),
         )
-    target = contained
     stale = _was_already_in_the_checkout(workspace, rule.output_path)
     if stale is not None:
         # **The run did not produce the number.** The workspace is a checkout
@@ -1022,22 +1030,22 @@ def analyse(
             outputs=outputs,
             notes=(*notes, f"{rule.output_path} was not written by this run"),
         )
-    try:
-        if target.stat().st_size > MAX_METRIC_DOCUMENT_BYTES:
-            return Analysis(
-                conclusion=EmpiricalConclusion.INSUFFICIENT,
-                summary=(
-                    f"{rule.output_path} is larger than "
-                    f"{MAX_METRIC_DOCUMENT_BYTES} bytes, so the preregistered "
-                    f"metric was not read out of it here"
-                ),
-                outputs=outputs,
-                notes=tuple(notes),
-            )
-        document = json.loads(
-            target.read_text(encoding="utf-8"), parse_constant=_not_a_number
+    recorded = _read_recorded(
+        workspace,
+        rule.output_path,
+        digest={path: digest for path, digest, _ in outputs}[rule.output_path],
+        max_bytes=MAX_METRIC_DOCUMENT_BYTES,
+    )
+    if isinstance(recorded, str):
+        return Analysis(
+            conclusion=EmpiricalConclusion.INSUFFICIENT,
+            summary=f"{recorded}, so the preregistered metric was not read out of it here",
+            outputs=outputs,
+            notes=tuple(notes),
         )
-    except (OSError, ValueError, UnicodeDecodeError) as exc:
+    try:
+        document = json.loads(recorded.decode("utf-8"), parse_constant=_not_a_number)
+    except (ValueError, UnicodeDecodeError) as exc:
         return Analysis(
             conclusion=EmpiricalConclusion.INSUFFICIENT,
             summary=f"{rule.output_path} could not be read as JSON: {exc}",
@@ -1116,6 +1124,7 @@ def analyse_contract(
     ordered = [*sources, *(item for item in spec.outputs if item not in sources)]
     outputs = _collect(workspace, ordered)
     produced = {path for path, _digest, _size in outputs}
+    digests = {path: digest for path, digest, _size in outputs}
     absent = [item for item in ordered if item not in produced]
     missing = [item for item in absent if not (workspace / item).exists()]
     unrecorded = [item for item in absent if (workspace / item).exists()]
@@ -1149,13 +1158,19 @@ def analyse_contract(
                 f"{stale[:12]}, so it was not written by this run (exit {exit_code})"
             )
             continue
-        contained = _contained_output(workspace, source)
+        # Read once, through the containment rule, and only if the bytes are
+        # the bytes `_collect` recorded: the conclusion must rest on exactly
+        # the output the evidence names by hash.
+        recorded = _read_recorded(
+            workspace,
+            source,
+            digest=digests[source],
+            max_bytes=engine.MAX_DOCUMENT_BYTES,
+        )
         documents[source] = (
-            engine.load_document(contained)
-            if contained is not None
-            else engine.Unavailable(
-                f"{source} is not a file this run wrote in its workspace"
-            )
+            engine.Unavailable(recorded)
+            if isinstance(recorded, str)
+            else engine.parse_bytes(recorded, name=source)
         )
     result = engine.evaluate(verified.analysis, documents)
     return (
@@ -1188,28 +1203,44 @@ def _contained_output(workspace: Path, relative: str) -> Path | None:
     ``None`` for an absolute or escaping path, a path any component of which
     is a link, one that resolves outside the workspace, or anything that is
     not a regular file.
+
+    The rule itself now lives in :func:`research_os.automation.filescope.
+    open_contained`, so the runtime's readers and the v1 experiment route
+    apply it too; this is the answer-only form. A caller that reads the file uses
+    :func:`_read_recorded` or the store's ``put_contained``, which open it
+    once, so the path cannot be swapped between the check and the read.
     """
 
-    pure = PurePosixPath(relative)
-    if (
-        pure.is_absolute()
-        or not pure.parts
-        or any(part in {"", ".", ".."} for part in pure.parts)
-    ):
-        return None
-    current = workspace
-    for part in pure.parts:
-        current = current / part
-        if current.is_symlink():
-            return None
-    try:
-        resolved = current.resolve(strict=True)
-        inside = resolved.is_relative_to(workspace.resolve(strict=True))
-    except (OSError, RuntimeError):
-        return None
-    if not inside or not resolved.is_file():
-        return None
-    return current
+    return contained_file(workspace, relative)
+
+
+def _read_recorded(
+    workspace: Path, relative: str, *, digest: str, max_bytes: int
+) -> bytes | str:
+    """The bytes ``_collect`` recorded at ``relative``, or why they cannot be read.
+
+    Opened once through the containment rule and compared with the digest the
+    evidence record carries. A reader that re-opened the path after hashing it
+    could read different bytes from the ones the record names -- the file
+    replaced, or a directory on its path turned into a link, in between -- and
+    the conclusion would rest on an output nothing recorded.
+    """
+
+    handle = open_contained(workspace, relative)
+    if handle is None:
+        return f"{relative} is not a file this run wrote in its workspace"
+    with handle:
+        if os.fstat(handle.fileno()).st_size > max_bytes:
+            return f"{relative} is larger than {max_bytes} bytes"
+        data = handle.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        return f"{relative} is larger than {max_bytes} bytes"
+    if hashlib.sha256(data).hexdigest() != digest:
+        return (
+            f"{relative} changed after its hash was recorded, so what would be "
+            f"read is not the output the evidence names"
+        )
+    return data
 
 
 def _reached_through_a_link(workspace: Path, relative: str) -> bool:
@@ -1224,38 +1255,64 @@ def _reached_through_a_link(workspace: Path, relative: str) -> bool:
 
 
 def _was_already_in_the_checkout(workspace: Path, relative: str) -> str | None:
-    """The base commit, when ``relative`` there is byte-identical to the committed copy.
+    """The base commit, when ``relative`` there is exactly what Git put there.
 
     ``None`` means the run wrote something the checkout did not already have,
     which is the only case in which a declared output is a *measurement*.
 
-    Compared through Git's own object ids rather than by reading bytes:
-    ``hash-object`` hashes the working file exactly as Git would and
-    ``rev-parse HEAD:<path>`` names what was committed, so the comparison is
-    binary-exact and needs no decoding. Asked of Git rather than of a
-    timestamp because it needs no state carried from submission to reading --
-    the workspace is a worktree at the base commit, so Git is the
-    authoritative answer to "was this the committed copy". A file Git does
-    not know is never stale.
+    Asked of Git rather than of a timestamp because it needs no state carried
+    from submission to reading -- the workspace is a checkout of the base
+    commit, so Git is the authoritative answer to "was this the committed
+    copy". A file Git does not know is never stale.
+
+    **Identity is the committed object, never a filter's view of it.** The
+    first form hashed the working file with ``git hash-object``, which runs it
+    through the *clean* side of ``.gitattributes`` first: under ``text=auto``
+    a specimen committed with CRLF line endings hashes as its LF
+    normalisation, differs from its own blob, and was read as a new
+    measurement although nothing touched it. So the file's bytes are compared,
+    unfiltered, with two things and only two:
+
+    - the committed blob itself (``hash-object --no-filters``); and
+    - the bytes checkout writes for that blob -- ``cat-file --filters`` under
+      the attributes *committed at HEAD* (``--attr-source``), because
+      ``eol=crlf``, ``ident`` or ``working-tree-encoding`` make checkout write
+      bytes that are not the blob's, and ``--no-filters`` alone would call
+      that untouched specimen new. HEAD's attributes and not the worktree's,
+      because the run can rewrite ``.gitattributes`` in its workspace and
+      would otherwise choose what "what checkout wrote" means.
+
+    Anything else is bytes the run produced, whatever a clean filter would
+    make of them.
     """
 
-    from research_os.automation.gitutil import git
+    from research_os.automation.gitutil import git, git_bytes
 
     try:
         committed = git(
-            ["rev-parse", f"HEAD:{relative}"], cwd=workspace, check=False
-        ).stdout.strip()
-        if not committed:
-            return None
-        current = git(
-            ["hash-object", "--", str(workspace / relative)],
+            ["rev-parse", "--verify", "--quiet", f"HEAD:{relative}"],
             cwd=workspace,
             check=False,
         ).stdout.strip()
+        if not committed:
+            return None
+        data = read_contained(workspace, relative, max_bytes=MAX_COLLECTED_BYTES)
+        if data is None:
+            return None
+        unfiltered = git_bytes(
+            ["hash-object", "--no-filters", "--stdin"], cwd=workspace, stdin=data
+        )
+        same = (unfiltered or b"").strip().decode("ascii", "replace") == committed
+        if not same:
+            rendered = git_bytes(
+                ["--attr-source=HEAD", "cat-file", "--filters", f"HEAD:{relative}"],
+                cwd=workspace,
+            )
+            same = rendered is not None and rendered == data
+        if not same:
+            return None
         head = git(["rev-parse", "HEAD"], cwd=workspace, check=False).stdout.strip()
     except ResearchOSError:  # pragma: no cover - a workspace with no git
-        return None
-    if not current or current != committed:
         return None
     return head or committed
 
@@ -1274,16 +1331,16 @@ def _collect(
 
     found: list[tuple[str, str, int]] = []
     for relative in list(declared)[:MAX_COLLECTED_OUTPUTS]:
-        target = _contained_output(workspace, relative)
-        if target is None:
+        handle = open_contained(workspace, relative)
+        if handle is None:
             continue
         try:
-            size = target.stat().st_size
-            if size > MAX_COLLECTED_BYTES:
-                continue
-            digest = hashlib.sha256()
-            with target.open("rb") as handle:
-                for block in iter(lambda: handle.read(1024 * 1024), b""):
+            with handle:
+                size = os.fstat(handle.fileno()).st_size
+                if size > MAX_COLLECTED_BYTES:
+                    continue
+                digest = hashlib.sha256()
+                while block := handle.read(1024 * 1024):
                     digest.update(block)
         except OSError:
             continue
@@ -3782,18 +3839,23 @@ def _store_logs(
 
     stored: list[dict[str, str]] = []
     for relative in ("logs/stdout.txt", "logs/stderr.txt"):
-        target = run_dir / relative
-        if not target.is_file() or not target.stat().st_size:
-            continue
+        # Through the containment rule, and not `is_file()`: the run
+        # directory is the one host directory besides the workspace that the
+        # contained program may write, so it can replace its own log -- or
+        # `logs/` -- with a link to anything on the host, and a reader that
+        # followed it stored that file as the run's log.
         try:
-            ref = context.artifacts.put_file(
-                target,
+            ref = context.artifacts.put_contained(
+                run_dir,
+                relative,
                 media_type="text/plain; charset=utf-8",
                 role=f"idea_experiment_log:{experiment.experiment_id}",
                 producer=f"executor:{experiment.command}",
             )
         except ResearchOSError as exc:  # pragma: no cover - a log that vanished
-            LOG.warning("could not store %s: %s", target, exc)
+            LOG.warning("could not store %s from %s: %s", relative, run_dir, exc)
+            continue
+        if ref is None or not ref.size_bytes:
             continue
         context.artifacts.link(
             ref,
@@ -3838,17 +3900,26 @@ def _store_outputs(
 
     stored: list[dict[str, str]] = []
     for relative, digest, _size in analysis.outputs:
-        target = _contained_output(workspace, relative)
-        if target is None:  # pragma: no cover - collected, so contained
-            continue
         try:
-            ref = context.artifacts.put_file(
-                target,
+            ref = context.artifacts.put_contained(
+                workspace,
+                relative,
                 role=f"idea_experiment_output:{experiment.experiment_id}",
                 producer=f"executor:{experiment.command}",
             )
         except ResearchOSError as exc:
             LOG.warning("could not store %s from %s: %s", relative, workspace, exc)
+            continue
+        if ref is None or ref.artifact_id != digest:
+            # Not the output that was hashed and analysed: gone, behind a
+            # link, or different bytes. Stored anyway it would sit beside a
+            # sha256 it does not have.
+            LOG.warning(
+                "%s in %s is no longer the output recorded as sha256:%s; not stored",
+                relative,
+                workspace,
+                digest[:12],
+            )
             continue
         context.artifacts.link(
             ref,

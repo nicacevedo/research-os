@@ -19,7 +19,9 @@ one ``lstat`` rather than a walk of the filesystem.
 from __future__ import annotations
 
 import os
-from pathlib import Path
+import stat
+from pathlib import Path, PurePosixPath
+from typing import BinaryIO
 
 from research_os.errors import SymlinkScopeError
 
@@ -89,3 +91,98 @@ def _is_contained(candidate: Path, root: Path) -> bool:
     except (OSError, RuntimeError):
         return False
     return resolved == root or root in resolved.parents
+
+
+_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
+_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
+_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
+
+
+def open_contained(root: Path, relative: str) -> BinaryIO | None:
+    """Open ``root/relative`` for reading, if it is a file written *there*.
+
+    The one containment rule every scientific reader applies to a directory a
+    run could write -- a workspace, a run directory, a checkout. It began as
+    the portfolio's ``_contained_output`` and lives here, beside the worktree
+    link scan, so the runtime's readers and the v1 experiment route apply the
+    same rule rather than one each. ``None`` for an absolute or escaping
+    path, a path any component of which is a link, or anything that is not a
+    regular file.
+
+    **The check is the read.** The path is walked one component at a time
+    with ``O_NOFOLLOW`` relative to the directory already opened, and the file
+    is opened the same way, so a component replaced by a link between an
+    earlier check and this read is refused by the kernel rather than
+    followed. The earlier form asked ``is_symlink()`` and then reopened by
+    path. ``O_NONBLOCK`` because a program can leave a FIFO where its log
+    should be, and a blocking open of one waits for a writer that never comes.
+
+    ``root`` itself is trusted and followed: it is a directory the host chose.
+    """
+
+    pure = PurePosixPath(relative)
+    if (
+        pure.is_absolute()
+        or not pure.parts
+        or any(part in {"", ".", ".."} for part in pure.parts)
+        or not (_NOFOLLOW and _DIRECTORY)
+    ):
+        return None
+    descriptor = -1
+    try:
+        descriptor = os.open(root, os.O_RDONLY | _DIRECTORY | _CLOEXEC)
+        for part in pure.parts[:-1]:
+            child = os.open(
+                part,
+                os.O_RDONLY | _DIRECTORY | _NOFOLLOW | _CLOEXEC,
+                dir_fd=descriptor,
+            )
+            os.close(descriptor)
+            descriptor = child
+        leaf = os.open(
+            pure.parts[-1],
+            os.O_RDONLY | _NOFOLLOW | _CLOEXEC | _NONBLOCK,
+            dir_fd=descriptor,
+        )
+    except OSError:
+        return None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    try:
+        if not stat.S_ISREG(os.fstat(leaf).st_mode):
+            os.close(leaf)
+            return None
+        return os.fdopen(leaf, "rb")
+    except OSError:
+        os.close(leaf)
+        return None
+
+
+def contained_file(root: Path, relative: str) -> Path | None:
+    """``root/relative`` if :func:`open_contained` would open it, else ``None``.
+
+    For a caller that needs the answer rather than the bytes. A caller that
+    goes on to *read* the file should use :func:`open_contained` instead, or
+    the path can change under it between the two.
+    """
+
+    handle = open_contained(root, relative)
+    if handle is None:
+        return None
+    handle.close()
+    return root / relative
+
+
+def read_contained(root: Path, relative: str, *, max_bytes: int) -> bytes | None:
+    """The bytes of a contained file no larger than ``max_bytes``, else ``None``."""
+
+    handle = open_contained(root, relative)
+    if handle is None:
+        return None
+    with handle:
+        if os.fstat(handle.fileno()).st_size > max_bytes:
+            return None
+        data = handle.read(max_bytes + 1)
+    return data if len(data) <= max_bytes else None

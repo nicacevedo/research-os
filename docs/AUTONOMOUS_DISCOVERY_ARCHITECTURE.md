@@ -1114,25 +1114,34 @@ different class would mean nothing serialises it against the coding pipeline.
 portfolio   → BudgetScope.PROJECT     (a portfolio is per project)
 project     → BudgetScope.PROJECT
 run         → BudgetScope.RUN         (one idea-track stage is one run)
-idea        → the allocator, before the stage is enqueued
-lineage     → the allocator, before the stage is enqueued
-stage       → the request's max_cost_usd, from stage config
+idea        → BudgetScope.IDEA        (sql/0036), reserved per call
+lineage     → BudgetScope.LINEAGE     (sql/0036), reserved per call
+call        → the request's max_cost_usd, from stage config, reserved whole
 role        → the router's existing per-role model selection
 ```
 
-**Idea and lineage ceilings are enforced in the allocator, not as budget
-scopes,** and that is a deliberate downgrade from an earlier draft. Adding
-`BudgetScope.IDEA` would not have been "a one-line enum addition": three
-enforcement paths in `budgets.py` hardcode the scope triple, and `ModelRouter`
-carries no idea id to reserve against. `BudgetScope.WORK_ITEM` already exists,
-is in the check constraint, and is used by nothing -- which is what an enum
-value without enforcement looks like.
+**Every ceiling is a ledger reservation taken before the call.** An earlier
+release enforced idea and lineage ceilings in the allocator alone, against
+`idea_actions.cost_usd` summed after each stage finished, and described the
+overshoot as "bounded by one stage's own `max_cost_usd`, which the router does
+enforce per call". The router did not: it reserved the provider profile's 0.05
+estimate whatever the request declared. A hostile review reproduced both the
+per-call overshoot and a lineage one cent under its ceiling being sold a stage
+per free slot in one tick.
 
-So the allocator sums `idea_actions.cost_usd` per idea and per lineage root and
-refuses to enqueue a stage that would exceed a ceiling. The overshoot that
-allows is bounded by one stage's own `max_cost_usd`, which the router does
-enforce per call. That bound is stated rather than hidden, and it is the honest
-trade for not reshaping the budget ledger.
+Now a stage's call names its idea and lineage (`ModelRequest.budget_scopes`),
+`track.open_stage_budgets` makes both ceilings ledger rows at the effective
+bounds when the stage starts, and the router reserves the call's whole
+`max_cost_usd` against run, project, system, idea and lineage in one
+all-or-nothing pass -- the same `where`-clause check that makes two concurrent
+workers unable to share the last of a project's budget. A refusal fails the
+stage `BUDGET_EXHAUSTED` and parks the idea `BLOCKED_BUDGET`; spend is settled at
+the provider's reported cost in every scope. The allocator additionally charges
+each sale as it makes it -- against the idea's and lineage's committed spend
+(recorded, plus what calls in flight hold, plus one call ceiling per item bought
+and not started) and against the project's remaining authority -- so it does not
+*sell* what the ledger will refuse. `docs/RUNTIME.md` §8a states the one residual:
+the provider stops a call at its ceiling after a model response, not during one.
 
 **Expensive stages require stronger gates.** `stage_policy` maps each stage to
 the minimum tier that may enter it: `evidence` requires `PROMISING`,

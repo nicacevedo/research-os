@@ -44,7 +44,7 @@ from research_os.portfolio.store import (
     PortfolioStore,
 )
 from research_os.runtime.artifacts import FilesystemArtifactStore
-from research_os.runtime.budgets import BudgetLedger
+from research_os.runtime.budgets import BudgetExhaustedError, BudgetLedger, Dimension
 from research_os.runtime.checkpoints import DURABILITY, checkpointer
 from research_os.runtime.config import RuntimeConfig
 from research_os.runtime.db import Database
@@ -52,7 +52,13 @@ from research_os.runtime.failures import FailureClass
 from research_os.runtime.idempotency import InvocationLedger
 from research_os.runtime.interfaces import ModelProvider
 from research_os.runtime.locks import research_run_lock
-from research_os.runtime.models import Autonomy, RunKind, RunStatus, TerminalState
+from research_os.runtime.models import (
+    Autonomy,
+    BudgetScope,
+    RunKind,
+    RunStatus,
+    TerminalState,
+)
 from research_os.runtime.routing import IndependenceUnavailableError
 from research_os.runtime.store import RuntimeStore
 
@@ -447,6 +453,9 @@ def advance_idea(
     runtime_store.set_run_status(run.run_id, RunStatus.RUNNING)
 
     try:
+        # Inside the guard: a failure opening the rows must fail the action
+        # it has already claimed, not leave it ACTIVE for the reconciler.
+        open_stage_budgets(db, store, idea_id=idea_id, config=portfolio_config)
         with (
             research_run_lock(db, run.run_id),
             checkpointer(runtime_config.require_dsn()) as saver,
@@ -489,6 +498,30 @@ def advance_idea(
             run.run_id,
             RunStatus.FAILED,
             terminal_state=TerminalState.WAITING_FOR_EXTERNAL_DEPENDENCY,
+            detail=str(exc)[:500],
+        )
+        raise
+    except BudgetExhaustedError as exc:
+        # A ledger refused a call before it was made -- the idea's, its
+        # lineage's, the project's or the system's ceiling could not cover
+        # the call's own -- or the provider stopped a call at that ceiling.
+        # Either way the budget worked, and the taxonomy has a class for it
+        # that is terminal and that `_operational_for` already maps to
+        # BLOCKED_BUDGET. Before this it reached the catch-all below as
+        # UNKNOWN, left the idea IDLE, and the next tick bought the same
+        # refused stage again until the failure ceiling called it external.
+        store.complete_action(
+            action_id=action.action_id,
+            status=ActionStatus.FAILED,
+            detail=f"a budget refused this stage's next model call: {exc}",
+            failure_class=str(FailureClass.BUDGET_EXHAUSTED),
+            cost_usd=_run_cost(runtime_store, run.run_id),
+            operational_state=_operational_for(str(FailureClass.BUDGET_EXHAUSTED)),
+        )
+        runtime_store.set_run_status(
+            run.run_id,
+            RunStatus.FAILED,
+            terminal_state=TerminalState.BUDGET_EXHAUSTED,
             detail=str(exc)[:500],
         )
         raise
@@ -547,6 +580,64 @@ def advance_idea(
         cost_usd=cost,
         model_calls=calls,
         failure_class=FailureClass(failure) if failure else None,
+    )
+
+
+def open_stage_budgets(
+    db: Database, store: PortfolioStore, *, idea_id: str, config: PortfolioConfig
+) -> None:
+    """Make the idea's and its lineage's ceilings ledger budgets, at today's values.
+
+    Every model call the stage makes names both scopes (see
+    ``runner.stage_budget_scopes``), and the ledger reserves the call's whole
+    ceiling against them in the same statement that checks the project's --
+    so a lineage near its ceiling cannot be sold several stages that together
+    exceed it, and two concurrent stages of one lineage cannot both be told
+    the remainder is theirs. An absent row would mean unlimited, which is why
+    this runs before the stage does.
+
+    The limits are the *effective* bounds: the configured ones with this
+    project's stored overrides applied, the same numbers the tick reads.
+    Written on every stage start, so a person lowering or raising a ceiling
+    takes effect at the next stage; derived, never ``explicit`` -- the person's
+    number lives in configuration and this row mirrors it. ``opening_spent``
+    carries what the scope had spent before it had a row.
+    """
+
+    idea = store.require_idea(idea_id)
+    state = store.get_state(idea.project_id)
+    bounds = config.with_overrides(state.bounds if state else None).bounds
+    ledger = BudgetLedger(db)
+    ledger.set_limit(
+        scope=BudgetScope.IDEA,
+        scope_id=idea.idea_id,
+        dimension=Dimension.MODEL_COST_USD,
+        limit_value=bounds.idea_spend_ceiling_usd,
+        opening_spent=store.spend_for_idea(idea.idea_id),
+    )
+    ledger.set_limit(
+        scope=BudgetScope.LINEAGE,
+        scope_id=idea.lineage_root,
+        dimension=Dimension.MODEL_COST_USD,
+        limit_value=bounds.lineage_spend_ceiling_usd,
+        opening_spent=store.spend_for_lineage(idea.lineage_root),
+    )
+
+
+def _run_cost(runtime: RuntimeStore, run_id: str) -> Decimal:
+    """What this run's calls were billed, from their provenance rows.
+
+    Read on the failure path, where no stage outcome carried a cost back: a
+    reviewer that ran before the call that was refused still spent money.
+    """
+
+    return sum(
+        (
+            Decimal(str(call.cost_usd))
+            for call in runtime.list_model_calls(run_id=run_id, limit=1_000)
+            if call.cost_usd is not None
+        ),
+        Decimal(0),
     )
 
 
@@ -610,4 +701,5 @@ __all__ = [
     "TrackState",
     "advance_idea",
     "build_track_graph",
+    "open_stage_budgets",
 ]
