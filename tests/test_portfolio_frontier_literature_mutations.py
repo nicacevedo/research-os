@@ -1224,6 +1224,14 @@ def test_a_deferred_request_does_not_hold_off_the_barren_pause(
             parent_idea_id=parent.idea_id,
             origin_role="brancher",
         )
+    # Live, so the lineage is full and the request is deferred -- and
+    # running, so none of them is something the tick could buy instead.
+    # Barren exploration pauses a portfolio only when nothing is left to
+    # deepen; ideas with a stage to run would keep it RUNNING, and rightly.
+    for idea in portfolio.list_ideas(project_id=runtime_project):
+        portfolio.set_operational_state(
+            idea_id=idea.idea_id, state=OperationalState.ACTIVE
+        )
     _request(portfolio, runtime_project, parent)
     _barren(runtime_db, runtime_project)
     report = _tick(runtime_db, pg_dsn, tmp_path, runtime_project)

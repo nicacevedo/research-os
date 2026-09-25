@@ -102,7 +102,7 @@ class Allocation:
     idea_version: int | None = None
     #: How many times this ``(idea, stage, version)`` triple has already
     #: failed terminally. Part of the dedup key, and nothing else reads it.
-    failed_attempts: int = 0
+    generation: int = 0
 
     @property
     def dedup_key(self) -> str:
@@ -132,7 +132,11 @@ class Allocation:
         this was the actual cause. It surfaced the moment ``work_refused``
         existed to show a tick allocating eight items and buying none.
 
-        **The failure count is load-bearing and was missing.** The sentence
+        **The generation is load-bearing and was missing** -- first as a
+        failure count, which is what this paragraph describes, and then as
+        only that: an item that *succeeded* without running a stage spent the
+        key the same way. It now counts every finished item for the stage
+        (``PortfolioStore.advance_generations``). The sentence
         above says this key only has to stop two items existing *at once*, and
         without the count it did much more than that: ``work_items.dedup_key``
         is a permanent unique index and ``enqueue`` is ``on conflict do
@@ -151,7 +155,7 @@ class Allocation:
         if self.kind == ADVANCE_IDEA:
             return (
                 f"{self.kind}:{self.idea_id}:{self.stage}:"
-                f"v{self.idea_version}:{self.failed_attempts}"
+                f"v{self.idea_version}:{self.generation}"
             )
         if self.kind == SYNTHESIZE:
             return (
@@ -190,7 +194,7 @@ class Candidate:
     #: on this version. Carried into the allocation so the dedup key can name
     #: the generation; the ceiling that stops it growing forever is applied in
     #: ``tick._candidates``, where the idea can also be marked blocked.
-    failed_attempts: int = 0
+    generation: int = 0
 
 
 def diversity_key(
@@ -306,6 +310,7 @@ def plan(
     minable_failures: int,
     tick_bucket: str,
     explorers_in_flight: int = 0,
+    may_explore: bool = True,
     open_requests: Sequence[tuple[str, int, str]] = (),
     follow_ups_in_flight: int = 0,
     literature_requests: Sequence[tuple[str, int, str]] = (),
@@ -370,7 +375,8 @@ def plan(
         )
 
     if (
-        remaining
+        may_explore
+        and remaining
         and candidate_pool < config.bounds.candidate_pool_floor
         and explorers_in_flight == 0
     ):
@@ -443,7 +449,7 @@ def plan(
                     idea_id=item.idea.idea_id,
                     stage=item.stage,
                     idea_version=item.idea.current_version,
-                    failed_attempts=item.failed_attempts,
+                    generation=item.generation,
                 )
             )
             break
@@ -464,7 +470,8 @@ def plan(
     # its *ceiling*, which on a quiet portfolio is every tick, so it bought an
     # explorer every cadence whether or not the last one had even started.
     if (
-        remaining
+        may_explore
+        and remaining
         and candidate_pool < config.bounds.candidate_pool_ceiling
         and explorers_in_flight == 0
     ):

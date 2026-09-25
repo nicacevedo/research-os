@@ -167,9 +167,17 @@ def _safe(relative: str) -> str:
 
 # ------------------------------------------------------------ rendering --
 def _provenance(store: PortfolioStore, idea: PortfolioIdea) -> dict[str, int]:
-    """The numbers every page's header carries. Computed, never written."""
+    """The numbers every page's header carries. Computed, never written.
 
-    evidence = store.list_evidence(idea_id=idea.idea_id)
+    For the version the page shows, and they were for every version: a
+    revision's page carried its predecessor's executions and their direction
+    under its own question and falsifier -- measurements of a different
+    hypothesis, presented as this one's.
+    """
+
+    evidence = store.list_evidence(
+        idea_id=idea.idea_id, idea_version=idea.current_version
+    )
     reviews = store.live_reviews(idea_id=idea.idea_id)
     objections = store.open_objections(idea_id=idea.idea_id)
     return {

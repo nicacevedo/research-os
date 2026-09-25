@@ -500,8 +500,20 @@ class PortfolioStore:
                 origin_role=origin_role,
                 origin_stage=origin_stage,
             )
+            # The status a revision replaces described the *previous*
+            # version. REVIEW, VALIDATED and HUMAN_READY are claims about what
+            # was measured and reviewed, and none of it was measured or
+            # reviewed as this text: a revision kept VALIDATED on a question
+            # nobody had asked yet, and the bank printed the old version's
+            # executions under the new version's falsifier -- found by the
+            # final hostile review. Back to INVESTIGATING, where the stage
+            # machine asks for this version's own evidence; the tier
+            # high-water mark stays, because it is history, not a claim.
             conn.execute(
-                "update ideas set current_version = %s, updated_at = now() "
+                "update ideas set current_version = %s, "
+                "       status = case when status in ('REVIEW','VALIDATED','HUMAN_READY') "
+                "                     then 'INVESTIGATING' else status end, "
+                "       updated_at = now() "
                 "where idea_id = %s",
                 (version, idea_id),
             )
@@ -3372,6 +3384,47 @@ class PortfolioStore:
         return {
             key: total
             for key, (total, _recent) in self.stage_failures(project_id).items()
+        }
+
+    def advance_generations(self, project_id: str) -> dict[tuple[str, str, str], int]:
+        """Finished advance items per ``(idea, stage, version)``: the dedup key's generation.
+
+        Every *finished* item, and it was only the failed ones. An advance that
+        runs no stage -- another pass already holds the idea, the basis was
+        already bought, or the stage machine has nothing to do by the time the
+        item runs -- is recorded SUCCEEDED, which left the count where it was;
+        so the next time the allocator chose the same stage it built the same
+        key, ``enqueue`` refused it against the permanent unique index, and it
+        refused it on every tick after. The idea looked healthy -- IDLE, not
+        blocked -- and, untouched, collected the staleness bonus that kept it
+        winning slots nobody could fill. The final hostile review reproduced it
+        through a worker killed mid-stage and through a branch left with no
+        room by a follow-up that ran first.
+
+        A pending or leased item is not finished, so two ticks still compute
+        one key for work that is already queued; that is all the key has to
+        prevent. The failure *ceiling* still counts failures, in
+        :meth:`stage_failures`.
+        """
+
+        with self._db.tx() as conn:
+            rows = conn.execute(
+                "select payload->>'idea_id' as idea_id, payload->>'stage' as stage, "
+                "       coalesce(payload->>'idea_version', '') as idea_version, "
+                "       count(*) as n "
+                "  from work_items "
+                " where project_id = %s and kind = 'portfolio_advance_idea' "
+                "   and status in ('SUCCEEDED','FAILED','CANCELLED') "
+                "   and payload->>'idea_id' is not null "
+                "   and payload->>'stage' is not null "
+                " group by 1, 2, 3",
+                (project_id,),
+            ).fetchall()
+        return {
+            (str(row["idea_id"]), str(row["stage"]), str(row["idea_version"])): int(
+                row["n"]
+            )
+            for row in rows
         }
 
     def stage_failures(

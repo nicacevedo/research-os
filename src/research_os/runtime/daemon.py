@@ -1839,7 +1839,25 @@ def default_repo_resolver(store: RuntimeStore) -> RepoResolver:
         project = store.get_project(project_id)
         if project is None:
             raise ResearchOSError(f"no repository recorded for project {project_id!r}")
-        return Path(project.repo_path)
+        repo = Path(project.repo_path)
+        # And the repository must still *be* that project. The path is read
+        # from a row written at enable time, and a directory can be reused --
+        # a re-clone, another project checked out where this one was. Nothing
+        # re-read the capsule, so one project's bank was committed into
+        # another's repository, its explorers were shown the other charter,
+        # and its declared commands ran against the other code -- all recorded
+        # as this project's. The final hostile review reproduced the first.
+        from research_os.runtime.kernel import ScientificKernelAdapter
+
+        found = ScientificKernelAdapter(repo).project_id()
+        if found != project_id:
+            raise ResearchOSError(
+                f"{repo} holds the capsule of {found!r}, not {project_id!r}; "
+                f"nothing is done in it for {project_id!r}. "
+                f"`researchctl portfolio enable <path>` points the project at "
+                f"its repository."
+            )
+        return repo
 
     return resolve
 

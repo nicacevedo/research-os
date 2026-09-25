@@ -37,9 +37,11 @@ from research_os.portfolio.models import (
     IdeaOrigin,
     IdeaStatus,
     OperationalState,
+    PortfolioIdea,
     PortfolioStatus,
     RequestKind,
     RequestState,
+    Stage,
 )
 from research_os.portfolio.stages import select_stage, snapshot_for
 from research_os.portfolio.store import PortfolioStore
@@ -213,12 +215,22 @@ def tick(
     barren = store.barren_explorations(project_id=project_id)
     # An open request is information the explorers did not have, exactly as
     # a seed is, so it holds off the pause for the same reason.
-    if (
+    exploration_exhausted = (
         barren >= config.bounds.max_barren_explorations
         and not pending_seeds
         and not requests
         and not literature_requests
-    ):
+    )
+
+    candidates, report.settled = _candidates(store, project_id, config, moment)
+    # The pause is for a portfolio with nothing left to do, and it was taken
+    # before the candidates were even read: six barren explorer runs froze
+    # every idea that still had a stage to run, and told the researcher the
+    # idea space looked exhausted while ten ideas sat one cheap screen from
+    # their next step. The final hostile review reproduced it. Barren
+    # exploration now stops *exploring*; it stops the portfolio only when
+    # there is also nothing to deepen.
+    if exploration_exhausted and not candidates:
         return _pause(
             store,
             report,
@@ -227,8 +239,13 @@ def tick(
             f"project's idea space looks exhausted to the explorers available "
             f"here. `researchctl seed add` gives them somewhere else to look.",
         )
-
-    candidates, report.settled = _candidates(store, project_id, config, moment)
+    if exploration_exhausted:
+        report.notes.append(
+            f"{barren} explorer run(s) in a row produced no new idea, so no "
+            f"explorer is bought; the {len(candidates)} idea(s) that still have "
+            f"work continue. `researchctl seed add` gives the explorers "
+            f"somewhere else to look."
+        )
     ideas = store.list_ideas(project_id=project_id, limit=500)
     blocked_externally = [
         item
@@ -256,6 +273,7 @@ def tick(
         + counts.get(IdeaStatus.PARKED, 0),
         tick_bucket=moment.strftime("%Y%m%dT%H%M"),
         explorers_in_flight=in_flight,
+        may_explore=not exploration_exhausted,
         open_requests=[
             (item.request_id, request_generation[item.request_id], str(item.basis))
             for item in requests
@@ -658,6 +676,7 @@ def _candidates(
     found: list[allocation.Candidate] = []
     settled = 0
     failures = store.stage_failures(project_id)
+    generations = store.advance_generations(project_id)
     for idea in store.list_ideas(project_id=project_id, limit=500):
         if not allocation.allocatable(idea):
             continue
@@ -684,12 +703,35 @@ def _candidates(
             if frontier.settle(store, idea, snapshot, config):
                 settled += 1
             continue
-        failed_attempts, recent_failures, refusals = failures.get(
-            (idea.idea_id, str(stage), str(version.version)), (0, 0, 0)
-        )
-        # Three numbers, three readers. The dedup key reads the all-time
-        # count, because it is built from it against a permanently unique
-        # index and a key that repeats is a retry `enqueue` refuses silently.
+        never = _never_allocatable(store, idea, version, stage, config)
+        if never is not None:
+            # The allocator would skip this idea on every tick for as long as
+            # the portfolio runs, silently -- and it would still count in the
+            # candidate pool (which stops exploration at its ceiling) and in
+            # its lineage's population (which stops follow-ups and branches).
+            # The final hostile review filled a pool with forty such ideas and
+            # reproduced the first qualification's frozen portfolio, with no
+            # note at all. Parked, with the reason and what would revisit it,
+            # by the same compare-and-set `settle` uses.
+            reason_text, revisit = never
+            applied = store.set_status(
+                idea_id=idea.idea_id,
+                status=IdeaStatus.PARKED,
+                retire_reason=reason_text,
+                revisit_if=revisit,
+                expected_status=idea.status,
+                require_idle=True,
+            )
+            if applied is not None:
+                settled += 1
+            continue
+        stage_key = (idea.idea_id, str(stage), str(version.version))
+        _all_failures, recent_failures, refusals = failures.get(stage_key, (0, 0, 0))
+        generation = generations.get(stage_key, 0)
+        # Three numbers, three readers. The dedup key reads the generation --
+        # every finished item for this stage, succeeded or not -- because it is
+        # built from it against a permanently unique index and a key that
+        # repeats is a retry `enqueue` refuses silently.
         # The ceiling reads the *recent* count, so a stage that failed while
         # a capability was missing is retryable once `portfolio resume` says
         # it arrived. And a *refusal* counts once: "no declared command can
@@ -730,10 +772,60 @@ def _candidates(
                 open_objections=len(snapshot.open_objections),
                 spent=store.spend_for_idea(idea.idea_id),
                 lineage_spent=store.spend_for_lineage(idea.lineage_root),
-                failed_attempts=failed_attempts,
+                generation=generation,
             )
         )
     return tuple(found), settled
+
+
+def _never_allocatable(
+    store: PortfolioStore,
+    idea: PortfolioIdea,
+    version: Any,
+    stage: Stage,
+    config: PortfolioConfig,
+) -> tuple[str, str] | None:
+    """Why :func:`allocation.plan` will skip this idea on every tick, if it will.
+
+    The same three conditions the plan applies, read from the same rows, so
+    the two cannot disagree: an idea is parked here exactly when the plan
+    would never choose it. ``None`` for an idea the plan may still choose.
+    """
+
+    novelty = version.dimensions.novelty
+    if (
+        novelty is not None
+        and novelty < config.thresholds.novelty_floor
+        and stage not in {Stage.DEDUP, Stage.NOVELTY_SCREEN}
+    ):
+        return (
+            (
+                f"novelty assessed at {novelty:.2f}, below the floor of "
+                f"{config.thresholds.novelty_floor:.2f}: the screen found it "
+                f"likely already known, and the portfolio does not spend below "
+                f"the floor"
+            ),
+            "a literature audit or a revision that lifts its novelty above the floor",
+        )
+    spent = store.spend_for_idea(idea.idea_id)
+    if spent >= config.bounds.idea_spend_ceiling_usd:
+        return (
+            (
+                f"spent {spent} USD, at its idea ceiling of "
+                f"{config.bounds.idea_spend_ceiling_usd} USD"
+            ),
+            "a person raises bounds.idea_spend_ceiling_usd",
+        )
+    lineage_spent = store.spend_for_lineage(idea.lineage_root)
+    if lineage_spent >= config.bounds.lineage_spend_ceiling_usd:
+        return (
+            (
+                f"its lineage has spent {lineage_spent} USD, at the lineage "
+                f"ceiling of {config.bounds.lineage_spend_ceiling_usd} USD"
+            ),
+            "a person raises bounds.lineage_spend_ceiling_usd",
+        )
+    return None
 
 
 def ensure_schedule(

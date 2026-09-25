@@ -184,6 +184,28 @@ def verify(answer: LiteratureAnswer, packet: Any) -> list[str]:
     return problems
 
 
+def _evidencing_key(item: Any, packet: Any) -> str:
+    """The cited work a statement's evidence row names.
+
+    The one its quotation was *found in*, when it quotes: :func:`verify`
+    accepts a quotation present in any of the cited works, and the row named
+    the first cited work regardless -- so a claim citing two works and
+    quoting only the second was stored as evidence from the first, a source
+    that says no such thing. Found by the final hostile review. A statement
+    with no quotation is at the documented CITED trust level and names its
+    first citation, as before.
+    """
+
+    excerpt = getattr(item, "excerpt", "")
+    if excerpt:
+        quoted = normalised(excerpt)
+        texts = source_texts(packet)
+        for key in item.work_keys:
+            if any(quoted in normalised(field) for field in texts.get(key, ())):
+                return str(key)
+    return str(item.work_keys[0])
+
+
 def claim_digest(
     project_id: str,
     kind: str,
@@ -231,12 +253,14 @@ def answer_request(
         return AnswerResult(ok=True, detail=f"{request_id} is already {request.state}")
     idea = store.get_idea(request.source_idea_id) if request.source_idea_id else None
     discovered = ""
+    discovery_failed = False
     if retriever is not None:
         try:
             summary = retriever.retrieve(request.question)
             discovered = f"; discovery ingested {summary.get('ingested', 0)} work(s)"
         except Exception as exc:  # noqa: BLE001 - reported, never fatal
             discovered = f"; discovery could not run ({exc})"
+            discovery_failed = True
     if literature is None:
         _release(store, idea)
         store.close_request(
@@ -250,6 +274,20 @@ def answer_request(
         return AnswerResult(ok=True, detail="declined: no literature source")
     packet = literature.search(request.question, limit=MAX_WORKS)
     keys = tuple(getattr(packet, "work_keys", ()))
+    if not keys and discovery_failed:
+        # Nothing retrieved *because the providers could not be asked* is an
+        # outage, not an answer, and declining on it retired the idea in one
+        # attempt: the next tick parked it as "novelty cannot be established
+        # here" -- a provider failure written down as a disposition, found by
+        # the final hostile review. The request stays open and the item fails
+        # as a provider outage, so the queue retries it; `_servable_requests`
+        # declines it, with the reason, after `max_stage_failures`.
+        return AnswerResult(
+            ok=False,
+            detail="discovery could not reach the literature providers and the "
+            "local index holds nothing for this question" + discovered,
+            failure_class=FailureClass.PROVIDER_UNAVAILABLE,
+        )
     if not keys:
         _release(store, idea)
         store.close_request(
@@ -397,7 +435,7 @@ def answer_request(
                 # novelty" would pass the audit's bar with rows that never
                 # asked the audit's question. The claim is linked either way.
                 literature_key=(
-                    item.work_keys[0]
+                    _evidencing_key(item, packet)
                     if request.source_ref.startswith("novelty:")
                     else None
                 ),

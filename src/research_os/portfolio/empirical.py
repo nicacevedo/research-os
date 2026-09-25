@@ -49,7 +49,7 @@ import math
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from research_os.errors import ExperimentSpecError, ResearchOSError
@@ -945,7 +945,20 @@ def analyse(
         # that fix did not carry it here -- so the evidence row held the
         # correction and the falsehood side by side. A rule output past the
         # collection bound is a file the run *did* write.
-        wrote_it = (workspace / rule.output_path).exists()
+        linked = _reached_through_a_link(workspace, rule.output_path)
+        wrote_it = not linked and (workspace / rule.output_path).exists()
+        if linked:
+            return Analysis(
+                conclusion=EmpiricalConclusion.INSUFFICIENT,
+                summary=(
+                    f"the run exited {exit_code} and {rule.output_path} is "
+                    f"reached through a symbolic link, so what is there is not "
+                    f"something this run wrote in its workspace and the "
+                    f"preregistered metric was not read out of it"
+                ),
+                outputs=outputs,
+                notes=(*notes, f"{rule.output_path} is behind a link"),
+            )
         return Analysis(
             conclusion=EmpiricalConclusion.INSUFFICIENT,
             summary=(
@@ -970,7 +983,15 @@ def analyse(
             ),
         )
 
-    target = workspace / rule.output_path
+    contained = _contained_output(workspace, rule.output_path)
+    if contained is None:  # pragma: no cover - collected above, so contained
+        return Analysis(
+            conclusion=EmpiricalConclusion.INSUFFICIENT,
+            summary=f"{rule.output_path} is not a file in this run's workspace",
+            outputs=outputs,
+            notes=tuple(notes),
+        )
+    target = contained
     stale = _was_already_in_the_checkout(workspace, rule.output_path)
     if stale is not None:
         # **The run did not produce the number.** The workspace is a checkout
@@ -1109,6 +1130,12 @@ def analyse_contract(
         )
     documents: dict[str, Any] = {}
     for source in sources:
+        if source not in produced and _reached_through_a_link(workspace, source):
+            documents[source] = engine.Unavailable(
+                f"{source} is reached through a symbolic link, so what is there "
+                f"is not something this run wrote in its workspace"
+            )
+            continue
         if source not in produced:
             documents[source] = engine.Unavailable(
                 f"{source} was not written, or was not collected and hashed, so "
@@ -1122,7 +1149,14 @@ def analyse_contract(
                 f"{stale[:12]}, so it was not written by this run (exit {exit_code})"
             )
             continue
-        documents[source] = engine.load_document(workspace / source)
+        contained = _contained_output(workspace, source)
+        documents[source] = (
+            engine.load_document(contained)
+            if contained is not None
+            else engine.Unavailable(
+                f"{source} is not a file this run wrote in its workspace"
+            )
+        )
     result = engine.evaluate(verified.analysis, documents)
     return (
         Analysis(
@@ -1134,6 +1168,59 @@ def analyse_contract(
         ),
         result,
     )
+
+
+def _contained_output(workspace: Path, relative: str) -> Path | None:
+    """``workspace/relative``, if it is a file this run could have written there.
+
+    Every component of the path is checked, not only the last. The readers
+    used to ask ``is_symlink()`` of the file alone, so a *directory* link --
+    ``results -> specimens`` committed as a "latest results" convenience,
+    ``results -> /host/scratch``, or a link the contained program made on its
+    way out -- was followed by the unsandboxed reader, and a program that
+    wrote nothing had a file it never saw read as its contained measurement:
+    SUPPORTS, with a frozen contract, a job id and a "network denied"
+    containment record. The committed-specimen guard missed it too, because
+    Git does not follow a link inside a tree, so ``HEAD:results/run.json``
+    named nothing and the file looked new. An independent review found all
+    three.
+
+    ``None`` for an absolute or escaping path, a path any component of which
+    is a link, one that resolves outside the workspace, or anything that is
+    not a regular file.
+    """
+
+    pure = PurePosixPath(relative)
+    if (
+        pure.is_absolute()
+        or not pure.parts
+        or any(part in {"", ".", ".."} for part in pure.parts)
+    ):
+        return None
+    current = workspace
+    for part in pure.parts:
+        current = current / part
+        if current.is_symlink():
+            return None
+    try:
+        resolved = current.resolve(strict=True)
+        inside = resolved.is_relative_to(workspace.resolve(strict=True))
+    except (OSError, RuntimeError):
+        return None
+    if not inside or not resolved.is_file():
+        return None
+    return current
+
+
+def _reached_through_a_link(workspace: Path, relative: str) -> bool:
+    """Whether ``relative`` exists only by way of a link, which is not writing it."""
+
+    current = workspace
+    for part in PurePosixPath(relative).parts:
+        current = current / part
+        if current.is_symlink():
+            return True
+    return False
 
 
 def _was_already_in_the_checkout(workspace: Path, relative: str) -> str | None:
@@ -1178,16 +1265,17 @@ def _collect(
 ) -> tuple[tuple[str, str, int], ...]:
     """Hash every declared output that exists, newest state, never following a link.
 
-    A symlink is skipped rather than followed. The workspace is scanned for
-    outbound links before the run, but a command can create one during it, and
-    hashing whatever it points at would record a file outside the experiment
-    as the experiment's result.
+    A path reached through a link -- at *any* component -- is skipped rather
+    than followed: a command can create one during the run, and a link can be
+    committed, and hashing whatever it points at would record a file outside
+    the experiment, or one Git already had, as the experiment's result. See
+    :func:`_contained_output`.
     """
 
     found: list[tuple[str, str, int]] = []
     for relative in list(declared)[:MAX_COLLECTED_OUTPUTS]:
-        target = workspace / relative
-        if target.is_symlink() or not target.is_file():
+        target = _contained_output(workspace, relative)
+        if target is None:
             continue
         try:
             size = target.stat().st_size
@@ -3638,13 +3726,17 @@ def _evidence_summary(
             "authored by the researcher: "
             + ", ".join(f"{path} sha256:{digest[:12]}" for path, digest in composed)
         )
-    if attempts > 1:
+    if attempts >= 1:
         # A run that failed operationally and was resubmitted is disclosed:
         # with a command whose exit status depends on its result, "retry
-        # until it runs" can become "retry until it passes".
+        # until it runs" can become "retry until it passes". `attempts`
+        # counts the recorded *failures*, so this reading is attempt
+        # `attempts + 1` -- the test was `> 1`, which hid the commonest case,
+        # one failure and a passing rerun, and printed a count one short.
+        # Found by the final hostile review.
         parts.append(
-            f"executed {attempts} time(s); the earlier attempt(s) failed "
-            f"operationally and produced no reading"
+            f"executed {attempts + 1} time(s); the earlier {attempts} "
+            f"attempt(s) failed operationally and produced no reading"
         )
     if analysis.outputs:
         parts.append(
@@ -3726,8 +3818,8 @@ def _store_outputs(
 
     stored: list[dict[str, str]] = []
     for relative, digest, _size in analysis.outputs:
-        target = workspace / relative
-        if target.is_symlink() or not target.is_file():  # pragma: no cover - raced
+        target = _contained_output(workspace, relative)
+        if target is None:  # pragma: no cover - collected, so contained
             continue
         try:
             ref = context.artifacts.put_file(

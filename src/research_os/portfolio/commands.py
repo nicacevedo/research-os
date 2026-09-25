@@ -320,7 +320,11 @@ def _last_failure(store: PortfolioStore, idea_id: str) -> tuple[IdeaAction, str]
 
 
 def _provenance_line(store: PortfolioStore, idea: PortfolioIdea) -> str:
-    evidence = store.list_evidence(idea_id=idea.idea_id)
+    # The current version's evidence only, as the bank's headers count it: a
+    # revision's measurements are its own, never its predecessor's.
+    evidence = store.list_evidence(
+        idea_id=idea.idea_id, idea_version=idea.current_version
+    )
     reviews = store.live_reviews(idea_id=idea.idea_id)
     objections = store.open_objections(idea_id=idea.idea_id)
     models = board_independence(reviews)

@@ -279,6 +279,73 @@ def test_an_idea_past_its_spend_ceiling_is_not_allocated(
     )
     report = _tick(runtime_db, pg_dsn, tmp_path, runtime_project)
     assert idea.idea_id not in {item.idea_id for item in report.allocations}
+    # And not silently: skipped for good, it must say so and stop counting
+    # against its lineage and the pool.
+    parked = portfolio.require_idea(idea.idea_id)
+    assert parked.status is IdeaStatus.PARKED
+    assert "idea ceiling" in (parked.retire_reason or "")
+    assert "idea_spend_ceiling_usd" in (parked.revisit_if or "")
+
+
+def test_a_candidate_below_the_novelty_floor_is_parked_not_left_to_fill_the_pool(
+    portfolio: PortfolioStore,
+    runtime_db: Database,
+    pg_dsn: str,
+    tmp_path,
+    runtime_project: str,
+) -> None:
+    """The final hostile review's second wedge, in miniature.
+
+    A novelty screen that finds an idea "likely known" records novelty 0.2,
+    under the default floor of 0.25. The stage machine still had a next stage
+    for it, so nothing settled it; the allocator skipped it with a silent
+    `continue`; and it went on counting as a CANDIDATE -- against the pool
+    ceiling that stops exploration, and against its lineage. Forty of them
+    froze a portfolio with no note at all.
+    """
+
+    from research_os.portfolio.models import QualityDimensions
+    from research_os.runtime.db import jsonb
+
+    config = load_config()
+    below = config.thresholds.novelty_floor - 0.05
+    ideas = []
+    for n in range(3):
+        idea, _ = seed_idea(portfolio, runtime_project, title=f"likely known {n}")
+        for stage in (Stage.DEDUP, Stage.NOVELTY_SCREEN):
+            action = portfolio.open_action(
+                idea_id=idea.idea_id,
+                idea_version=1,
+                stage=stage,
+                basis_digest=f"{stage}-{n}",
+            )
+            portfolio.complete_action(
+                action_id=action.action_id, status=ActionStatus.SUCCEEDED
+            )
+        with runtime_db.tx() as conn:
+            conn.execute(
+                "update idea_versions set dimensions = %s where idea_id = %s",
+                (jsonb(QualityDimensions(novelty=below).model_dump()), idea.idea_id),
+            )
+        ideas.append(idea)
+
+    report = _tick(runtime_db, pg_dsn, tmp_path, runtime_project)
+    assert report.settled >= len(ideas)
+    for idea in ideas:
+        after = portfolio.require_idea(idea.idea_id)
+        assert after.status is IdeaStatus.PARKED, after.status
+        assert "below the floor" in (after.retire_reason or "")
+    assert report.candidate_pool == 0 or all(
+        portfolio.require_idea(idea.idea_id).status is not IdeaStatus.CANDIDATE
+        for idea in ideas
+    )
+    # The pool they no longer occupy is the room the explorer needs: one is
+    # bought across these ticks (the first, or the next once nothing is in
+    # flight), and the parked ideas are not.
+    second = _tick(runtime_db, pg_dsn, tmp_path, runtime_project)
+    bought = [*report.allocations, *second.allocations]
+    assert any(item.kind == allocation.EXPLORE for item in bought)
+    assert not {idea.idea_id for idea in ideas} & {item.idea_id for item in bought}
 
 
 # ------------------------------------------------------ reconciliation --
@@ -711,6 +778,56 @@ def test_exploration_that_produces_nothing_stops(
     assert not report.allocations
 
 
+def test_barren_exploration_stops_exploring_not_the_ideas_that_have_work(
+    portfolio: PortfolioStore,
+    runtime_db: Database,
+    pg_dsn: str,
+    tmp_path,
+    runtime_project: str,
+) -> None:
+    """The pause used to be taken before the candidates were read.
+
+    Six barren explorer runs then froze every idea that still had a stage to
+    run, under a status saying the idea space looked exhausted -- the final
+    hostile review showed ten ideas one cheap screen from their next step,
+    PAUSED_NO_FRONTIER with eight free slots. What is exhausted is exploring.
+    """
+
+    # The ideas first: barren runs are counted from the newest idea.
+    ideas = [
+        seed_idea(portfolio, runtime_project, title=f"still has work {n}")[0]
+        for n in range(3)
+    ]
+    bound = load_config().bounds.max_barren_explorations
+    with runtime_db.tx() as conn:
+        for index in range(bound):
+            conn.execute(
+                """
+                insert into work_items
+                       (work_id, project_id, kind, payload, status, dedup_key,
+                        created_at)
+                values (%(work_id)s, %(project_id)s, 'portfolio_explore',
+                        '{}'::jsonb, 'SUCCEEDED', %(work_id)s,
+                        now() + interval '1 second')
+                """,
+                {"work_id": f"WORK-barren-{index}", "project_id": runtime_project},
+            )
+    assert portfolio.barren_explorations(project_id=runtime_project) == bound
+
+    report = _tick(runtime_db, pg_dsn, tmp_path, runtime_project)
+    assert report.status is PortfolioStatus.RUNNING
+    advanced = {
+        item.idea_id
+        for item in report.allocations
+        if item.kind == allocation.ADVANCE_IDEA
+    }
+    assert advanced == {idea.idea_id for idea in ideas}
+    assert not any(item.kind == allocation.EXPLORE for item in report.allocations), [
+        (item.kind, item.reason) for item in report.allocations
+    ]
+    assert any("no explorer is bought" in note for note in report.notes)
+
+
 def test_a_seed_is_what_restarts_exhausted_exploration(
     portfolio: PortfolioStore,
     runtime_db: Database,
@@ -847,7 +964,7 @@ def test_a_failed_stage_can_be_bought_again(
     # The mechanism, named. The retry is a *different* key from the one the
     # failed item holds forever, and the generation is what makes it different.
     retried = next(item for item in again if item.stage is not None)
-    assert retried.failed_attempts == 1
+    assert retried.generation == 1
     assert retried.dedup_key.endswith(":1")
     with runtime_db.tx() as conn:
         row = conn.execute(
@@ -1045,6 +1162,112 @@ def test_a_stage_that_succeeded_on_its_second_attempt_is_not_bought_again(
     assert counts.get((idea.idea_id, stage), 0) == 0, (
         "a work item that succeeded on its second attempt was counted as a "
         "failure, so the next tick will buy the same stage again"
+    )
+
+
+def test_an_advance_that_ran_no_stage_does_not_spend_the_next_ones_key(
+    portfolio: PortfolioStore,
+    runtime_db: Database,
+    pg_dsn: str,
+    tmp_path,
+    runtime_project: str,
+) -> None:
+    """A worker killed mid-stage, the documented retry, and the idea after it.
+
+    The final hostile review's reproduction, through the real queue, handler
+    and tick. The retry meets the dead worker's still-open action, runs no
+    stage ("another pass is already doing this"), and is recorded SUCCEEDED.
+    The generation used to count only *failed* items, so when the reconciler
+    freed the action and the allocator chose the stage again it built the
+    same key, and the queue refused it on every tick after -- an idea that
+    looked IDLE and unblocked and was never worked again.
+    """
+
+    from research_os.portfolio import extensions as portfolio_extensions
+    from research_os.portfolio import track
+    from research_os.runtime.daemon import Daemon, TickReport
+    from research_os.runtime.models import WorkStatus
+    from tests.runtime_graph_helpers import ScriptedRouter, make_capsule
+
+    portfolio_extensions.register()
+    repo = make_capsule(tmp_path / "project")
+    RuntimeStore(runtime_db).upsert_project(
+        project_id=runtime_project, repo_path=str(repo)
+    )
+    daemon = Daemon(
+        config=make_config(pg_dsn, tmp_path / "artifacts"),
+        db=runtime_db,
+        repo_for=lambda _project: repo,
+        models=lambda _run, _project, _work: ScriptedRouter(
+            answers={}, store=RuntimeStore(runtime_db)
+        ),
+        owner="restarted-worker",
+    )
+    queue = WorkQueue(runtime_db)
+    idea, _ = seed_idea(portfolio, runtime_project)
+    first = _tick(runtime_db, pg_dsn, tmp_path, runtime_project)
+    assert any(
+        item.kind == allocation.ADVANCE_IDEA and item.idea_id == idea.idea_id
+        for item in first.allocations
+    )
+
+    # A worker takes it, opens the idea's action, and is killed.
+    (dead,) = queue.claim(
+        owner="dead-worker", lease_seconds=120, kinds=(allocation.ADVANCE_IDEA,)
+    )
+    portfolio.open_action(
+        idea_id=idea.idea_id,
+        idea_version=1,
+        stage=Stage.DEDUP,
+        basis_digest=track._basis_for(
+            portfolio, idea_id=idea.idea_id, version=1, stage=Stage.DEDUP
+        ),
+        thread_id="thread-of-the-dead-worker",
+    )
+    with runtime_db.tx() as conn:
+        conn.execute(
+            "update work_items set lease_expires_at = now() - interval '1 second' "
+            "where work_id = %s",
+            (dead.work_id,),
+        )
+
+    # The restarted daemon reclaims the lease and runs the retry, which finds
+    # the action held and does nothing.
+    assert [item.work_id for item in queue.reclaim_expired()] == [dead.work_id]
+    (retry,) = queue.claim(
+        owner=daemon.owner, lease_seconds=120, kinds=(allocation.ADVANCE_IDEA,)
+    )
+    daemon._run_item(retry, TickReport())
+    assert queue.get(dead.work_id).status is WorkStatus.SUCCEEDED
+
+    # The reconciler frees the orphaned action.
+    with runtime_db.tx() as conn:
+        conn.execute(
+            "update idea_actions set updated_at = now() - interval '2 hours' "
+            "where idea_id = %s",
+            (idea.idea_id,),
+        )
+    freed = _tick(runtime_db, pg_dsn, tmp_path, runtime_project)
+    assert freed.stale_actions_reclaimed == 1
+
+    # And the stage is bought again, under a new key.
+    mine = [
+        item
+        for item in freed.allocations
+        if item.kind == allocation.ADVANCE_IDEA and item.idea_id == idea.idea_id
+    ] or [
+        item
+        for item in _tick(runtime_db, pg_dsn, tmp_path, runtime_project).allocations
+        if item.kind == allocation.ADVANCE_IDEA and item.idea_id == idea.idea_id
+    ]
+    assert mine, "the allocator stopped choosing an idea nobody worked"
+    assert mine[0].dedup_key != dead.dedup_key
+    with runtime_db.tx() as conn:
+        row = conn.execute(
+            "select status from work_items where dedup_key = %s", (mine[0].dedup_key,)
+        ).fetchone()
+    assert row is not None and str(row["status"]) == "PENDING", (
+        "the stage was chosen again and the queue refused it"
     )
 
 
