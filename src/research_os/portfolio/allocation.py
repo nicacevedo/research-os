@@ -299,7 +299,7 @@ def plan(
     candidates: Sequence[Candidate],
     config: PortfolioConfig,
     free_slots: int,
-    lineage_active: Mapping[str, int],
+    lineage_in_flight: Mapping[str, int],
     candidate_pool: int,
     pending_seeds: int,
     origin_counts: Mapping[IdeaOrigin, int],
@@ -398,7 +398,11 @@ def plan(
     # with four free slots would allocate four ideas from one lineage, each
     # scored against the same unchanged active set.
     active: list[DiversityKey] = []
-    taken_lineage = dict(lineage_active)
+    # Tracks *running* per lineage, plus what this plan takes. Not the ideas a
+    # lineage has alive: that is the bound on creating members, and reading it
+    # here froze every full lineage -- see
+    # `PortfolioStore.lineage_in_flight_counts`.
+    taken_lineage = dict(lineage_in_flight)
     pool = list(candidates)
     while remaining > 0 and pool:
         scored = [(utility(item, config=config, active=active), item) for item in pool]

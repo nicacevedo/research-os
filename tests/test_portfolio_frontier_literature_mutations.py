@@ -1048,7 +1048,7 @@ def _plan(**overrides: Any) -> tuple[Allocation, ...]:
         "candidates": (),
         "config": CONFIG,
         "free_slots": 4,
-        "lineage_active": {},
+        "lineage_in_flight": {},
         # At the ceiling, so no explorer is bought and every allocation below
         # is the project-level work under test.
         "candidate_pool": CONFIG.bounds.candidate_pool_ceiling,

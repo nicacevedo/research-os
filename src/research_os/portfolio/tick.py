@@ -248,7 +248,7 @@ def tick(
         candidates=candidates,
         config=config,
         free_slots=report.free_slots,
-        lineage_active=store.lineage_active_counts(project_id),
+        lineage_in_flight=store.lineage_in_flight_counts(project_id),
         candidate_pool=report.candidate_pool,
         pending_seeds=pending_seeds,
         origin_counts=_origin_counts(ideas),

@@ -3525,6 +3525,32 @@ class PortfolioStore:
             ).fetchone()
         return int(row["n"])
 
+    def lineage_in_flight_counts(self, project_id: str) -> dict[str, int]:
+        """Idea tracks running, per lineage: what the *allocator's* cap bounds.
+
+        Not :meth:`lineage_active_counts`, and the difference stopped the
+        second live qualification. That one counts the ideas a lineage has
+        alive, which is what bounds *creating* a member -- a follow-up, a
+        branch, a revival -- and children are admitted until it is full, so
+        full is where every lineage settles. The allocator read the same
+        number as work in flight, skipped every member of every full lineage,
+        and a portfolio whose fifteen lineages were all full and all idle
+        bought nothing, tick after tick, while reporting RUNNING. What bounds
+        how much of the portfolio one lineage may occupy *right now* is how
+        many of its tracks are running, which is this.
+        """
+
+        with self._db.tx() as conn:
+            rows = conn.execute(
+                """
+                select lineage_root, count(*) as n from ideas
+                 where project_id = %s and operational_state = 'ACTIVE'
+                 group by lineage_root
+                """,
+                (project_id,),
+            ).fetchall()
+        return {str(row["lineage_root"]): int(row["n"]) for row in rows}
+
     def lineage_active_counts(self, project_id: str) -> dict[str, int]:
         """Ideas still in progress, per lineage: what the lineage ceiling bounds.
 

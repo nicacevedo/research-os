@@ -162,7 +162,98 @@ def test_one_lineage_cannot_take_the_whole_portfolio(
     advances = [
         item for item in report.allocations if item.kind == allocation.ADVANCE_IDEA
     ]
-    assert len(advances) <= config.bounds.max_active_per_lineage
+    # Exactly the cap, not "at most": this assertion read `<=` and passed on
+    # an allocator that bought *nothing* for a full lineage -- the defect that
+    # stopped the second live qualification. At most is the diversity bound;
+    # at least is the portfolio working at all.
+    assert len(advances) == config.bounds.max_active_per_lineage
+
+
+def test_a_portfolio_whose_every_lineage_is_full_still_works_its_ideas(
+    portfolio: PortfolioStore,
+    runtime_db: Database,
+    pg_dsn: str,
+    tmp_path,
+    runtime_project: str,
+) -> None:
+    """The state the live qualification wedged in, rebuilt from rows.
+
+    On 2026-09-24 every one of 15 lineages held exactly
+    ``max_active_per_lineage`` live ideas -- children are admitted until a
+    lineage is full, so full is where lineages settle -- and not one idea was
+    running. The allocator read "live ideas in this lineage" as "work in
+    flight in this lineage", skipped every candidate, and, with the pool over
+    its ceiling so no explorer either, bought nothing on every tick for as
+    long as anyone let it run: RUNNING, eight free slots, no failure anywhere,
+    and $9 of budget that could not be spent.
+
+    The population bound is right where members are *created* and is
+    untouched. What the allocator bounds is concurrency, so it counts tracks.
+    """
+
+    config = load_config()
+    ceiling = config.bounds.max_active_per_lineage
+    lineages = 5
+    for family in range(lineages):
+        root, _ = seed_idea(portfolio, runtime_project, title=f"root {family}")
+        portfolio.set_status(idea_id=root.idea_id, status=IdeaStatus.PROMISING)
+        for index in range(ceiling - 1):
+            portfolio.create_idea(
+                project_id=runtime_project,
+                origin=IdeaOrigin.FOLLOW_UP,
+                fields=idea_fields(title=f"child {family}.{index}"),
+                parent_idea_id=root.idea_id,
+                origin_role="follow_up_explorer",
+            )
+    counts = portfolio.lineage_active_counts(runtime_project)
+    assert len(counts) == lineages and set(counts.values()) == {ceiling}
+    assert portfolio.active_count(runtime_project) == 0
+
+    report = _tick(runtime_db, pg_dsn, tmp_path, runtime_project)
+    advances = [
+        item for item in report.allocations if item.kind == allocation.ADVANCE_IDEA
+    ]
+    assert len(advances) == min(config.bounds.max_active_tracks, lineages * ceiling)
+    per_lineage: dict[str, int] = {}
+    for item in advances:
+        root = portfolio.require_idea(item.idea_id).lineage_root
+        per_lineage[root] = per_lineage.get(root, 0) + 1
+    assert max(per_lineage.values()) <= ceiling
+    assert report.work_enqueued >= len(advances)
+
+
+def test_the_lineage_cap_still_bounds_the_work_in_flight(
+    portfolio: PortfolioStore,
+    runtime_db: Database,
+    pg_dsn: str,
+    tmp_path,
+    runtime_project: str,
+) -> None:
+    """A lineage with a track already running gets only what is left of its cap."""
+
+    config = load_config()
+    root, _ = seed_idea(portfolio, runtime_project, title="root")
+    portfolio.set_status(idea_id=root.idea_id, status=IdeaStatus.PROMISING)
+    for index in range(4):
+        child, _ = portfolio.create_idea(
+            project_id=runtime_project,
+            origin=IdeaOrigin.BRANCH,
+            fields=idea_fields(title=f"child {index}"),
+            parent_idea_id=root.idea_id,
+            origin_role="brancher",
+        )
+        portfolio.set_status(idea_id=child.idea_id, status=IdeaStatus.PROMISING)
+    running = child
+    portfolio.set_operational_state(
+        idea_id=running.idea_id, state=OperationalState.ACTIVE
+    )
+
+    report = _tick(runtime_db, pg_dsn, tmp_path, runtime_project)
+    advances = [
+        item for item in report.allocations if item.kind == allocation.ADVANCE_IDEA
+    ]
+    assert len(advances) == config.bounds.max_active_per_lineage - 1
+    assert running.idea_id not in {item.idea_id for item in advances}
 
 
 def test_an_idea_past_its_spend_ceiling_is_not_allocated(

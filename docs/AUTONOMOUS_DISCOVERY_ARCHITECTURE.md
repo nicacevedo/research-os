@@ -916,8 +916,14 @@ regularisation" and "spectral penalty" are not two families. Free-text model
 labels are not used unnormalised anywhere a bound depends on them.
 
 Each candidate's utility carries a configurable penalty proportional to how
-much of the active set already shares its coordinates, and a hard cap bounds
-active descendants per lineage root. The digest's top-ideas selection is a
+much of the active set already shares its coordinates, and one hard cap,
+`max_active_per_lineage`, bounds a lineage root twice over: how many of its
+ideas may be *alive*, enforced wherever a member is created (a follow-up, a
+branch, a revival), and how many of its tracks may *run* at once, enforced by
+the allocator. The two are different counts, and the allocator once read the
+first: children are admitted until a lineage is full, so every lineage settled
+full, and an allocator skipping full lineages bought nothing at all -- the
+second live qualification stopped there. The digest's top-ideas selection is a
 Pareto front with a diversity constraint rather than `order by U`.
 
 The front's dimensions are `novelty`, `evidence_strength` and
