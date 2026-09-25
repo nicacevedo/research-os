@@ -1511,3 +1511,39 @@ def open_store(path: Path | None = None) -> Iterator[LiteratureStore]:
     store = LiteratureStore.open(path)
     with closing(store.connection):
         yield store
+
+
+def resolve_keys(keys: Iterable[str], path: Path | None = None) -> dict[str, str]:
+    """Map each work key to the key that addresses the same work now.
+
+    A merge folds the loser into the winner and keeps the loser as an alias
+    (:meth:`LiteratureStore._merge_into`), so a key written down before the
+    merge and one written after it can name one paper. A reader that counts
+    works rather than strings -- the portfolio's source counts -- asks here.
+
+    Read-only, and it never creates anything: an index that does not exist,
+    cannot be opened or predates the alias table resolves every key to
+    itself, which is what "no merge is known" means. One hop suffices,
+    because a merge re-points the aliases of its loser at the winner.
+    """
+
+    wanted = sorted({key for key in keys if key})
+    resolved = {key: key for key in wanted}
+    target = path if path is not None else database_path()
+    if not wanted or not target.exists():
+        return resolved
+    try:
+        connection = sqlite3.connect(f"{target.as_uri()}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return resolved
+    try:
+        with closing(connection):
+            rows = connection.execute(
+                "SELECT alias_key, work_key FROM work_aliases "
+                f"WHERE alias_key IN ({','.join('?' for _ in wanted)})",
+                wanted,
+            ).fetchall()
+    except sqlite3.Error:
+        return resolved
+    resolved.update({str(alias): str(work) for alias, work in rows})
+    return resolved

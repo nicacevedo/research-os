@@ -2720,6 +2720,26 @@ def submit(context: Any, experiment: IdeaExperiment) -> ExperimentStep:
         # with it and report the isolation machinery as an escape. What the
         # fingerprint is for is what the *command* did, and the command has
         # not run yet.
+        #
+        # **And the checkout is always fresh.** `perform` runs only when the
+        # ledger holds no outcome for this attempt, so a workspace that already
+        # exists here was left by an execution nothing recorded -- a worker
+        # killed mid-run, whose program died with it. Adopting that tree read
+        # the killed run's checkpoint as the retry's measurement: a program
+        # that skips a result already on disk, or appends to one, made a
+        # partial run into a complete preregistered reading under the retry's
+        # job id. The pre-qualification review reproduced it. What the killed
+        # attempt left that matters -- its job row and run directory -- is
+        # outside the worktree and is kept.
+        if Path(experiment.workspace_path).exists():
+            release_workspace(experiment, repository=repository)
+            if Path(experiment.workspace_path).exists():
+                raise EmpiricalError(
+                    f"the workspace {experiment.workspace_path} holds what an "
+                    f"unrecorded execution of {experiment.experiment_id} left "
+                    f"and could not be removed, so a clean run cannot be taken",
+                    failure_class=FailureClass.EXECUTOR_FAILED,
+                )
         workspace = ensure_workspace(experiment, repository=repository)
         # Composed inputs are written from the artifact store rather than
         # from anything this process still holds in memory, and rehashed on

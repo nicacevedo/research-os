@@ -712,7 +712,21 @@ class ModelRouter:
             status = (
                 ModelCallStatus.TIMEOUT if result.timed_out else ModelCallStatus.FAILED
             )
-            self._budgets.release_all(cost_grants)
+            # A failure the provider *billed* is spent. The Claude CLI's
+            # `is_error` envelope -- `error_max_turns`,
+            # `error_max_structured_output_retries` -- still reports
+            # `total_cost_usd`, and releasing the reservation over it let an
+            # explicit 1.00 USD ceiling authorise ten calls billed 9.00 USD
+            # while the ledger showed nothing spent. The pre-qualification
+            # review reproduced it. A failure that reports *no* number is
+            # still released, not charged at the estimate: an outage that
+            # never reached the model would otherwise exhaust a person's
+            # ceiling on work nobody did. `runtime/spend.py` has always drawn
+            # the line in the same place.
+            if result.total_cost_usd is not None:
+                self._budgets.settle_all(cost_grants, actual=result.total_cost_usd)
+            else:
+                self._budgets.release_all(cost_grants)
             self._budgets.settle_all(grants)
             detail = result.error or f"exit {result.exit_code}"
             health = self._record_health(profile.name, ok=False, error=detail)
@@ -724,6 +738,9 @@ class ModelRouter:
                 output_ref=output_ref,
                 latency_ms=latency,
                 error=detail,
+                tokens_in=result.input_tokens,
+                tokens_out=result.output_tokens,
+                cost=result.total_cost_usd,
                 resolved_model=result.resolved_model,
             )
             # Everything above is unchanged: the call is recorded, the budget

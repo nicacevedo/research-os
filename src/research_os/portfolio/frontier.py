@@ -204,6 +204,8 @@ def settle(
     ``select_stage`` read and the reason is its reason.
     """
 
+    if idea.status is IdeaStatus.VALIDATED and snapshot.status is idea.status:
+        return _reject_validated(store, idea, snapshot, config)
     if idea.status not in _UNSETTLED or snapshot.status is not idea.status:
         return None
     stage, reason = stages.select_stage(snapshot, config)
@@ -255,11 +257,7 @@ def settle(
                 wait=True,
             )
             return "WAITING_FOR_LITERATURE"
-    fatal = [
-        item
-        for item in snapshot.open_objections
-        if item.severity is Severity.FATAL and item.target is ObjectionTarget.CLAIM
-    ]
+    fatal = _fatal_to_claim(snapshot)
     # Compare-and-set, on the status the snapshot was read with and on the
     # idea being idle: a worker that finished a stage on this idea since the
     # snapshot was taken has made the decision below about a state that no
@@ -298,6 +296,52 @@ def settle(
             detail=settled.detail or "",
         )
     return str(IdeaStatus.PARKED) if applied is not None else None
+
+
+def _fatal_to_claim(snapshot: stages.TrackSnapshot) -> list[Any]:
+    return [
+        item
+        for item in snapshot.open_objections
+        if item.severity is Severity.FATAL and item.target is ObjectionTarget.CLAIM
+    ]
+
+
+def _reject_validated(
+    store: PortfolioStore,
+    idea: Any,
+    snapshot: stages.TrackSnapshot,
+    config: PortfolioConfig,
+) -> str | None:
+    """REJECTED, for a VALIDATED idea whose claim now has a fatal objection standing.
+
+    VALIDATED was exempt from continuation, and the exemption was right for
+    every case but this one: second-line verification runs *after*
+    VALIDATED, so a replicator that finds the claim false raised a standing
+    FATAL objection on an idea no code would ever move again. It stayed
+    VALIDATED, was listed on the bank's VALIDATED page as having passed this
+    system's gates, and was handed to the synthesis writer as validated --
+    while the gate, asked, permitted nothing at all. The pre-qualification
+    review reproduced it.
+
+    Only this. A VALIDATED idea whose track ended for any other reason -- no
+    route to a second line on this host, say -- is a result for a person to
+    read, and parking it would retire work that passed the gates because a
+    verification was unavailable here. Compare-and-set, as every other
+    continuation write is.
+    """
+
+    stage, _reason = stages.select_stage(snapshot, config)
+    fatal = _fatal_to_claim(snapshot)
+    if stage is not None or not fatal:
+        return None
+    applied = store.set_status(
+        idea_id=idea.idea_id,
+        status=IdeaStatus.REJECTED,
+        retire_reason=f"a fatal objection to the claim stands: {fatal[0].summary}",
+        expected_status=snapshot.status,
+        require_idle=True,
+    )
+    return str(IdeaStatus.REJECTED) if applied is not None else None
 
 
 #: The revisit condition of an idea parked only because its lineage was full,

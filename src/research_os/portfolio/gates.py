@@ -569,6 +569,18 @@ def _second_terminology_path(
     Grouped by the call that produced each row and ordered by when it was
     written, so "the first search" is a fact about the record rather than a
     label somebody applied.
+
+    **Only an audit is a search here.** A row with a ``claim_id`` is a
+    verified *reading* (``litintel``), and the only reading that carries a
+    source key answers the idea's own novelty top-up -- "what published work
+    bears on" the research question, which is the first search asked again,
+    raised precisely because that search came back thin. Counting it as the
+    second path let the one retrieval that filled VALIDATED's source count
+    also pass as HUMAN_READY's independent re-search, over an index that
+    returned the same three works whatever it was asked; the
+    pre-qualification review reproduced it. So what a reading cited belongs
+    to the first path, and the later path is an audit call -- which, on one
+    version, is the one ``run_replicate`` makes with different words.
     """
 
     literature = sorted(
@@ -581,19 +593,22 @@ def _second_terminology_path(
         ),
         key=lambda item: (item.created_at, item.evidence_id),
     )
-    if not literature:
+    audits = [item for item in literature if not item.claim_id]
+    if not audits:
         return False
     calls: list[str] = []
-    for item in literature:
+    for item in audits:
         if item.source_call_id not in calls:
             calls.append(str(item.source_call_id))
     if len(calls) < 2:
         return False
     first = calls[0]
     original = {
-        item.literature_key for item in literature if item.source_call_id == first
+        item.literature_key
+        for item in literature
+        if item.source_call_id == first or item.claim_id
     }
-    later = {item.literature_key for item in literature if item.source_call_id != first}
+    later = {item.literature_key for item in audits if item.source_call_id != first}
     return len(later - original) >= minimum_new_keys
 
 

@@ -216,6 +216,41 @@ def clipped_detail(detail: str | None) -> str | None:
     return text[: MAX_DETAIL_CHARS - len(_CLIP_MARKER)].rstrip() + _CLIP_MARKER
 
 
+def _as_works(evidence: tuple[IdeaEvidence, ...]) -> tuple[IdeaEvidence, ...]:
+    """Literature rows keyed by the work they cite *now*, not the key they were cited by.
+
+    The shared index merges a preprint into its published version and keeps
+    the losing key as an alias, and a row is written once -- so the same
+    paper, cited as ``arxiv:...`` before a merge and as ``doi:...`` after it,
+    was two retrieved sources toward VALIDATED's ``novelty_min_sources`` and a
+    source the first search "did not find" toward HUMAN_READY's second
+    terminology path. The pre-qualification review reproduced both, with the
+    top-up's own discovery performing the merge. Resolved here, where every
+    reader gets its rows -- the gates, the stage machine, the bank and the
+    CLI -- so no two of them can count differently. The row itself is not
+    rewritten: the key its search returned is history.
+    """
+
+    keys = {
+        item.literature_key
+        for item in evidence
+        if item.kind is EvidenceKind.LITERATURE and item.literature_key
+    }
+    if not keys:
+        return evidence
+    from research_os.literature.store import resolve_keys
+
+    live = resolve_keys(keys)
+    return tuple(
+        item.model_copy(update={"literature_key": live[item.literature_key]})
+        if item.kind is EvidenceKind.LITERATURE
+        and item.literature_key
+        and live.get(item.literature_key, item.literature_key) != item.literature_key
+        else item
+        for item in evidence
+    )
+
+
 #: The same version list, prefixed, for the queries that join ``ideas``. A bare
 #: ``idea_id`` beside the ideas table's own is ambiguous, and PostgreSQL says
 #: so rather than guessing -- which is the good outcome, but only once.
@@ -1252,7 +1287,7 @@ class PortfolioStore:
                     "order by created_at, evidence_id",
                     (idea_id, idea_version),
                 ).fetchall()
-        return tuple(IdeaEvidence.model_validate(row) for row in rows)
+        return _as_works(tuple(IdeaEvidence.model_validate(row) for row in rows))
 
     def evidence_digest(self, *, idea_id: str, idea_version: int) -> str:
         """The digest of the evidence set a review of this version would read."""
