@@ -90,6 +90,18 @@ def _key(lock_class: LockClass, subject: str) -> int:
     return int.from_bytes(digest[:4], "big") & 0x7FFF_FFFF
 
 
+def lock_key(lock_class: LockClass, subject: str) -> int:
+    """The key :func:`advisory_lock` takes for this subject.
+
+    Public so that a reader can *probe* a lock without holding it: the
+    portfolio decides whether a stage's owner is alive by asking whether the
+    owner's session still holds its run lock (``docs/ARCHITECTURE_INVARIANTS.md``
+    INV-03), and a probe on a different key would say "dead" about everyone.
+    """
+
+    return _key(lock_class, subject)
+
+
 @contextmanager
 def advisory_lock(
     db: Database,

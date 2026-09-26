@@ -1024,6 +1024,14 @@ class IdeaAction(_Record):
     created_at: datetime
     updated_at: datetime
     completed_at: datetime | None = None
+    #: The execution that owns this action while it is ACTIVE (`sql/0038`):
+    #: the run whose session lock its process holds, and the work item
+    #: attempt and lease owner that bought it. See
+    #: ``docs/ARCHITECTURE_INVARIANTS.md`` INV-03.
+    run_id: str | None = None
+    attempt: int | None = None
+    lease_owner: str | None = None
+    executor: str | None = None
 
 
 class PortfolioState(_Record):

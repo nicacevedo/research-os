@@ -1165,7 +1165,7 @@ properties that must survive.
 |---|---|---|
 | provider unavailable | an idea is rejected, or reads as reviewed | `ProviderCallFailedError` leaves the graph as an exception; the stage retries against the provider's cooldown; `BLOCKED_PROVIDER`; no disposition written |
 | daemon killed mid-stage | duplicate side effects; a lost idea | the invocation ledger; the lease is reclaimed and the stage re-runs; the basis index makes a repeat of a *succeeded* stage a no-op, and does not poison a *failed* one |
-| a stage fails permanently | the idea sits ACTIVE forever, silently unallocatable | `stale_actions` — the portfolio's `stranded_runs`, reconciled in the tick |
+| a stage fails permanently | the idea sits ACTIVE forever, silently unallocatable | `stale_actions` — the portfolio's `stranded_runs`, reconciled in the tick, and only for an owner that is provably gone: its session lock free and its work item's lease lapsed (`docs/ARCHITECTURE_INVARIANTS.md` INV-03), never on age alone |
 | DB reconnect / duplicate event | two tracks for one idea | the active-track partial unique index |
 | malformed model response | prose becomes idea content | schema validation before any write; `MODEL_OUTPUT_INVALID` |
 | a reviewer fails | promotion on two reviews | the gate counts *live* reviews; two is not three |

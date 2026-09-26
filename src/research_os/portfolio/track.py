@@ -21,6 +21,8 @@ the crashed one did.
 from __future__ import annotations
 
 import logging
+import os
+import socket
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from decimal import Decimal
@@ -41,7 +43,9 @@ from research_os.portfolio.models import (
 from research_os.portfolio.store import (
     ActiveTrackExistsError,
     DuplicateBasisError,
+    PortfolioStateError,
     PortfolioStore,
+    StaleExecutionError,
 )
 from research_os.runtime.artifacts import FilesystemArtifactStore
 from research_os.runtime.budgets import BudgetExhaustedError, BudgetLedger, Dimension
@@ -58,7 +62,9 @@ from research_os.runtime.models import (
     RunKind,
     RunStatus,
     TerminalState,
+    WorkStatus,
 )
+from research_os.runtime.queue import WorkQueue
 from research_os.runtime.routing import IndependenceUnavailableError
 from research_os.runtime.store import RuntimeStore
 
@@ -394,34 +400,106 @@ def advance_idea(
     )
     runtime_store.set_thread_id(run.run_id, track_thread_id(run.run_id))
     run = runtime_store.require_run(run.run_id)
-    try:
-        action = store.open_action(
-            idea_id=idea_id,
-            idea_version=version.version,
-            stage=stage,
-            basis_digest=basis,
-            thread_id=run.thread_id,
-        )
-    except (ActiveTrackExistsError, DuplicateBasisError) as exc:
-        runtime_store.set_run_status(
-            run.run_id,
-            RunStatus.CANCELLED,
-            terminal_state=TerminalState.CANCELLED,
-            detail=str(exc),
-        )
-        return TrackResult(
-            idea_id=idea_id,
-            run_id=run.run_id,
-            action_id=None,
+    # INV-03: the execution's identity is taken, and recorded, before the
+    # stage exists. The session lock on this run is held from before the
+    # action is opened until after it is closed; PostgreSQL releases it when
+    # this process's session ends, which is how a reclaimer learns -- from
+    # the server, not from a clock -- that the owner is gone. The action
+    # records the lock's run and the leased work item's attempt and owner, so
+    # a stage that runs for an hour with a live owner is never declared dead.
+    with research_run_lock(db, run.run_id):
+        attempt, lease_owner = _lease_of(db, work_id)
+        try:
+            action = store.open_action(
+                idea_id=idea_id,
+                idea_version=version.version,
+                stage=stage,
+                basis_digest=basis,
+                thread_id=run.thread_id,
+                work_id=work_id,
+                run_id=run.run_id,
+                attempt=attempt,
+                lease_owner=lease_owner,
+                executor=_executor(),
+            )
+        except (ActiveTrackExistsError, DuplicateBasisError) as exc:
+            runtime_store.set_run_status(
+                run.run_id,
+                RunStatus.CANCELLED,
+                terminal_state=TerminalState.CANCELLED,
+                detail=str(exc),
+            )
+            return TrackResult(
+                idea_id=idea_id,
+                run_id=run.run_id,
+                action_id=None,
+                stage=stage,
+                reason=reason,
+                ok=True,
+                detail=f"another pass is already doing this: {exc}",
+            )
+        return _run_owned_stage(
+            runtime_config=runtime_config,
+            portfolio_config=portfolio_config,
+            db=db,
+            store=store,
+            runtime_store=runtime_store,
+            probe=context_probe,
+            run=run,
+            action_id=action.action_id,
             stage=stage,
             reason=reason,
-            ok=True,
-            detail=f"another pass is already doing this: {exc}",
+            models=models,
+            project_id=project_id,
+            idea_id=idea_id,
+            work_id=work_id,
+            charter=charter,
+            problem=problem,
+            established_facts=established_facts,
+            constraints=constraints,
+            literature=literature,
+            repo_path=repo_path,
+            executors=executors,
         )
 
+
+def _run_owned_stage(
+    *,
+    runtime_config: RuntimeConfig,
+    portfolio_config: PortfolioConfig,
+    db: Database,
+    store: PortfolioStore,
+    runtime_store: RuntimeStore,
+    probe: runner.TrackContext,
+    run: Any,
+    action_id: str,
+    stage: Stage,
+    reason: str,
+    models: ModelProvider | Callable[[str], ModelProvider],
+    project_id: str,
+    idea_id: str,
+    work_id: str | None,
+    charter: str,
+    problem: str,
+    established_facts: tuple[str, ...],
+    constraints: tuple[str, ...],
+    literature: runner.LiteratureSource | None,
+    repo_path: Path | None,
+    executors: Mapping[str, Any] | None,
+) -> TrackResult:
+    """Run one stage whose action this execution owns, and close it.
+
+    Called with the run's session lock held. The stage sees only a store
+    *fenced* to its action: if this execution loses ownership -- its lease
+    lapsed and its session died, and the action was reclaimed or taken over
+    -- the next write it attempts raises :class:`StaleExecutionError` and
+    nothing it computed afterwards lands.
+    """
+
+    fenced = store.fenced(action_id)
     context = runner.TrackContext(
         config=portfolio_config,
-        portfolio=store,
+        portfolio=fenced,
         runtime=runtime_store,
         # Built *after* the run exists, so every call this track makes is
         # recorded against it. A router constructed earlier would carry a run
@@ -430,11 +508,12 @@ def advance_idea(
         # row with no project, which is the attribution `sql/0015` exists to
         # keep.
         models=models(run.run_id) if callable(models) else models,
-        artifacts=context_probe.artifacts,
+        artifacts=probe.artifacts,
         project_id=project_id,
         idea_id=idea_id,
         run_id=run.run_id,
         work_id=work_id,
+        action_id=action_id,
         charter=charter,
         problem=problem,
         established_facts=established_facts,
@@ -455,11 +534,11 @@ def advance_idea(
     try:
         # Inside the guard: a failure opening the rows must fail the action
         # it has already claimed, not leave it ACTIVE for the reconciler.
-        open_stage_budgets(db, store, idea_id=idea_id, config=portfolio_config)
-        with (
-            research_run_lock(db, run.run_id),
-            checkpointer(runtime_config.require_dsn()) as saver,
-        ):
+        open_stage_budgets(db, fenced, idea_id=idea_id, config=portfolio_config)
+        # No second `research_run_lock` here: this session already holds it,
+        # for the whole life of the action, and a second session asking for
+        # the same key would be refused.
+        with checkpointer(runtime_config.require_dsn()) as saver:
             app = build_track_graph().compile(checkpointer=saver)
             graph_config = {"configurable": {"thread_id": run.thread_id}}
             app.invoke(
@@ -476,6 +555,9 @@ def advance_idea(
                 durability=DURABILITY,
             )
             final = dict(app.get_state(graph_config).values or {})
+    except StaleExecutionError as exc:
+        _lost_ownership(runtime_store, run.run_id, exc)
+        raise
     except IndependenceUnavailableError as exc:
         # A deployment fact, not a defect, and the taxonomy has a member for
         # it. `IndependenceUnavailableError` is a sibling of
@@ -487,8 +569,11 @@ def advance_idea(
         # they install. §10 of the architecture already says the answer is
         # WAITING_FOR_EXTERNAL_DEPENDENCY; the objective cycle does this at
         # `graphs/cycle.py:893` and this layer did not.
-        store.complete_action(
-            action_id=action.action_id,
+        _close(
+            store,
+            runtime_store,
+            run.run_id,
+            action_id=action_id,
             status=ActionStatus.FAILED,
             detail=f"required review independence is unavailable here: {exc}",
             failure_class=str(FailureClass.CAPABILITY_DENIED),
@@ -510,8 +595,11 @@ def advance_idea(
         # BLOCKED_BUDGET. Before this it reached the catch-all below as
         # UNKNOWN, left the idea IDLE, and the next tick bought the same
         # refused stage again until the failure ceiling called it external.
-        store.complete_action(
-            action_id=action.action_id,
+        _close(
+            store,
+            runtime_store,
+            run.run_id,
+            action_id=action_id,
             status=ActionStatus.FAILED,
             detail=f"a budget refused this stage's next model call: {exc}",
             failure_class=str(FailureClass.BUDGET_EXHAUSTED),
@@ -526,8 +614,11 @@ def advance_idea(
         )
         raise
     except Exception as exc:
-        store.complete_action(
-            action_id=action.action_id,
+        _close(
+            store,
+            runtime_store,
+            run.run_id,
+            action_id=action_id,
             status=ActionStatus.FAILED,
             detail=str(exc),
             failure_class=str(FailureClass.UNKNOWN),
@@ -548,8 +639,11 @@ def advance_idea(
     detail = final.get("detail") or reason
 
     ok = not failure
-    store.complete_action(
-        action_id=action.action_id,
+    _close(
+        store,
+        runtime_store,
+        run.run_id,
+        action_id=action_id,
         status=ActionStatus.SUCCEEDED if ok else ActionStatus.FAILED,
         disposition=Disposition(disposition) if disposition else None,
         detail=detail,
@@ -571,7 +665,7 @@ def advance_idea(
     return TrackResult(
         idea_id=idea_id,
         run_id=run.run_id,
-        action_id=action.action_id,
+        action_id=action_id,
         stage=stage,
         reason=reason,
         ok=ok,
@@ -581,6 +675,63 @@ def advance_idea(
         model_calls=calls,
         failure_class=FailureClass(failure) if failure else None,
     )
+
+
+def _close(
+    store: PortfolioStore,
+    runtime_store: RuntimeStore,
+    run_id: str,
+    *,
+    action_id: str,
+    **completion: Any,
+) -> None:
+    """Complete this execution's action, or learn that it is no longer ours.
+
+    ``complete_action`` only moves an ``ACTIVE`` row. If the row is not
+    active, something closed it while this execution ran -- the reclaimer, or
+    a later attempt that took over a dead owner -- and this attempt's outcome
+    is not the stage's: it is reported as lost ownership, not recorded.
+    """
+
+    try:
+        store.complete_action(action_id=action_id, **completion)
+    except StaleExecutionError:
+        raise
+    except PortfolioStateError as exc:
+        stale = StaleExecutionError(
+            f"{action_id} was closed by another owner before this execution "
+            f"finished: {exc}"
+        )
+        _lost_ownership(runtime_store, run_id, stale)
+        raise stale from exc
+
+
+def _lost_ownership(
+    runtime_store: RuntimeStore, run_id: str, exc: StaleExecutionError
+) -> None:
+    runtime_store.set_run_status(
+        run_id,
+        RunStatus.CANCELLED,
+        terminal_state=TerminalState.CANCELLED,
+        detail=f"this execution lost ownership of its stage: {exc}"[:500],
+    )
+
+
+def _lease_of(db: Database, work_id: str | None) -> tuple[int | None, str | None]:
+    """The attempt and lease owner of the work item that bought this stage."""
+
+    if not work_id:
+        return None, None
+    item = WorkQueue(db).get(work_id)
+    if item is None or item.status is not WorkStatus.LEASED:
+        return None, None
+    return item.attempts, item.lease_owner
+
+
+def _executor() -> str:
+    """Which process opened an action, for a person reading the row."""
+
+    return f"{socket.gethostname()}:{os.getpid()}"
 
 
 def open_stage_budgets(

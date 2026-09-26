@@ -26,7 +26,8 @@ current version, and must be by a different role than the one that raised it.
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
@@ -102,6 +103,9 @@ from research_os.portfolio.models import (
 from research_os.runtime.db import Database, RuntimeDatabaseError, jsonb
 from research_os.runtime.failures import FailureClass
 from research_os.runtime.interfaces import Independence
+from research_os.runtime.locks import LockClass, lock_key
+from research_os.runtime.migrations import ADVISORY_NAMESPACE
+from research_os.runtime.queue import LeaseLostError
 
 LOG = logging.getLogger("research_os.portfolio.store")
 
@@ -154,7 +158,7 @@ CONTRACT_COLUMNS = (
 ACTION_COLUMNS = (
     "action_id, idea_id, idea_version, stage, basis_digest, status, work_id, "
     "thread_id, utility, disposition, detail, failure_class, cost_usd, model_calls, "
-    "created_at, updated_at, completed_at"
+    "created_at, updated_at, completed_at, run_id, attempt, lease_owner, executor"
 )
 STATE_COLUMNS = (
     "project_id, status, charter_digest, detail, paused_at, paused_by, "
@@ -316,6 +320,32 @@ class DuplicateBasisError(PortfolioStateError):
     """
 
 
+class StaleExecutionError(PortfolioStateError, LeaseLostError):
+    """Raised when an execution acts on a stage it no longer owns.
+
+    INV-03's fence. A stage's writes go through a store bound to its action
+    (:meth:`PortfolioStore.fenced`), and every transaction re-checks that the
+    action is still ``ACTIVE``. An attempt whose owner was declared dead --
+    its session and its lease both gone -- and whose action was reclaimed or
+    taken over finds out here, and writes nothing: a late result from an
+    obsolete attempt must not land beside the result of the one that
+    replaced it.
+
+    A :class:`~research_os.runtime.queue.LeaseLostError` as well, because
+    that is what the daemon already treats as "stop touching this item; the
+    new owner will finish it".
+    """
+
+
+#: What a check of an ACTIVE action's owner found.
+OWNER_LIVE = "live"
+OWNER_DEAD = "dead"
+#: No owner was recorded -- an action opened outside ``track.advance_idea``,
+#: which records one on every action it opens. Nothing can prove such an
+#: owner alive, and nothing can prove it dead either.
+OWNER_UNKNOWN = "unknown"
+
+
 @dataclass(frozen=True, slots=True)
 class SpendPosition:
     """One idea's or lineage's spend: what is recorded, and what calls hold now."""
@@ -374,16 +404,61 @@ REFUSAL_CLASSES: frozenset[FailureClass] = frozenset(
 
 
 class PortfolioStore:
-    """Portfolio reads and writes against one database."""
+    """Portfolio reads and writes against one database.
 
-    __slots__ = ("_db",)
+    Optionally *fenced* to one stage execution (:meth:`fenced`): every
+    transaction such a store opens first checks, under a row lock, that the
+    action it is bound to is still ``ACTIVE``, and raises
+    :class:`StaleExecutionError` if it is not. A stage is given only a fenced
+    store, so nothing it writes can outlive its ownership of the stage.
+    """
 
-    def __init__(self, db: Database) -> None:
+    __slots__ = ("_db", "_fence")
+
+    def __init__(self, db: Database, *, fence: str | None = None) -> None:
         self._db = db
+        self._fence = fence
 
     @property
     def db(self) -> Database:
         return self._db
+
+    @property
+    def fence(self) -> str | None:
+        """The action this store is bound to, or ``None`` for an unbound store."""
+
+        return self._fence
+
+    def fenced(self, action_id: str) -> PortfolioStore:
+        """The same store, bound to one execution's action."""
+
+        return PortfolioStore(self._db, fence=action_id)
+
+    @contextmanager
+    def _tx(self) -> Iterator[Any]:
+        """One transaction, fenced when this store is bound to an action.
+
+        ``for share`` rather than a plain read: the reclaimer and a takeover
+        close an action with an ``update`` of the same row, which waits for
+        this transaction to finish. So a write either commits while its
+        execution still owns the stage, or sees that it does not -- there is
+        no moment in which both an obsolete attempt's write and its
+        replacement's can land.
+        """
+
+        with self._db.tx() as conn:
+            if self._fence is not None:
+                row = conn.execute(
+                    "select status from idea_actions where action_id = %s for share",
+                    (self._fence,),
+                ).fetchone()
+                if row is None or str(row["status"]) != "ACTIVE":
+                    raise StaleExecutionError(
+                        f"{self._fence} is "
+                        f"{'gone' if row is None else row['status']}; this "
+                        f"execution no longer owns its stage and may not write"
+                    )
+            yield conn
 
     # -------------------------------------------------------------- ideas --
     def create_idea(
@@ -425,7 +500,7 @@ class PortfolioStore:
         # portfolio -- while listing its ideas perfectly well.
         self.upsert_state(project_id=project_id)
 
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             if parent_idea_id is None:
                 depth, lineage_root = 0, idea_id
             else:
@@ -518,7 +593,7 @@ class PortfolioStore:
         :meth:`resolve_objection` requires a re-review by another role.
         """
 
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             idea = conn.execute(
                 "select project_id, current_version, status from ideas "
                 "where idea_id = %s for update",
@@ -670,7 +745,7 @@ class PortfolioStore:
         ).fetchone()
 
     def get_idea(self, idea_id: str) -> PortfolioIdea | None:
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             row = conn.execute(
                 f"select {IDEA_COLUMNS} from ideas where idea_id = %s", (idea_id,)
             ).fetchone()
@@ -687,7 +762,7 @@ class PortfolioStore:
     ) -> IdeaVersion | None:
         """One version, or the current one when ``version`` is omitted."""
 
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             if version is None:
                 row = conn.execute(
                     f"""
@@ -715,7 +790,7 @@ class PortfolioStore:
         return found
 
     def list_versions(self, idea_id: str) -> tuple[IdeaVersion, ...]:
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             rows = conn.execute(
                 f"select {VERSION_COLUMNS} from idea_versions where idea_id = %s "
                 "order by version",
@@ -739,7 +814,7 @@ class PortfolioStore:
         if operational:
             clauses.append("operational_state = any(%(operational)s)")
             params["operational"] = [str(item) for item in operational]
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             rows = conn.execute(
                 f"select {IDEA_COLUMNS} from ideas where {' and '.join(clauses)} "
                 "order by created_at desc, idea_id limit %(limit)s",
@@ -778,7 +853,7 @@ class PortfolioStore:
             IdeaStatus.VALIDATED: QualityTier.VALIDATED,
             IdeaStatus.HUMAN_READY: QualityTier.HUMAN_READY,
         }.get(status)
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             current = conn.execute(
                 "select status, quality_tier, operational_state from ideas "
                 "where idea_id = %s for update",
@@ -839,7 +914,7 @@ class PortfolioStore:
         expectation no longer holds.
         """
 
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             row = conn.execute(
                 f"update ideas set operational_state = %s, updated_at = now() "
                 f"where idea_id = %s and (%s::text is null or operational_state = %s) "
@@ -878,7 +953,7 @@ class PortfolioStore:
         is finished.
         """
 
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             rows = conn.execute(
                 """
                 update ideas
@@ -905,7 +980,7 @@ class PortfolioStore:
         kind: EdgeKind,
         detail: str = "",
     ) -> IdeaEdge:
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             row = self._insert_edge(
                 conn,
                 parent_idea_id=parent_idea_id,
@@ -965,7 +1040,7 @@ class PortfolioStore:
         return row
 
     def edges_of(self, idea_id: str) -> tuple[IdeaEdge, ...]:
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             rows = conn.execute(
                 f"select {EDGE_COLUMNS} from idea_edges "
                 "where parent_idea_id = %(id)s or child_idea_id = %(id)s "
@@ -983,7 +1058,7 @@ class PortfolioStore:
         corrupt row could hang the control plane rather than fail a query.
         """
 
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             rows = conn.execute(
                 """
                 with recursive up (idea_id, generation) as (
@@ -1010,7 +1085,7 @@ class PortfolioStore:
         )
 
     def descendants(self, idea_id: str, *, limit: int = 200) -> tuple[str, ...]:
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             rows = conn.execute(
                 """
                 with recursive down (idea_id, generation) as (
@@ -1047,7 +1122,7 @@ class PortfolioStore:
 
         seen: set[str] = {idea_id}
         current = idea_id
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             for _ in range(limit):
                 row = conn.execute(
                     "select parent_idea_id from idea_edges "
@@ -1067,7 +1142,7 @@ class PortfolioStore:
     def find_by_content_digest(
         self, *, project_id: str, content_digest: str
     ) -> tuple[str, int] | None:
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             row = conn.execute(
                 """
                 select v.idea_id, v.version from idea_versions v
@@ -1082,7 +1157,7 @@ class PortfolioStore:
     def find_by_canonical_digest(
         self, *, project_id: str, canonical_digest: str, exclude: str | None = None
     ) -> str | None:
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             row = conn.execute(
                 """
                 select v.idea_id from idea_versions v
@@ -1110,7 +1185,7 @@ class PortfolioStore:
         duplicate, and saying so is cheaper than investigating it again.
         """
 
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             rows = conn.execute(
                 """
                 select v.idea_id, v.research_question, v.core_idea
@@ -1155,7 +1230,7 @@ class PortfolioStore:
         integrity error rather than a row.
         """
 
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             row = self._insert_evidence(
                 conn,
                 idea_id=idea_id,
@@ -1247,7 +1322,7 @@ class PortfolioStore:
         neither did; and an experiment that already names evidence keeps it.
         """
 
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             current = conn.execute(
                 f"select {EXPERIMENT_COLUMNS} from idea_experiments "
                 "where experiment_id = %s for update",
@@ -1286,7 +1361,7 @@ class PortfolioStore:
     def list_evidence(
         self, *, idea_id: str, idea_version: int | None = None
     ) -> tuple[IdeaEvidence, ...]:
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             if idea_version is None:
                 rows = conn.execute(
                     f"select {EVIDENCE_COLUMNS} from idea_evidence "
@@ -1355,7 +1430,7 @@ class PortfolioStore:
 
         experiment_id = experiment_id or new_idea_experiment_id()
         try:
-            with self._db.tx() as conn:
+            with self._tx() as conn:
                 if supersedes is not None:
                     # The repair's two writes as one: retiring the failed
                     # execution and recording its successor. Apart, a crash
@@ -1445,7 +1520,7 @@ class PortfolioStore:
         id.
         """
 
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             row = conn.execute(
                 f"select {EXPERIMENT_COLUMNS} from idea_experiments "
                 "where idea_id = %s and idea_version = %s and role = %s "
@@ -1455,7 +1530,7 @@ class PortfolioStore:
         return IdeaExperiment.model_validate(row) if row else None
 
     def require_experiment(self, experiment_id: str) -> IdeaExperiment:
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             row = conn.execute(
                 f"select {EXPERIMENT_COLUMNS} from idea_experiments "
                 "where experiment_id = %s",
@@ -1468,7 +1543,7 @@ class PortfolioStore:
     def list_experiments(
         self, *, idea_id: str, idea_version: int | None = None
     ) -> tuple[IdeaExperiment, ...]:
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             if idea_version is None:
                 rows = conn.execute(
                     f"select {EXPERIMENT_COLUMNS} from idea_experiments "
@@ -1506,7 +1581,7 @@ class PortfolioStore:
         rather than a second submission.
         """
 
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             row = conn.execute(
                 f"""
                 update idea_experiments
@@ -1549,7 +1624,7 @@ class PortfolioStore:
         what was measured was measured, and the record of it is the point.
         """
 
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             rows = conn.execute(
                 """
                 update idea_experiments
@@ -1613,7 +1688,7 @@ class PortfolioStore:
     ) -> IdeaProvenance:
         """Record one more reason an idea exists. Append-only, by trigger."""
 
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             row = self._insert_provenance(
                 conn,
                 idea_id=idea_id,
@@ -1626,7 +1701,7 @@ class PortfolioStore:
         return IdeaProvenance.model_validate(row)
 
     def provenance_of(self, idea_id: str) -> tuple[IdeaProvenance, ...]:
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             rows = conn.execute(
                 f"select {PROVENANCE_COLUMNS} from idea_provenance where idea_id = %s "
                 "order by created_at, provenance_id",
@@ -1646,7 +1721,7 @@ class PortfolioStore:
     ) -> Synthesis:
         from research_os.portfolio.ids import new_synthesis_id
 
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             row = conn.execute(
                 f"""
                 insert into syntheses
@@ -1682,7 +1757,7 @@ class PortfolioStore:
     def synthesis_for_basis(
         self, *, project_id: str, basis_digest: str
     ) -> Synthesis | None:
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             row = conn.execute(
                 f"select {SYNTHESIS_COLUMNS} from syntheses "
                 "where project_id = %s and basis_digest = %s",
@@ -1699,7 +1774,7 @@ class PortfolioStore:
         verdict: str,
         findings: int,
     ) -> Synthesis:
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             row = conn.execute(
                 f"""
                 update syntheses
@@ -1721,7 +1796,7 @@ class PortfolioStore:
     def list_syntheses(
         self, *, project_id: str, limit: int = 20
     ) -> tuple[Synthesis, ...]:
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             rows = conn.execute(
                 f"select {SYNTHESIS_COLUMNS} from syntheses where project_id = %s "
                 "order by created_at desc, synthesis_id limit %s",
@@ -1755,7 +1830,7 @@ class PortfolioStore:
 
         from research_os.portfolio.ids import new_claim_id
 
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             row = conn.execute(
                 f"""
                 insert into literature_claims
@@ -1806,7 +1881,7 @@ class PortfolioStore:
         if frontier_only:
             clauses.append("kind = any(%(kinds)s)")
             params["kinds"] = sorted(str(item) for item in FRONTIER_CLAIM_KINDS)
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             rows = conn.execute(
                 f"select {CLAIM_COLUMNS} from literature_claims "
                 f"where {' and '.join(clauses)} "
@@ -1816,7 +1891,7 @@ class PortfolioStore:
         return tuple(LiteratureClaim.model_validate(row) for row in rows)
 
     def get_literature_claim(self, claim_id: str) -> LiteratureClaim | None:
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             row = conn.execute(
                 f"select {CLAIM_COLUMNS} from literature_claims where claim_id = %s",
                 (claim_id,),
@@ -1844,7 +1919,7 @@ class PortfolioStore:
         number of retries.
         """
 
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             row = conn.execute(
                 f"""
                 insert into frontier_requests
@@ -1876,7 +1951,7 @@ class PortfolioStore:
         return FrontierRequest.model_validate(row)
 
     def get_request(self, request_id: str) -> FrontierRequest | None:
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             row = conn.execute(
                 f"select {REQUEST_COLUMNS} from frontier_requests where request_id = %s",
                 (request_id,),
@@ -1909,7 +1984,7 @@ class PortfolioStore:
         if source_idea_id is not None:
             clauses.append("source_idea_id = %(source)s")
             params["source"] = source_idea_id
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             rows = conn.execute(
                 f"select {REQUEST_COLUMNS} from frontier_requests "
                 f"where {' and '.join(clauses)} "
@@ -1928,7 +2003,7 @@ class PortfolioStore:
     ) -> FrontierRequest:
         if state is RequestState.OPEN:
             raise PortfolioStateError("closing a request needs a closed state")
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             row = conn.execute(
                 f"""
                 update frontier_requests
@@ -1944,7 +2019,7 @@ class PortfolioStore:
         return FrontierRequest.model_validate(row)
 
     def count_request_attempt(self, request_id: str) -> int:
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             row = conn.execute(
                 "update frontier_requests set attempts = attempts + 1, "
                 "updated_at = now() where request_id = %s returning attempts",
@@ -1968,7 +2043,7 @@ class PortfolioStore:
         ceiling reads.
         """
 
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             rows = conn.execute(
                 """
                 select w.payload->>'request_id' as request_id,
@@ -1995,7 +2070,7 @@ class PortfolioStore:
         -- which is what the ceiling counts.
         """
 
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             rows = conn.execute(
                 """
                 select w.payload->>'basis' as basis, count(*) as n
@@ -2013,7 +2088,7 @@ class PortfolioStore:
     def provenance_for_request(self, request_id: str) -> tuple[IdeaProvenance, ...]:
         """Every provenance row that names this request: what it already made."""
 
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             rows = conn.execute(
                 f"select {PROVENANCE_COLUMNS} from idea_provenance "
                 "where request_id = %s order by created_at, provenance_id",
@@ -2024,7 +2099,7 @@ class PortfolioStore:
     def work_in_flight(self, *, project_id: str, kind: str) -> int:
         """Queued or running work of one kind for this project."""
 
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             row = conn.execute(
                 """
                 select count(*) as n from work_items w
@@ -2076,7 +2151,7 @@ class PortfolioStore:
         )
         columns = dict(design or {})
         try:
-            with self._db.tx() as conn:
+            with self._tx() as conn:
                 row = conn.execute(
                     f"""
                     insert into scientific_contracts
@@ -2152,7 +2227,7 @@ class PortfolioStore:
         clause refuses writing it twice.
         """
 
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             row = conn.execute(
                 f"""
                 update scientific_contracts
@@ -2198,7 +2273,7 @@ class PortfolioStore:
     ) -> ScientificContract:
         """Record that no declared command can produce what the analysis reads."""
 
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             row = conn.execute(
                 f"""
                 update scientific_contracts
@@ -2228,7 +2303,7 @@ class PortfolioStore:
     def supersede_contract(
         self, contract_id: str, *, detail: str
     ) -> ScientificContract:
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             row = conn.execute(
                 f"""
                 update scientific_contracts
@@ -2243,7 +2318,7 @@ class PortfolioStore:
         return ScientificContract.model_validate(row)
 
     def get_contract(self, contract_id: str) -> ScientificContract | None:
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             row = conn.execute(
                 f"select {CONTRACT_COLUMNS} from scientific_contracts "
                 "where contract_id = %s",
@@ -2262,7 +2337,7 @@ class PortfolioStore:
     ) -> ScientificContract | None:
         """The one preregistered contract still being asked for, if any."""
 
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             row = conn.execute(
                 f"select {CONTRACT_COLUMNS} from scientific_contracts "
                 "where idea_id = %s and idea_version = %s and role = %s "
@@ -2291,7 +2366,7 @@ class PortfolioStore:
             clauses.append("state = any(%(states)s)")
             params["states"] = [str(item) for item in states]
         where = f"where {' and '.join(clauses)}" if clauses else ""
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             rows = conn.execute(
                 f"select {CONTRACT_COLUMNS} from scientific_contracts {where} "
                 "order by created_at, contract_id limit %(limit)s",
@@ -2300,7 +2375,7 @@ class PortfolioStore:
         return tuple(ScientificContract.model_validate(row) for row in rows)
 
     def set_command_set_digest(self, *, project_id: str, digest: str) -> None:
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             conn.execute(
                 "update portfolio_state set command_set_digest = %s, "
                 "updated_at = now() where project_id = %s",
@@ -2362,7 +2437,7 @@ class PortfolioStore:
             "context": context_class,
             "note": independence_note,
         }
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             row = conn.execute(
                 f"""
                 insert into idea_reviews
@@ -2413,7 +2488,7 @@ class PortfolioStore:
         if idea_version is not None:
             clauses.append("idea_version = %(version)s")
             params["version"] = idea_version
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             rows = conn.execute(
                 f"select {REVIEW_COLUMNS} from idea_reviews "
                 f"where {' and '.join(clauses)} order by created_at, review_id",
@@ -2466,7 +2541,7 @@ class PortfolioStore:
             max_age_seconds = load_config().thresholds.review_max_age_seconds
 
         evidence = None
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             head = conn.execute(
                 """
                 select v.version, v.content_digest from idea_versions v
@@ -2543,7 +2618,7 @@ class PortfolioStore:
             )
         key = pdigests.objection_key(summary)
         objection_id = new_objection_id()
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             row = conn.execute(
                 f"""
                 insert into idea_objections
@@ -2601,7 +2676,7 @@ class PortfolioStore:
             if minimum
             else list(order)
         )
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             rows = conn.execute(
                 f"select {OBJECTION_COLUMNS} from idea_objections "
                 "where idea_id = %s and resolved_at is null and severity = any(%s) "
@@ -2634,7 +2709,7 @@ class PortfolioStore:
           objection did not answer it by accident.
         """
 
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             objection = conn.execute(
                 "select idea_id, objection_key, raised_at_version, raised_in_review "
                 "from idea_objections where objection_id = %s for update",
@@ -2736,25 +2811,50 @@ class PortfolioStore:
         utility: Decimal | float | None = None,
         work_id: str | None = None,
         thread_id: str | None = None,
+        run_id: str | None = None,
+        attempt: int | None = None,
+        lease_owner: str | None = None,
+        executor: str | None = None,
     ) -> IdeaAction:
-        """Claim the one active track slot for this idea.
+        """Claim the one active track slot for this idea, for one execution.
 
         Raises :class:`ActiveTrackExistsError` when something is already in
-        flight and :class:`DuplicateBasisError` when this exact scientific
-        basis already has a running or successful action. Both are lost races
-        rather than defects: two portfolio ticks can reach the same conclusion.
+        flight and its owner is alive (or cannot be shown dead), and
+        :class:`DuplicateBasisError` when this exact scientific basis already
+        has a running or successful action. Both are lost races rather than
+        defects: two portfolio ticks can reach the same conclusion.
+
+        **The owner is recorded here, before any external work starts**
+        (INV-03): ``run_id`` names the session lock the executing process
+        holds for the stage's whole life, and ``work_id`` / ``attempt`` /
+        ``lease_owner`` the leased work item that bought it. An action whose
+        recorded owner is *provably* dead -- its lock free and its lease gone
+        -- is taken over here, in the same transaction, rather than left for
+        the tick to reclaim: a retried work item after a crash starts at once,
+        and a live owner can never be displaced, because a live owner holds
+        its lock.
         """
 
         action_id = new_idea_action_id()
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             busy = conn.execute(
-                "select action_id from idea_actions "
-                "where idea_id = %s and status = 'ACTIVE'",
+                f"select {ACTION_COLUMNS} from idea_actions "
+                "where idea_id = %s and status = 'ACTIVE' for update",
                 (idea_id,),
             ).fetchone()
             if busy is not None:
-                raise ActiveTrackExistsError(
-                    f"{idea_id} already has {busy['action_id']} in flight"
+                if self._owner_state(conn, busy) != OWNER_DEAD:
+                    raise ActiveTrackExistsError(
+                        f"{idea_id} already has {busy['action_id']} in flight"
+                    )
+                self._fail_dead(
+                    conn,
+                    str(busy["action_id"]),
+                    detail=(
+                        f"the execution holding this stage is gone (its session "
+                        f"lock is free and its lease has lapsed); taken over by "
+                        f"{action_id}"
+                    ),
                 )
             done = conn.execute(
                 """
@@ -2773,9 +2873,11 @@ class PortfolioStore:
                 f"""
                 insert into idea_actions
                     (action_id, idea_id, idea_version, stage, basis_digest, status,
-                     work_id, thread_id, utility)
+                     work_id, thread_id, utility, run_id, attempt, lease_owner,
+                     executor)
                 values (%(action_id)s, %(idea_id)s, %(version)s, %(stage)s,
-                        %(basis)s, 'ACTIVE', %(work_id)s, %(thread_id)s, %(utility)s)
+                        %(basis)s, 'ACTIVE', %(work_id)s, %(thread_id)s, %(utility)s,
+                        %(run_id)s, %(attempt)s, %(lease_owner)s, %(executor)s)
                 returning {ACTION_COLUMNS}
                 """,
                 {
@@ -2787,6 +2889,10 @@ class PortfolioStore:
                     "work_id": work_id,
                     "thread_id": thread_id,
                     "utility": Decimal(str(utility)) if utility is not None else None,
+                    "run_id": run_id,
+                    "attempt": attempt,
+                    "lease_owner": lease_owner,
+                    "executor": executor,
                 },
             ).fetchone()
             conn.execute(
@@ -2795,6 +2901,96 @@ class PortfolioStore:
                 (idea_id,),
             )
         return IdeaAction.model_validate(row)
+
+    # ------------------------------------------------------ action owners --
+    @staticmethod
+    def _owner_state(conn: Any, action: Mapping[str, Any]) -> str:
+        """Whether an ACTIVE action's recorded owner is live, dead or unknown.
+
+        Live if **either** signal says so, dead only if both are absent:
+
+        - the lease -- the work item that bought the stage is still
+          ``LEASED`` to the same owner at the same attempt, with a deadline
+          PostgreSQL has not passed. The daemon's ``LeaseKeeper`` renews it
+          while the handler runs, so this is a heartbeat; an attempt the item
+          has moved past is a different owner;
+        - the lock -- the execution's session still holds its run's advisory
+          lock. Probed with ``pg_try_advisory_xact_lock``: if this
+          transaction can take it, no session holds it, and PostgreSQL, not a
+          timer, is the one that decided so. The probe is released with this
+          transaction.
+
+        An action with neither a run nor a work item recorded has no owner
+        to check: ``OWNER_UNKNOWN``.
+        """
+
+        run_id = action.get("run_id")
+        work_id = action.get("work_id")
+        if not run_id and not work_id:
+            return OWNER_UNKNOWN
+        if work_id:
+            leased = conn.execute(
+                """
+                select 1 from work_items
+                 where work_id = %(work_id)s
+                   and status = 'LEASED'
+                   and lease_expires_at > now()
+                   and (%(attempt)s::int is null or attempts = %(attempt)s::int)
+                   and (%(owner)s::text is null or lease_owner = %(owner)s::text)
+                """,
+                {
+                    "work_id": work_id,
+                    "attempt": action.get("attempt"),
+                    "owner": action.get("lease_owner"),
+                },
+            ).fetchone()
+            if leased is not None:
+                return OWNER_LIVE
+        if run_id:
+            probe = conn.execute(
+                "select pg_try_advisory_xact_lock(%s, %s) as free",
+                (ADVISORY_NAMESPACE, lock_key(LockClass.RESEARCH_RUN, str(run_id))),
+            ).fetchone()
+            if not (probe and probe["free"]):
+                return OWNER_LIVE
+        return OWNER_DEAD
+
+    @staticmethod
+    def _fail_dead(conn: Any, action_id: str, *, detail: str) -> None:
+        """Close an ACTIVE action whose owner is gone, and free its idea."""
+
+        row = conn.execute(
+            """
+            update idea_actions
+               set status = 'FAILED', failure_class = %(failure)s,
+                   detail = %(detail)s, updated_at = now(), completed_at = now()
+             where action_id = %(action_id)s and status = 'ACTIVE'
+            returning idea_id
+            """,
+            {
+                "action_id": action_id,
+                "failure": str(FailureClass.WORKER_CRASH),
+                "detail": clipped_detail(detail),
+            },
+        ).fetchone()
+        if row is not None:
+            conn.execute(
+                "update ideas set operational_state = 'IDLE', updated_at = now() "
+                "where idea_id = %s and operational_state = 'ACTIVE'",
+                (str(row["idea_id"]),),
+            )
+
+    def owner_is_live(self, action_id: str) -> str:
+        """``OWNER_LIVE``, ``OWNER_DEAD`` or ``OWNER_UNKNOWN`` for one action."""
+
+        with self._tx() as conn:
+            row = conn.execute(
+                f"select {ACTION_COLUMNS} from idea_actions where action_id = %s",
+                (action_id,),
+            ).fetchone()
+            if row is None or str(row["status"]) != "ACTIVE":
+                return OWNER_DEAD
+            return self._owner_state(conn, row)
 
     def complete_action(
         self,
@@ -2810,7 +3006,7 @@ class PortfolioStore:
     ) -> IdeaAction:
         if status is ActionStatus.ACTIVE:
             raise PortfolioStateError("completing an action means it is not active")
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             row = conn.execute(
                 f"""
                 update idea_actions
@@ -2847,7 +3043,7 @@ class PortfolioStore:
         return IdeaAction.model_validate(row)
 
     def active_action(self, idea_id: str) -> IdeaAction | None:
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             row = conn.execute(
                 f"select {ACTION_COLUMNS} from idea_actions "
                 "where idea_id = %s and status = 'ACTIVE'",
@@ -2856,7 +3052,7 @@ class PortfolioStore:
         return IdeaAction.model_validate(row) if row else None
 
     def list_actions(self, *, idea_id: str, limit: int = 200) -> tuple[IdeaAction, ...]:
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             rows = conn.execute(
                 f"select {ACTION_COLUMNS} from idea_actions where idea_id = %s "
                 "order by created_at, action_id limit %s",
@@ -2869,7 +3065,7 @@ class PortfolioStore:
     ) -> frozenset[Stage]:
         """Which stages have already succeeded against this exact basis."""
 
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             rows = conn.execute(
                 "select distinct stage from idea_actions "
                 "where idea_id = %s and idea_version = %s and basis_digest = %s "
@@ -2890,13 +3086,31 @@ class PortfolioStore:
         all, the second makes a replay free.
         """
 
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             rows = conn.execute(
                 "select distinct stage from idea_actions "
                 "where idea_id = %s and idea_version = %s and status = 'SUCCEEDED'",
                 (idea_id, idea_version),
             ).fetchall()
         return frozenset(Stage(str(row["stage"])) for row in rows)
+
+    def set_dimensions(
+        self, *, idea_id: str, version: int, dimensions: QualityDimensions
+    ) -> None:
+        """Replace one version's assessed dimensions (immaterial to its digest).
+
+        Through this store, so a stage's write of its assessment is fenced to
+        its execution like every other (INV-03); it used to be a raw
+        ``update`` on the database handle, the one stage write the fence
+        could not see.
+        """
+
+        with self._tx() as conn:
+            conn.execute(
+                "update idea_versions set dimensions = %s "
+                "where idea_id = %s and version = %s",
+                (jsonb(dimensions.model_dump()), idea_id, version),
+            )
 
     def set_adjudication_types(
         self, *, idea_id: str, version: int, types: Sequence[str]
@@ -2915,7 +3129,7 @@ class PortfolioStore:
         here.
         """
 
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             conn.execute(
                 "update idea_versions set adjudication_types = %s "
                 "where idea_id = %s and version = %s",
@@ -2933,7 +3147,7 @@ class PortfolioStore:
         version would spend the bound on bookkeeping.
         """
 
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             row = conn.execute(
                 "select count(*) as n from idea_versions "
                 "where idea_id = %s and origin_stage = 'discover'",
@@ -2944,7 +3158,7 @@ class PortfolioStore:
     def review_count(self, idea_id: str) -> int:
         """Every review this idea has attracted, across every version."""
 
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             row = conn.execute(
                 "select count(*) as n from idea_reviews where idea_id = %s",
                 (idea_id,),
@@ -2954,7 +3168,7 @@ class PortfolioStore:
     def lineage_family(self, idea_id: str) -> tuple[str, ...]:
         """Every idea sharing this one's lineage root, including itself."""
 
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             rows = conn.execute(
                 """
                 select i.idea_id from ideas i
@@ -2976,7 +3190,7 @@ class PortfolioStore:
         looking busy.
         """
 
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             row = conn.execute(
                 """
                 with recursive up (idea_id, depth) as (
@@ -3014,7 +3228,7 @@ class PortfolioStore:
         explorations produced nothing, whatever any counter says.
         """
 
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             row = conn.execute(
                 """
                 select count(*) as n
@@ -3041,7 +3255,7 @@ class PortfolioStore:
         explorer that finishes inside one cadence never blocks the next.
         """
 
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             row = conn.execute(
                 """
                 select count(*) as n
@@ -3057,17 +3271,26 @@ class PortfolioStore:
     def stale_actions(
         self, *, project_id: str, older_than_seconds: float, limit: int = 50
     ) -> tuple[IdeaAction, ...]:
-        """Active actions whose work item can no longer advance them.
+        """Active actions whose owner can no longer advance them.
 
         The portfolio's equivalent of ``RuntimeStore.stranded_runs``, and it
         exists for the same reason: a worker killed between claiming a stage
         and completing it leaves an idea ACTIVE forever, which silently removes
-        it from allocation. A grace period rather than an immediate check,
-        because "active with no live work" is also the ordinary state between a
-        failed attempt and the queue's backoff making it claimable again.
+        it from allocation.
+
+        **Age is where the search starts, never the proof** (INV-03). An
+        action older than ``older_than_seconds`` is a *candidate*; it is stale
+        only if its recorded owner is provably dead -- no live lease and no
+        held session lock (:meth:`_owner_state`). A stage that has run for
+        an hour with a live owner is not stale, which is the whole difference
+        from the frozen build: there, ``work_id`` was never written, the
+        lease check joined against NULL, and every stage past the grace
+        period was reclaimed while it ran. An action with no recorded owner --
+        opened outside ``track.advance_idea``, which records one every time --
+        cannot be checked either way and is judged by age, as before.
         """
 
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             rows = conn.execute(
                 f"""
                 select {", ".join("a." + c.strip() for c in ACTION_COLUMNS.split(","))}
@@ -3076,11 +3299,6 @@ class PortfolioStore:
                  where i.project_id = %(project_id)s
                    and a.status = 'ACTIVE'
                    and a.updated_at < now() - make_interval(secs => %(grace)s)
-                   and not exists (
-                       select 1 from work_items w
-                        where w.work_id = a.work_id
-                          and w.status in ('PENDING','LEASED','WAITING')
-                   )
                  order by a.updated_at
                  limit %(limit)s
                 """,
@@ -3090,10 +3308,55 @@ class PortfolioStore:
                     "limit": limit,
                 },
             ).fetchall()
-        return tuple(IdeaAction.model_validate(row) for row in rows)
+            stale = [row for row in rows if self._owner_state(conn, row) != OWNER_LIVE]
+        return tuple(IdeaAction.model_validate(row) for row in stale)
+
+    def reclaim_dead_actions(
+        self, *, project_id: str, older_than_seconds: float, limit: int = 50
+    ) -> tuple[IdeaAction, ...]:
+        """Fail every stale action, each re-checked under its row lock.
+
+        The check and the close are one transaction per action: the owner is
+        re-examined with the action row locked ``for update``, so an owner
+        that renewed its lease or re-took its lock between the scan and here
+        keeps its stage.
+        """
+
+        reclaimed: list[IdeaAction] = []
+        for candidate in self.stale_actions(
+            project_id=project_id, older_than_seconds=older_than_seconds, limit=limit
+        ):
+            with self._tx() as conn:
+                row = conn.execute(
+                    f"select {ACTION_COLUMNS} from idea_actions "
+                    "where action_id = %s and status = 'ACTIVE' for update",
+                    (candidate.action_id,),
+                ).fetchone()
+                if row is None or self._owner_state(conn, row) == OWNER_LIVE:
+                    continue
+                self._fail_dead(
+                    conn,
+                    candidate.action_id,
+                    detail=(
+                        "the worker holding this stage is gone"
+                        if row.get("run_id") or row.get("work_id")
+                        else "no owner was recorded for this stage and it has "
+                        "not moved within the grace period"
+                    ),
+                )
+                reclaimed.append(
+                    IdeaAction.model_validate(
+                        conn.execute(
+                            f"select {ACTION_COLUMNS} from idea_actions "
+                            "where action_id = %s",
+                            (candidate.action_id,),
+                        ).fetchone()
+                    )
+                )
+        return tuple(reclaimed)
 
     def spend_for_idea(self, idea_id: str) -> Decimal:
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             row = conn.execute(
                 "select coalesce(sum(cost_usd), 0) as total from idea_actions "
                 "where idea_id = %s",
@@ -3102,7 +3365,7 @@ class PortfolioStore:
         return Decimal(str(row["total"]))
 
     def spend_for_lineage(self, lineage_root: str) -> Decimal:
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             row = conn.execute(
                 """
                 select coalesce(sum(a.cost_usd), 0) as total
@@ -3127,7 +3390,7 @@ class PortfolioStore:
         now, which a sum of finished actions could never see.
         """
 
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             idea_rows = conn.execute(
                 """
                 select i.idea_id,
@@ -3185,7 +3448,7 @@ class PortfolioStore:
         call is already held in the ledger.
         """
 
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             rows = conn.execute(
                 """
                 select kind,
@@ -3206,7 +3469,7 @@ class PortfolioStore:
     def upsert_state(
         self, *, project_id: str, bounds: Mapping[str, Any] | None = None
     ) -> PortfolioState:
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             row = conn.execute(
                 f"""
                 insert into portfolio_state (project_id, bounds)
@@ -3228,7 +3491,7 @@ class PortfolioStore:
         return PortfolioState.model_validate(row)
 
     def get_state(self, project_id: str) -> PortfolioState | None:
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             row = conn.execute(
                 f"select {STATE_COLUMNS} from portfolio_state where project_id = %s",
                 (project_id,),
@@ -3244,7 +3507,7 @@ class PortfolioStore:
         paused_by: str | None = None,
     ) -> PortfolioState:
         running = status is PortfolioStatus.RUNNING
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             row = conn.execute(
                 f"""
                 update portfolio_state
@@ -3277,7 +3540,7 @@ class PortfolioStore:
         reserved ref namespace creates in the coding pipeline's escape check.
         """
 
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             conn.execute(
                 "update portfolio_state set bank_commit = %s, bank_digest = %s, "
                 "bank_written_at = now(), updated_at = now() where project_id = %s",
@@ -3297,7 +3560,7 @@ class PortfolioStore:
         happened.
         """
 
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             conn.execute(
                 "update portfolio_state set bank_commit = %s, bank_digest = null, "
                 "updated_at = now() where project_id = %s",
@@ -3305,7 +3568,7 @@ class PortfolioStore:
             )
 
     def touch_tick(self, project_id: str, *, charter_digest: str | None = None) -> None:
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             conn.execute(
                 "update portfolio_state set last_tick_at = now(), "
                 "charter_digest = coalesce(%s, charter_digest), updated_at = now() "
@@ -3314,7 +3577,7 @@ class PortfolioStore:
             )
 
     def mark_digest_scheduled(self, project_id: str) -> None:
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             conn.execute(
                 "update portfolio_state set last_digest_at = now(), updated_at = now() "
                 "where project_id = %s",
@@ -3324,7 +3587,7 @@ class PortfolioStore:
     # --------------------------------------------------------------- seeds --
     def add_seed(self, *, project_id: str, text: str, note: str = "") -> PortfolioSeed:
         seed_id = new_seed_id()
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             row = conn.execute(
                 f"""
                 insert into portfolio_seeds (seed_id, project_id, text, note)
@@ -3338,7 +3601,7 @@ class PortfolioStore:
     def pending_seeds(
         self, *, project_id: str, limit: int = 20
     ) -> tuple[PortfolioSeed, ...]:
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             rows = conn.execute(
                 f"select {SEED_COLUMNS} from portfolio_seeds "
                 "where project_id = %s and consumed_at is null "
@@ -3348,7 +3611,7 @@ class PortfolioStore:
         return tuple(PortfolioSeed.model_validate(row) for row in rows)
 
     def consume_seed(self, *, seed_id: str, consumed_by: str) -> bool:
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             row = conn.execute(
                 "update portfolio_seeds set consumed_at = now(), consumed_by = %s "
                 "where seed_id = %s and consumed_at is null returning seed_id",
@@ -3359,7 +3622,7 @@ class PortfolioStore:
     def list_seeds(
         self, *, project_id: str, limit: int = 100
     ) -> tuple[PortfolioSeed, ...]:
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             rows = conn.execute(
                 f"select {SEED_COLUMNS} from portfolio_seeds where project_id = %s "
                 "order by created_at desc limit %s",
@@ -3378,7 +3641,7 @@ class PortfolioStore:
         artifact_id: str | None = None,
     ) -> PortfolioDigestRecord:
         digest_id = new_portfolio_digest_id()
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             row = conn.execute(
                 f"""
                 insert into portfolio_digests
@@ -3399,7 +3662,7 @@ class PortfolioStore:
         return PortfolioDigestRecord.model_validate(row)
 
     def latest_digest(self, project_id: str) -> PortfolioDigestRecord | None:
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             row = conn.execute(
                 f"select {DIGEST_COLUMNS} from portfolio_digests where project_id = %s "
                 "order by created_at desc, digest_id desc limit 1",
@@ -3408,7 +3671,7 @@ class PortfolioStore:
         return PortfolioDigestRecord.model_validate(row) if row else None
 
     def get_digest(self, digest_id: str) -> PortfolioDigestRecord | None:
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             row = conn.execute(
                 f"select {DIGEST_COLUMNS} from portfolio_digests where digest_id = %s",
                 (digest_id,),
@@ -3418,7 +3681,7 @@ class PortfolioStore:
     def list_digests(
         self, *, project_id: str, limit: int = 20
     ) -> tuple[PortfolioDigestRecord, ...]:
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             rows = conn.execute(
                 f"select {DIGEST_COLUMNS} from portfolio_digests where project_id = %s "
                 "order by created_at desc, digest_id desc limit %s",
@@ -3428,7 +3691,7 @@ class PortfolioStore:
 
     # ------------------------------------------------------------ counting --
     def counts_by_status(self, project_id: str) -> dict[IdeaStatus, int]:
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             rows = conn.execute(
                 "select status, count(*) as n from ideas where project_id = %s "
                 "group by status",
@@ -3447,7 +3710,7 @@ class PortfolioStore:
         idea.
         """
 
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             rows = conn.execute(
                 "select operational_state, count(*) as n from ideas "
                 "where project_id = %s "
@@ -3469,7 +3732,7 @@ class PortfolioStore:
         is the point the *ceiling* counts from.
         """
 
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             conn.execute(
                 "update portfolio_state set failures_forgiven_at = now(), "
                 "updated_at = now() where project_id = %s",
@@ -3543,7 +3806,7 @@ class PortfolioStore:
         :meth:`stage_failures`.
         """
 
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             rows = conn.execute(
                 "select payload->>'idea_id' as idea_id, payload->>'stage' as stage, "
                 "       coalesce(payload->>'idea_version', '') as idea_version, "
@@ -3594,7 +3857,7 @@ class PortfolioStore:
         buying the same sentence three times.
         """
 
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             rows = conn.execute(
                 "select w.payload->>'idea_id' as idea_id, "
                 "       w.payload->>'stage' as stage, "
@@ -3665,7 +3928,7 @@ class PortfolioStore:
         problem.
         """
 
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             rows = conn.execute(
                 """
                 select kind, coalesce(failure_class, 'unknown') as failure_class,
@@ -3706,7 +3969,7 @@ class PortfolioStore:
         is not ACTIVE, so it is not counted here and its slot is free.
         """
 
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             row = conn.execute(
                 "select count(*) as n from ideas "
                 "where project_id = %s and operational_state = 'ACTIVE'",
@@ -3729,7 +3992,7 @@ class PortfolioStore:
         many of its tracks are running, which is this.
         """
 
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             rows = conn.execute(
                 """
                 select lineage_root, count(*) as n from ideas
@@ -3749,7 +4012,7 @@ class PortfolioStore:
         from a validated idea's own replication met a full lineage.
         """
 
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             rows = conn.execute(
                 """
                 select lineage_root, count(*) as n from ideas
@@ -3769,7 +4032,7 @@ class PortfolioStore:
         docs/adr/0002: everything curated survives, and this is what would not.
         """
 
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             row = conn.execute(
                 """
                 select count(*) as n from ideas i
@@ -3784,7 +4047,7 @@ class PortfolioStore:
         ids = list(idea_ids)
         if not ids:
             return 0
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             rows = conn.execute(
                 "update ideas set curated_digest = %s, curated_at = now() "
                 "where idea_id = any(%s) returning idea_id",
@@ -3795,7 +4058,7 @@ class PortfolioStore:
     def adjudication_counts(self, project_id: str) -> dict[str, int]:
         """How the live ideas divide across adjudication types, for diversity."""
 
-        with self._db.tx() as conn:
+        with self._tx() as conn:
             rows = conn.execute(
                 """
                 select unnest(v.adjudication_types) as kind, count(*) as n

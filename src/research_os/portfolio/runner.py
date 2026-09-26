@@ -71,7 +71,6 @@ from research_os.portfolio.models import (
 from research_os.portfolio.prompts import CURRENT_REVIEW_PROMPTS
 from research_os.portfolio.prompts import TEMPLATES as PORTFOLIO_TEMPLATES
 from research_os.portfolio.store import PortfolioStore
-from research_os.runtime.db import jsonb
 from research_os.runtime.failures import FailureClass
 from research_os.runtime.interfaces import (
     ArtifactStore,
@@ -121,6 +120,10 @@ class TrackContext:
     idea_id: str
     run_id: str
     work_id: str | None = None
+    #: The ``idea_actions`` row this stage execution owns. Every write goes
+    #: through ``portfolio``, which is fenced to it (INV-03), and records that
+    #: need to name their execution -- a review, a retrieval -- name this.
+    action_id: str | None = None
     #: Read-only project context for the generators. Plain strings, assembled
     #: by the caller from the charter and the capsule, never read from disk
     #: here.
@@ -2345,12 +2348,9 @@ def _merge_dimensions(
     """
 
     merged = snapshot.version.dimensions.merged(assessed)
-    with context.portfolio.db.tx() as conn:
-        conn.execute(
-            "update idea_versions set dimensions = %s "
-            "where idea_id = %s and version = %s",
-            (jsonb(merged.model_dump()), context.idea_id, snapshot.version.version),
-        )
+    context.portfolio.set_dimensions(
+        idea_id=context.idea_id, version=snapshot.version.version, dimensions=merged
+    )
 
 
 def _evaluate(context: TrackContext) -> gates.GateResult:

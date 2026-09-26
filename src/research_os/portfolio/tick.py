@@ -33,7 +33,6 @@ from typing import Any
 from research_os.portfolio import allocation, frontier
 from research_os.portfolio.config import PortfolioConfig
 from research_os.portfolio.models import (
-    ActionStatus,
     FrontierRequest,
     IdeaOrigin,
     IdeaStatus,
@@ -498,22 +497,18 @@ def _reclaim_stale(
     ACTIVE forever, which removes it from allocation silently. Silently is the
     part that matters -- the idea is not rejected, not parked, not blocked, and
     not in the digest as any of those. It is simply never chosen again.
+
+    Only an action whose owner is provably gone is freed (INV-03): the grace
+    period says when to *look*, and the owner's lease and session lock say
+    whether it is dead. A stage that is merely slow keeps running.
     """
 
-    reclaimed = 0
-    for action in store.stale_actions(
-        project_id=project_id,
-        older_than_seconds=config.cadence.stale_action_grace_seconds,
-    ):
-        store.complete_action(
-            action_id=action.action_id,
-            status=ActionStatus.FAILED,
-            detail="the worker holding this stage is gone",
-            failure_class="worker_crash",
-            operational_state=OperationalState.IDLE,
+    return len(
+        store.reclaim_dead_actions(
+            project_id=project_id,
+            older_than_seconds=config.cadence.stale_action_grace_seconds,
         )
-        reclaimed += 1
-    return reclaimed
+    )
 
 
 def _clear_blocks(store: PortfolioStore, runtime: RuntimeStore, project_id: str) -> int:

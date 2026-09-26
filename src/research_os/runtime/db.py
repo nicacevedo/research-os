@@ -232,10 +232,28 @@ class Database:
         try:
             with pool.connection() as conn:
                 conn.set_autocommit(True)
+                body_failed = False
                 try:
                     yield conn
+                except BaseException:
+                    body_failed = True
+                    raise
                 finally:
-                    conn.set_autocommit(False)
+                    try:
+                        conn.set_autocommit(False)
+                    except Exception as exc:
+                        # A connection the server closed under the body --
+                        # an advisory-lock holder whose session was ended --
+                        # cannot be reset, and raising that here would
+                        # replace the body's own exception with "the
+                        # connection is lost". The pool discards the
+                        # connection either way.
+                        if not body_failed:
+                            raise
+                        LOG.warning(
+                            "could not reset a connection after its body failed: %s",
+                            exc,
+                        )
         except ResearchOSError:
             raise
         except Exception as exc:  # noqa: BLE001 - classified, then re-raised
