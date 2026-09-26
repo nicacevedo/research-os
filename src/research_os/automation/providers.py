@@ -147,6 +147,16 @@ class InvocationResult:
     #: unavailable and nothing will change by retrying -- the call needed more
     #: than it was authorised to spend, which is the budget working.
     budget_exhausted: bool = False
+    #: Whether the provider process was started at all.
+    #:
+    #: ``False`` is an *authoritative* statement that nothing could have been
+    #: billed: the executable was never executed. It is the only evidence a
+    #: budget may release a reservation on when the provider also reported no
+    #: cost -- a process that ran and then timed out, was killed or printed no
+    #: envelope may have spent up to its whole ceiling, and "no number" is not
+    #: "zero" (``docs/ARCHITECTURE_INVARIANTS.md`` INV-01). Defaults to
+    #: ``True`` so that an adapter which does not know fails closed.
+    invoked: bool = True
 
     @property
     def ok(self) -> bool:
@@ -239,14 +249,24 @@ class ClaudeCodeProvider:
                 input=request.prompt,
                 timeout=request.timeout_seconds,
             )
-        except FileNotFoundError as exc:
+        except (FileNotFoundError, PermissionError, NotADirectoryError) as exc:
+            # The exec itself failed, so the child never ran a line of the
+            # provider: the one failure after which "nothing was billed" is a
+            # fact rather than a guess. Any other error from here on is not
+            # classified and reaches the caller as an exception, which the
+            # router treats as spend of unknown size.
             return InvocationResult(
                 argv=tuple(argv),
                 exit_code=None,
                 timed_out=False,
                 stdout="",
                 stderr="",
-                error=f"provider executable not found: {exc}",
+                error=(
+                    f"provider executable not found: {exc}"
+                    if isinstance(exc, FileNotFoundError)
+                    else f"provider executable could not be started: {exc}"
+                ),
+                invoked=False,
             )
         except subprocess.TimeoutExpired as exc:
             return InvocationResult(

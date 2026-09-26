@@ -56,6 +56,7 @@ from research_os.runtime.budgets import (
     BudgetLedger,
     Dimension,
     Grant,
+    SettlementBasis,
 )
 from research_os.runtime.failures import FailureClass
 from research_os.runtime.interfaces import (
@@ -661,6 +662,12 @@ class ModelRouter:
         # refusing -- leaked up to three HELD call-budget rows with no handle on
         # them, and a cost-exhausted run silently exhausted its call budget too
         # and then misreported which one ran out.
+        #
+        # Both are reserved *pending*: nothing has been handed to a provider
+        # yet, so a crash from here to `mark_submitted` below provably spent
+        # nothing and the reconciler may release it. From `mark_submitted` on
+        # the outcome is unknown until the provider reports, and unknown spend
+        # is charged, never handed back (INV-01).
         grants: tuple[Grant, ...] = ()
         cost_grants: tuple[Grant, ...] = ()
         try:
@@ -671,6 +678,7 @@ class ModelRouter:
                 project_id=self._project_id,
                 work_id=self._work_id,
                 extra=extra,
+                pending=True,
             )
             cost_grants = self._budgets.reserve_all(
                 dimension=Dimension.MODEL_COST_USD,
@@ -679,6 +687,7 @@ class ModelRouter:
                 project_id=self._project_id,
                 work_id=self._work_id,
                 extra=extra,
+                pending=True,
             )
             prompt_ref = self._artifacts.put_text(
                 request.prompt,
@@ -701,9 +710,13 @@ class ModelRouter:
             # invocation belongs under the release, and a line added below the
             # guard is how it comes back.
             model, effort = self._model_and_effort(request, profile)
+            # The last statement before the provider is asked, durably. After
+            # it, a crash leaves reservations the reconciler charges in full;
+            # before it, reservations it may hand back.
+            self._budgets.mark_submitted(grants + cost_grants)
         except BaseException:
-            self._budgets.release_all(cost_grants)
-            self._budgets.release_all(grants)
+            self._budgets.release_all(cost_grants, basis=SettlementBasis.NOT_INVOKED)
+            self._budgets.release_all(grants, basis=SettlementBasis.NOT_INVOKED)
             raise
 
         started = time.monotonic()
@@ -727,8 +740,24 @@ class ModelRouter:
             )
         except Exception as exc:
             latency = int((time.monotonic() - started) * 1000)
-            self._budgets.release_all(cost_grants)
-            self._budgets.settle_all(grants)
+            # An adapter that raised produced no result and no cost, and --
+            # unlike a provider that could not be executed at all, which
+            # returns a result saying so -- it may have raised after its
+            # process ran. So the spend is unknown and is charged in full.
+            # The one exception is an adapter with no implementation: it
+            # raises before anything could have run.
+            if isinstance(exc, NotImplementedError):
+                self._budgets.release_all(
+                    cost_grants, basis=SettlementBasis.NOT_INVOKED
+                )
+                self._budgets.release_all(grants, basis=SettlementBasis.NOT_INVOKED)
+                spend_note = "nothing was started, so nothing was charged"
+            else:
+                self._budgets.settle_unknown(cost_grants)
+                self._budgets.settle_all(grants)
+                spend_note = (
+                    f"spend unknown; charged the whole {cost_amount} USD reservation"
+                )
             health = self._record_health(profile.name, ok=False, error=str(exc))
             call_id = self._record(
                 request,
@@ -737,7 +766,7 @@ class ModelRouter:
                 prompt_ref=prompt_ref,
                 output_ref=None,
                 latency_ms=latency,
-                error=f"{type(exc).__name__}: {exc}",
+                error=f"{type(exc).__name__}: {exc} ({spend_note})",
             )
             # Re-raised *as a provider failure* rather than bare. The bare
             # exception was an `OSError` or whatever else the adapter's
@@ -763,23 +792,38 @@ class ModelRouter:
             status = (
                 ModelCallStatus.TIMEOUT if result.timed_out else ModelCallStatus.FAILED
             )
-            # A failure the provider *billed* is spent. The Claude CLI's
-            # `is_error` envelope -- `error_max_turns`,
-            # `error_max_structured_output_retries` -- still reports
-            # `total_cost_usd`, and releasing the reservation over it let an
-            # explicit 1.00 USD ceiling authorise ten calls billed 9.00 USD
-            # while the ledger showed nothing spent. The pre-qualification
-            # review reproduced it. A failure that reports *no* number is
-            # still released, not charged at the estimate: an outage that
-            # never reached the model would otherwise exhaust a person's
-            # ceiling on work nobody did. `runtime/spend.py` has always drawn
-            # the line in the same place.
+            # Three outcomes, and only the evidence decides between them
+            # (docs/ARCHITECTURE_INVARIANTS.md, INV-01):
+            #
+            # - the provider *reported* a cost -- the Claude CLI's `is_error`
+            #   envelope does, for `error_max_turns`, for an outage (0.00 on
+            #   every session-limit failure of qualification run 1), for a
+            #   refused request -- and that cost is what is settled;
+            # - the provider provably never started (its executable could not
+            #   be executed), and only then is the reservation released;
+            # - anything else: it ran and reported nothing. A call killed at
+            #   its timeout under `--max-budget-usd 0.60` may have billed the
+            #   whole 0.60, and releasing that reservation is how the final
+            #   review of 37e8afe ran five such calls under a 1.00 ceiling
+            #   with the ledger showing nothing spent. It is charged in full.
             if result.total_cost_usd is not None:
                 self._budgets.settle_all(cost_grants, actual=result.total_cost_usd)
+                self._budgets.settle_all(grants)
+                spend_note = ""
+            elif not result.invoked:
+                self._budgets.release_all(
+                    cost_grants, basis=SettlementBasis.NOT_INVOKED
+                )
+                self._budgets.release_all(grants, basis=SettlementBasis.NOT_INVOKED)
+                spend_note = ""
             else:
-                self._budgets.release_all(cost_grants)
-            self._budgets.settle_all(grants)
-            detail = result.error or f"exit {result.exit_code}"
+                self._budgets.settle_unknown(cost_grants)
+                self._budgets.settle_all(grants)
+                spend_note = (
+                    f" (no cost was reported; charged the whole {cost_amount} USD "
+                    f"reservation)"
+                )
+            detail = (result.error or f"exit {result.exit_code}") + spend_note
             if result.budget_exhausted:
                 # The provider stopped the call at its authorised ceiling. It
                 # answered, so the breaker is not advanced -- this is not an

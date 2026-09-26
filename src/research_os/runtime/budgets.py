@@ -13,18 +13,29 @@ it could not.
 **It under-counts after a crash.** A worker that spends and dies before
 incrementing leaves the budget believing the money is still there. So the
 reservation is durable and separate from the settlement: a crash leaves a
-``HELD`` reservation, and `available` already excludes it. The daemon later
-settles or releases it. Pessimism in the crash window is the right direction of
-error for money.
+``HELD`` reservation, and `available` already excludes it. Pessimism in the
+crash window is the right direction of error for money.
+
+**Unknown spend fails closed** (``docs/ARCHITECTURE_INVARIANTS.md``, INV-01).
+Whether a reservation may be handed back without a reported cost depends on
+one fact, recorded durably *before* the external call starts: whether it was
+ever submitted. A caller that knows the window exists reserves ``pending``
+and calls :meth:`BudgetLedger.mark_submitted` immediately before it hands the
+work over; every other reservation is submitted from the moment it exists.
 
 Hence:
 
 ```text
-reserve(amount)   -> HELD, and `available` drops immediately
-  ...spend...
-settle(actual)    -> HELD becomes SETTLED, `spent` += actual, `reserved` -= held
-  or release()    -> HELD becomes RELEASED, `reserved` -= held, nothing spent
+reserve(amount, pending=True)  -> HELD, not submitted; `available` drops now
+mark_submitted()               -> HELD, submitted: the outcome is now unknown
+settle(actual)                 -> SETTLED at a reported cost
+settle_unknown()               -> SETTLED at the whole amount: no report exists
+release()                      -> RELEASED, only on evidence nothing was spent
 ```
+
+and the reconciler follows the same rule for a worker that never came back:
+a reservation that was never submitted is released, and one that was is
+settled at its whole amount, because its outcome is exactly what nobody knows.
 
 **Exhaustion is a destination, not an error to retry.** A budget that retries is
 not a budget. ``FailureClass.BUDGET_EXHAUSTED`` is terminal, and a run whose
@@ -47,7 +58,12 @@ from enum import StrEnum
 from research_os.errors import ResearchOSError
 from research_os.runtime.db import Database
 from research_os.runtime.ids import new_budget_id, new_reservation_id
-from research_os.runtime.models import BudgetRecord, BudgetScope, Reservation
+from research_os.runtime.models import (
+    BudgetRecord,
+    BudgetScope,
+    Reservation,
+    SettlementBasis,
+)
 
 LOG = logging.getLogger("research_os.runtime.budgets")
 
@@ -56,7 +72,8 @@ BUDGET_COLUMNS = (
     "explicit, created_at, updated_at"
 )
 RESERVATION_COLUMNS = (
-    "reservation_id, budget_id, work_id, amount, status, created_at, settled_at"
+    "reservation_id, budget_id, work_id, amount, status, created_at, settled_at, "
+    "submitted_at, settlement_basis"
 )
 
 
@@ -202,6 +219,7 @@ class BudgetLedger:
         dimension: Dimension,
         amount: Decimal | float,
         work_id: str | None = None,
+        pending: bool = False,
     ) -> Grant:
         """Take capacity now, before spending it.
 
@@ -210,6 +228,13 @@ class BudgetLedger:
         lock, so two workers cannot both pass. An absent budget means
         unlimited -- budgets are opt-in per dimension -- and that is recorded as
         a zero-amount grant so the caller's settle/release path is unconditional.
+
+        ``pending`` says the spend has not been handed to anything yet, and
+        obliges the caller to :meth:`mark_submitted` before it is. Without
+        it the reservation is submitted from the moment it exists, which is
+        the conservative reading for a caller that never said otherwise: its
+        outcome is unknown, and the reconciler will charge it rather than
+        hand it back.
         """
 
         wanted = Decimal(str(amount))
@@ -256,14 +281,17 @@ class BudgetLedger:
             reservation_id = new_reservation_id()
             conn.execute(
                 """
-                insert into budget_reservations (reservation_id, budget_id, work_id, amount)
-                values (%(reservation_id)s, %(budget_id)s, %(work_id)s, %(amount)s)
+                insert into budget_reservations
+                    (reservation_id, budget_id, work_id, amount, submitted_at)
+                values (%(reservation_id)s, %(budget_id)s, %(work_id)s, %(amount)s,
+                        case when %(pending)s then null else now() end)
                 """,
                 {
                     "reservation_id": reservation_id,
                     "budget_id": budget["budget_id"],
                     "work_id": work_id,
                     "amount": wanted,
+                    "pending": pending,
                 },
             )
         return Grant(
@@ -284,6 +312,7 @@ class BudgetLedger:
         project_id: str,
         work_id: str | None = None,
         extra: tuple[tuple[BudgetScope, str], ...] = (),
+        pending: bool = False,
     ) -> tuple[Grant, ...]:
         """Reserve against run, project and system, or reserve against none.
 
@@ -315,6 +344,7 @@ class BudgetLedger:
                         dimension=dimension,
                         amount=amount,
                         work_id=work_id,
+                        pending=pending,
                     )
                 )
         except BaseException:
@@ -325,7 +355,7 @@ class BudgetLedger:
             # best-effort so a failing release cannot mask the original error.
             for grant in taken:
                 try:
-                    self.release(grant)
+                    self._rollback(grant)
                 except Exception as exc:  # noqa: BLE001 - must not mask the cause
                     LOG.warning(
                         "could not release %s while rolling back a reservation: %s",
@@ -335,27 +365,65 @@ class BudgetLedger:
             raise
         return tuple(taken)
 
+    # ------------------------------------------------------------ submitting --
+    def mark_submitted(self, grants: tuple[Grant, ...]) -> None:
+        """Record, durably, that these reservations' work is being handed over.
+
+        Called immediately before the external call and never after it: from
+        this statement on, the reservation's outcome is unknown until the
+        provider reports, and nothing may release it without a report that
+        says it was not spent. A crash *before* it leaves a reservation the
+        reconciler may hand back, because the work provably never started.
+        """
+
+        ids = [grant.reservation_id for grant in grants if grant.reservation_id]
+        if not ids:
+            return
+        with self._db.tx() as conn:
+            conn.execute(
+                "update budget_reservations set submitted_at = now() "
+                "where reservation_id = any(%s) and status = 'HELD' "
+                "and submitted_at is null",
+                (ids,),
+            )
+
     # ------------------------------------------------------------- settling --
-    def settle(self, grant: Grant, *, actual: Decimal | float | None = None) -> None:
+    def settle(
+        self,
+        grant: Grant,
+        *,
+        actual: Decimal | float | None = None,
+        basis: SettlementBasis | None = None,
+    ) -> None:
         """Convert a held reservation into a recorded spend.
 
         ``actual`` may differ from the reservation: a model call is reserved at
         an estimate and settled at the reported cost. Where the provider reports
         nothing, the estimate stands -- a spend recorded as zero because the
         number was unavailable is the one accounting error that compounds.
+
+        Idempotent: only a HELD reservation is settled, so a second settlement
+        of the same grant -- a retried handler, the reconciler racing the
+        worker -- changes nothing.
         """
 
         if not grant.reservation_id:
             return
         spent = Decimal(str(actual)) if actual is not None else grant.amount
+        recorded = basis or (
+            SettlementBasis.REPORTED if actual is not None else SettlementBasis.ESTIMATE
+        )
         with self._db.tx() as conn:
             row = conn.execute(
                 """
-                update budget_reservations set status = 'SETTLED', settled_at = now()
+                update budget_reservations
+                   set status = 'SETTLED', settled_at = now(),
+                       settlement_basis = %s,
+                       submitted_at = coalesce(submitted_at, now())
                 where reservation_id = %s and status = 'HELD'
                 returning budget_id, amount
                 """,
-                (grant.reservation_id,),
+                (str(recorded), grant.reservation_id),
             ).fetchone()
             if row is None:
                 return
@@ -374,19 +442,39 @@ class BudgetLedger:
                 },
             )
 
-    def release(self, grant: Grant) -> None:
-        """Give capacity back because the spend did not happen."""
+    def settle_unknown(self, grants: tuple[Grant, ...]) -> None:
+        """Charge the whole reservation: the work was submitted, its cost is unknown.
+
+        The fail-closed half of INV-01. A provider killed at its timeout, an
+        adapter that raised after starting a process, a response lost before
+        it was read -- none of them says what was billed, and every one of
+        them may have billed up to the ceiling it was capped at. Handing that
+        ceiling back is how five calls capped at 0.60 USD each ran under a
+        1.00 USD ceiling; charging it is how the sixth is refused.
+        """
+
+        for grant in grants:
+            self.settle(grant, basis=SettlementBasis.UNKNOWN_OUTCOME)
+
+    def release(self, grant: Grant, *, basis: SettlementBasis | None = None) -> None:
+        """Give capacity back because the spend did not happen.
+
+        Only on evidence. ``basis`` names it; a caller with none should not be
+        here, and :meth:`settle_unknown` is where it belongs instead.
+        """
 
         if not grant.reservation_id:
             return
         with self._db.tx() as conn:
             row = conn.execute(
                 """
-                update budget_reservations set status = 'RELEASED', settled_at = now()
+                update budget_reservations
+                   set status = 'RELEASED', settled_at = now(),
+                       settlement_basis = %s
                 where reservation_id = %s and status = 'HELD'
                 returning budget_id, amount
                 """,
-                (grant.reservation_id,),
+                (str(basis or SettlementBasis.NOT_INVOKED), grant.reservation_id),
             ).fetchone()
             if row is None:
                 return
@@ -395,6 +483,11 @@ class BudgetLedger:
                 "where budget_id = %s",
                 (Decimal(row["amount"]), row["budget_id"]),
             )
+
+    def _rollback(self, grant: Grant) -> None:
+        """Undo a reservation this ledger took and nothing has used yet."""
+
+        self.release(grant, basis=SettlementBasis.REFUSED)
 
     def charge_all(
         self,
@@ -484,24 +577,38 @@ class BudgetLedger:
         return tuple(over)
 
     def settle_all(
-        self, grants: tuple[Grant, ...], *, actual: Decimal | float | None = None
+        self,
+        grants: tuple[Grant, ...],
+        *,
+        actual: Decimal | float | None = None,
+        basis: SettlementBasis | None = None,
     ) -> None:
         for grant in grants:
-            self.settle(grant, actual=actual)
+            self.settle(grant, actual=actual, basis=basis)
 
-    def release_all(self, grants: tuple[Grant, ...]) -> None:
+    def release_all(
+        self, grants: tuple[Grant, ...], *, basis: SettlementBasis | None = None
+    ) -> None:
         for grant in grants:
-            self.release(grant)
+            self.release(grant, basis=basis)
 
     # ----------------------------------------------------------- reconciling --
     def reconcile_stale(self, *, older_than_seconds: int, limit: int = 500) -> int:
-        """Release reservations whose worker never came back.
+        """Close reservations whose worker never came back, failing closed.
 
-        Called by the daemon. Deliberately releases rather than settles: the
-        spend is *unknown*, and assuming it happened would charge for work that
-        may never have been done. The model-call provenance table is the record
-        of what was actually spent; this is only the capacity reservation
-        catching up.
+        Called by the daemon. Two cases, told apart by the one fact that
+        decides them (`sql/0037`):
+
+        - **never submitted** -- the worker died after reserving and before
+          it handed anything to a provider. Nothing can have been spent, so
+          the capacity is released;
+        - **submitted** -- the worker may have started the call and died
+          before it recorded what the call cost. Nobody knows, and this used
+          to *release* it on exactly that ground, which hands a person's
+          ceiling back for work that may have been billed in full. It is
+          settled at its whole amount instead: an over-count here is visible
+          and recoverable by a person, an under-count is money that is gone
+          and a ceiling that has silently stopped binding.
 
         Aggregated in SQL and bounded. What makes it deadlock-safe is the ``for
         update skip locked`` on the reservations: two daemons never contend for
@@ -511,44 +618,69 @@ class BudgetLedger:
         paragraph said it did. The first
         version issued one ``update budgets`` per stale row from a Python loop
         in arbitrary order, which two daemons could deadlock against each other
-        -- and since this is the only thing that releases leaked capacity,
+        -- and since this is the only thing that closes leaked reservations,
         starving it starves the recovery.
+
+        Idempotent: a reservation leaves ``HELD`` exactly once, so a second
+        pass over the same rows finds nothing.
         """
 
         with self._db.tx() as conn:
             row = conn.execute(
                 """
                 with stale as (
-                    select reservation_id, budget_id, amount
+                    select reservation_id, budget_id, amount,
+                           submitted_at is not null as submitted
                     from budget_reservations
                     where status = 'HELD'
                       and created_at < now() - make_interval(secs => %(age)s)
                     order by reservation_id
                     for update skip locked
                     limit %(limit)s
-                ), released as (
+                ), closed as (
                     update budget_reservations r
-                    set status = 'RELEASED', settled_at = now()
+                    set status = case when s.submitted then 'SETTLED'
+                                      else 'RELEASED' end,
+                        settlement_basis = case when s.submitted
+                                                then %(unknown)s
+                                                else %(unsubmitted)s end,
+                        settled_at = now()
                     from stale s where r.reservation_id = s.reservation_id
-                    returning r.budget_id, r.amount
+                    returning r.budget_id, r.amount, s.submitted
                 ), totals as (
-                    select budget_id, sum(amount) as amount
-                    from released group by budget_id
+                    select budget_id,
+                           sum(amount) as held,
+                           sum(case when submitted then amount else 0 end) as spent
+                    from closed group by budget_id
                 ), applied as (
                     update budgets b
-                    set reserved = greatest(b.reserved - t.amount, 0),
+                    set reserved = greatest(b.reserved - t.held, 0),
+                        spent = b.spent + t.spent,
                         updated_at = now()
                     from (select * from totals order by budget_id) t
                     where b.budget_id = t.budget_id
                     returning 1
                 )
-                select (select count(*) from released) as n
+                select (select count(*) from closed) as n,
+                       (select count(*) from closed where submitted) as charged
                 """,
-                {"age": float(older_than_seconds), "limit": limit},
+                {
+                    "age": float(older_than_seconds),
+                    "limit": limit,
+                    "unknown": str(SettlementBasis.STALE_UNKNOWN_OUTCOME),
+                    "unsubmitted": str(SettlementBasis.STALE_NOT_SUBMITTED),
+                },
             ).fetchone()
         count = int(row["n"]) if row else 0
+        charged = int(row["charged"]) if row else 0
         if count:
-            LOG.warning("released %d stale budget reservation(s)", count)
+            LOG.warning(
+                "reconciled %d stale budget reservation(s): %d released as never "
+                "submitted, %d charged in full because their outcome is unknown",
+                count,
+                count - charged,
+                charged,
+            )
         return count
 
     def held_reservations(self, *, budget_id: str) -> tuple[Reservation, ...]:

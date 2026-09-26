@@ -264,13 +264,18 @@ def test_a_refused_multi_scope_reservation_leaks_nothing(
         assert budget.available == Decimal(10)
 
 
-def test_a_crashed_workers_reservation_is_released_not_charged(
+def test_a_crashed_workers_submitted_reservation_is_charged_not_released(
     ledger: BudgetLedger, runtime_db: Database
 ) -> None:
-    """The spend is unknown. Charging for work that may not have happened is worse.
+    """The spend is unknown, and unknown spend fails closed (INV-01).
 
-    What was actually spent lives in ``model_calls``; this is only the capacity
-    reservation catching up with a worker that never came back.
+    This test used to assert the opposite -- "charging for work that may not
+    have happened is worse" -- and that rule is what the final adversarial
+    review of 37e8afe turned into five calls under a ceiling that allowed
+    one. A reservation that was submitted may have been billed in full; a
+    person's ceiling is not handed back on a guess. See
+    ``test_a_crashed_workers_unsubmitted_reservation_is_released`` for the
+    case in which releasing is a fact rather than a guess.
     """
 
     ledger.set_limit(
@@ -284,6 +289,43 @@ def test_a_crashed_workers_reservation_is_released_not_charged(
         scope_id="r1",
         dimension=Dimension.MODEL_COST_USD,
         amount=4,
+    )
+    with runtime_db.tx() as conn:
+        conn.execute(
+            "update budget_reservations set created_at = now() - interval '2 hours' "
+            "where reservation_id = %s",
+            (grant.reservation_id,),
+        )
+    assert ledger.reconcile_stale(older_than_seconds=3600) == 1
+    budget = ledger.get(
+        scope=BudgetScope.RUN, scope_id="r1", dimension=Dimension.MODEL_COST_USD
+    )
+    assert budget is not None
+    assert budget.reserved == Decimal(0)
+    assert budget.spent == Decimal(4)
+    assert ledger.reconcile_stale(older_than_seconds=3600) == 0, "idempotent"
+    assert ledger.get(
+        scope=BudgetScope.RUN, scope_id="r1", dimension=Dimension.MODEL_COST_USD
+    ).spent == Decimal(4)  # type: ignore[union-attr]
+
+
+def test_a_crashed_workers_unsubmitted_reservation_is_released(
+    ledger: BudgetLedger, runtime_db: Database
+) -> None:
+    """A reservation never handed to a provider provably spent nothing."""
+
+    ledger.set_limit(
+        scope=BudgetScope.RUN,
+        scope_id="r1",
+        dimension=Dimension.MODEL_COST_USD,
+        limit_value=10,
+    )
+    grant = ledger.reserve(
+        scope=BudgetScope.RUN,
+        scope_id="r1",
+        dimension=Dimension.MODEL_COST_USD,
+        amount=4,
+        pending=True,
     )
     with runtime_db.tx() as conn:
         conn.execute(

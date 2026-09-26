@@ -222,7 +222,7 @@ report.
 | dimension | enforcement |
 |---|---|
 | `model_calls` | reserved before the call, settled after. A call cannot happen without capacity |
-| `model_cost_usd` | a call that declares `max_cost_usd` reserves **that whole ceiling** against run, project, system and any scope it names (the portfolio names its idea and lineage, `sql/0036`) before it starts, is refused if any of them cannot cover it, and is capped at the same number by the provider; settled at the provider's reported cost, including a failure the provider billed. A call that declares nothing reserves the profile's estimate -- see below |
+| `model_cost_usd` | a call that declares `max_cost_usd` reserves **that whole ceiling** against run, project, system and any scope it names (the portfolio names its idea and lineage, `sql/0036`) before it starts, is refused if any of them cannot cover it, and is capped at the same number by the provider; settled at the provider's reported cost, including a failure the provider billed. A call that declares nothing reserves the profile's estimate -- see below. **A call whose cost is unknown is charged its whole reservation** -- see "unknown spend" below |
 | `external_jobs` | reserved before submission |
 | `work_items` | reserved before a local experiment |
 | `wall_clock_seconds` | **charged after the fact**, per cycle entry |
@@ -239,6 +239,23 @@ never counted against the provider's health). A ceiling can therefore be exceede
 by the part of **one model response** per concurrently running call that crosses
 its own per-call cap, and that excess is recorded exactly. It is not exceeded by
 whole calls, or by a call that should never have started.
+
+**Unknown spend fails closed** (`docs/ARCHITECTURE_INVARIANTS.md`, INV-01).
+A reservation is taken *pending* and marked submitted (`sql/0037`) in the last
+statement before the provider is asked. From then on its outcome is unknown
+until the provider reports, and three cases are distinguished only by evidence:
+a reported cost is settled; a provider that provably never started (its
+executable could not be executed) is released; anything else -- a call killed
+at its timeout, an adapter that raised, a process that printed no envelope --
+is settled at its **whole reservation**. The reconciler follows the same rule
+for a worker that died: a reservation never submitted is released, one that
+was is charged in full. A frozen build released both, and a call capped at
+0.60 USD that ran to its timeout handed its 0.60 back to every scope: five
+such calls ran under a 1.00 ceiling with the ledger showing nothing spent. The
+cost of the rule is an over-count when a timed-out call was cheap, which is
+visible and a person can correct; the under-count it replaces was neither.
+An outage the provider reports is unaffected: the CLI's error envelope carries
+`total_cost_usd` (0.00 on every session-limit failure of qualification run 1).
 
 Every call the discovery portfolio makes declares a ceiling (its stage's, its
 explorer's, its follow-up's). The objective cycle's graph nodes and actions do

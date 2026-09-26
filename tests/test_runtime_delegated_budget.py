@@ -216,20 +216,28 @@ def test_an_unused_reservation_is_released(budgeted: dict[str, Any]) -> None:
     assert Decimal(cost.reserved) == 0, "the unused part of the hold was not released"
 
 
-def test_a_provider_that_reports_no_cost_is_charged_for_the_call_only(
+def test_a_provider_that_reports_no_cost_is_charged_its_reservation(
     budgeted: dict[str, Any],
 ) -> None:
-    """A spend recorded as zero because the number was unavailable compounds."""
+    """A spend recorded as zero because the number was unavailable compounds.
 
-    wrapped = BudgetedProvider(
-        inner=PricedProvider(price=None), authority=authority(budgeted)
-    )
+    This test used to assert the reservation was *released* ("charged for the
+    call only"), relying on the after-the-fact backstop -- which reads the same
+    missing number and so charged nothing either. Under INV-01 a provider that
+    ran and reported no cost is charged its whole reservation, and the charge
+    is kept apart from ``settled_usd`` so the backstop does not double-count.
+    """
+
+    auth = authority(budgeted)
+    wrapped = BudgetedProvider(inner=PricedProvider(price=None), authority=auth)
     wrapped.invoke(request())
 
     assert Decimal(budget(budgeted, Dimension.MODEL_CALLS).spent) == 1
     cost = budget(budgeted, Dimension.MODEL_COST_USD)
-    assert Decimal(cost.spent) == 0
+    assert Decimal(cost.spent) == DEFAULT_PER_CALL_CEILING_USD
     assert Decimal(cost.reserved) == 0
+    assert auth.settled_usd == 0
+    assert auth.unknown_usd == DEFAULT_PER_CALL_CEILING_USD
 
 
 def test_the_ceiling_ratchets_to_the_largest_observed_call(
@@ -331,9 +339,11 @@ def test_a_worker_that_dies_mid_call_leaves_the_capacity_held(
     """Pessimism in the crash window is the right direction of error for money.
 
     A reservation taken and never settled keeps `available` low, so a second
-    worker does not spend money the first may already have spent. It is
-    recoverable rather than lost: `reconcile_stale` releases it once it is old
-    enough to be certainly abandoned.
+    worker does not spend money the first may already have spent. This worker
+    died after authorising and *before* handing the call to its provider, so
+    the reservation was never submitted and `reconcile_stale` may release it:
+    nothing can have been billed. A worker that dies after submitting is
+    charged instead (INV-01); see the next test.
     """
 
     auth = authority(budgeted)
@@ -349,15 +359,47 @@ def test_a_worker_that_dies_mid_call_leaves_the_capacity_held(
     after = budget(budgeted, Dimension.MODEL_COST_USD)
     assert Decimal(after.reserved) == 0
     assert Decimal(after.spent) == 0, (
-        "an abandoned reservation must be released, not charged: assuming the "
-        "spend happened would bill for work that may never have been done"
+        "a reservation that was never submitted provably spent nothing and is released"
     )
 
 
-def test_a_provider_that_raises_counts_the_call_and_invents_no_cost(
+def test_a_worker_that_dies_after_submitting_is_charged_in_full(
     budgeted: dict[str, Any],
 ) -> None:
-    """Exactly what `ModelRouter.complete` does on the same event."""
+    """Submitted and never settled: the outcome is unknown, so it is charged.
+
+    The rule this file used to state -- an abandoned reservation is released,
+    "assuming the spend happened would bill for work that may never have been
+    done" -- is the rule INV-01 reverses: the worker may have been billed up
+    to the whole reservation, and handing it back lets the next call spend it
+    again.
+    """
+
+    auth = authority(budgeted)
+    grant = auth.authorize()
+    auth.submitted(grant)
+    del grant  # the process dies here, mid-call
+
+    released = budgeted["ledger"].reconcile_stale(older_than_seconds=-1)
+    assert released == 2
+    after = budget(budgeted, Dimension.MODEL_COST_USD)
+    assert Decimal(after.reserved) == 0
+    assert Decimal(after.spent) == DEFAULT_PER_CALL_CEILING_USD
+    assert budgeted["ledger"].reconcile_stale(older_than_seconds=-1) == 0
+
+
+def test_a_provider_that_raises_is_charged_its_whole_reservation(
+    budgeted: dict[str, Any],
+) -> None:
+    """Exactly what `ModelRouter.complete` does on the same event.
+
+    An adapter that raised after it was handed the call reports no cost and
+    may have spent up to its reservation. It used to be released -- "count the
+    call, invent no cost" -- which is the unknown-spend release INV-01
+    forbids. No cost is *invented* in the reported column (``settled_usd``
+    stays zero, so the backstop's subtraction is unchanged); the reservation
+    is charged in full and counted apart.
+    """
 
     auth = authority(budgeted)
     wrapped = BudgetedProvider(inner=PricedProvider(raises=True), authority=auth)
@@ -366,10 +408,11 @@ def test_a_provider_that_raises_counts_the_call_and_invents_no_cost(
 
     assert Decimal(budget(budgeted, Dimension.MODEL_CALLS).spent) == 1
     cost = budget(budgeted, Dimension.MODEL_COST_USD)
-    assert Decimal(cost.spent) == 0
+    assert Decimal(cost.spent) == DEFAULT_PER_CALL_CEILING_USD
     assert Decimal(cost.reserved) == 0
     assert auth.settled_calls == 1
     assert auth.settled_usd == 0
+    assert auth.unknown_usd == DEFAULT_PER_CALL_CEILING_USD
 
 
 def test_every_reservation_ends_settled_or_released(

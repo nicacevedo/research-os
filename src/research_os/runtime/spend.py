@@ -52,11 +52,16 @@ first call costs 3 USD reserves 3 USD for its second. What cannot be promised
 is that the *first* expensive call is refused, and nothing that bills after the
 fact can promise it.
 
-**Crashes.** A worker that dies between ``authorize`` and ``settle`` leaves a
-HELD reservation, which ``available`` already excludes -- pessimism in the
-crash window is the right direction of error for money -- and which
-``BudgetLedger.reconcile_stale`` releases later. The accounting is conservative
-and recoverable, never optimistic and lost.
+**Crashes and unknown outcomes.** A worker that dies between ``authorize`` and
+``settle`` leaves a HELD reservation, which ``available`` already excludes --
+pessimism in the crash window is the right direction of error for money. The
+reservation is taken *pending* and marked submitted immediately before the
+provider is invoked, so ``BudgetLedger.reconcile_stale`` can tell a call that
+never started (released) from one that did (charged in full). The same rule
+applies while the worker is alive: a call that reports no cost -- a timeout, a
+kill, an adapter that raised -- is charged its whole reservation, because
+"no number" is not "zero" (``docs/ARCHITECTURE_INVARIANTS.md``, INV-01). The
+accounting is conservative and visible, never optimistic and lost.
 
 This module deliberately knows nothing about proposals or coding. It knows
 about a registry of adapters and a budget.
@@ -80,6 +85,7 @@ from research_os.runtime.budgets import (
     BudgetLedger,
     Dimension,
     Grant,
+    SettlementBasis,
 )
 
 LOG = logging.getLogger("research_os.runtime.spend")
@@ -120,7 +126,13 @@ class DelegatedSpendAuthority:
     per_call_ceiling_usd: Decimal = DEFAULT_PER_CALL_CEILING_USD
 
     settled_calls: int = field(default=0, init=False)
+    #: What providers *reported*, and settled here. Only reported cost: the
+    #: after-the-fact backstop subtracts this from the reported costs in the
+    #: run's own invocation records, and a conservative charge for a call
+    #: whose cost is unknown has no counterpart there.
     settled_usd: Decimal = field(default_factory=lambda: Decimal(0), init=False)
+    #: What was charged in full because a call's outcome was unknown.
+    unknown_usd: Decimal = field(default_factory=lambda: Decimal(0), init=False)
     refusals: int = field(default=0, init=False)
     largest_call_usd: Decimal = field(default_factory=lambda: Decimal(0), init=False)
     """The most expensive single call settled here, and the reservation floor.
@@ -150,6 +162,7 @@ class DelegatedSpendAuthority:
                 run_id=self.run_id,
                 project_id=self.project_id,
                 work_id=self.work_id,
+                pending=True,
             )
             cost = self.budgets.reserve_all(
                 dimension=Dimension.MODEL_COST_USD,
@@ -157,10 +170,11 @@ class DelegatedSpendAuthority:
                 run_id=self.run_id,
                 project_id=self.project_id,
                 work_id=self.work_id,
+                pending=True,
             )
         except BudgetExhaustedError as exc:
-            self.budgets.release_all(cost)
-            self.budgets.release_all(calls)
+            self.budgets.release_all(cost, basis=SettlementBasis.REFUSED)
+            self.budgets.release_all(calls, basis=SettlementBasis.REFUSED)
             self.refusals += 1
             # Re-raised as the automation layer's own budget error, because
             # both delegated controllers already treat that as terminal and
@@ -174,10 +188,28 @@ class DelegatedSpendAuthority:
                 f"call before it was made: {exc}"
             ) from exc
         except BaseException:
-            self.budgets.release_all(cost)
-            self.budgets.release_all(calls)
+            self.budgets.release_all(cost, basis=SettlementBasis.NOT_INVOKED)
+            self.budgets.release_all(calls, basis=SettlementBasis.NOT_INVOKED)
             raise
         return Authorization(calls=calls, cost=cost, reserved_usd=ceiling)
+
+    def submitted(self, grant: Authorization) -> None:
+        """Record that the call is being handed to the provider now."""
+
+        self.budgets.mark_submitted(grant.calls + grant.cost)
+
+    def not_invoked(self, grant: Authorization) -> None:
+        """The provider provably never started: nothing was spent.
+
+        The call is still *counted* -- the controller records the attempt, and
+        the after-the-fact backstop charges any recorded call this authority
+        did not -- but its cost reservation is released, on the one piece of
+        evidence that allows it.
+        """
+
+        self.budgets.settle_all(grant.calls)
+        self.settled_calls += 1
+        self.budgets.release_all(grant.cost, basis=SettlementBasis.NOT_INVOKED)
 
     # ------------------------------------------------------------- settling --
     def settle(self, grant: Authorization, *, cost_usd: float | None) -> None:
@@ -186,12 +218,14 @@ class DelegatedSpendAuthority:
         self.budgets.settle_all(grant.calls)
         self.settled_calls += 1
         if cost_usd is None:
-            # No number from the provider. Release rather than settle at the
-            # estimate, matching the runtime router, because the *backstop*
-            # reconciles from the run's own invocation records afterwards and
-            # charging here as well would double-count. What must not happen is
-            # recording a zero, and this records nothing.
-            self.budgets.release_all(grant.cost)
+            # No number from a provider that ran. This used to *release* the
+            # reservation, on the reasoning that the backstop would charge
+            # from the run's records -- but the records carry the same
+            # missing number, so a call killed at its timeout was charged by
+            # neither. Charged in full instead, and counted apart from
+            # `settled_usd` so the backstop's subtraction stays exact.
+            self.budgets.settle_unknown(grant.cost)
+            self.unknown_usd += grant.reserved_usd
             return
         spent = Decimal(str(cost_usd))
         self.budgets.settle_all(grant.cost, actual=spent)
@@ -207,17 +241,18 @@ class DelegatedSpendAuthority:
             )
 
     def abandon(self, grant: Authorization) -> None:
-        """The provider raised. Count the call, do not invent a cost.
+        """The provider raised after it was handed the call.
 
         Exactly what ``ModelRouter.complete`` does on the same event, and for
         the same reason: an adapter that raised produced no result and reported
-        no cost, so the money is unknown. If the run record later shows one, the
-        after-the-fact reconciliation charges it.
+        no cost, so the money is unknown -- and unknown is charged in full,
+        never handed back (INV-01).
         """
 
         self.budgets.settle_all(grant.calls)
         self.settled_calls += 1
-        self.budgets.release_all(grant.cost)
+        self.budgets.settle_unknown(grant.cost)
+        self.unknown_usd += grant.reserved_usd
 
     # ---------------------------------------------------------- the wrapper --
     def wrap(self, registry: dict[str, ProviderAdapter]) -> dict[str, ProviderAdapter]:
@@ -256,9 +291,21 @@ class BudgetedProvider:
     def invoke(self, request: InvocationRequest) -> InvocationResult:
         grant = self.authority.authorize()
         try:
+            self.authority.submitted(grant)
+        except BaseException:
+            self.authority.not_invoked(grant)
+            raise
+        try:
             result = self.inner.invoke(request)
+        except NotImplementedError:
+            # An adapter with no implementation raises before anything runs.
+            self.authority.not_invoked(grant)
+            raise
         except BaseException:
             self.authority.abandon(grant)
             raise
+        if result.total_cost_usd is None and not result.invoked:
+            self.authority.not_invoked(grant)
+            return result
         self.authority.settle(grant, cost_usd=result.total_cost_usd)
         return result

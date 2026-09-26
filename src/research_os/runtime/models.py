@@ -193,6 +193,31 @@ class ReservationStatus(StrEnum):
     RELEASED = "RELEASED"
 
 
+class SettlementBasis(StrEnum):
+    """Which rule closed a reservation (`sql/0037`); mirrored by ``budget_reservations_basis_ck``.
+
+    Recorded so a ledger that charged a whole ceiling because it could not
+    know is distinguishable from one that charged what a provider reported,
+    and so a release can always name the evidence it rested on.
+    """
+
+    #: The provider reported what the call cost.
+    REPORTED = "reported"
+    #: A spend that happened and reported no number; the reservation stands.
+    ESTIMATE = "estimate"
+    #: The work was submitted and its outcome is unknown -- a timeout, a kill,
+    #: an adapter that raised. Charged at the whole amount.
+    UNKNOWN_OUTCOME = "unknown_outcome"
+    #: Authoritative evidence that the external system never started.
+    NOT_INVOKED = "not_invoked"
+    #: Rolled back because another scope refused the same spend.
+    REFUSED = "refused"
+    #: Reconciled after the worker vanished, never having submitted it.
+    STALE_NOT_SUBMITTED = "stale_not_submitted"
+    #: Reconciled after the worker vanished with the work submitted.
+    STALE_UNKNOWN_OUTCOME = "stale_unknown_outcome"
+
+
 class Autonomy(StrEnum):
     LOW = "low"
     MEDIUM = "medium"
@@ -487,6 +512,12 @@ class Reservation(_Record):
     status: ReservationStatus
     created_at: datetime
     settled_at: datetime | None
+    #: When the reserved work was handed to the external system (`sql/0037`).
+    #: ``None`` proves it was not, and is the only state a reservation with no
+    #: reported cost may be released from.
+    submitted_at: datetime | None = None
+    #: Which rule closed it; see :class:`research_os.runtime.budgets.SettlementBasis`.
+    settlement_basis: str | None = None
 
 
 class Schedule(_Record):
@@ -540,6 +571,7 @@ ENUM_CONSTRAINTS: dict[str, frozenset[str]] = {
     "external_jobs_status_ck": frozenset(s.value for s in ExternalJobStatus),
     "budgets_scope_ck": frozenset(s.value for s in BudgetScope),
     "budget_reservations_status_ck": frozenset(s.value for s in ReservationStatus),
+    "budget_reservations_basis_ck": frozenset(s.value for s in SettlementBasis),
     "experiment_interpretations_status_ck": frozenset(
         s.value for s in InterpretationStatus
     ),

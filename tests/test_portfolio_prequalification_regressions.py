@@ -241,15 +241,20 @@ def test_billed_failures_cannot_spend_past_an_explicit_ceiling(
     assert budget.exhausted
 
 
-def test_a_failed_call_that_reports_no_cost_is_released_not_charged(
+def test_a_failed_call_that_reports_no_cost_is_charged_in_full(
     runtime_db: Database, tmp_path: Path, runtime_project: str
 ) -> None:
-    """The control. No number from the provider is not a number.
+    """The control, reversed by INV-01. No number is not zero either.
 
-    A process that could not authenticate or never produced an envelope
-    reports nothing, and charging the estimate for it would let a provider
-    outage exhaust a person's ceiling on work that was never done. The
-    unchanged policy, shared with ``runtime/spend.py``.
+    This test used to assert the release: "no number from the provider is not
+    a number", so charging for it would let an outage exhaust a ceiling. The
+    final adversarial review of 37e8afe showed where that rule leads -- a call
+    killed at its timeout reports no number too, and five of them ran under a
+    ceiling that allowed one. A provider process that ran and reported
+    nothing may have billed its whole ceiling; it is charged it. An outage the
+    real CLI reports is not affected: its envelope carries ``total_cost_usd``
+    (0.00 on every session-limit failure of qualification run 1), and that is
+    what is settled -- see the next test.
     """
 
     ledger = _explicit_ceiling(runtime_db, runtime_project, "1.00")
@@ -259,6 +264,32 @@ def test_a_failed_call_that_reports_no_cost_is_released_not_charged(
         project_id=runtime_project,
         response=ScriptedResponse(
             structured=None, exit_code=1, error="not logged in", total_cost_usd=None
+        ),
+    )
+
+    with pytest.raises(ProviderCallFailedError, match="charged the whole"):
+        router.complete(_request())
+
+    budget = _project_cost(ledger, runtime_project)
+    assert budget.reserved == 0
+    assert budget.spent > 0
+
+
+def test_an_outage_the_provider_reports_at_zero_is_charged_zero(
+    runtime_db: Database, tmp_path: Path, runtime_project: str
+) -> None:
+    """The real outage shape: an error envelope that says it cost nothing."""
+
+    ledger = _explicit_ceiling(runtime_db, runtime_project, "1.00")
+    router, _ = _billing_router(
+        runtime_db,
+        tmp_path,
+        project_id=runtime_project,
+        response=ScriptedResponse(
+            structured=None,
+            exit_code=1,
+            error="You've hit your session limit",
+            total_cost_usd=0.0,
         ),
     )
 

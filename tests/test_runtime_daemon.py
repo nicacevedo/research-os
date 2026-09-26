@@ -344,7 +344,16 @@ def test_a_stale_invocation_is_flagged_not_retried(plane: dict[str, Any]) -> Non
     assert ledger.get("k1").status is InvocationStatus.ABANDONED  # type: ignore[union-attr]
 
 
-def test_a_stale_reservation_is_released(plane: dict[str, Any]) -> None:
+def test_a_stale_reservation_is_reconciled_failing_closed(
+    plane: dict[str, Any],
+) -> None:
+    """The daemon closes a dead worker's reservations by what is known.
+
+    It used to release every one, asserting "unknown spend must not be
+    charged" -- the rule INV-01 reverses. A reservation that was submitted is
+    charged in full; one that was never submitted is released.
+    """
+
     from decimal import Decimal
 
     from research_os.runtime.budgets import BudgetLedger, Dimension
@@ -363,18 +372,28 @@ def test_a_stale_reservation_is_released(plane: dict[str, Any]) -> None:
         dimension=Dimension.MODEL_COST_USD,
         amount=4,
     )
+    budgets.reserve(
+        scope=BudgetScope.RUN,
+        scope_id="r1",
+        dimension=Dimension.MODEL_COST_USD,
+        amount=3,
+        pending=True,
+    )
     with plane["db"].tx() as conn:
         conn.execute(
             "update budget_reservations set created_at = now() - interval '3 hours'"
         )
     report = plane["daemon"].tick()
-    assert report.reservations_released == 1
+    assert report.reservations_released == 2
     budget = budgets.get(
         scope=BudgetScope.RUN, scope_id="r1", dimension=Dimension.MODEL_COST_USD
     )
     assert budget is not None
     assert budget.reserved == Decimal(0)
-    assert budget.spent == Decimal(0), "unknown spend must not be charged"
+    assert budget.spent == Decimal(4), (
+        "the submitted reservation's outcome is unknown and is charged in full; "
+        "the unsubmitted one provably spent nothing and is released"
+    )
 
 
 # --------------------------------------------------------------- approvals --
