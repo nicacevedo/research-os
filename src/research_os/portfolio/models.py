@@ -730,6 +730,62 @@ class IdeaEvidence(_Record):
     #: The verified literature claim this row rests on, when it rests on one.
     claim_id: str | None = None
     created_at: datetime
+    #: The executed search whose results this row cites (`sql/0039`). A
+    #: literature row without one cannot count as a retrieval path: nothing
+    #: records which search produced it (INV-05).
+    retrieval_id: str | None = None
+
+
+class RetrievalPurpose(StrEnum):
+    """Why the system executed a literature search. Mirrored by
+    ``literature_retrievals_purpose_ck``.
+
+    Set by the code that runs the search, never by a model, and it is what a
+    gate reads to tell the first terminology path from the second.
+    """
+
+    #: The cheap screen's search of the research question.
+    NOVELTY_SCREEN = "novelty_screen"
+    #: The deep audit's search of the research question -- the first path,
+    #: and every retry of it.
+    AUDIT = "audit"
+    #: ``REPLICATE``'s search on the core idea and the claimed difference: the
+    #: only purpose that can be a second terminology path.
+    SECOND_PATH = "second_path"
+    #: A literature request's search, answered by a verified reading.
+    READING = "reading"
+
+
+class RetrievalStatus(StrEnum):
+    """Mirrored by ``literature_retrievals_status_ck``."""
+
+    STARTED = "STARTED"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+
+
+class LiteratureRetrieval(_Record):
+    """One literature search the system actually executed (`sql/0039`)."""
+
+    retrieval_id: str
+    project_id: str
+    idea_id: str | None = None
+    idea_version: int | None = None
+    action_id: str | None = None
+    request_id: str | None = None
+    run_id: str | None = None
+    work_id: str | None = None
+    purpose: RetrievalPurpose
+    query: str
+    query_digest: str
+    backend: str
+    result_limit: int
+    status: RetrievalStatus
+    result_keys: tuple[str, ...] = ()
+    result_digest: str | None = None
+    error: str | None = None
+    started_at: datetime
+    completed_at: datetime | None = None
 
 
 class IdeaReview(_Record):
@@ -1128,6 +1184,8 @@ ENUM_CONSTRAINTS: dict[str, frozenset[str]] = {
     "idea_actions_stage_ck": frozenset(s.value for s in Stage),
     "idea_actions_disposition_ck": frozenset(s.value for s in Disposition),
     "portfolio_state_status_ck": frozenset(s.value for s in PortfolioStatus),
+    "literature_retrievals_purpose_ck": frozenset(s.value for s in RetrievalPurpose),
+    "literature_retrievals_status_ck": frozenset(s.value for s in RetrievalStatus),
 }
 
 

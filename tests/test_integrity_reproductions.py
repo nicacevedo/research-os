@@ -15,12 +15,13 @@ in ``tests/test_integrity_*.py``; this file is only the original failures.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
 from research_os.portfolio.allocation import ADVANCE_IDEA
 from research_os.portfolio.config import load_config
-from research_os.portfolio.models import IdeaStatus, Stage
+from research_os.portfolio.models import IdeaStatus, QualityTier, Stage
 from research_os.portfolio.store import PortfolioStateError, PortfolioStore
 from research_os.portfolio.track import advance_idea
 from research_os.runtime.budgets import BudgetLedger
@@ -44,7 +45,9 @@ from tests.test_final_hardening_regressions import (
 )
 from tests.test_portfolio_promotion import (
     LITERATURE_FALSIFIER,
+    TerminologyAwareLiterature,
     TwoPathRouter,
+    _drive,
     _Entry,
     _matrix,
     _Packet,
@@ -352,3 +355,158 @@ def test_h2_the_idea_page_cannot_carry_a_forged_reviews_section(
     headings = [line for line in page.splitlines() if line.startswith("## ")]
     assert headings.count("## Reviews") == 1, headings
     assert FORGED_HEADER not in page.splitlines(), page
+
+
+# ------------------------------------------------------------------ H1 -----
+def test_h1_a_retried_first_audit_is_not_a_second_terminology_path(
+    portfolio: PortfolioStore,
+    runtime_db: Database,
+    pg_dsn: str,
+    checkpoint_tables: str,
+    tmp_path: Path,
+    runtime_project: str,
+) -> None:
+    """H1. ``_review_revision_audit_retry.py`` (second test), sha256
+    ce281e4720a1b758c990b32f4ae9f04ac76ea6d13f8c5a69cafaf1b48e9dfddb.
+    """
+
+    trace, early = _run_audit_retry(
+        portfolio, runtime_db, pg_dsn, tmp_path, runtime_project
+    )
+    assert not early, (
+        "HUMAN_READY was granted on a re-run of the first audit, before "
+        "REPLICATE ran, over an index with nothing new to find" + _why(trace)
+    )
+
+
+FOUR = ("openalex:W1", "openalex:W2", "openalex:W3", "openalex:W4")
+
+
+class SameFourIndex:
+    """Returns the same four works whatever it is asked."""
+
+    def __init__(self) -> None:
+        self.retrieved: list[tuple[str, tuple[str, ...]]] = []
+
+    def search(self, query: str, *, limit: int = 12) -> _Packet:
+        keys = FOUR[:limit]
+        self.retrieved.append((query, keys))
+        return _Packet(
+            query=query,
+            entries=tuple(
+                _Entry(_Work(key, f"Title of {key}", f"Abstract of {key}"))
+                for key in keys
+            ),
+        )
+
+
+class SamplingScout(TwoPathRouter):
+    """A scout whose matrix names three of the four works it was shown the
+    first time, and all four the second -- ordinary sampling variance on the
+    same prompt."""
+
+    scout_prompts: list[str]
+
+    def complete(self, request: Any) -> Any:  # type: ignore[override]
+        if str(request.role) == "literature_scout":
+            self.scout_prompts.append(request.prompt)
+            shown = tuple(dict.fromkeys(re.findall(r"openalex:W\d+", request.prompt)))
+            cited = shown[:3] if len(self.scout_prompts) == 1 else shown
+            self.answers = {**self.answers, "literature_scout": _matrix(cited)}
+            return super(TwoPathRouter, self).complete(request)
+        return super().complete(request)
+
+
+def test_h1_one_retrieval_sampled_twice_is_not_a_second_terminology_path(
+    portfolio: PortfolioStore,
+    runtime_db: Database,
+    pg_dsn: str,
+    checkpoint_tables: str,
+    tmp_path: Path,
+    runtime_project: str,
+) -> None:
+    """H1. ``_review_litcur_second_path.py``, sha256
+    8b1a8998b6d8b8a99e8defecba018f368f290e5d266fed0861f073dd974959e7.
+    """
+
+    idea, _ = seed_idea(portfolio, runtime_project, falsifier=LITERATURE_FALSIFIER)
+    base = _portfolio_router(runtime_db)
+    router = SamplingScout(answers=base.answers, store=base.store)
+    router.scout_prompts = []
+    index = SameFourIndex()
+
+    trace = _drive(
+        runtime_db, pg_dsn, tmp_path, runtime_project, idea.idea_id, router, index
+    )
+    final = portfolio.require_idea(idea.idea_id)
+    version = portfolio.require_version(idea.idea_id)
+
+    # Both audits ran (the research-question audit and REPLICATE's second path).
+    succeeded = portfolio.succeeded_stages_for_version(
+        idea_id=idea.idea_id, idea_version=version.version
+    )
+    assert {Stage.LITERATURE_AUDIT, Stage.REPLICATE} <= succeeded, _why(trace)
+    assert len(router.scout_prompts) == 2, _why(trace)
+    # Every search retrieved exactly the same works ...
+    assert {keys for _query, keys in index.retrieved} == {FOUR}
+    # ... and the two scouts were handed byte-identical prompts: nothing about
+    # the second call looked anywhere the first did not.
+    assert router.scout_prompts[0] == router.scout_prompts[1]
+
+    # The second search found no source the first did not retrieve, so the
+    # "second terminology path" does not exist and HUMAN_READY must not be
+    # reached.
+    assert final.status is not IdeaStatus.HUMAN_READY, _why(trace)
+    assert final.quality_tier is not QualityTier.HUMAN_READY, _why(trace)
+
+
+# ------------------------------------------------------------------ M1 -----
+INVENTED = tuple(f"invented query {n}" for n in range(6))
+
+
+class ClaimsSixQueries(TwoPathRouter):
+    def complete(self, request: Any) -> Any:  # type: ignore[override]
+        if str(request.role) == "literature_scout":
+            keys = tuple(dict.fromkeys(re.findall(r"openalex:W\d+", request.prompt)))
+            self.answers = {
+                **self.answers,
+                "literature_scout": {**_matrix(keys), "queries": list(INVENTED)},
+            }
+            return super(TwoPathRouter, self).complete(request)
+        return super().complete(request)
+
+
+def test_m1_literature_confidence_counts_searches_that_were_run(
+    portfolio: PortfolioStore,
+    runtime_db: Database,
+    pg_dsn: str,
+    checkpoint_tables: str,
+    tmp_path: Path,
+    runtime_project: str,
+) -> None:
+    """M1. ``_review_litcur_queries.py``, sha256
+    4027c09bfae7ab58fdb9b027e09fba39b891a76ab55ed74efb981ef26707ac1a.
+    """
+
+    idea, _ = seed_idea(portfolio, runtime_project, falsifier=LITERATURE_FALSIFIER)
+    base = _portfolio_router(runtime_db)
+    router = ClaimsSixQueries(answers=base.answers, store=base.store)
+    index = TerminologyAwareLiterature()
+    trace = _drive(
+        runtime_db,
+        pg_dsn,
+        tmp_path,
+        runtime_project,
+        idea.idea_id,
+        router,
+        index,
+        steps=12,
+    )
+    executed = [q for q in index.queries if not any(q == i for i in INVENTED)]
+    assert not set(INVENTED) & set(index.queries), "none of these was ever searched"
+    version = portfolio.require_version(idea.idea_id)
+    confidence = version.dimensions.literature_confidence
+    assert confidence is not None, _why(trace)
+    # The index was asked at most a couple of questions per audit; none of the
+    # six the scout listed. A confidence of 1.0 is the model's claim, not a count.
+    assert confidence < 1.0, (confidence, executed, _why(trace))

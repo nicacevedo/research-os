@@ -47,7 +47,10 @@ from research_os.portfolio.models import (
     IdeaObjection,
     IdeaReview,
     IdeaVersion,
+    LiteratureRetrieval,
     QualityTier,
+    RetrievalPurpose,
+    RetrievalStatus,
     ReviewVerdict,
     Severity,
     Stage,
@@ -189,8 +192,9 @@ REPLICATION_RULES: dict[AdjudicationType, ReplicationRule] = {
     ),
     AdjudicationType.NOVELTY_OR_LITERATURE: ReplicationRule(
         description=(
-            "a second terminology path: a retrieval by a different call that "
-            "finds sources the first did not"
+            "a second terminology path: a separately executed search, with "
+            "different words, that retrieved and assessed sources no search of "
+            "the first path retrieved"
         ),
         kinds=frozenset({EvidenceKind.LITERATURE, EvidenceKind.REPLICATION}),
         new_literature_keys=1,
@@ -451,6 +455,7 @@ def _human_ready_unmet(
     reviews: Sequence[IdeaReview],
     objections: Sequence[IdeaObjection],
     evidence: Sequence[IdeaEvidence],
+    retrievals: Sequence[LiteratureRetrieval] = (),
 ) -> list[str]:
     unmet: list[str] = []
     _, _, replication_rules = _rules_for(version)
@@ -482,7 +487,7 @@ def _human_ready_unmet(
         if call
     }
     for rule in replication_rules:
-        if not _replication_met(rule, evidence, origin_calls):
+        if not _replication_met(rule, evidence, origin_calls, retrievals):
             unmet.append(f"no second-line verification: {rule.description}")
     if not replication_rules:
         unmet.append(
@@ -505,6 +510,7 @@ def _replication_met(
     rule: ReplicationRule,
     evidence: Sequence[IdeaEvidence],
     origin_calls: set[str | None],
+    retrievals: Sequence[LiteratureRetrieval] = (),
 ) -> bool:
     """Whether the second-line verification this type requires actually exists.
 
@@ -530,7 +536,7 @@ def _replication_met(
     """
 
     if rule.new_literature_keys:
-        return _second_terminology_path(evidence, rule.new_literature_keys)
+        return _second_terminology_path(evidence, retrievals, rule.new_literature_keys)
 
     # Substantive, for the same reason the evidence rule demands it: a
     # replication that measured again and could not tell is a record of
@@ -562,54 +568,82 @@ def _replication_met(
 
 
 def _second_terminology_path(
-    evidence: Sequence[IdeaEvidence], minimum_new_keys: int
+    evidence: Sequence[IdeaEvidence],
+    retrievals: Sequence[LiteratureRetrieval],
+    minimum_new_keys: int,
 ) -> bool:
-    """Whether a later retrieval found sources the first one did not.
+    """Whether a genuinely separate search found, and assessed, new sources.
 
-    Grouped by the call that produced each row and ordered by when it was
-    written, so "the first search" is a fact about the record rather than a
-    label somebody applied.
+    INV-05 (``docs/ARCHITECTURE_INVARIANTS.md``), and the conservative
+    criterion stated there, over the rows of searches the system *executed*
+    (``literature_retrievals``) rather than over what any scout cited. A
+    completed retrieval ``R2`` whose purpose is ``second_path`` -- set by the
+    ``REPLICATE`` stage that ran it, never by a model -- is a second path only
+    if, against every completed first-path retrieval of the version (the
+    screen, the audit and every retry of it, the readings):
 
-    **Only an audit is a search here.** A row with a ``claim_id`` is a
-    verified *reading* (``litintel``), and the only reading that carries a
-    source key answers the idea's own novelty top-up -- "what published work
-    bears on" the research question, which is the first search asked again,
-    raised precisely because that search came back thin. Counting it as the
-    second path let the one retrieval that filled VALIDATED's source count
-    also pass as HUMAN_READY's independent re-search, over an index that
-    returned the same three works whatever it was asked; the
-    pre-qualification review reproduced it. So what a reading cited belongs
-    to the first path, and the later path is an audit call -- which, on one
-    version, is the one ``run_replicate`` makes with different words.
+    1. it is its own execution: owned by a different action;
+    2. it used different words: its normalised query digest matches none;
+    3. it retrieved something different: its result digest matches none, so
+       an identical or cached result reused under new words is not a path;
+    4. it retrieved at least ``minimum_new_keys`` works no first-path search
+       retrieved and no reading cited, *and* its own audit assessed them:
+       evidence rows bound to ``R2`` cite them.
+
+    What the frozen gate compared was the keys two scouts *cited*. So two
+    byte-identical retrievals passed when the second scout happened to cite a
+    work the first left out of its matrix, and a retried first audit was a
+    "second path" of its own -- the final adversarial review reproduced both
+    (H1). Citing different papers from the same search satisfies none of the
+    four conditions above. Evidence with no ``retrieval_id`` -- every row
+    written before `sql/0039` -- names no search, and so is no path at all.
     """
 
-    literature = sorted(
-        (
-            item
+    completed = [
+        item for item in retrievals if item.status is RetrievalStatus.COMPLETED
+    ]
+    first = [
+        item for item in completed if item.purpose is not RetrievalPurpose.SECOND_PATH
+    ]
+    second = [
+        item for item in completed if item.purpose is RetrievalPurpose.SECOND_PATH
+    ]
+    if not first or not second:
+        return False
+    already: set[str] = set()
+    for item in first:
+        already |= set(item.result_keys)
+    # What a verified reading cited belongs to the first path too: the only
+    # reading that carries a source key answers the idea's own novelty
+    # top-up, which is the first search asked again.
+    already |= {
+        item.literature_key
+        for item in evidence
+        if item.kind is EvidenceKind.LITERATURE
+        and item.claim_id
+        and item.literature_key
+    }
+    first_queries = {item.query_digest for item in first}
+    first_results = {item.result_digest for item in first}
+    first_actions = {item.action_id for item in first if item.action_id}
+    for candidate in second:
+        if not candidate.action_id or candidate.action_id in first_actions:
+            continue
+        if candidate.query_digest in first_queries:
+            continue
+        if candidate.result_digest in first_results:
+            continue
+        new = set(candidate.result_keys) - already
+        assessed = {
+            item.literature_key
             for item in evidence
             if item.kind is EvidenceKind.LITERATURE
-            and item.literature_key
-            and item.source_call_id
-        ),
-        key=lambda item: (item.created_at, item.evidence_id),
-    )
-    audits = [item for item in literature if not item.claim_id]
-    if not audits:
-        return False
-    calls: list[str] = []
-    for item in audits:
-        if item.source_call_id not in calls:
-            calls.append(str(item.source_call_id))
-    if len(calls) < 2:
-        return False
-    first = calls[0]
-    original = {
-        item.literature_key
-        for item in literature
-        if item.source_call_id == first or item.claim_id
-    }
-    later = {item.literature_key for item in audits if item.source_call_id != first}
-    return len(later - original) >= minimum_new_keys
+            and item.retrieval_id == candidate.retrieval_id
+            and item.literature_key in new
+        }
+        if len(assessed) >= minimum_new_keys:
+            return True
+    return False
 
 
 def evaluate(
@@ -621,6 +655,7 @@ def evaluate(
     succeeded_stages: frozenset[Stage],
     config: PortfolioConfig,
     requested: QualityTier = QualityTier.HUMAN_READY,
+    retrievals: Sequence[LiteratureRetrieval] = (),
 ) -> GateResult:
     """What this idea's rows permit.
 
@@ -635,7 +670,7 @@ def evaluate(
         version, live_reviews, objections, evidence, succeeded_stages, config
     )
     human_ready = validated + _human_ready_unmet(
-        version, live_reviews, objections, evidence
+        version, live_reviews, objections, evidence, retrievals
     )
 
     if not human_ready:

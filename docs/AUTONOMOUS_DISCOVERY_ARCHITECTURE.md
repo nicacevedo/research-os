@@ -784,7 +784,7 @@ requirements and never removes them.
 |---|---|---|
 | `mathematical` | a `derivation` evidence row, **and** at least one machine-checkable artifact: an executed counterexample search with an `external_jobs` row and a spec digest | an independent derivation by a `replicator` that did not read the first, **or** a second executed search under a different parameterisation |
 | `empirical` | an `experiment` evidence row naming an `external_jobs` row, and its interpretation bound to a stored preregistration | a second execution with its own `ExecutionSpec` digest, differing in seed or implementation |
-| `novelty_or_literature` | `novelty_min_sources` distinct retrieved literature keys and a novelty matrix | a second terminology path: a retrieval whose query set is disjoint from the first |
+| `novelty_or_literature` | `novelty_min_sources` distinct retrieved literature keys and a novelty matrix | a second terminology path: a separately executed, recorded search (`literature_retrievals`) with different words and a different result that retrieved, and assessed, works no first-path search retrieved -- the criterion in `docs/ARCHITECTURE_INVARIANTS.md` INV-05 |
 | `diagnostic` | an `inspection` or `code` evidence row naming an artifact | an independent checker or an alternate implementation |
 | `mixed` | the union over its components | the union over its components |
 | `undetermined` | cannot reach `VALIDATED`; the gate says so and names the missing falsifier | — |
@@ -928,7 +928,11 @@ Pareto front with a diversity constraint rather than `order by U`.
 
 The front's dimensions are `novelty`, `evidence_strength` and
 `literature_confidence`, and `evidence_strength` is **computed from the
-evidence and review rows**, never taken from a model's own score. An earlier
+evidence and review rows**, never taken from a model's own score.
+`literature_confidence` is the number of distinct literature searches the
+system executed and recorded for the version (`literature_retrievals`), over
+six -- never the scout's own list of queries, which an adversarial review
+raised to 1.0 with six invented queries over one search. An earlier
 build ranked the front on five dimensions, three of them self-assessed, which
 let an idea reach the researcher's attention by rating itself highly. Model
 self-assessment is still stored and still shown; it no longer orders

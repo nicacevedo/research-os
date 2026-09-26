@@ -47,6 +47,7 @@ from research_os.portfolio.ids import (
     new_portfolio_digest_id,
     new_provenance_id,
     new_request_id,
+    new_retrieval_id,
     new_seed_id,
 )
 from research_os.portfolio.models import (
@@ -80,6 +81,7 @@ from research_os.portfolio.models import (
     IdeaStatus,
     IdeaVersion,
     LiteratureClaim,
+    LiteratureRetrieval,
     ObjectionTarget,
     OperationalState,
     PortfolioDigestRecord,
@@ -93,6 +95,7 @@ from research_os.portfolio.models import (
     RequestBasis,
     RequestKind,
     RequestState,
+    RetrievalPurpose,
     ReviewerRole,
     ReviewVerdict,
     ScientificContract,
@@ -126,7 +129,13 @@ EDGE_COLUMNS = (
 )
 EVIDENCE_COLUMNS = (
     "evidence_id, idea_id, idea_version, kind, strength, summary, artifact_id, "
-    "finding_id, job_id, literature_key, source_call_id, claim_id, created_at"
+    "finding_id, job_id, literature_key, source_call_id, claim_id, created_at, "
+    "retrieval_id"
+)
+RETRIEVAL_COLUMNS = (
+    "retrieval_id, project_id, idea_id, idea_version, action_id, request_id, "
+    "run_id, work_id, purpose, query, query_digest, backend, result_limit, status, "
+    "result_keys, result_digest, error, started_at, completed_at"
 )
 REVIEW_COLUMNS = (
     "review_id, idea_id, idea_version, reviewer_role, verdict, severity, summary, "
@@ -1219,6 +1228,7 @@ class PortfolioStore:
         literature_key: str | None = None,
         source_call_id: str | None = None,
         claim_id: str | None = None,
+        retrieval_id: str | None = None,
     ) -> IdeaEvidence:
         """Link one piece of evidence to one idea version.
 
@@ -1244,6 +1254,7 @@ class PortfolioStore:
                 literature_key=literature_key,
                 source_call_id=source_call_id,
                 claim_id=claim_id,
+                retrieval_id=retrieval_id,
             )
         return IdeaEvidence.model_validate(row)
 
@@ -1262,6 +1273,7 @@ class PortfolioStore:
         literature_key: str | None = None,
         source_call_id: str | None = None,
         claim_id: str | None = None,
+        retrieval_id: str | None = None,
     ) -> Any:
         evidence_id = new_idea_evidence_id()
         row = conn.execute(
@@ -1269,10 +1281,11 @@ class PortfolioStore:
             insert into idea_evidence
                 (evidence_id, idea_id, idea_version, kind, strength, summary,
                  artifact_id, finding_id, job_id, literature_key, source_call_id,
-                 claim_id)
+                 claim_id, retrieval_id)
             values (%(evidence_id)s, %(idea_id)s, %(version)s, %(kind)s,
                     %(strength)s, %(summary)s, %(artifact_id)s, %(finding_id)s,
-                    %(job_id)s, %(literature_key)s, %(call_id)s, %(claim_id)s)
+                    %(job_id)s, %(literature_key)s, %(call_id)s, %(claim_id)s,
+                    %(retrieval_id)s)
             on conflict (idea_id, idea_version, claim_id)
                 where claim_id is not null do nothing
             returning {EVIDENCE_COLUMNS}
@@ -1290,6 +1303,7 @@ class PortfolioStore:
                 "literature_key": literature_key,
                 "call_id": source_call_id,
                 "claim_id": claim_id,
+                "retrieval_id": retrieval_id,
             },
         ).fetchone()
         if row is None:
@@ -1301,6 +1315,112 @@ class PortfolioStore:
                 (idea_id, idea_version, claim_id),
             ).fetchone()
         return row
+
+    # --------------------------------------------------------- retrievals --
+    def begin_retrieval(
+        self,
+        *,
+        project_id: str,
+        purpose: RetrievalPurpose,
+        query: str,
+        backend: str,
+        result_limit: int,
+        idea_id: str | None = None,
+        idea_version: int | None = None,
+        action_id: str | None = None,
+        request_id: str | None = None,
+        run_id: str | None = None,
+        work_id: str | None = None,
+    ) -> LiteratureRetrieval:
+        """Record that a search is about to run, before it runs (INV-05).
+
+        Written first so that a search is a fact whatever happens to it: one
+        that completes says what it found, one that raises says so, and one
+        whose worker died is visibly ``STARTED`` and never counted.
+        """
+
+        with self._tx() as conn:
+            row = conn.execute(
+                f"""
+                insert into literature_retrievals
+                    (retrieval_id, project_id, idea_id, idea_version, action_id,
+                     request_id, run_id, work_id, purpose, query, query_digest,
+                     backend, result_limit)
+                values (%(retrieval_id)s, %(project_id)s, %(idea_id)s,
+                        %(idea_version)s, %(action_id)s, %(request_id)s,
+                        %(run_id)s, %(work_id)s, %(purpose)s, %(query)s,
+                        %(query_digest)s, %(backend)s, %(limit)s)
+                returning {RETRIEVAL_COLUMNS}
+                """,
+                {
+                    "retrieval_id": new_retrieval_id(),
+                    "project_id": project_id,
+                    "idea_id": idea_id,
+                    "idea_version": idea_version,
+                    "action_id": action_id,
+                    "request_id": request_id,
+                    "run_id": run_id,
+                    "work_id": work_id,
+                    "purpose": str(purpose),
+                    "query": query,
+                    "query_digest": pdigests.retrieval_query_digest(query),
+                    "backend": backend,
+                    "limit": int(result_limit),
+                },
+            ).fetchone()
+        return LiteratureRetrieval.model_validate(row)
+
+    def complete_retrieval(
+        self, retrieval_id: str, *, keys: Sequence[str]
+    ) -> LiteratureRetrieval:
+        """Record what a started search returned. Only a started one completes."""
+
+        ordered = list(dict.fromkeys(str(key) for key in keys))
+        with self._tx() as conn:
+            row = conn.execute(
+                f"""
+                update literature_retrievals
+                   set status = 'COMPLETED', result_keys = %(keys)s,
+                       result_digest = %(digest)s, completed_at = now()
+                 where retrieval_id = %(retrieval_id)s and status = 'STARTED'
+                returning {RETRIEVAL_COLUMNS}
+                """,
+                {
+                    "retrieval_id": retrieval_id,
+                    "keys": jsonb(ordered),
+                    "digest": pdigests.retrieval_result_digest(ordered),
+                },
+            ).fetchone()
+        if row is None:
+            raise PortfolioStateError(
+                f"{retrieval_id} is not a started retrieval; its result cannot "
+                f"be recorded twice"
+            )
+        return LiteratureRetrieval.model_validate(row)
+
+    def fail_retrieval(self, retrieval_id: str, *, error: str) -> None:
+        with self._tx() as conn:
+            conn.execute(
+                "update literature_retrievals set status = 'FAILED', error = %s, "
+                "completed_at = now() where retrieval_id = %s and status = 'STARTED'",
+                (clipped_detail(error), retrieval_id),
+            )
+
+    def list_retrievals(
+        self, *, idea_id: str, idea_version: int | None = None
+    ) -> tuple[LiteratureRetrieval, ...]:
+        clauses = ["idea_id = %(idea_id)s"]
+        params: dict[str, Any] = {"idea_id": idea_id}
+        if idea_version is not None:
+            clauses.append("idea_version = %(version)s")
+            params["version"] = idea_version
+        with self._tx() as conn:
+            rows = conn.execute(
+                f"select {RETRIEVAL_COLUMNS} from literature_retrievals "
+                f"where {' and '.join(clauses)} order by started_at, retrieval_id",
+                params,
+            ).fetchall()
+        return tuple(LiteratureRetrieval.model_validate(row) for row in rows)
 
     def record_reading(
         self,

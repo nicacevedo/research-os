@@ -43,6 +43,8 @@ CANONICAL_DIGEST_VERSION = "pidea-canonical-v1"
 BASIS_DIGEST_VERSION = "pidea-basis-v1"
 OBJECTION_KEY_VERSION = "pidea-objection-v1"
 EVIDENCE_SET_DIGEST_VERSION = "pidea-evidence-set-v1"
+RETRIEVAL_QUERY_DIGEST_VERSION = "pidea-retrieval-query-v1"
+RETRIEVAL_RESULT_DIGEST_VERSION = "pidea-retrieval-result-v1"
 
 #: The fields of an idea version that are scientifically material, in the order
 #: they appear in the specification. Declared as data rather than written into
@@ -349,6 +351,31 @@ def evidence_set_digest(evidence_ids: Iterable[str]) -> str:
     """
 
     return _hash(EVIDENCE_SET_DIGEST_VERSION, sorted(set(evidence_ids)))
+
+
+def retrieval_query_digest(query: str) -> str:
+    """The identity of a search's *words*, for telling two terminology paths apart.
+
+    Case and whitespace are not words: ``"Lasso  paths"`` and ``"lasso paths"``
+    are one query asked twice, and a second path that differed from the first
+    only in capitalisation looked nowhere new. Anything else -- a different
+    term, a different order -- is a different query, which is deliberately
+    generous: whether the *results* are different is checked separately, on
+    what the search returned.
+    """
+
+    return _hash(RETRIEVAL_QUERY_DIGEST_VERSION, " ".join(query.lower().split()))
+
+
+def retrieval_result_digest(keys: Iterable[str]) -> str:
+    """The identity of what a search returned: the *set* of retrieved works.
+
+    Order is not part of it. Two searches that retrieved the same works in a
+    different order found nothing different, and an identical or cached
+    result reused under a new query must not count as a second path.
+    """
+
+    return _hash(RETRIEVAL_RESULT_DIGEST_VERSION, sorted(set(keys)))
 
 
 def objection_key(summary: str) -> str:

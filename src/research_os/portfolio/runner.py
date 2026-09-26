@@ -58,11 +58,14 @@ from research_os.portfolio.models import (
     ExperimentRole,
     IdeaOrigin,
     IdeaStatus,
+    LiteratureRetrieval,
     ObjectionTarget,
     ProvenanceBasis,
     QualityDimensions,
     QualityTier,
     RequestBasis,
+    RetrievalPurpose,
+    RetrievalStatus,
     ReviewerRole,
     ReviewVerdict,
     Severity,
@@ -356,6 +359,87 @@ def _cost(response: ModelResponse) -> Decimal:
     return Decimal(str(response.cost_usd or 0))
 
 
+def literature_backend(source: Any) -> str:
+    """What answered a search, as recorded on its retrieval row."""
+
+    return str(getattr(source, "backend", "") or type(source).__name__)
+
+
+def _retrieve(
+    context: TrackContext,
+    *,
+    purpose: RetrievalPurpose,
+    query: str,
+    limit: int,
+    idea_version: int,
+) -> tuple[Any, LiteratureRetrieval]:
+    """Run one literature search as a recorded, owned retrieval (INV-05).
+
+    The row is written ``STARTED`` before the search, owned by this stage's
+    action and run, and ``COMPLETED`` with every key the search returned, or
+    ``FAILED`` with why. Nothing a model says afterwards about what it
+    searched is read by anything: a gate reads these rows.
+    """
+
+    assert context.literature is not None
+    retrieval = context.portfolio.begin_retrieval(
+        project_id=context.project_id,
+        purpose=purpose,
+        query=query,
+        backend=literature_backend(context.literature),
+        result_limit=limit,
+        idea_id=context.idea_id,
+        idea_version=idea_version,
+        action_id=context.action_id,
+        run_id=context.run_id,
+        work_id=context.work_id,
+    )
+    try:
+        packet = context.literature.search(query, limit=limit)
+    except BaseException as exc:
+        context.portfolio.fail_retrieval(
+            retrieval.retrieval_id, error=f"{type(exc).__name__}: {exc}"
+        )
+        raise
+    completed = context.portfolio.complete_retrieval(
+        retrieval.retrieval_id, keys=tuple(getattr(packet, "work_keys", ()))
+    )
+    return packet, completed
+
+
+#: The purposes whose searches count towards how thoroughly the literature was
+#: searched. The cheap screen's search is not an audit.
+_AUDIT_PURPOSES = frozenset(
+    {RetrievalPurpose.AUDIT, RetrievalPurpose.SECOND_PATH, RetrievalPurpose.READING}
+)
+
+
+def executed_searches(
+    context: TrackContext, idea_version: int
+) -> tuple[LiteratureRetrieval, ...]:
+    """The distinct, completed, non-empty literature searches of one version.
+
+    Distinct by normalised query: asking the same words twice is one search.
+    This, and never a model's list of the queries it says it would run, is
+    what ``literature_confidence`` and "over N searches" count (M1).
+    """
+
+    seen: set[str] = set()
+    found: list[LiteratureRetrieval] = []
+    for item in context.portfolio.list_retrievals(
+        idea_id=context.idea_id, idea_version=idea_version
+    ):
+        if (
+            item.status is RetrievalStatus.COMPLETED
+            and item.purpose in _AUDIT_PURPOSES
+            and item.result_keys
+            and item.query_digest not in seen
+        ):
+            seen.add(item.query_digest)
+            found.append(item)
+    return tuple(found)
+
+
 # --------------------------------------------------------------- stages --
 def run_dedup(context: TrackContext, snapshot: stages.TrackSnapshot) -> StageOutcome:
     """Layers one to three for free; layer four only if they could not decide."""
@@ -520,7 +604,13 @@ def run_novelty_screen(
     retrieved: list[str] = []
     supplied_keys: tuple[str, ...] = ()
     if context.literature is not None:
-        packet = context.literature.search(snapshot.version.research_question, limit=8)
+        packet, _retrieval = _retrieve(
+            context,
+            purpose=RetrievalPurpose.NOVELTY_SCREEN,
+            query=snapshot.version.research_question,
+            limit=8,
+            idea_version=snapshot.version.version,
+        )
         supplied_keys = tuple(getattr(packet, "work_keys", ()))
         retrieved = _render_literature(packet)
     try:
@@ -869,7 +959,13 @@ def run_literature_audit(
         if second_path
         else snapshot.version.research_question
     )
-    packet = context.literature.search(query, limit=12)
+    packet, retrieval = _retrieve(
+        context,
+        purpose=RetrievalPurpose.SECOND_PATH if second_path else RetrievalPurpose.AUDIT,
+        query=query,
+        limit=12,
+        idea_version=snapshot.version.version,
+    )
     supplied = tuple(getattr(packet, "work_keys", ()))
     if not supplied:
         return StageOutcome.failed(
@@ -970,13 +1066,21 @@ def run_literature_audit(
             literature_key=row.source_key,
             artifact_id=artifact.artifact_id,
             source_call_id=response.call_id,
+            # The search that supplied this source. What makes this row part
+            # of a retrieval path is this binding, never the scout's say-so.
+            retrieval_id=retrieval.retrieval_id,
         )
         recorded += 1
+    # Confidence from the searches this system executed and recorded for the
+    # version -- never `audit.queries`, the scout's own list, none of which
+    # had to have been run (M1; the final adversarial review raised it to 1.0
+    # with six invented queries over one executed search).
+    searches = executed_searches(context, snapshot.version.version)
     _merge_dimensions(
         context,
         snapshot,
         QualityDimensions(
-            literature_confidence=min(1.0, len(audit.queries) / 6.0),
+            literature_confidence=min(1.0, len(searches) / 6.0),
             novelty=0.1 if any(row.relation == "same" for row in audit.rows) else 0.8,
         ),
     )
@@ -985,11 +1089,14 @@ def run_literature_audit(
     return StageOutcome.succeeded(
         ("second terminology path: " if second_path else "")
         + f"{recorded} matrix row(s) from {len(set(audit.source_keys))} retrieved "
-        f"source(s), over {len(audit.queries)} query(ies)",
+        f"source(s), over {len(searches)} executed search(es)",
         disposition=Disposition.CONTINUE,
         cost_usd=_cost(response),
         model_calls=1,
-        data={"queries": list(audit.queries)},
+        data={
+            "retrieval_id": retrieval.retrieval_id,
+            "executed_queries": [item.query for item in searches],
+        },
     )
 
 
@@ -2371,6 +2478,9 @@ def _evaluate(context: TrackContext) -> gates.GateResult:
             idea_id=context.idea_id, idea_version=version.version
         ),
         config=context.config,
+        retrievals=store.list_retrievals(
+            idea_id=context.idea_id, idea_version=version.version
+        ),
     )
 
 

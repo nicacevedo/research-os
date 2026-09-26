@@ -54,6 +54,7 @@ RUNTIME_TABLES = (
     "idea_provenance",
     "frontier_requests",
     "idea_evidence",
+    "literature_retrievals",
     "idea_actions",
     "idea_edges",
     "idea_versions",

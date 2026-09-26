@@ -58,6 +58,7 @@ from research_os.portfolio.models import (
     RequestBasis,
     RequestKind,
     RequestState,
+    RetrievalPurpose,
     Stage,
 )
 from research_os.portfolio.prompts import TEMPLATES as PORTFOLIO_TEMPLATES
@@ -272,8 +273,34 @@ def answer_request(
             ),
         )
         return AnswerResult(ok=True, detail="declined: no literature source")
-    packet = literature.search(request.question, limit=MAX_WORKS)
+    # A recorded retrieval, like every search the portfolio makes (INV-05):
+    # what the reading cites is bound to the search that supplied it.
+    from research_os.portfolio.runner import literature_backend
+
+    retrieval = store.begin_retrieval(
+        project_id=context.project_id,
+        purpose=RetrievalPurpose.READING,
+        query=request.question,
+        backend=literature_backend(literature),
+        result_limit=MAX_WORKS,
+        idea_id=idea.idea_id if idea is not None else None,
+        idea_version=(
+            (request.source_version or idea.current_version)
+            if idea is not None
+            else None
+        ),
+        request_id=request_id,
+        run_id=context.run_id,
+    )
+    try:
+        packet = literature.search(request.question, limit=MAX_WORKS)
+    except BaseException as exc:
+        store.fail_retrieval(
+            retrieval.retrieval_id, error=f"{type(exc).__name__}: {exc}"
+        )
+        raise
     keys = tuple(getattr(packet, "work_keys", ()))
+    store.complete_retrieval(retrieval.retrieval_id, keys=keys)
     if not keys and discovery_failed:
         # Nothing retrieved *because the providers could not be asked* is an
         # outage, not an answer, and declining on it retired the idea in one
@@ -442,6 +469,7 @@ def answer_request(
                 artifact_id=artifact.artifact_id,
                 source_call_id=response.call_id,
                 claim_id=claim.claim_id,
+                retrieval_id=retrieval.retrieval_id,
             )
             evidence.append(row.evidence_id)
         if kind in {"DISAGREEMENT", "GAP"}:

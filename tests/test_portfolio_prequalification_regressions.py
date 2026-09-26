@@ -36,6 +36,7 @@ import pytest
 
 from research_os.literature.models import AuthorRecord
 from research_os.literature.store import LiteratureStore, resolve_keys
+from research_os.portfolio import digests as pdigests
 from research_os.portfolio import frontier, gates, litintel, runner, stages, synthesis
 from research_os.portfolio.config import load_config
 from research_os.portfolio.curator import BANK_ROOT, snapshot
@@ -48,8 +49,11 @@ from research_os.portfolio.models import (
     IdeaEvidence,
     IdeaOrigin,
     IdeaStatus,
+    LiteratureRetrieval,
     QualityTier,
     RequestState,
+    RetrievalPurpose,
+    RetrievalStatus,
     ReviewerRole,
     Severity,
     Stage,
@@ -308,7 +312,12 @@ _T0 = datetime(2026, 9, 25, tzinfo=UTC)
 
 
 def _literature_row(
-    key: str, *, call: str, minute: int, claim_id: str | None = None
+    key: str,
+    *,
+    call: str,
+    minute: int,
+    claim_id: str | None = None,
+    retrieval: str | None = None,
 ) -> IdeaEvidence:
     return IdeaEvidence(
         evidence_id=f"IEVI-{call}-{key}",
@@ -321,37 +330,125 @@ def _literature_row(
         source_call_id=call,
         claim_id=claim_id,
         created_at=_T0 + timedelta(minutes=minute),
+        retrieval_id=retrieval,
     )
 
 
+def _retrieval(
+    retrieval_id: str,
+    *,
+    purpose: RetrievalPurpose,
+    query: str,
+    keys: tuple[str, ...],
+    action: str | None,
+    minute: int,
+) -> LiteratureRetrieval:
+    """A search the system executed, as ``literature_retrievals`` records it."""
+
+    return LiteratureRetrieval(
+        retrieval_id=retrieval_id,
+        project_id="demo-project",
+        idea_id="PIDEA-x",
+        idea_version=1,
+        action_id=action,
+        purpose=purpose,
+        query=query,
+        query_digest=pdigests.retrieval_query_digest(query),
+        backend="test-index",
+        result_limit=12,
+        status=RetrievalStatus.COMPLETED,
+        result_keys=keys,
+        result_digest=pdigests.retrieval_result_digest(keys),
+        started_at=_T0 + timedelta(minutes=minute),
+        completed_at=_T0 + timedelta(minutes=minute),
+    )
+
+
+#: The first audit's search: the research question, two works retrieved.
+AUDIT_SEARCH = _retrieval(
+    "PRET-audit",
+    purpose=RetrievalPurpose.AUDIT,
+    query="has this comparison been published",
+    keys=("openalex:W1", "openalex:W2"),
+    action="IACT-audit",
+    minute=0,
+)
 FIRST_AUDIT = (
-    _literature_row("openalex:W1", call="MCALL-audit", minute=0),
-    _literature_row("openalex:W2", call="MCALL-audit", minute=0),
+    _literature_row(
+        "openalex:W1", call="MCALL-audit", minute=0, retrieval="PRET-audit"
+    ),
+    _literature_row(
+        "openalex:W2", call="MCALL-audit", minute=0, retrieval="PRET-audit"
+    ),
 )
-#: The top-up: a verified reading of the research question, under its own call.
+#: The top-up: a verified reading of the research question, under its own call
+#: and its own search -- which is the first search asked again.
+READING_SEARCH = _retrieval(
+    "PRET-reading",
+    purpose=RetrievalPurpose.READING,
+    query="what published work bears on this comparison",
+    keys=("openalex:W3",),
+    action=None,
+    minute=5,
+)
 TOP_UP = (
-    _literature_row("openalex:W3", call="MCALL-reader", minute=5, claim_id="PLCL-1"),
+    _literature_row(
+        "openalex:W3",
+        call="MCALL-reader",
+        minute=5,
+        claim_id="PLCL-1",
+        retrieval="PRET-reading",
+    ),
 )
+
+
+def _second_search(*keys: str) -> LiteratureRetrieval:
+    return _retrieval(
+        "PRET-second",
+        purpose=RetrievalPurpose.SECOND_PATH,
+        query="the same result under other terminology",
+        keys=keys,
+        action="IACT-replicate",
+        minute=9,
+    )
 
 
 def test_a_novelty_top_up_reading_is_not_a_second_terminology_path() -> None:
-    assert not gates._second_terminology_path((*FIRST_AUDIT, *TOP_UP), 1)
+    assert not gates._second_terminology_path(
+        (*FIRST_AUDIT, *TOP_UP), (AUDIT_SEARCH, READING_SEARCH), 1
+    )
 
 
 def test_a_second_audit_that_finds_a_work_neither_search_cited_is_one() -> None:
     """The control: the real second path, which ``run_replicate`` performs."""
 
-    second = (_literature_row("openalex:W4", call="MCALL-second", minute=9),)
-    assert gates._second_terminology_path((*FIRST_AUDIT, *TOP_UP, *second), 1)
+    search = _second_search("openalex:W4")
+    second = (
+        _literature_row(
+            "openalex:W4", call="MCALL-second", minute=9, retrieval="PRET-second"
+        ),
+    )
+    assert gates._second_terminology_path(
+        (*FIRST_AUDIT, *TOP_UP, *second), (AUDIT_SEARCH, READING_SEARCH, search), 1
+    )
     # And without the top-up at all, which is the ordinary case.
-    assert gates._second_terminology_path((*FIRST_AUDIT, *second), 1)
+    assert gates._second_terminology_path(
+        (*FIRST_AUDIT, *second), (AUDIT_SEARCH, search), 1
+    )
 
 
 def test_a_second_audit_that_only_refinds_the_top_ups_work_is_not_new() -> None:
     """The work the top-up read was found by the research-question search."""
 
-    second = (_literature_row("openalex:W3", call="MCALL-second", minute=9),)
-    assert not gates._second_terminology_path((*FIRST_AUDIT, *TOP_UP, *second), 1)
+    search = _second_search("openalex:W3")
+    second = (
+        _literature_row(
+            "openalex:W3", call="MCALL-second", minute=9, retrieval="PRET-second"
+        ),
+    )
+    assert not gates._second_terminology_path(
+        (*FIRST_AUDIT, *TOP_UP, *second), (AUDIT_SEARCH, READING_SEARCH, search), 1
+    )
 
 
 THIN = {
@@ -467,7 +564,11 @@ def test_the_top_up_does_not_carry_an_idea_to_human_ready_on_a_thin_index(
     )
     # The top-up did its own job: VALIDATED's source count is now met.
     assert len(gates._distinct_literature_keys(evidence)) == 3
-    assert not gates._second_terminology_path(evidence, 1)
+    assert not gates._second_terminology_path(
+        evidence,
+        portfolio.list_retrievals(idea_id=idea.idea_id, idea_version=version.version),
+        1,
+    )
 
     for _ in range(30):
         step = advance_idea(
@@ -586,7 +687,9 @@ def test_a_work_the_index_merged_is_one_source_and_not_a_new_one(
 
     evidence = portfolio.list_evidence(idea_id=idea.idea_id, idea_version=1)
     assert gates._distinct_literature_keys(evidence) == {PUBLISHED, "openalex:W20"}
-    assert not gates._second_terminology_path(evidence, 1)
+    assert not gates._second_terminology_path(
+        evidence, portfolio.list_retrievals(idea_id=idea.idea_id, idea_version=1), 1
+    )
     # The stage machine counts what the gate counts, or the tick and the
     # track disagree about what runs next.
     snap = snapshot_for(portfolio, portfolio.require_idea(idea.idea_id))

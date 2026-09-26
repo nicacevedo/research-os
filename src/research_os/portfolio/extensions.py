@@ -115,6 +115,9 @@ class _IndexedLiterature:
     microseconds.
     """
 
+    #: Recorded on every retrieval row this source answers (`sql/0039`).
+    backend = "shared-literature-index"
+
     def search(self, query: str, *, limit: int = 12) -> Any:
         from research_os.literature.packet import build_packet
         from research_os.literature.search import SearchOptions
