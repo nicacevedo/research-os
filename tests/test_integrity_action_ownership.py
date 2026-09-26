@@ -320,7 +320,7 @@ def test_a_renewed_lease_is_a_heartbeat_and_a_lapsed_one_is_not(
     idea, _ = seed_idea(portfolio, runtime_project)
     queue = WorkQueue(runtime_db)
     queue.enqueue(project_id=runtime_project, kind=ADVANCE_IDEA, dedup_key="hb")
-    (item,) = queue.claim(owner="beating", lease_seconds=2, kinds=(ADVANCE_IDEA,))
+    (item,) = queue.claim(owner="beating", lease_seconds=4, kinds=(ADVANCE_IDEA,))
     action = portfolio.open_action(
         idea_id=idea.idea_id,
         idea_version=1,
@@ -331,9 +331,9 @@ def test_a_renewed_lease_is_a_heartbeat_and_a_lapsed_one_is_not(
         lease_owner="beating",
     )
     with LeaseKeeper(
-        queue, work_id=item.work_id, owner="beating", lease_seconds=2, renew_every=0.5
+        queue, work_id=item.work_id, owner="beating", lease_seconds=4, renew_every=0.5
     ):
-        time.sleep(3.0)  # longer than the lease: only renewal keeps it
+        time.sleep(6.0)  # longer than the lease: only renewal keeps it
         _age(runtime_db, idea.idea_id, minutes=30)
         assert portfolio.owner_is_live(action.action_id) == OWNER_LIVE
         assert (
@@ -342,7 +342,7 @@ def test_a_renewed_lease_is_a_heartbeat_and_a_lapsed_one_is_not(
             )
             == ()
         )
-    time.sleep(2.5)  # the keeper stopped: the lease lapses
+    time.sleep(5.0)  # the keeper stopped: the lease lapses
     assert portfolio.owner_is_live(action.action_id) == OWNER_DEAD
     (reclaimed,) = portfolio.reclaim_dead_actions(
         project_id=runtime_project, older_than_seconds=600

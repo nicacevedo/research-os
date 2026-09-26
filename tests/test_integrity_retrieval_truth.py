@@ -208,6 +208,15 @@ def test_new_works_retrieved_but_never_assessed_are_not_a_path() -> None:
     assert not _met((AUDIT, _second()), AUDIT_ROWS)
 
 
+def test_a_new_work_cited_outside_the_second_search_is_not_its_assessment() -> None:
+    """The second search retrieved W4, but the row citing W4 names another search."""
+
+    elsewhere = _cites("PRET-audit", "openalex:W4", call="MCALL-other", minute=12)
+    unbound = _cites(None, "openalex:W4", call="MCALL-prose", minute=13)
+    assert not _met((AUDIT, _second()), (*AUDIT_ROWS, *elsewhere))
+    assert not _met((AUDIT, _second()), (*AUDIT_ROWS, *unbound))
+
+
 def test_a_claimed_search_with_no_completed_execution_is_not_a_path() -> None:
     """The scout says it searched; nothing completed. Rows naming no search count for nothing."""
 

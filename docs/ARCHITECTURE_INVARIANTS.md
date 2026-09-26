@@ -126,7 +126,7 @@ ran.)
   timer decides it) or while the work item that bought it is `LEASED` to the
   same owner and attempt with an unexpired, renewed lease (the daemon's
   `LeaseKeeper` is the heartbeat);
-- `PortfolioStore.stale_actions` / `reclaim_dead_action` -- only an action
+- `PortfolioStore.stale_actions` / `reclaim_dead_actions` -- only an action
   whose owner is provably not live is reclaimed; elapsed time is a
   precondition for looking, never the proof;
 - `PortfolioStore.open_action` -- takes over a provably dead owner's action
@@ -243,10 +243,11 @@ replication inherits the primary's frozen analysis rather than re-asking.
 The replication execution manifest added for INV-07 is frozen at submission,
 before the replication runs, and re-verified by digest when it is read.
 
-**PASS requires.** The existing contract, provenance and mutation suites
+**PASS requires.** The existing contract, lineage and mutation suites
 (`tests/test_portfolio_scientific_contract.py`,
-`tests/test_portfolio_contract_provenance.py`,
-`tests/test_portfolio_engine_mutations.py`) passing unchanged.
+`tests/test_portfolio_contract_lineage.py`,
+`tests/test_portfolio_engine_mutations.py`) passing unchanged, and the
+replication manifest frozen before its execution.
 
 ## INV-07 -- Replication causality
 
@@ -342,9 +343,9 @@ board that could not complete is a failed stage, not an inferred one
 (INV-08).
 
 **PASS requires.** The existing refusal tests
-(`tests/test_portfolio_prequalification_regressions.py`,
-`tests/test_runtime_refusal*.py`) passing unchanged, and the new
-capability-limited replication test.
+(`tests/test_portfolio_literature_intel.py`, `tests/test_portfolio_empirical.py`,
+`tests/test_portfolio_scientific_contract.py`, `tests/test_runtime_actions.py`)
+passing unchanged, and the new capability-limited replication test.
 
 ## INV-10 -- Human authority
 
@@ -383,6 +384,29 @@ one.
 | M3 re-run objections on the first review | one call's record reused for another | INV-04 |
 | M4 budget-parked ideas never revived | a structural block reason was prose | INV-10 (a person's ceiling increase is what revives it) |
 
+## Status at the integrity-closure round (2026-09-26)
+
+Each invariant was checked against the evidence its **PASS requires** on the
+tree that closed the ten findings:
+
+| invariant | status | how it was shown |
+|---|---|---|
+| INV-01 | PASS | 16 adversarial tests incl. real `os._exit` deaths at four boundaries; the H5 reproduction; the 0036 upgrade test; 6 mutants killed |
+| INV-02 | PASS | 21 payloads x every model-authored field x every page kind; both H2 reproductions; 5 mutants killed |
+| INV-03 | PASS | 11 tests incl. a real killed worker and a terminated lock session; the H3 reproduction; 5 mutants killed |
+| INV-04 | PASS | 5 tests; the H4 reproduction; 3 mutants killed |
+| INV-05 | PASS | 13 tests incl. end-to-end retrieval provenance; the H1 and M1 reproductions; 7 mutants killed |
+| INV-06 | PASS | existing contract, lineage and engine-mutation suites unchanged and passing; the replication manifest frozen before execution |
+| INV-07 | PASS | the four named cases, a lying receipt, a model-composed receipt, a missing manifest; the H6 reproduction; 4 mutants killed |
+| INV-08 | PASS | board completeness per role, a superseded-prompt review, masking by a re-run; the M2 reproduction; 3 mutants killed |
+| INV-09 | PASS | the existing refusal tests unchanged; the no-receipt replication recorded INSUFFICIENT with its reason |
+| INV-10 | PASS | package scans for bound writes, explicit ceilings and block lifts; the researcher's pause held; the M4 reproduction; 3 mutants killed |
+
+Every one of the eleven original reproductions fails on `37e8afe` with the
+defect's own assertion and passes here. `tests/integrity_mutations.py`
+kills all 35 of its mutants; the two equivalent ones it records are
+defence in depth, argued in its `EQUIVALENT` table.
+
 ## What these invariants do not claim
 
 - They do not make a model's judgement correct. A gate that checks the right
@@ -395,3 +419,19 @@ one.
   treated as dead and fenced: its later writes are refused, and its already
   started provider call may be paid for twice. That is a cost, never a second
   scientific record.
+- INV-01 errs towards over-counting. A call killed at its timeout is charged
+  its whole ceiling even if it cost less, and a worker that died after the
+  provider answered but before settling is charged the ceiling although the
+  answer (lost with the process) named a smaller number. Both are visible in
+  `budget_reservations.settlement_basis` and correctable by a person; the
+  under-count they replace was neither.
+- INV-07 needs the declared program's cooperation. A command that writes no
+  `execution_receipt` still runs, and its replications are recorded
+  `INSUFFICIENT` with the reason: the cg project's `benchmark` and
+  `adjudicate-pricing` commands do not write one today, so a replication of
+  theirs cannot count until their programs report what they consumed
+  (`docs/EXPERIMENTS.md`). That is a capability limit stated, not a gap
+  hidden.
+- An action recorded with no owner at all -- only possible outside
+  `track.advance_idea`, which records one every time -- cannot be proved
+  alive or dead and is still reclaimed by age.
