@@ -751,3 +751,50 @@ def test_h6_a_seed_ignoring_rerun_with_a_timestamp_is_not_a_replication(
         f"{step.conclusion}: {step.detail}; evidence rows: "
         f"{[(r.kind, r.strength) for r in rows]}"
     )
+
+
+# ------------------------------------------------------------------ M4 -----
+def test_m4_raising_the_ceiling_the_record_names_revisits_the_idea(
+    portfolio: PortfolioStore,
+    runtime_db: Database,
+    pg_dsn: str,
+    tmp_path: Path,
+    runtime_project: str,
+) -> None:
+    """M4. ``_review_budget_parked.py``, sha256
+    cbff327b2205d74854c1765d0ef3cb8cff7f48fba405f236710066fe7955c970.
+    """
+
+    from decimal import Decimal
+
+    from research_os.portfolio.models import ActionStatus
+
+    config = load_config()
+    idea, _ = seed_idea(portfolio, runtime_project)
+    portfolio.set_status(idea_id=idea.idea_id, status=IdeaStatus.PROMISING)
+    action = portfolio.open_action(
+        idea_id=idea.idea_id, idea_version=1, stage=Stage.FALSIFY, basis_digest="s"
+    )
+    portfolio.complete_action(
+        action_id=action.action_id,
+        status=ActionStatus.SUCCEEDED,
+        cost_usd=config.bounds.idea_spend_ceiling_usd - Decimal("0.01"),
+    )
+    _tick(runtime_db, pg_dsn, tmp_path, runtime_project)
+    parked = portfolio.require_idea(idea.idea_id)
+    assert parked.status is IdeaStatus.PARKED
+    assert "idea_spend_ceiling_usd" in (parked.revisit_if or "")
+
+    # The person does what the record says: raises the idea ceiling (the
+    # project's stored override, the number the tick and the ledger read).
+    portfolio.upsert_state(
+        project_id=runtime_project, bounds={"idea_spend_ceiling_usd": "100"}
+    )
+    for _ in range(2):
+        _tick(runtime_db, pg_dsn, tmp_path, runtime_project)
+
+    after = portfolio.require_idea(idea.idea_id)
+    assert after.status is not IdeaStatus.PARKED, (
+        f"still {after.status} with 'revisit if: {after.revisit_if}' after the "
+        f"ceiling was raised to 100 USD"
+    )

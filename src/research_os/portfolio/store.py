@@ -84,6 +84,7 @@ from research_os.portfolio.models import (
     LiteratureRetrieval,
     ObjectionTarget,
     OperationalState,
+    ParkReason,
     PortfolioDigestRecord,
     PortfolioIdea,
     PortfolioSeed,
@@ -115,7 +116,7 @@ LOG = logging.getLogger("research_os.portfolio.store")
 IDEA_COLUMNS = (
     "idea_id, project_id, depth, lineage_root, origin, current_version, status, "
     "operational_state, quality_tier, curated_digest, curated_at, retire_reason, "
-    "revisit_if, created_at, updated_at"
+    "revisit_if, created_at, updated_at, park_reason, park_stage, resume_status"
 )
 VERSION_COLUMNS = (
     "idea_id, version, title, research_question, core_idea, mechanism, "
@@ -843,8 +844,15 @@ class PortfolioStore:
         expected_status: IdeaStatus | None = None,
         require_idle: bool = False,
         clear_retirement: bool = False,
+        park_reason: ParkReason | None = None,
+        park_stage: str | None = None,
+        resume_status: IdeaStatus | None = None,
     ) -> PortfolioIdea | None:
         """Move an idea's scientific status, and raise its tier high-water mark.
+
+        ``park_reason``, ``park_stage`` and ``resume_status`` are kept only on
+        a PARKED idea (`sql/0042`): moving to any other status clears them,
+        so a structural block cannot outlive the parking it explains.
 
         ``quality_tier`` is a ``greatest``: it records how far this idea ever
         got, so a rejection after ``PROMISING`` stays distinguishable from a
@@ -894,6 +902,15 @@ class PortfolioStore:
                                             else coalesce(%(reason)s, retire_reason) end,
                        revisit_if = case when %(clear)s then null
                                          else coalesce(%(revisit)s, revisit_if) end,
+                       park_reason = case when %(status)s = 'PARKED'
+                                          then coalesce(%(park_reason)s, park_reason)
+                                          else null end,
+                       park_stage = case when %(status)s = 'PARKED'
+                                         then coalesce(%(park_stage)s, park_stage)
+                                         else null end,
+                       resume_status = case when %(status)s = 'PARKED'
+                                            then coalesce(%(resume)s, resume_status)
+                                            else null end,
                        updated_at = now()
                  where idea_id = %(idea_id)s
                 returning {IDEA_COLUMNS}
@@ -905,6 +922,9 @@ class PortfolioStore:
                     "reason": retire_reason,
                     "revisit": revisit_if,
                     "clear": clear_retirement,
+                    "park_reason": str(park_reason) if park_reason else None,
+                    "park_stage": park_stage,
+                    "resume": str(resume_status) if resume_status else None,
                 },
             ).fetchone()
         return PortfolioIdea.model_validate(row)

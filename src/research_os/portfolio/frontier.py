@@ -51,6 +51,7 @@ from research_os.portfolio.models import (
     IdeaOrigin,
     IdeaStatus,
     ObjectionTarget,
+    ParkReason,
     ProvenanceBasis,
     RequestBasis,
     RequestKind,
@@ -224,6 +225,8 @@ def settle(
             revisit_if=f"{LINEAGE_ROOM}{idea.status}",
             expected_status=snapshot.status,
             require_idle=True,
+            park_reason=ParkReason.LINEAGE_ROOM,
+            resume_status=idea.status,
         )
         return str(IdeaStatus.PARKED) if applied is not None else None
     if "retrieved source" in reason:

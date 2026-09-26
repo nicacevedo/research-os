@@ -630,6 +630,30 @@ class QualityDimensions(BaseModel):
         return QualityDimensions(**values)
 
 
+class ParkReason(StrEnum):
+    """Why the *system* parked an idea, when the reason is a structural block.
+
+    Mirrored by ``ideas_park_reason_ck`` (`sql/0042`). A reason here is one a
+    later tick can re-check mechanically -- which is the difference from the
+    prose in ``revisit_if``, which nothing could read: an idea parked on its
+    spend ceiling said "a person raises bounds.idea_spend_ceiling_usd", a
+    person did, and the idea stayed parked (M4). An idea parked for any other
+    reason -- a synthesis that parked it, a dead end -- carries none, and no
+    ceiling change can revive it.
+    """
+
+    IDEA_SPEND_CEILING = "idea_spend_ceiling"
+    LINEAGE_SPEND_CEILING = "lineage_spend_ceiling"
+    NOVELTY_FLOOR = "novelty_floor"
+    LINEAGE_ROOM = "lineage_room"
+
+
+#: The park reasons a raised spend ceiling can lift, and nothing else can.
+BUDGET_PARK_REASONS: frozenset[ParkReason] = frozenset(
+    {ParkReason.IDEA_SPEND_CEILING, ParkReason.LINEAGE_SPEND_CEILING}
+)
+
+
 class PortfolioIdea(_Record):
     """One candidate research direction. Not a capsule object."""
 
@@ -652,6 +676,12 @@ class PortfolioIdea(_Record):
     revisit_if: str | None = None
     created_at: datetime
     updated_at: datetime
+    #: A PARKED idea's structural block (`sql/0042`): what parked it, the
+    #: stage it was waiting to run, and the status it resumes as when the
+    #: block lifts. ``None`` unless the system parked it for such a reason.
+    park_reason: ParkReason | None = None
+    park_stage: str | None = None
+    resume_status: IdeaStatus | None = None
 
     @property
     def allocatable(self) -> bool:
@@ -1198,6 +1228,7 @@ ENUM_CONSTRAINTS: dict[str, frozenset[str]] = {
     "portfolio_state_status_ck": frozenset(s.value for s in PortfolioStatus),
     "literature_retrievals_purpose_ck": frozenset(s.value for s in RetrievalPurpose),
     "literature_retrievals_status_ck": frozenset(s.value for s in RetrievalStatus),
+    "ideas_park_reason_ck": frozenset(s.value for s in ParkReason),
 }
 
 

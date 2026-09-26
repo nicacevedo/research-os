@@ -33,10 +33,12 @@ from typing import Any
 from research_os.portfolio import allocation, frontier
 from research_os.portfolio.config import PortfolioConfig
 from research_os.portfolio.models import (
+    BUDGET_PARK_REASONS,
     FrontierRequest,
     IdeaOrigin,
     IdeaStatus,
     OperationalState,
+    ParkReason,
     PortfolioIdea,
     PortfolioStatus,
     RequestKind,
@@ -70,6 +72,8 @@ class TickReport:
     candidate_pool: int = 0
     stale_actions_reclaimed: int = 0
     blocks_cleared: int = 0
+    #: Ideas parked only on a spend ceiling that a raised ceiling now covers.
+    budget_parks_revived: int = 0
     #: Ideas with nothing left to run that this pass gave an explicit state.
     settled: int = 0
     #: Capability-blocked ideas released because the declared commands changed.
@@ -97,6 +101,7 @@ class TickReport:
             "candidate_pool": self.candidate_pool,
             "stale_actions_reclaimed": self.stale_actions_reclaimed,
             "blocks_cleared": self.blocks_cleared,
+            "budget_parks_revived": self.budget_parks_revived,
             "settled": self.settled,
             "capability_unblocked": self.capability_unblocked,
             "open_requests": self.open_requests,
@@ -155,6 +160,12 @@ def tick(
     if revived:
         report.notes.append(
             f"{revived} idea(s) parked on a full lineage resumed: it has room now"
+        )
+    report.budget_parks_revived = _revive_budget_parks(store, project_id, config)
+    if report.budget_parks_revived:
+        report.notes.append(
+            f"{report.budget_parks_revived} idea(s) parked on a spend ceiling "
+            f"resumed: the ceiling a person set now covers their next stage"
         )
 
     # --- inspect capacity ------------------------------------------------
@@ -808,7 +819,7 @@ def _candidates(
             # reproduced the first qualification's frozen portfolio, with no
             # note at all. Parked, with the reason and what would revisit it,
             # by the same compare-and-set `settle` uses.
-            reason_text, revisit = never
+            reason_text, revisit, park_reason = never
             applied = store.set_status(
                 idea_id=idea.idea_id,
                 status=IdeaStatus.PARKED,
@@ -816,6 +827,12 @@ def _candidates(
                 revisit_if=revisit,
                 expected_status=idea.status,
                 require_idle=True,
+                # Structural, so the block can be re-checked rather than
+                # read (M4): what parked it, the stage it waits to run, and
+                # the status it resumes as.
+                park_reason=park_reason,
+                park_stage=str(stage),
+                resume_status=idea.status,
             )
             if applied is not None:
                 settled += 1
@@ -886,7 +903,7 @@ def _never_allocatable(
     *,
     idea_settled: Decimal,
     lineage_settled: Decimal,
-) -> tuple[str, str] | None:
+) -> tuple[str, str, ParkReason] | None:
     """Why :func:`allocation.plan` will skip this idea on every tick, if it will.
 
     The same three conditions the plan applies, read from the same rows, so
@@ -914,6 +931,7 @@ def _never_allocatable(
                 f"the floor"
             ),
             "a literature audit or a revision that lifts its novelty above the floor",
+            ParkReason.NOVELTY_FLOOR,
         )
     exposure = allocation.call_ceiling(allocation.ADVANCE_IDEA, stage, config)
     if idea_settled + exposure > config.bounds.idea_spend_ceiling_usd:
@@ -924,6 +942,7 @@ def _never_allocatable(
                 f"({stage}) may cost {exposure} USD a call"
             ),
             "a person raises bounds.idea_spend_ceiling_usd",
+            ParkReason.IDEA_SPEND_CEILING,
         )
     if lineage_settled + exposure > config.bounds.lineage_spend_ceiling_usd:
         return (
@@ -933,8 +952,75 @@ def _never_allocatable(
                 f"its next stage ({stage}) may cost {exposure} USD a call"
             ),
             "a person raises bounds.lineage_spend_ceiling_usd",
+            ParkReason.LINEAGE_SPEND_CEILING,
         )
     return None
+
+
+def _revive_budget_parks(
+    store: PortfolioStore, project_id: str, config: PortfolioConfig
+) -> int:
+    """Return ideas parked *only* on a spend ceiling once the ceiling has room.
+
+    M4: an idea parked by :func:`_never_allocatable` on its idea or lineage
+    ceiling said "revisit if a person raises bounds.idea_spend_ceiling_usd",
+    and nothing read that -- a person who did exactly what the record said
+    found the idea still retired, listed with the negative results.
+
+    The block is structural now (``ideas.park_reason``), so it is re-checked
+    rather than read: with the *effective* bounds a person set (the
+    configuration with this project's stored overrides, the numbers the rest
+    of the tick uses) and the recorded spend, the same
+    :func:`_never_allocatable` that parked the idea is asked again about the
+    stage it was waiting for. The idea returns to the status it was parked
+    from only when that says nothing blocks it at all -- so an idea whose
+    ceiling was raised but which is also below the novelty floor stays
+    parked, and one parked for any reason that is not a ceiling is not
+    looked at. Nothing here raises a ceiling; it reads one (INV-10).
+    """
+
+    parked = [
+        idea
+        for idea in store.list_ideas(
+            project_id=project_id, statuses=[IdeaStatus.PARKED], limit=500
+        )
+        if idea.park_reason in BUDGET_PARK_REASONS
+        and idea.park_stage
+        and idea.resume_status is not None
+    ]
+    if not parked:
+        return 0
+    idea_spend, lineage_spend = store.committed_spend(project_id)
+    revived = 0
+    for idea in sorted(parked, key=lambda item: (item.updated_at, item.idea_id)):
+        version = store.get_version(idea.idea_id)
+        if version is None:
+            continue
+        try:
+            stage = Stage(str(idea.park_stage))
+        except ValueError:
+            continue
+        still = _never_allocatable(
+            idea,
+            version,
+            stage,
+            config,
+            idea_settled=idea_spend.get(idea.idea_id, SpendPosition()).settled,
+            lineage_settled=lineage_spend.get(
+                idea.lineage_root, SpendPosition()
+            ).settled,
+        )
+        if still is not None:
+            continue
+        applied = store.set_status(
+            idea_id=idea.idea_id,
+            status=idea.resume_status,
+            expected_status=IdeaStatus.PARKED,
+            clear_retirement=True,
+        )
+        if applied is not None:
+            revived += 1
+    return revived
 
 
 def ensure_schedule(
