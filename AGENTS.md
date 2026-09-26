@@ -17,6 +17,10 @@ Read these, in this order, before significant work:
 7. `docs/RUNTIME.md` — the autonomous runtime (R5): the authority model, the
    queue's guarantees, the idempotency ledger, locking, the failure taxonomy,
    and the autonomy levels. Read it before touching `research_os.runtime`.
+8. `docs/ARCHITECTURE_INVARIANTS.md` — the ten integrity invariants (INV-01 to
+   INV-10) the autonomous layers must hold, where each is enforced and how it
+   is tested. Read it before touching budgets, stage ownership, reviews,
+   literature retrieval, replication or the bank renderer.
 
 `docs/CAPSULE.md` is authoritative on anything scientific. Where any other
 document disagrees with it, it wins.
