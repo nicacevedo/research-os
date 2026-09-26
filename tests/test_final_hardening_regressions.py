@@ -19,6 +19,7 @@ over-correcting.
 
 from __future__ import annotations
 
+import dataclasses
 import threading
 from decimal import Decimal
 from pathlib import Path
@@ -810,7 +811,9 @@ def test_a_tick_does_not_sell_what_the_queue_has_already_bought(
     authority the first tick had already committed.
     """
 
-    seed_idea(portfolio, runtime_project)
+    queued, _ = seed_idea(
+        portfolio, runtime_project, dimensions=QualityDimensions(novelty=0.9)
+    )
     _project_spent(runtime_db, runtime_project, limit="2.00", spent="1.10")
 
     first = _tick(runtime_db, pg_dsn, tmp_path, runtime_project)
@@ -819,11 +822,15 @@ def test_a_tick_does_not_sell_what_the_queue_has_already_bought(
         allocation.EXPLORE,
     ]
     assert first.work_enqueued == 2
+    assert sum(item.charged for item in first.allocations) == Decimal("0.85")
 
     later, _ = seed_idea(portfolio, runtime_project, title="another direction")
     second = _tick(runtime_db, pg_dsn, tmp_path, runtime_project)
 
     assert later.idea_id not in {item.idea_id for item in second.allocations}
+    (again,) = second.allocations
+    assert again.idea_id == queued.idea_id, "re-announced, and refused by the queue"
+    assert again.charged == 0
 
 
 def test_a_tick_with_room_for_both_rounds_buys_both(
@@ -835,14 +842,28 @@ def test_a_tick_with_room_for_both_rounds_buys_both(
 ) -> None:
     """The control: with authority for the second screen, it is bought."""
 
-    seed_idea(portfolio, runtime_project)
+    # The queued idea is made to rank first, deterministically: with two
+    # identical ideas the order fell to a rounded staleness term and a random
+    # id suffix, and the double charge this guards against is only visible
+    # when the queued item is reached first. A mutation run found the test
+    # passing a mutant one run in four for exactly that reason.
+    queued, _ = seed_idea(
+        portfolio, runtime_project, dimensions=QualityDimensions(novelty=0.9)
+    )
     _project_spent(runtime_db, runtime_project, limit="2.00", spent="0.80")
 
     _tick(runtime_db, pg_dsn, tmp_path, runtime_project)
     later, _ = seed_idea(portfolio, runtime_project, title="another direction")
     second = _tick(runtime_db, pg_dsn, tmp_path, runtime_project)
 
-    assert later.idea_id in {item.idea_id for item in second.allocations}
+    ideas = [item.idea_id for item in second.allocations]
+    assert ideas == [queued.idea_id, later.idea_id]
+    charged = {item.idea_id: item.charged for item in second.allocations}
+    # Once, by the tick that bought it; never again.
+    assert charged[queued.idea_id] == 0
+    assert charged[later.idea_id] == Decimal("0.25")
+    # 1.20 available, 0.85 of it already bought and queued.
+    assert sum(charged.values()) <= Decimal("0.35")
 
 
 def test_the_adapter_passes_the_ceiling_to_the_cli(
@@ -1352,3 +1373,317 @@ def test_an_explorer_run_a_budget_refuses_ends_budget_exhausted(
         if refused
         else TerminalState.FATAL_INFRASTRUCTURE_ERROR
     )
+
+
+# =============================================================================
+# Reproduced by the first clean qualification (eea3fb8), and what holds instead.
+# =============================================================================
+def _live_shaped_pool(
+    store: PortfolioStore, project: str, *, deep: int = 1, fresh: int = 9
+) -> tuple[list[allocation.Candidate], list[allocation.Candidate]]:
+    """The tick the qualification paused on, in the numbers it had.
+
+    Fresh follow-up children: every dimension unassessed, no objections, a
+    0.25 stage. And a PROMISING, empirically adjudicated idea that survived
+    the falsifier on two versions -- ten open objections, novelty 0.70 --
+    whose next stage is its 1.50 literature audit.
+    """
+
+    fresh_pool = [
+        _candidate(store, project, lineage=f"F{n}", stage=Stage.DEDUP, title=f"f{n}")
+        for n in range(fresh)
+    ]
+    deep_pool = []
+    for n in range(deep):
+        item = _candidate(
+            store, project, lineage=f"D{n}", stage=Stage.LITERATURE_AUDIT, title=f"d{n}"
+        )
+        deep_pool.append(
+            dataclasses.replace(
+                item,
+                dimensions=QualityDimensions(novelty=0.7),
+                open_objections=10,
+                expected_cost=Decimal("1.50"),
+            )
+        )
+    return fresh_pool, deep_pool
+
+
+def _plain_plan(
+    candidates: list[allocation.Candidate], **kwargs: Any
+) -> tuple[allocation.Allocation, ...]:
+    return allocation.plan(
+        candidates=candidates,
+        config=load_config(),
+        free_slots=8,
+        lineage_in_flight={},
+        candidate_pool=100,
+        pending_seeds=0,
+        origin_counts={},
+        minable_failures=0,
+        tick_bucket="t",
+        may_explore=False,
+        **kwargs,
+    )
+
+
+def test_the_pool_reproduces_the_starvation_the_qualification_measured(
+    portfolio: PortfolioStore, runtime_project: str
+) -> None:
+    """Not vacuous: the deep track really does rank below all eight fresh ones."""
+
+    fresh, (deep,) = _live_shaped_pool(portfolio, runtime_project)
+    config = load_config()
+    eighth = sorted(
+        (allocation.utility(item, config=config, active=[]) for item in fresh),
+        reverse=True,
+    )[7]
+    assert allocation.utility(deep, config=config, active=[]) < eighth
+
+
+def test_a_deep_track_gets_a_slot_however_much_breadth_outranks_it(
+    portfolio: PortfolioStore, runtime_project: str
+) -> None:
+    """Eight slots, nine fresh children, one audit waiting: the audit is bought.
+
+    The qualification paused on this: seven ticks, eight slots each, the
+    audit in none of them, and fresh children arriving from 23 open requests.
+    """
+
+    fresh, (deep,) = _live_shaped_pool(portfolio, runtime_project)
+
+    sold = _plain_plan([*fresh, deep])
+
+    ideas = [item.idea_id for item in sold if item.kind == allocation.ADVANCE_IDEA]
+    assert ideas[0] == deep.idea.idea_id
+    assert "reserved for depth" in sold[0].reason
+    assert len(ideas) == 8, "the other seven slots are still breadth"
+
+
+def test_the_reservation_is_one_slot_not_a_preference_for_depth(
+    portfolio: PortfolioStore, runtime_project: str
+) -> None:
+    """Three audits waiting: one is bought for depth, the rest compete as usual."""
+
+    fresh, deep = _live_shaped_pool(portfolio, runtime_project, deep=3)
+
+    sold = _plain_plan([*fresh, *deep])
+
+    deep_ids = {item.idea.idea_id for item in deep}
+    assert sum(1 for item in sold if item.idea_id in deep_ids) == 1
+
+
+def test_without_a_deep_track_the_plan_is_what_it_was(
+    portfolio: PortfolioStore, runtime_project: str
+) -> None:
+    fresh, _ = _live_shaped_pool(portfolio, runtime_project, deep=0)
+
+    sold = _plain_plan(fresh)
+
+    assert len(sold) == 8
+    assert not any("reserved for depth" in item.reason for item in sold)
+
+
+def test_a_deep_track_no_bound_admits_does_not_hold_the_slot(
+    portfolio: PortfolioStore, runtime_project: str
+) -> None:
+    """Every bound still applies: a lineage at its ceiling is not bought for depth."""
+
+    fresh, (deep,) = _live_shaped_pool(portfolio, runtime_project)
+    blocked = dataclasses.replace(deep, lineage_spent=Decimal("39.00"))
+
+    sold = _plain_plan([*fresh, blocked])
+
+    assert blocked.idea.idea_id not in {item.idea_id for item in sold}
+    assert len(sold) == 8, "the slot went back to breadth"
+
+
+def test_a_queued_deep_track_leaves_the_slot_to_one_that_is_not(
+    portfolio: PortfolioStore, runtime_project: str
+) -> None:
+    fresh, (first, second) = _live_shaped_pool(portfolio, runtime_project, deep=2)
+    # The queued track ranks first, deterministically, so a reservation that
+    # admitted it would take it: with two identical tracks the order fell to
+    # rounding and a random id suffix, and a mutation run saw that pass.
+    queued = dataclasses.replace(
+        first, bought=True, dimensions=QualityDimensions(novelty=0.9)
+    )
+
+    sold = _plain_plan([*fresh, queued, second])
+
+    reserved = [item for item in sold if "reserved for depth" in item.reason]
+    assert [item.idea_id for item in reserved] == [second.idea.idea_id]
+
+
+def test_an_outage_is_not_an_attempt_at_a_follow_up_question(
+    portfolio: PortfolioStore,
+    runtime_db: Database,
+    tmp_path: Path,
+    runtime_project: str,
+) -> None:
+    """One outage declined a falsifier's question in the qualification.
+
+    Each queue retry of the failed work item counted a request attempt, and
+    the tick then counted the failed item as well: 3 + 1 >= 3. The request
+    must survive an outage with its ceiling intact.
+    """
+
+    from research_os.portfolio import frontier
+    from research_os.portfolio.models import RequestBasis, RequestState
+    from research_os.portfolio.tick import _servable_requests
+    from research_os.runtime.failures import FailureClass
+    from research_os.runtime.queue import WorkQueue
+    from tests.runtime_graph_helpers import ScriptedRouter
+
+    source, version = seed_idea(portfolio, runtime_project)
+    request = frontier.raise_request(
+        portfolio,
+        project_id=runtime_project,
+        basis=RequestBasis.FALSIFIER_OBJECTION,
+        source_ref="objection:qualification",
+        question="Does randomizing column order reproduce the spread of supports?",
+        source_idea_id=source.idea_id,
+        source_version=version.version,
+    )
+    runtime = RuntimeStore(runtime_db)
+    context = frontier.FrontierContext(
+        config=load_config(),
+        portfolio=portfolio,
+        runtime=runtime,
+        models=ScriptedRouter(unavailable=True, store=runtime),
+        artifacts=FilesystemArtifactStore(tmp_path / "artifacts", store=runtime),
+        project_id=runtime_project,
+        run_id=runtime.create_run(project_id=runtime_project, objective="f").run_id,
+    )
+    queue = WorkQueue(runtime_db)
+    queue.enqueue(
+        project_id=runtime_project,
+        kind=allocation.FOLLOW_UP,
+        payload={"request_id": request.request_id},
+        dedup_key=f"{allocation.FOLLOW_UP}:{request.request_id}:0",
+    )
+    # Three queue attempts of one work item, each meeting the outage.
+    for _attempt in range(3):
+        outcome = frontier.run_follow_up(context, request.request_id)
+        assert not outcome.ok
+        assert outcome.failure_class is FailureClass.PROVIDER_UNAVAILABLE
+    (item,) = queue.claim(owner="w", lease_seconds=60, kinds=(allocation.FOLLOW_UP,))
+    queue.fail(
+        item.work_id,
+        owner="w",
+        failure_class=FailureClass.PROVIDER_UNAVAILABLE,
+        error="session limit",
+        force_terminal=True,
+    )
+
+    after = portfolio.require_request(request.request_id)
+    assert after.attempts == 0
+    assert after.state is RequestState.OPEN
+    kept, _literature, generation = _servable_requests(
+        portfolio, runtime_project, load_config(), [after], []
+    )
+    assert [kept_item.request_id for kept_item in kept] == [request.request_id]
+    assert portfolio.require_request(request.request_id).state is RequestState.OPEN
+    assert generation[request.request_id] == 1
+
+
+# ------------------------------------------ a queued item is charged once --
+@pytest.mark.parametrize("queued_first", [True, False])
+def test_a_queued_item_is_charged_once_in_whatever_order_the_plan_reaches_it(
+    portfolio: PortfolioStore, runtime_project: str, queued_first: bool
+) -> None:
+    """The invariant M8 guards, asserted on the plan's own record of each sale.
+
+    Authority for exactly one screen remains after the queue's own exposure.
+    A queued screen and a new one: the new one is bought (charged 0.25), the
+    queued one is re-announced (charged 0), whichever the plan reaches first.
+    Charging the queued item again leaves no room for the new one in one
+    order, and no room to re-announce the queued one in the other.
+    """
+
+    strong = QualityDimensions(novelty=0.9)
+    queued = dataclasses.replace(
+        _candidate(
+            portfolio, runtime_project, lineage="Q", stage=Stage.DEDUP, title="q"
+        ),
+        bought=True,
+        spent=Decimal("0.25"),
+        dimensions=strong if queued_first else QualityDimensions(),
+    )
+    new = dataclasses.replace(
+        _candidate(
+            portfolio, runtime_project, lineage="N", stage=Stage.DEDUP, title="n"
+        ),
+        dimensions=QualityDimensions() if queued_first else strong,
+    )
+    authority = allocation.SaleAuthority(cost_usd=Decimal("0.25"))
+
+    sold = _plain_plan([queued, new], authority=authority)
+
+    order = [item.idea_id for item in sold]
+    expected = [queued.idea.idea_id, new.idea.idea_id]
+    assert order == (expected if queued_first else expected[::-1])
+    charged = {item.idea_id: item.charged for item in sold}
+    assert charged == {queued.idea.idea_id: 0, new.idea.idea_id: Decimal("0.25")}
+    assert sum(charged.values()) <= authority.cost_usd
+
+
+def test_a_queued_item_carries_one_unit_of_exposure_until_it_runs(
+    portfolio: PortfolioStore, runtime_db: Database, runtime_project: str
+) -> None:
+    """Queued, running, requeued: counted exactly once at every step.
+
+    PENDING: one call ceiling of queued exposure, and no ledger row. LEASED:
+    none -- its call holds the ledger reservation instead, and counting both
+    would charge a running item twice. Requeued after a transient failure:
+    one again, not two.
+    """
+
+    from research_os.portfolio.tick import _sale_authority
+    from research_os.runtime.failures import FailureClass
+    from research_os.runtime.queue import WorkQueue
+
+    idea, _version = seed_idea(portfolio, runtime_project)
+    config = load_config()
+    ledger = _ceiling(runtime_db, BudgetScope.PROJECT, runtime_project, "1.00")
+    queue = WorkQueue(runtime_db)
+    queue.enqueue(
+        project_id=runtime_project,
+        kind=allocation.ADVANCE_IDEA,
+        payload={"idea_id": idea.idea_id, "stage": "dedup", "idea_version": "1"},
+        dedup_key=f"test:{idea.idea_id}",
+    )
+
+    def authority() -> Decimal:
+        record = _budget(ledger, BudgetScope.PROJECT, runtime_project)
+        queued = portfolio.queued_work(
+            project_id=runtime_project, kinds=allocation.MODEL_KINDS
+        )
+        found = _sale_authority(
+            {(BudgetScope.PROJECT, Dimension.MODEL_COST_USD): record}, queued, config
+        )
+        assert found.cost_usd is not None
+        return found.cost_usd
+
+    ceiling = config.cost_for(Stage.DEDUP)
+    assert authority() == Decimal("1.00") - ceiling, "queued: one unit, no ledger row"
+
+    (item,) = queue.claim(owner="w", lease_seconds=60, kinds=(allocation.ADVANCE_IDEA,))
+    grant = ledger.reserve(
+        scope=BudgetScope.PROJECT,
+        scope_id=runtime_project,
+        dimension=Dimension.MODEL_COST_USD,
+        amount=ceiling,
+        work_id=item.work_id,
+    )
+    assert authority() == Decimal("1.00") - ceiling, "running: the held call, not both"
+
+    ledger.release(grant)
+    queue.fail(
+        item.work_id,
+        owner="w",
+        failure_class=FailureClass.PROVIDER_UNAVAILABLE,
+        error="transient",
+    )
+    assert queue.get(item.work_id).status.name == "PENDING"
+    assert authority() == Decimal("1.00") - ceiling, "requeued: one unit again"

@@ -584,7 +584,13 @@ def run_follow_up(context: FrontierContext, request_id: str) -> FollowUpResult:
             )
         )
     except ProviderCallFailedError as exc:
-        store.count_request_attempt(request_id)
+        # An outage is not an attempt at the question. The failed work item is
+        # what `tick._servable_requests` counts against the ceiling, once;
+        # counting a request attempt here as well charged every queue retry
+        # of one outage a second time, and the first clean qualification had
+        # a falsifier's question on its most advanced idea DECLINED -- "failed
+        # 4 time(s)" -- by one subscription session limit. The literature
+        # reader already draws the line here: only a malformed answer counts.
         return FollowUpResult(
             ok=False,
             detail=f"the follow-up explorer could not be reached: {exc}",

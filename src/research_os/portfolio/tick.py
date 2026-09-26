@@ -113,6 +113,7 @@ class TickReport:
                     "stage": str(item.stage) if item.stage else None,
                     "explorer": item.explorer,
                     "utility": str(item.utility),
+                    "charged_usd": str(item.charged),
                     "reason": item.reason,
                 }
                 for item in self.allocations

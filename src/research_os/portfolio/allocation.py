@@ -62,6 +62,24 @@ MODEL_KINDS: tuple[str, ...] = (
 )
 
 
+#: The stages that deepen an admitted track rather than widen the portfolio.
+#:
+#: What one slot per tick is reserved for. The cheap ladder -- dedup, the
+#: novelty screen, the falsifier, discovery, adjudication -- is how an idea
+#: earns admission; these are what it is admitted *to*. BRANCH is absent on
+#: purpose: it opens children, which is breadth, and the reservation exists
+#: because breadth crowds depth out.
+DEPTH_STAGES: frozenset[Stage] = frozenset(
+    {
+        Stage.LITERATURE_AUDIT,
+        Stage.EVIDENCE,
+        Stage.REVIEW_BOARD,
+        Stage.META_REVIEW,
+        Stage.REPLICATE,
+    }
+)
+
+
 def call_ceiling(
     kind: str, stage: Stage | str | None, config: PortfolioConfig
 ) -> Decimal:
@@ -179,6 +197,13 @@ class Allocation:
     #: How many times this ``(idea, stage, version)`` triple has already
     #: failed terminally. Part of the dedup key, and nothing else reads it.
     generation: int = 0
+    #: The authority this sale took from the tick: the call ceiling of new
+    #: work, and zero for work that makes no model call or for re-announcing
+    #: an item the queue already holds. The invariant is that a queued item
+    #: is charged once -- as queued exposure in the sale authority, by the
+    #: tick that bought it -- and never again by a later plan; recorded so
+    #: that it is asserted rather than inferred.
+    charged: Decimal = Decimal(0)
 
     @property
     def dedup_key(self) -> str:
@@ -434,12 +459,13 @@ def plan(
             sold_calls=sold_calls,
         )
 
-    def charge(kind: str, stage: Stage | None = None) -> None:
+    def charge(kind: str, stage: Stage | None = None) -> Decimal:
         nonlocal sold_cost, sold_calls
         ceiling = call_ceiling(kind, stage, config)
         if ceiling > 0:
             sold_cost += ceiling
             sold_calls += 1
+        return ceiling
 
     # Project-level work first, and outside the idea slots. A follow-up, a
     # synthesis and a literature question each hold no idea's capacity --
@@ -455,12 +481,12 @@ def plan(
     # already filtered to the requests that may run now.
     if open_requests and follow_ups_in_flight == 0 and affordable(FOLLOW_UP):
         request_id, generation, basis = open_requests[0]
-        charge(FOLLOW_UP)
         allocations.append(
             Allocation(
                 kind=FOLLOW_UP,
                 reason=f"an open {basis} request owes the frontier new ideas",
                 payload={"request_id": request_id, "generation": generation},
+                charged=charge(FOLLOW_UP),
             )
         )
     # A synthesis, when the reviewed evidence changed. Its referee's findings
@@ -468,12 +494,12 @@ def plan(
     # as a question is -- one at a time, once per basis and generation.
     if synthesis_basis and syntheses_in_flight == 0 and affordable(SYNTHESIZE):
         basis_digest, generation = synthesis_basis
-        charge(SYNTHESIZE)
         allocations.append(
             Allocation(
                 kind=SYNTHESIZE,
                 reason="the reviewed evidence changed since the last synthesis",
                 payload={"basis": basis_digest, "generation": generation},
+                charged=charge(SYNTHESIZE),
             )
         )
     # And a question put to the literature, the same way and for the same
@@ -484,12 +510,12 @@ def plan(
         and affordable(LITERATURE_REQUEST)
     ):
         request_id, generation, basis = literature_requests[0]
-        charge(LITERATURE_REQUEST)
         allocations.append(
             Allocation(
                 kind=LITERATURE_REQUEST,
                 reason=f"an open {basis} question for the literature",
                 payload={"request_id": request_id, "generation": generation},
+                charged=charge(LITERATURE_REQUEST),
             )
         )
 
@@ -506,7 +532,6 @@ def plan(
             minable_failures=minable_failures,
             frontier_claims=frontier_claims,
         )
-        charge(EXPLORE)
         allocations.append(
             Allocation(
                 kind=EXPLORE,
@@ -516,6 +541,7 @@ def plan(
                 ),
                 explorer=explorer,
                 payload={"bucket": tick_bucket},
+                charged=charge(EXPLORE),
             )
         )
         remaining -= 1
@@ -533,11 +559,34 @@ def plan(
     #: What this plan has already charged to each lineage's ceiling.
     sold_lineage: dict[str, Decimal] = {}
     pool = list(candidates)
+    # **One slot is reserved for depth.** The utility is a breadth-first
+    # number by construction -- it subtracts a stage's cost and divides its
+    # decisiveness by the idea's open objections, and an idea that has
+    # survived the falsifier twice carries ten of them -- so a steady supply
+    # of fresh children, every one of which scores near 3.0, outranked a
+    # PROMISING, empirically adjudicated idea waiting on its literature audit
+    # (2.12) on every tick of the first clean qualification, and no track
+    # ever reached a contract. So the first idea slot of a tick goes to the
+    # best deep track that every bound below admits, when there is one; if
+    # none is admissible the slot returns to the ordinary order. One slot and
+    # no more: breadth is still how the portfolio finds what to deepen.
+    #
+    # An item already queued does not take it: its need is served, and the
+    # slot is for a track that is not.
+    reserve_depth = any(item.stage in DEPTH_STAGES and not item.bought for item in pool)
     while remaining > 0 and pool:
         scored = [(utility(item, config=config, active=active), item) for item in pool]
         # Ties broken by idea id, so the plan is a function of state and not of
         # dictionary order.
         scored.sort(key=lambda pair: (-pair[0], pair[1].idea.idea_id))
+        reserved = reserve_depth
+        reserve_depth = False
+        if reserved:
+            scored = [
+                pair
+                for pair in scored
+                if pair[1].stage in DEPTH_STAGES and not pair[1].bought
+            ]
         chosen: Candidate | None = None
         for score, item in scored:
             if taken_lineage.get(item.idea.lineage_root, 0) >= (
@@ -563,6 +612,7 @@ def plan(
             # the lineage's ceilings *after* what is committed and what this
             # plan already sold -- not merely "not yet at the ceiling", which
             # sold a 2.50 stage to a lineage with a cent left.
+            charged = Decimal(0)
             if not item.bought:
                 exposure = call_ceiling(ADVANCE_IDEA, item.stage, config)
                 if item.spent + exposure > config.bounds.idea_spend_ceiling_usd:
@@ -575,21 +625,29 @@ def plan(
                     continue
                 if not affordable(ADVANCE_IDEA, item.stage):
                     continue
-                charge(ADVANCE_IDEA, item.stage)
+                charged = charge(ADVANCE_IDEA, item.stage)
                 sold_lineage[root] = sold_lineage.get(root, Decimal(0)) + exposure
             chosen = item
             allocations.append(
                 Allocation(
                     kind=ADVANCE_IDEA,
-                    reason=item.reason,
+                    reason=(
+                        f"{item.reason} [the slot reserved for depth]"
+                        if reserved
+                        else item.reason
+                    ),
                     utility=score,
                     idea_id=item.idea.idea_id,
                     stage=item.stage,
                     idea_version=item.idea.current_version,
                     generation=item.generation,
+                    charged=charged,
                 )
             )
             break
+        if chosen is None and reserved:
+            # No deep track is admissible this tick; the slot is ordinary.
+            continue
         if chosen is None:
             break
         pool.remove(chosen)
@@ -621,13 +679,13 @@ def plan(
         if not any(item.kind == EXPLORE for item in allocations) and affordable(
             EXPLORE
         ):
-            charge(EXPLORE)
             allocations.append(
                 Allocation(
                     kind=EXPLORE,
                     reason=f"capacity to spare: {why}",
                     explorer=explorer,
                     payload={"bucket": tick_bucket},
+                    charged=charge(EXPLORE),
                 )
             )
     return tuple(allocations)
