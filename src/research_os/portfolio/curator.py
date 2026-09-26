@@ -254,255 +254,355 @@ def _direction(counts: dict[str, int]) -> str:
     return f"> executed evidence: {supporting} supporting, none refuting"
 
 
-def _one_line(text: str) -> str:
-    """A model-authored string rendered where one line is expected.
+#: The visible stand-in for a line break inside model-authored text. A reader
+#: can tell that the text contained one; the page cannot be broken by it.
+NEWLINE_MARKER = " ↵ "
 
-    The bank is committed Markdown and it is the document a person reads
-    before deciding whether to promote an idea. `_bounded` strips and
-    length-checks and permits newlines, so a title or a summary could
-    carry `\n## Reviews` and forge a heading, or a line shaped like the
-    computed provenance header, in the page whose whole purpose is to be
-    trusted. A security review of this branch found it.
+#: Characters that form Markdown or HTML *inside* a line. Escaped with a
+#: backslash wherever model-authored text is rendered, which CommonMark renders
+#: as the literal character: ``\<`` is a less-than sign, not a tag or a comment
+#: that would hide the rest of the page; ``\|`` does not split a table cell;
+#: ``\*`` is not emphasis dressed up as the computed header. The characters
+#: that only act at the *start* of a line (``-``, ``+``, ``=``, digits and
+#: ``.``) are left alone, because a value never begins one -- that is what
+#: collapsing its line breaks guarantees, and what :meth:`_Page.render` checks.
+_MARKDOWN_ACTIVE = frozenset("\\`*_[]<>|~&#!")
 
-    Newlines become a visible marker rather than disappearing: a reader
-    should be able to tell that the text contained one. `terminal_safe`
-    then handles the rest, so `cat` of a bank page cannot move the
-    researcher's cursor either.
+
+def _untrusted(text: str | None) -> str:
+    """A model-authored string, made inert, for a place a value is expected.
+
+    INV-02 (``docs/ARCHITECTURE_INVARIANTS.md``): model text must never be
+    able to create or impersonate what this module computes. The bank is the
+    document a person reads before promoting an idea, and a model string
+    rendered as-is could carry ``\n## Reviews`` or a second
+    ``> executed evidence:`` line and forge the page's structure -- the final
+    adversarial review of 37e8afe did both, through the research question on
+    ``HUMAN_READY.md`` and the claimed difference on an idea page, fields a
+    per-field ``_one_line`` had not been applied to.
+
+    So there is one path and every model-authored value takes it:
+
+    - line breaks become :data:`NEWLINE_MARKER`, so the value is one line and
+      can never *begin* a line -- and every structural construct in Markdown
+      (a heading, a blockquote, a list item, a table, a fence, a delimiter,
+      a link definition) is a property of how a line begins;
+    - every character that can start or form Markdown or HTML markup is
+      backslash-escaped, so inside its line it is only text: no emphasis
+      mimicking the computed header, no tag, no comment hiding what follows;
+    - control and deceptive characters are made visible by
+      :func:`research_os.textsafe.terminal_safe`, so ``cat`` of a page cannot
+      move the reader's cursor or reorder what they see.
+
+    Deliberately not a blacklist of words such as "Reviews": what is
+    neutralised is the *syntax* that makes structure, whatever it says.
     """
 
-    collapsed = " ".join(text.replace("\r\n", "\n").split("\n"))
-    return terminal_safe(collapsed, keep=frozenset())
+    if not text:
+        return ""
+    # `splitlines`, not `split("\n")`: it also breaks on \r, \v, \f, \x1c-\x1e,
+    # \x85 and U+2028/U+2029, every one of which some reader treats as a line
+    # boundary. A value is one line to all of them or it is not one line.
+    collapsed = NEWLINE_MARKER.join(part.strip() for part in text.splitlines()).strip()
+    escaped = "".join(
+        f"\\{character}" if character in _MARKDOWN_ACTIVE else character
+        for character in collapsed
+    )
+    return terminal_safe(escaped, keep=frozenset())
 
 
-def _indented(detail: str) -> str:
-    """Keep a multi-paragraph explanation inside the bullet that owns it.
+#: How a line that renders as structure can begin. A line the renderer did not
+#: emit as structure must begin with none of these; see :meth:`_Page.render`.
+_STRUCTURAL_STARTS = ("#", ">", "<", "|", "`", "~", "[", "!", "=", "---", "***", "___")
 
-    A stage that refuses says why in numbered prose with blank lines between
-    the reasons, and this is Markdown: an unindented blank line ends the list
-    item. Rendered flat, the page a researcher opens shows the history
-    stopping at the first refusal, its reasons loose in the body, and the
-    actions after it starting a second list. Two spaces is what a continuation
-    line costs.
+
+class _Page:
+    """One bank page, built from trusted structure and inert values only.
+
+    Three kinds of line and no fourth:
+
+    - **structure** (:meth:`structure`) -- headings, the computed provenance
+      header, fixed prose, table rows -- written by this module from database
+      records. A value interpolated into one is passed through
+      :func:`_untrusted` first;
+    - **fields** (:meth:`field`) -- a trusted bullet and label, then one
+      untrusted value;
+    - blank lines.
+
+    :meth:`render` then checks the result as a *structure*, not as text: every
+    line that begins like structure must be a line this module emitted as
+    structure, in that position. A value that somehow reached the start of a
+    line would make the page refuse to render rather than be committed.
     """
 
-    head, *rest = detail.splitlines()
-    if not rest:
-        return head
-    return "\n".join([head, *(f"  {line}".rstrip() for line in rest)])
+    __slots__ = ("_lines", "_structural")
+
+    def __init__(self) -> None:
+        self._lines: list[str] = []
+        self._structural: set[int] = set()
+
+    def structure(self, *lines: str) -> None:
+        for line in lines:
+            if "\n" in line or "\r" in line:
+                raise CuratorError(f"a structural line cannot span lines: {line!r}")
+            self._structural.add(len(self._lines))
+            self._lines.append(line)
+
+    def field(
+        self,
+        label: str,
+        value: str | None,
+        *,
+        empty: str = "(none)",
+        bullet: str = "- ",
+    ) -> None:
+        shown = _untrusted(value)
+        self._lines.append(f"{bullet}{label}: {shown or empty}")
+
+    def item(self, value: str | None, *, bullet: str = "- ") -> None:
+        """A bullet whose whole text is one untrusted value."""
+
+        self._lines.append(f"{bullet}{_untrusted(value)}")
+
+    def text(self, line: str) -> None:
+        """A fixed, trusted line that is not structure: ``(none)`` and the like."""
+
+        self._lines.append(line)
+
+    def blank(self) -> None:
+        self._lines.append("")
+
+    def render(self) -> str:
+        for index, line in enumerate(self._lines):
+            if "\n" in line or "\r" in line:
+                raise CuratorError(f"line {index} of a bank page spans lines")
+            if index in self._structural:
+                continue
+            if line.lstrip(" ").startswith(_STRUCTURAL_STARTS):
+                raise CuratorError(
+                    f"line {index} of a bank page begins like structure and was "
+                    f"not emitted as structure: {line[:80]!r}. Refusing to render "
+                    f"a page whose provenance could be forged."
+                )
+        return "\n".join(self._lines) + "\n"
+
+
+def _code(identifier: str) -> str:
+    """A system identifier in a code span, refusing one that could close it."""
+
+    if "`" in identifier or "\n" in identifier:
+        return _untrusted(identifier)
+    return f"`{identifier}`"
 
 
 def render_idea(store: PortfolioStore, idea: PortfolioIdea) -> str:
     """One idea's complete record: every version, its lineage, what it rests on."""
 
     counts = _provenance(store, idea)
-    lines = _header(counts)
-    lines.append(f"# {idea.idea_id}")
-    lines.append("")
-    lines.append(
+    page = _Page()
+    page.structure(*_header(counts))
+    page.structure(f"# {idea.idea_id}")
+    page.blank()
+    page.text(
         f"- status: `{idea.status}`  (quality tier reached: `{idea.quality_tier}`)"
     )
-    lines.append(f"- operational: `{idea.operational_state}`")
-    lines.append(f"- origin: `{idea.origin}`")
-    lines.append(f"- depth: {idea.depth}, lineage root: `{idea.lineage_root}`")
+    page.text(f"- operational: `{idea.operational_state}`")
+    page.text(f"- origin: `{idea.origin}`")
+    page.text(f"- depth: {idea.depth}, lineage root: {_code(idea.lineage_root)}")
     if idea.retire_reason:
-        lines.append(f"- why it stopped: {idea.retire_reason}")
+        page.field("why it stopped", idea.retire_reason)
     if idea.revisit_if:
-        lines.append(f"- revisit if: {idea.revisit_if}")
-    lines.append("")
+        page.field("revisit if", idea.revisit_if)
+    page.blank()
 
     for version in store.list_versions(idea.idea_id):
         current = version.version == idea.current_version
-        lines.append(f"## Version {version.version}{' (current)' if current else ''}")
-        lines.append("")
-        lines.append(f"**{_one_line(version.title)}**")
-        lines.append("")
-        lines.append(f"- research question: {_one_line(version.research_question)}")
-        lines.append(f"- core idea: {_one_line(version.core_idea)}")
-        lines.append(f"- mechanism: {_one_line(version.mechanism) or '(none stated)'}")
-        lines.append(
-            f"- why it matters: {_one_line(version.why_it_matters) or '(none stated)'}"
-        )
-        lines.append(f"- falsifier: {_one_line(version.falsifier) or '(none stated)'}")
-        lines.append(
+        page.structure(f"## Version {version.version}{' (current)' if current else ''}")
+        page.blank()
+        page.text(f"**{_untrusted(version.title) or '(untitled)'}**")
+        page.blank()
+        page.field("research question", version.research_question)
+        page.field("core idea", version.core_idea)
+        page.field("mechanism", version.mechanism, empty="(none stated)")
+        page.field("why it matters", version.why_it_matters, empty="(none stated)")
+        page.field("falsifier", version.falsifier, empty="(none stated)")
+        page.text(
             "- settled by: "
             + (
                 ", ".join(str(item) for item in version.adjudication_types)
                 or "(not yet classified)"
             )
         )
-        lines.append(f"- closest prior work: {version.closest_prior_work or '(none)'}")
-        lines.append(f"- claimed difference: {version.claimed_difference or '(none)'}")
+        page.field("closest prior work", version.closest_prior_work)
+        page.field("claimed difference", version.claimed_difference)
         for label, values in (
             ("assumption", version.assumptions),
             ("alternative explanation", version.alternative_explanations),
             ("open uncertainty", version.open_uncertainties),
         ):
             for item in values:
-                lines.append(f"- {label}: {item}")
-        lines.append(f"- content digest: `{version.content_digest}`")
-        lines.append("")
+                page.field(label, item)
+        page.text(f"- content digest: `{version.content_digest}`")
+        page.blank()
 
-    lines.append("## Lineage")
-    lines.append("")
+    page.structure("## Lineage")
+    page.blank()
     edges = store.edges_of(idea.idea_id)
     if not edges:
-        lines.append("(none)")
+        page.text("(none)")
     for edge in sorted(edges, key=lambda item: (item.kind, item.parent_idea_id)):
         here = "(this)"
         parent = here if edge.parent_idea_id == idea.idea_id else edge.parent_idea_id
         child = here if edge.child_idea_id == idea.idea_id else edge.child_idea_id
-        lines.append(f"- `{edge.kind}`: {parent} -> {child} {edge.detail}".rstrip())
-    lines.append("")
+        page.field(f"`{edge.kind}`", f"{parent} -> {child} {edge.detail}".rstrip())
+    page.blank()
 
-    lines.append("## Evidence")
-    lines.append("")
+    page.structure("## Evidence")
+    page.blank()
     evidence = store.list_evidence(idea_id=idea.idea_id)
     if not evidence:
-        lines.append("(none)")
+        page.text("(none)")
     for item in sorted(evidence, key=lambda row: row.evidence_id):
         refs = ", ".join(
             part
             for part in (
-                f"artifact `{item.artifact_id}`" if item.artifact_id else "",
-                f"job `{item.job_id}`" if item.job_id else "",
-                f"work `{item.literature_key}`" if item.literature_key else "",
-                f"finding `{item.finding_id}`" if item.finding_id else "",
+                f"artifact {_code(item.artifact_id)}" if item.artifact_id else "",
+                f"job {_code(item.job_id)}" if item.job_id else "",
+                f"work {_code(item.literature_key)}" if item.literature_key else "",
+                f"finding {_code(item.finding_id)}" if item.finding_id else "",
+                f"retrieval {_code(item.retrieval_id)}"
+                if getattr(item, "retrieval_id", None)
+                else "",
             )
             if part
         )
-        lines.append(
+        page.text(
             f"- v{item.idea_version} [{item.kind}/{item.strength}] "
-            f"{_one_line(item.summary)}" + (f"  ({refs})" if refs else "")
+            f"{_untrusted(item.summary)}" + (f"  ({refs})" if refs else "")
         )
-    lines.append("")
+    page.blank()
 
-    lines.append("## Reviews")
-    lines.append("")
+    page.structure("## Reviews")
+    page.blank()
     reviews = store.list_reviews(idea_id=idea.idea_id)
     live = {item.review_id for item in store.live_reviews(idea_id=idea.idea_id)}
     if not reviews:
-        lines.append("(none)")
+        page.text("(none)")
     for item in sorted(reviews, key=lambda row: row.review_id):
         status = "live" if item.review_id in live else "stale"
-        lines.append(
+        page.text(
             f"- [{status}] v{item.idea_version} **{item.reviewer_role}** "
             f"{item.verdict} ({item.severity}) "
-            f"-- {item.provider_family}/{item.model or 'unnamed'}, "
+            f"-- {_untrusted(item.provider_family)}/{_untrusted(item.model) or 'unnamed'}, "
             f"independence vs origin: `{item.independence_vs_origin}`, "
-            f"prompt `{item.prompt_version}`"
+            f"prompt {_code(item.prompt_version)}"
         )
-        lines.append(f"  - {_one_line(item.summary)}")
-    lines.append("")
+        page.item(item.summary, bullet="  - ")
+    page.blank()
 
-    lines.append("## Standing objections")
-    lines.append("")
+    page.structure("## Standing objections")
+    page.blank()
     objections = store.open_objections(idea_id=idea.idea_id)
     if not objections:
-        lines.append("(none unanswered)")
+        page.text("(none unanswered)")
     for item in sorted(objections, key=lambda row: row.objection_id):
-        lines.append(
+        page.text(
             f"- [{item.severity}] raised at v{item.raised_at_version}: "
-            f"{_one_line(item.summary)}"
+            f"{_untrusted(item.summary)}"
         )
-    lines.append("")
+    page.blank()
 
-    lines.append("## What was done, and when")
-    lines.append("")
+    page.structure("## What was done, and when")
+    page.blank()
     for action in store.list_actions(idea_id=idea.idea_id):
-        lines.append(
+        page.text(
             f"- {action.created_at:%Y-%m-%d %H:%M} `{action.stage}` "
             f"{action.status}"
             + (f" -> {action.disposition}" if action.disposition else "")
-            + (f" -- {_indented(action.detail)}" if action.detail else "")
+            # One line, like every other value: a refusal's numbered
+            # paragraphs keep their breaks as visible markers inside the
+            # bullet that owns them, and cannot open a line of their own.
+            + (f" -- {_untrusted(action.detail)}" if action.detail else "")
         )
-    lines.append("")
-    return "\n".join(lines) + "\n"
+    page.blank()
+    return page.render()
 
 
 def render_index(store: PortfolioStore, ideas: Sequence[PortfolioIdea]) -> str:
-    lines = [
-        HEADER_MARKER,
-        "",
-        "# Autonomous idea index",
-        "",
-        "Every idea this portfolio has explored, including the ones it rejected.",
-        "Nothing here is scientific state: these are candidate directions, and a",
-        "capsule object is created only when a person promotes one.",
-        "",
-        "| idea | status | tier | origin | title |",
-        "|---|---|---|---|---|",
-    ]
+    page = _Page()
+    page.structure(HEADER_MARKER)
+    page.blank()
+    page.structure("# Autonomous idea index")
+    page.blank()
+    page.text("Every idea this portfolio has explored, including the ones it rejected.")
+    page.text("Nothing here is scientific state: these are candidate directions, and a")
+    page.text("capsule object is created only when a person promotes one.")
+    page.blank()
+    page.structure("| idea | status | tier | origin | title |")
+    page.structure("|---|---|---|---|---|")
     for idea in ideas:
         version = store.get_version(idea.idea_id)
-        title = _one_line(version.title) if version else ""
-        lines.append(
+        title = _untrusted(version.title) if version else ""
+        page.structure(
             f"| `{idea.idea_id}` | {idea.status} | {idea.quality_tier} | "
             f"{idea.origin} | {title} |"
         )
-    lines.append("")
-    return "\n".join(lines) + "\n"
+    page.blank()
+    return page.render()
 
 
 def render_bank(
     store: PortfolioStore, ideas: Sequence[PortfolioIdea], *, status: IdeaStatus
 ) -> str:
-    lines = [
-        HEADER_MARKER,
-        "",
-        f"# {status}",
-        "",
-    ]
+    page = _Page()
+    page.structure(HEADER_MARKER)
+    page.blank()
+    page.structure(f"# {status}")
+    page.blank()
     if status is IdeaStatus.HUMAN_READY:
-        lines.extend(
-            [
-                "Research OS believes these merit your attention. That is not a",
-                "claim that they are true, and nothing here has been reviewed by a",
-                "person. The numbers under each one say what was actually done.",
-                "",
-            ]
-        )
+        for line in (
+            "Research OS believes these merit your attention. That is not a",
+            "claim that they are true, and nothing here has been reviewed by a",
+            "person. The numbers under each one say what was actually done.",
+        ):
+            page.text(line)
+        page.blank()
     else:
-        lines.extend(
-            [
-                "These passed this system's own gates: three separate readings, a",
-                "source-backed novelty case, and no unanswered objection above",
-                "MINOR. A gate of that shape can be satisfied by work that is",
-                "thorough and wrong; it checks that the right kinds of evidence",
-                "exist, not whether any of it is correct.",
-                "",
-            ]
-        )
+        for line in (
+            "These passed this system's own gates: three separate readings, a",
+            "source-backed novelty case, and no unanswered objection above",
+            "MINOR. A gate of that shape can be satisfied by work that is",
+            "thorough and wrong; it checks that the right kinds of evidence",
+            "exist, not whether any of it is correct.",
+        ):
+            page.text(line)
+        page.blank()
     if not ideas:
-        lines.append("(none)")
-        lines.append("")
-        return "\n".join(lines) + "\n"
+        page.text("(none)")
+        page.blank()
+        return page.render()
     for idea in ideas:
         version = store.get_version(idea.idea_id)
         counts = _provenance(store, idea)
-        lines.append(
-            f"## `{idea.idea_id}` — {_one_line(version.title) if version else ''}"
+        page.structure(
+            f"## `{idea.idea_id}` — {_untrusted(version.title) if version else ''}"
         )
-        lines.append("")
-        lines.extend(_header(counts)[1:])
+        page.blank()
+        page.structure(*_header(counts)[1:-1])
+        page.blank()
         if version is not None:
-            lines.append(f"- research question: {version.research_question}")
-            lines.append(
-                f"- why it matters: {_one_line(version.why_it_matters) or '(not stated)'}"
-            )
-            lines.append(
-                f"- falsifier: {_one_line(version.falsifier) or '(not stated)'}"
-            )
-            lines.append(
-                f"- closest prior work: {_one_line(version.closest_prior_work) or '(not stated)'}"
+            page.field("research question", version.research_question)
+            page.field("why it matters", version.why_it_matters, empty="(not stated)")
+            page.field("falsifier", version.falsifier, empty="(not stated)")
+            page.field(
+                "closest prior work", version.closest_prior_work, empty="(not stated)"
             )
             for item in version.open_uncertainties:
-                lines.append(f"- limitation: {_one_line(item)}")
-            lines.append(
-                f"- next: {_one_line(version.next_best_action) or '(none recorded)'}"
-            )
-        lines.append(f"- full record: `{BANK_ROOT}/ideas/{idea.idea_id}.md`")
-        lines.append("")
-    return "\n".join(lines) + "\n"
+                page.field("limitation", item)
+            page.field("next", version.next_best_action, empty="(none recorded)")
+        page.text(f"- full record: `{BANK_ROOT}/ideas/{idea.idea_id}.md`")
+        page.blank()
+    return page.render()
 
 
 def snapshot(db: Database, project_id: str) -> dict[str, str]:
@@ -550,23 +650,30 @@ def snapshot(db: Database, project_id: str) -> dict[str, str]:
 
 
 def _render_digest(payload: dict[str, Any]) -> str:
-    """A digest, rendered from its stored fields. No model writes a word of it."""
+    """A digest, rendered from its stored fields. No model writes a word of it.
 
-    lines = [HEADER_MARKER, "", f"# Digest {payload.get('digest_id', '')}", ""]
-    lines.append(
-        f"- period: {payload.get('period_start')} to {payload.get('period_end')}"
-    )
+    Its items are sentences the digest assembled, and several quote a model --
+    a retirement reason, a title -- so each is rendered as one untrusted value
+    like any other.
+    """
+
+    page = _Page()
+    page.structure(HEADER_MARKER)
+    page.blank()
+    page.structure(f"# Digest {_untrusted(str(payload.get('digest_id', '')))}")
+    page.blank()
+    page.item(f"period: {payload.get('period_start')} to {payload.get('period_end')}")
     counts = payload.get("counts", {})
     for key in sorted(counts):
-        lines.append(f"- {key.replace('_', ' ')}: {counts[key]}")
-    lines.append("")
+        page.item(f"{key.replace('_', ' ')}: {counts[key]}")
+    page.blank()
     for section, items in sorted(payload.get("sections", {}).items()):
-        lines.append(f"## {section.replace('_', ' ')}")
-        lines.append("")
+        page.structure(f"## {_untrusted(section.replace('_', ' '))}")
+        page.blank()
         for item in items:
-            lines.append(f"- {item}")
-        lines.append("")
-    return "\n".join(lines) + "\n"
+            page.item(str(item))
+        page.blank()
+    return page.render()
 
 
 def snapshot_digest(files: dict[str, str]) -> str:
