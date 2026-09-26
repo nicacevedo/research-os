@@ -155,7 +155,8 @@ EXPERIMENT_COLUMNS = (
     "spec_digest, variation_digest, workspace_path, preregistration_artifact_id, "
     "decision_rule, no_rule_reason, job_id, analysis_artifact_id, conclusion, "
     "evidence_id, failure_class, detail, attempts, origin_call_id, "
-    "prompt_version, contract_id, created_at, updated_at"
+    "prompt_version, contract_id, created_at, updated_at, "
+    "execution_manifest_artifact_id"
 )
 CONTRACT_COLUMNS = (
     "contract_id, project_id, idea_id, idea_version, role, kind, state, "
@@ -1679,6 +1680,16 @@ class PortfolioStore:
                     (idea_id, idea_version),
                 ).fetchall()
         return tuple(IdeaExperiment.model_validate(row) for row in rows)
+
+    def set_execution_manifest(self, experiment_id: str, *, artifact_id: str) -> None:
+        """Record a replication's frozen execution manifest (`sql/0041`, INV-07)."""
+
+        with self._tx() as conn:
+            conn.execute(
+                "update idea_experiments set execution_manifest_artifact_id = %s, "
+                "updated_at = now() where experiment_id = %s",
+                (artifact_id, experiment_id),
+            )
 
     def update_experiment(
         self,

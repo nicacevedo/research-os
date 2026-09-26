@@ -18,8 +18,8 @@ was before the fix. Grouped by what they hold:
   one per direction, seeds are shown with their ids, and a failure-mined
   child meets the same bounds a follow-up does;
 - **a replication must be independent and a reading must be legible**: one
-  that varies only its resources is refused, one whose outputs are
-  byte-identical to the primary's is INSUFFICIENT, and the evidence a
+  that varies only its resources is refused, one not shown to have
+  consumed its own configuration is INSUFFICIENT, and the evidence a
   reviewer reads carries the frozen analysis, the record counts and every
   earlier reading of the question that existed when the contract froze.
 """
@@ -1054,20 +1054,28 @@ def _measured(
     return context
 
 
-def test_a_replication_that_reproduces_the_bytes_is_insufficient(
+def test_a_replication_that_reproduces_the_number_is_judged_by_its_receipt(
     portfolio: PortfolioStore,
     runtime_db: Database,
     runtime_project: str,
     project_repo: Path,
     tmp_path: Path,
 ) -> None:
-    """Seeds 5 and 14 give the same number from this program: nothing varied.
+    """Seeds 5 and 14 give the same number from this program.
 
-    The seed did vary, so the specification check passes -- and the program
-    maps both seeds to the same output. A replication that reproduces the
-    primary's bytes establishes nothing a rerun would not, whatever it
-    concluded.
+    This test used to assert INSUFFICIENT because the replication's output
+    bytes were identical to the primary's. Byte identity is not evidence
+    either way, which is what the final adversarial review of 37e8afe showed
+    from the other side (H6): a timestamp makes the bytes differ without the
+    seed ever being used. What decides independence is whether the variation
+    reached the computation (INV-07), and this program reports the seed it
+    used -- so seed 14 *was* consumed, the replication is an independent
+    execution, and it agrees with the primary exactly. The same scenario
+    without a receipt is INSUFFICIENT; see
+    ``tests/test_integrity_replication_causality.py``.
     """
+
+    import json as _json
 
     context = _measured(
         portfolio,
@@ -1079,8 +1087,12 @@ def test_a_replication_that_reproduces_the_bytes_is_insufficient(
     )
     step = _advance(context, role=ExperimentRole.REPLICATION)
     assert step.ok, step.detail
-    assert step.conclusion is EmpiricalConclusion.INSUFFICIENT
-    assert "byte-identical" in step.detail
+    assert step.conclusion is EmpiricalConclusion.SUPPORTS, step.detail
+    document = _json.loads(
+        context.artifacts.get_text(step.experiment.analysis_artifact_id)
+    )
+    assert document["replication"]["independence"]["verified"] is True
+    assert document["replication"]["agreement"]["identical_scientific_values"] is True
 
     other = _measured(
         portfolio,

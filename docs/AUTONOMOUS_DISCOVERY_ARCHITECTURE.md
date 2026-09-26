@@ -1878,9 +1878,16 @@ the application refuses to run or read one under anything but the
 preregistered contract of its own role.
 
 **Replication must be independent.** A replication that differs from its
-primary only in resources or time limit is refused; one whose outputs are
-byte-identical to the primary's in every source the analysis reads is
-INSUFFICIENT whatever it concluded.
+primary only in resources or time limit is refused. Whether one that differs
+in a seed, a parameter, a composed input or a command is an *independent
+execution* is decided by evidence that the variation reached the computation
+-- the program's own execution receipt, checked against a manifest frozen
+before the replication ran -- and never by comparing output bytes, which a
+timestamp makes differ without the seed ever being used
+(`docs/ARCHITECTURE_INVARIANTS.md` INV-07). Without that evidence the
+replication is INSUFFICIENT whatever it concluded; with it, agreement with the
+primary is recorded separately, and an exact agreement is still a
+replication.
 
 **Readings older than the frontier.** A measurement read before frontier
 requests existed raised none, so after migration its idea was parked with

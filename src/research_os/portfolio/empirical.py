@@ -2804,6 +2804,13 @@ def submit(context: Any, experiment: IdeaExperiment) -> ExperimentStep:
         # a replay months later the same measurement: the bytes come from
         # the digest the preregistration names, or nothing runs.
         _materialise_inputs(context, spec, workspace=workspace)
+        if experiment.role is ExperimentRole.REPLICATION:
+            # Frozen here -- the workspace exists, so its base commit is
+            # known, and the executor has not been called -- so what this
+            # replication was meant to vary is on record before its result.
+            freeze_replication_manifest(
+                context, experiment, spec=spec, workspace=workspace, job_id=job_id
+            )
         # **The run directory is not the workspace.** It is the runtime's
         # immutable directory under the data home, holding the frozen
         # manifest and the logs -- and it has to be somewhere else, because
@@ -3390,25 +3397,42 @@ def interpret(context: Any, experiment: IdeaExperiment) -> ExperimentStep:
             spec=spec,
             exit_code=job.exit_code,
         )
+    # **A replication is an independent execution only on evidence that its
+    # variation reached the computation** (INV-07). Whole-file digests used to
+    # decide it, so a replication whose program ignored its new seed but wrote
+    # a timestamp was recorded REPLICATION/SUPPORTS (H6). Independence is now
+    # the receipt -- the computation's own report of what it consumed --
+    # checked against the manifest frozen before it ran; agreement with the
+    # primary is assessed separately, on the values the analysis read.
+    read_conclusion = analysis.conclusion
+    independence: Independence | None = None
     if (
         experiment.role is ExperimentRole.REPLICATION
         and analysis.conclusion in _READ_CONCLUSIONS
-        and (twin := _byte_identical_primary(context, experiment, analysis, verified))
     ):
-        # The variation did not reach the measurement: every file the analysis
-        # read is byte-for-byte what the primary produced. A command that
-        # ignores its seeds replicates perfectly and establishes nothing.
-        analysis = replace(
-            analysis,
-            conclusion=EmpiricalConclusion.INSUFFICIENT,
-            summary=(
-                f"the replication's outputs are byte-identical to the primary "
-                f"{twin}'s in every source the analysis reads, so the variation "
-                f"did not reach the measurement; an identical reading is not an "
-                f"independent one. (Read as: {analysis.summary})"
-            ),
-            notes=(*analysis.notes, f"byte-identical to {twin}"),
+        independence = assess_independence(
+            context, experiment, analysis=analysis, spec=spec, workspace=workspace
         )
+        if independence.verified:
+            analysis = replace(
+                analysis,
+                notes=(*analysis.notes, f"independent execution: {independence.basis}"),
+            )
+        else:
+            analysis = replace(
+                analysis,
+                conclusion=EmpiricalConclusion.INSUFFICIENT,
+                summary=(
+                    f"the replication's independence is not established: "
+                    f"{independence.basis}. A second execution not shown to have "
+                    f"consumed its own configuration is not an independent "
+                    f"reading. (Read as {read_conclusion}: {analysis.summary})"
+                ),
+                notes=(
+                    *analysis.notes,
+                    f"independence unverified: {independence.basis}",
+                ),
+            )
     stored = _store_outputs(context, experiment, workspace=workspace, analysis=analysis)
     document = analysis.record(
         experiment=experiment,
@@ -3431,6 +3455,37 @@ def interpret(context: Any, experiment: IdeaExperiment) -> ExperimentStep:
             "design_digest": verified.contract.design_digest,
         }
         document["analysis_result"] = contract_result.record()
+    if experiment.role is ExperimentRole.REPLICATION:
+        agreement = assess_agreement(
+            context, experiment, conclusion=read_conclusion, document=document
+        )
+        document["replication"] = {
+            "execution_manifest_artifact_id": experiment.execution_manifest_artifact_id,
+            "independence": (
+                independence.record()
+                if independence is not None
+                else {
+                    "verified": False,
+                    "basis": "the reading concluded nothing, so independence was "
+                    "not assessed",
+                }
+            ),
+            "agreement": agreement,
+        }
+        if independence is not None and independence.verified:
+            analysis = replace(
+                analysis,
+                notes=(
+                    *analysis.notes,
+                    "agreement with the primary: "
+                    + ("agrees" if agreement["agrees"] else "disagrees")
+                    + (
+                        ", identical scientific values"
+                        if agreement["identical_scientific_values"]
+                        else ""
+                    ),
+                ),
+            )
     document["stored_outputs"] = stored
     document["stored_logs"] = _store_logs(
         context, experiment, run_dir=Path(job.run_dir)
@@ -3634,41 +3689,414 @@ _READ_CONCLUSIONS: frozenset[EmpiricalConclusion] = frozenset(
 )
 
 
-def _byte_identical_primary(
+#: The key under which a declared command reports what it actually consumed.
+#:
+#: A top-level object in any JSON output the run collects::
+#:
+#:     {"execution_receipt": {"seeds": [14],
+#:                            "parameters": {"seed": 14},
+#:                            "inputs": {"plans/p.json": "<sha256>"}}}
+#:
+#: Written by the researcher's own program -- the one trusted to compute the
+#: measurement -- and never by a model: a receipt found inside a
+#: model-composed input is refused (INV-02, INV-07).
+RECEIPT_KEY = "execution_receipt"
+
+#: How large an output may be for its receipt to be read.
+MAX_RECEIPT_BYTES = 16 * 1024 * 1024
+
+
+def _document(context: Any, artifact_id: str | None) -> dict[str, Any] | None:
+    if not artifact_id:
+        return None
+    try:
+        loaded = json.loads(context.artifacts.get_text(artifact_id))
+    except (ResearchOSError, ValueError, UnicodeDecodeError):
+        return None
+    return loaded if isinstance(loaded, dict) else None
+
+
+def _parameters_of(preregistration: Mapping[str, Any] | None) -> dict[str, str]:
+    """A preregistration's accepted parameters, compared as the strings argv carries."""
+
+    if not preregistration:
+        return {}
+    return {
+        str(name): json.dumps(value, sort_keys=True)
+        if isinstance(value, Mapping)
+        else str(value)
+        for name, value in dict(preregistration.get("command_parameters") or {}).items()
+    }
+
+
+def independence_variables(
+    primary: Mapping[str, Any], replication: Mapping[str, Any]
+) -> dict[str, Any]:
+    """What the replication was meant to vary, from the two frozen preregistrations.
+
+    Deterministic and model-free: every seed, parameter, composed input and
+    command that differs between the specification the primary ran and the
+    one the replication was about to run. This is the *intended*
+    perturbation; whether it reached the computation is a separate question,
+    answered by :func:`assess_independence`.
+    """
+
+    first, second = primary.get("spec") or {}, replication.get("spec") or {}
+    variables: dict[str, Any] = {}
+    seeds = (list(first.get("seeds") or ()), list(second.get("seeds") or ()))
+    if seeds[0] != seeds[1]:
+        variables["seeds"] = {"primary": seeds[0], "replication": seeds[1]}
+    theirs, mine = _parameters_of(primary), _parameters_of(replication)
+    changed = {
+        name: {"primary": theirs.get(name), "replication": value}
+        for name, value in sorted(mine.items())
+        if theirs.get(name) != value
+    }
+    if changed:
+        variables["parameters"] = changed
+    inputs = (
+        {str(path): str(sha) for path, sha in first.get("inputs") or ()},
+        {str(path): str(sha) for path, sha in second.get("inputs") or ()},
+    )
+    moved = {
+        path: {"primary": inputs[0].get(path), "replication": sha}
+        for path, sha in sorted(inputs[1].items())
+        if inputs[0].get(path) != sha
+    }
+    if moved:
+        variables["inputs"] = moved
+    if primary.get("command") != replication.get("command"):
+        variables["command"] = {
+            "primary": primary.get("command"),
+            "replication": replication.get("command"),
+        }
+    return variables
+
+
+def freeze_replication_manifest(
     context: Any,
     experiment: IdeaExperiment,
-    analysis: Analysis,
-    verified: scicontract.VerifiedContract | None,
-) -> str | None:
-    """The primary this replication's read outputs are identical to, or nothing."""
+    *,
+    spec: ExecutionSpec,
+    workspace: Path,
+    job_id: str,
+) -> str:
+    """Freeze what a replication is, before it runs. Returns the artifact id.
+
+    INV-07 (``docs/ARCHITECTURE_INVARIANTS.md``). The parent result and its
+    specification, the code identity (the workspace's base commit and the
+    declared command), the immutable inputs, the environment, the intended
+    independence variables and the execution identity -- stored by content
+    hash and recorded on the experiment (`sql/0041`) before the executor is
+    called, so what the replication was *meant* to be cannot be restated
+    after its result exists.
+    """
 
     primary = context.portfolio.get_experiment(
         idea_id=experiment.idea_id,
         idea_version=experiment.idea_version,
         role=ExperimentRole.PRIMARY,
     )
-    if primary is None or primary.analysis_artifact_id is None:
-        return None
-    try:
-        document = json.loads(context.artifacts.get_text(primary.analysis_artifact_id))
-    except (ResearchOSError, ValueError):
-        return None
-    theirs = {
-        str(item.get("path")): str(item.get("sha256"))
-        for item in document.get("outputs") or ()
-        if isinstance(item, Mapping)
-    }
-    mine = {path: digest for path, digest, _size in analysis.outputs}
-    read = (
-        sorted({item.source for item in verified.analysis.observables})
-        if verified is not None
-        else sorted(mine)
+    theirs = _document(
+        context, primary.preregistration_artifact_id if primary else None
     )
-    if not read or any(path not in mine or path not in theirs for path in read):
+    mine = _document(context, experiment.preregistration_artifact_id) or {}
+    parent_analysis = _document(
+        context, primary.analysis_artifact_id if primary else None
+    )
+    manifest = {
+        "schema": "portfolio-replication-manifest-v1",
+        "experiment_id": experiment.experiment_id,
+        "idea_id": experiment.idea_id,
+        "idea_version": experiment.idea_version,
+        "parent": None
+        if primary is None
+        else {
+            "experiment_id": primary.experiment_id,
+            "spec_digest": primary.spec_digest,
+            "variation_digest": primary.variation_digest,
+            "contract_id": primary.contract_id,
+            "preregistration_artifact_id": primary.preregistration_artifact_id,
+            "analysis_artifact_id": primary.analysis_artifact_id,
+            "base_commit": (parent_analysis or {}).get("base_commit"),
+        },
+        "code": {
+            "base_commit": _workspace_commit(workspace),
+            "command": mine.get("command"),
+            "argv": list(spec.argv),
+        },
+        "inputs": [list(item) for item in spec.inputs],
+        "environment": dict(spec.environment),
+        "execution": {
+            "spec_digest": experiment.spec_digest,
+            "variation_digest": experiment.variation_digest,
+            "contract_id": experiment.contract_id,
+            "job_id": job_id,
+            "seeds": list(spec.seeds),
+        },
+        "independence_variables": (
+            independence_variables(theirs, mine) if theirs is not None else {}
+        ),
+    }
+    ref = context.artifacts.put_text(
+        json.dumps(manifest, indent=2, sort_keys=True, ensure_ascii=False),
+        media_type="application/json",
+        role=f"idea_replication_manifest:{experiment.experiment_id}",
+        producer="portfolio.empirical.replication_manifest@1",
+    )
+    context.portfolio.set_execution_manifest(
+        experiment.experiment_id, artifact_id=ref.artifact_id
+    )
+    return str(ref.artifact_id)
+
+
+@dataclass(frozen=True, slots=True)
+class Independence:
+    """Whether a replication is an independent execution, and on what evidence."""
+
+    verified: bool
+    basis: str
+    consumed: tuple[str, ...] = ()
+    unverified: tuple[str, ...] = ()
+    contradicted: tuple[str, ...] = ()
+
+    def record(self) -> dict[str, Any]:
+        return {
+            "verified": self.verified,
+            "basis": self.basis,
+            "consumed": list(self.consumed),
+            "unverified": list(self.unverified),
+            "contradicted": list(self.contradicted),
+        }
+
+
+def _receipt(
+    context: Any, workspace: Path, analysis: Analysis, spec: ExecutionSpec
+) -> tuple[dict[str, Any] | None, str]:
+    """The run's own report of what it consumed, or why there is none to trust."""
+
+    for _path, digest in spec.inputs:
+        try:
+            composed = context.artifacts.get_bytes(digest)
+        except ResearchOSError:
+            continue
+        if RECEIPT_KEY.encode("utf-8") in composed:
+            return None, (
+                f"a model-composed input carries the key {RECEIPT_KEY!r}, so any "
+                f"receipt in the output could be the model's and not the "
+                f"program's"
+            )
+    for relative, digest, size in analysis.outputs:
+        if size > MAX_RECEIPT_BYTES:
+            continue
+        data = _read_recorded(
+            workspace, relative, digest=digest, max_bytes=MAX_RECEIPT_BYTES
+        )
+        if isinstance(data, str):
+            continue
+        try:
+            document = json.loads(data)
+        except (ValueError, UnicodeDecodeError):
+            continue
+        if isinstance(document, dict) and isinstance(document.get(RECEIPT_KEY), dict):
+            return dict(document[RECEIPT_KEY]), relative
+    return None, "the command reported no execution receipt in any output it wrote"
+
+
+def assess_independence(
+    context: Any,
+    experiment: IdeaExperiment,
+    *,
+    analysis: Analysis,
+    spec: ExecutionSpec,
+    workspace: Path,
+) -> Independence:
+    """Whether the intended variation demonstrably reached the computation.
+
+    INV-07. Different output bytes prove nothing -- a replication whose
+    program ignored its new seed was recorded as independent because a
+    timestamp in its output differed from the primary's (H6). The evidence
+    this accepts, and nothing weaker:
+
+    - a **consumption receipt** (:data:`RECEIPT_KEY`) in which the
+      computation itself reports the seeds, parameters and input digests it
+      used. Each intended variable it reports must equal the replication's
+      value; at least one must be reported; a reported value that is the
+      primary's is a contradiction and fails the whole assessment;
+    - for a replication that runs a *different declared command*, the
+      execution record: the system itself launched the other program.
+
+    Whether the result agrees with the primary's is separate
+    (:func:`assess_agreement`): an independent execution that reproduces the
+    primary's number exactly is a replication that agrees.
+    """
+
+    manifest = _document(
+        context, getattr(experiment, "execution_manifest_artifact_id", None)
+    )
+    if manifest is None:
+        return Independence(
+            verified=False,
+            basis="no execution manifest was frozen for this replication, so what "
+            "it was meant to vary is not on record",
+        )
+    execution = manifest.get("execution") or {}
+    if execution.get("spec_digest") != experiment.spec_digest:
+        return Independence(
+            verified=False,
+            basis="the frozen execution manifest names a different specification "
+            "from the one that ran",
+        )
+    variables = dict(manifest.get("independence_variables") or {})
+    if not variables:
+        return Independence(
+            verified=False,
+            basis="the replication's specification differs from the primary's in "
+            "no seed, parameter, composed input or command",
+        )
+    if "command" in variables and not (
+        {"seeds", "parameters", "inputs"} & set(variables)
+    ):
+        return Independence(
+            verified=True,
+            basis=(
+                f"a different declared command ran "
+                f"({variables['command']['replication']} rather than "
+                f"{variables['command']['primary']}), by the executor's own record"
+            ),
+            consumed=("command",),
+        )
+    receipt, where = _receipt(context, workspace, analysis, spec)
+    if receipt is None:
+        intended = ", ".join(sorted(set(variables) - {"command"}))
+        return Independence(
+            verified=False,
+            basis=(
+                f"{where}, so whether the replication's {intended} reached the "
+                f"computation cannot be established; different output bytes are "
+                f"not that evidence"
+            ),
+            unverified=tuple(sorted(set(variables) - {"command"})),
+        )
+    consumed: list[str] = []
+    unverified: list[str] = []
+    contradicted: list[str] = []
+    if "seeds" in variables:
+        reported = receipt.get("seeds")
+        wanted = list(variables["seeds"]["replication"])
+        if reported is None:
+            unverified.append("seeds")
+        elif [int(item) for item in reported] == wanted:
+            consumed.append("seeds")
+        else:
+            contradicted.append(f"seeds (reported {reported}, intended {wanted})")
+    reported_parameters = receipt.get("parameters") or {}
+    for name, values in dict(variables.get("parameters") or {}).items():
+        if name not in reported_parameters:
+            unverified.append(f"parameter {name}")
+            continue
+        value = reported_parameters[name]
+        shown = (
+            json.dumps(value, sort_keys=True)
+            if isinstance(value, Mapping)
+            else str(value)
+        )
+        if shown == values["replication"]:
+            consumed.append(f"parameter {name}")
+        else:
+            contradicted.append(
+                f"parameter {name} (reported {shown}, intended {values['replication']})"
+            )
+    reported_inputs = receipt.get("inputs") or {}
+    for path, values in dict(variables.get("inputs") or {}).items():
+        if path not in reported_inputs:
+            unverified.append(f"input {path}")
+        elif str(reported_inputs[path]) == values["replication"]:
+            consumed.append(f"input {path}")
+        else:
+            contradicted.append(f"input {path}")
+    if "command" in variables:
+        consumed.append("command")
+    if contradicted:
+        return Independence(
+            verified=False,
+            basis=(
+                f"the computation reported in {where} that it consumed something "
+                f"other than the replication's configuration: "
+                f"{'; '.join(contradicted)}. The variation did not reach it."
+            ),
+            consumed=tuple(consumed),
+            unverified=tuple(unverified),
+            contradicted=tuple(contradicted),
+        )
+    if not consumed:
+        return Independence(
+            verified=False,
+            basis=(
+                f"the receipt in {where} reports none of the variables the "
+                f"replication was meant to vary ({', '.join(unverified)})"
+            ),
+            unverified=tuple(unverified),
+        )
+    return Independence(
+        verified=True,
+        basis=(
+            f"the computation reported in {where} that it consumed the "
+            f"replication's {', '.join(consumed)}"
+        ),
+        consumed=tuple(consumed),
+        unverified=tuple(unverified),
+    )
+
+
+def _scientific_values(document: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """What an analysis *read*: the metric, the statistic, the interval. Never bytes."""
+
+    if not document:
         return None
-    if all(mine[path] == theirs[path] for path in read):
-        return primary.experiment_id
-    return None
+    result = document.get("analysis_result") or {}
+    values = {
+        "observed": document.get("observed"),
+        "statistic": result.get("primary_statistic_value"),
+        "interval": result.get("interval"),
+    }
+    return values if any(value is not None for value in values.values()) else None
+
+
+def assess_agreement(
+    context: Any,
+    experiment: IdeaExperiment,
+    *,
+    conclusion: EmpiricalConclusion,
+    document: Mapping[str, Any],
+) -> dict[str, Any]:
+    """How the replication's reading compares with the primary's -- separately.
+
+    Compared on the scientific values the frozen analysis read (the metric,
+    the statistic, its interval) and on the two conclusions. File bytes and
+    run metadata -- timestamps, durations, the receipt itself -- are not part
+    of it. Agreement is recorded; it is not what decides independence.
+    """
+
+    primary = context.portfolio.get_experiment(
+        idea_id=experiment.idea_id,
+        idea_version=experiment.idea_version,
+        role=ExperimentRole.PRIMARY,
+    )
+    theirs = _document(context, primary.analysis_artifact_id if primary else None)
+    mine, other = _scientific_values(document), _scientific_values(theirs)
+    return {
+        "primary_experiment_id": primary.experiment_id if primary else None,
+        "primary_conclusion": (theirs or {}).get("conclusion"),
+        "replication_conclusion": str(conclusion),
+        "agrees": theirs is not None
+        and (theirs or {}).get("conclusion") == str(conclusion),
+        "identical_scientific_values": (
+            None if mine is None or other is None else mine == other
+        ),
+        "primary_values": other,
+        "replication_values": mine,
+    }
 
 
 def _prior_readings(

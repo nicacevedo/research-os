@@ -84,8 +84,13 @@ seed = int(sys.argv[sys.argv.index("--seed") + 1])
 out = pathlib.Path(sys.argv[sys.argv.index("--out") + 1])
 out.parent.mkdir(parents=True, exist_ok=True)
 # A deterministic "measurement": the overlap falls as the seed rises, so a
-# test can choose which side of a preregistered threshold it lands on.
-out.write_text(json.dumps({"summary": {"overlap": 0.9 - 0.1 * (seed % 9)}}))
+# test can choose which side of a preregistered threshold it lands on. The
+# program reports the seed it used -- the execution receipt a replication's
+# independence rests on (docs/ARCHITECTURE_INVARIANTS.md, INV-07).
+out.write_text(json.dumps({
+    "summary": {"overlap": 0.9 - 0.1 * (seed % 9)},
+    "execution_receipt": {"seeds": [seed], "parameters": {"seed": seed}},
+}))
 print("measured")
 """
 

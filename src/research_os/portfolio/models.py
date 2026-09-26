@@ -901,6 +901,10 @@ class IdeaExperiment(_Record):
     contract_id: str | None = None
     created_at: datetime
     updated_at: datetime
+    #: A replication's execution manifest (`sql/0041`), frozen before it ran:
+    #: parent, code identity, inputs, environment, the intended independence
+    #: variables and the execution. See ``empirical.freeze_replication_manifest``.
+    execution_manifest_artifact_id: str | None = None
 
     @property
     def open(self) -> bool:

@@ -334,15 +334,21 @@ def test_an_incoherent_analysis_is_refused_before_it_is_frozen() -> None:
 
 # ================================================================ project --
 GRID_SCRIPT = """\
-import json, pathlib, sys
-plan = json.loads(pathlib.Path(sys.argv[sys.argv.index("--plan") + 1]).read_text())
+import hashlib, json, pathlib, sys
+given = sys.argv[sys.argv.index("--plan") + 1]
+raw = pathlib.Path(given).read_bytes()
+plan = json.loads(raw)
 out = pathlib.Path("results/grid.json")
 out.parent.mkdir(parents=True, exist_ok=True)
 cells = [
     {"size": s, "difficulty": d, "iterations": 10 + 2*s + 3*d + 0.5*s*d}
     for s in plan["sizes"] for d in plan["difficulties"]
 ]
-out.write_text(json.dumps({"cells": cells}))
+# The receipt: the plan this run actually read, by content hash (INV-07).
+out.write_text(json.dumps({
+    "cells": cells,
+    "execution_receipt": {"inputs": {given: hashlib.sha256(raw).hexdigest()}},
+}))
 print(len(cells), "cells")
 """
 

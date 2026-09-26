@@ -19,6 +19,8 @@ import re
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from research_os.portfolio.allocation import ADVANCE_IDEA
 from research_os.portfolio.config import load_config
 from research_os.portfolio.models import IdeaStatus, QualityTier, Stage
@@ -683,4 +685,69 @@ def test_m2_a_board_missing_a_reviewer_is_not_a_completed_board(
     )
     assert status is not IdeaStatus.REVIEW, (
         "the idea was moved to REVIEW by a board of two" + detail
+    )
+
+
+# ------------------------------------------------------------------ H6 -----
+#: MEASURE_SCRIPT's measurement (seeds 5 and 14 give the same overlap), plus
+#: one field that is not the measurement -- as real benchmark output has.
+STAMPED_SCRIPT = """\
+import json, pathlib, sys, time
+seed = int(sys.argv[sys.argv.index("--seed") + 1])
+out = pathlib.Path(sys.argv[sys.argv.index("--out") + 1])
+out.parent.mkdir(parents=True, exist_ok=True)
+out.write_text(json.dumps({
+    "summary": {"overlap": 0.9 - 0.1 * (seed % 9)},
+    "meta": {"finished_at": time.time_ns()},
+}))
+print("measured")
+"""
+
+
+@pytest.mark.parametrize("project_repo", [STAMPED_SCRIPT], indirect=True)
+def test_h6_a_seed_ignoring_rerun_with_a_timestamp_is_not_a_replication(
+    portfolio: PortfolioStore,
+    runtime_db: Database,
+    runtime_project: str,
+    project_repo: Path,
+    tmp_path: Path,
+) -> None:
+    """H6. ``_review_evidence_replication.py``, sha256
+    e6e584d505c35e4d623b3d5b335864c5544d052766ca0bb98ac60db0816dc667.
+    """
+
+    from research_os.portfolio.models import (
+        EmpiricalConclusion,
+        EvidenceKind,
+        ExperimentRole,
+    )
+    from tests.test_portfolio_empirical import _advance
+    from tests.test_portfolio_integrity_regressions import _measured
+
+    context = _measured(
+        portfolio,
+        runtime_db,
+        runtime_project,
+        project_repo,
+        tmp_path,
+        replication_seed=14,
+    )
+    primary = portfolio.get_experiment(
+        idea_id=context.idea_id, idea_version=1, role=ExperimentRole.PRIMARY
+    )
+    assert primary is not None and primary.conclusion is EmpiricalConclusion.SUPPORTS
+
+    step = _advance(context, role=ExperimentRole.REPLICATION)
+    assert step.ok, step.detail
+    rows = [
+        row
+        for row in portfolio.list_evidence(idea_id=context.idea_id, idea_version=1)
+        if row.kind is EvidenceKind.REPLICATION
+    ]
+    # Same seed-independent metric as the primary: the variation did not reach
+    # the measurement, exactly the case the guard exists for.
+    assert step.conclusion is EmpiricalConclusion.INSUFFICIENT, (
+        f"seed-ignoring rerun recorded as an independent replication: "
+        f"{step.conclusion}: {step.detail}; evidence rows: "
+        f"{[(r.kind, r.strength) for r in rows]}"
     )

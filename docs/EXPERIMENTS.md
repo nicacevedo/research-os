@@ -201,6 +201,46 @@ Unobserved is `unknown`, never a number.
 
 A report that guesses gets quoted later as a measurement.
 
+## Replications and the execution receipt
+
+A replication is a second execution meant to differ from the first in a seed,
+a parameter, a composed input or a command. It counts as an **independent
+execution** only on evidence that the difference reached the computation
+(`docs/ARCHITECTURE_INVARIANTS.md`, INV-07). Different output bytes are not
+that evidence: a program that ignores its new seed but writes a timestamp
+produces different bytes and the same measurement.
+
+Before a replication runs, Research OS freezes an execution manifest -- the
+parent experiment, the code identity, the inputs, the environment, and the
+independence variables, i.e. everything that differs from the primary's
+frozen specification. The evidence it then accepts is the program's own
+**execution receipt**: a top-level `execution_receipt` object in any JSON
+output the command writes, reporting what it actually used:
+
+```json
+{
+  "summary": {"overlap": 0.4},
+  "execution_receipt": {
+    "seeds": [14],
+    "parameters": {"seed": 14},
+    "inputs": {"plans/sweep.json": "<sha256 of the bytes it read>"}
+  }
+}
+```
+
+Each reported value must equal the replication's intended one; at least one
+intended variable must be reported; a reported value that is the primary's
+is a contradiction. A replication that runs a *different declared command*
+needs no receipt: the executor itself launched the other program. A receipt
+found inside a model-composed input is refused.
+
+A command that writes no receipt still runs, and its replication is recorded
+`INSUFFICIENT` with the reason -- a capability-limited state, not a finding
+about the idea. Declared commands that support replication should therefore
+report the configuration they consumed. Whether the replication *agrees* with
+the primary is assessed separately, on the values the frozen analysis read,
+and recorded beside it.
+
 ## Isolation
 
 An experiment runs in a worktree, and the worktree is scanned for outbound
