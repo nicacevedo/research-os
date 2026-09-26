@@ -24,6 +24,8 @@ only handler that produces a *disposition* from a model's opinion is
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -73,7 +75,7 @@ from research_os.portfolio.models import (
 )
 from research_os.portfolio.prompts import CURRENT_REVIEW_PROMPTS
 from research_os.portfolio.prompts import TEMPLATES as PORTFOLIO_TEMPLATES
-from research_os.portfolio.store import PortfolioStore
+from research_os.portfolio.store import PortfolioStateError, PortfolioStore
 from research_os.runtime.failures import FailureClass
 from research_os.runtime.interfaces import (
     ArtifactStore,
@@ -1397,7 +1399,15 @@ def run_review_board(
             )
         recorded.append(str(outcome.data.get("review_id", "")))
 
-    finish_review_board(context, snapshot)
+    missing = finish_review_board(context, snapshot)
+    if missing:
+        return StageOutcome.failed(
+            f"the review board is incomplete: {', '.join(map(str, missing))} "
+            f"has no completed review of this revision",
+            failure_class=FailureClass.UNKNOWN,
+            cost_usd=total,
+            model_calls=calls,
+        )
     return StageOutcome.succeeded(
         f"{len(recorded)} review(s) recorded",
         disposition=Disposition.CONTINUE,
@@ -1407,20 +1417,32 @@ def run_review_board(
     )
 
 
-def finish_review_board(context: TrackContext, snapshot: stages.TrackSnapshot) -> None:
-    """What happens once every missing reviewer has answered.
+def finish_review_board(
+    context: TrackContext, snapshot: stages.TrackSnapshot
+) -> tuple[ReviewerRole, ...]:
+    """Close the board if, and only if, every required reviewer has answered.
 
     Separate from the reviewers so the graph can call it after its third node,
     and so that "the board is complete" is one statement rather than one per
-    dispatch path.
+    dispatch path. Returns the roles still missing, and does nothing else when
+    there are any (INV-08): a board missing a reviewer resolves no objection
+    and does not move the idea. The track graph ran all three reviewer nodes
+    unconditionally and each overwrote the last one's failure, so a board
+    whose methodology reviewer could not be reached was recorded SUCCEEDED
+    and moved the idea to REVIEW on two readings (M2).
     """
 
-    _try_resolve_objections(context, _refresh(context, snapshot))
+    refreshed = _refresh(context, snapshot)
+    missing = refreshed.missing_review_roles
+    if missing:
+        return missing
+    _try_resolve_objections(context, refreshed)
     if (
         context.portfolio.require_idea(context.idea_id).status
         is IdeaStatus.INVESTIGATING
     ):
         context.portfolio.set_status(idea_id=context.idea_id, status=IdeaStatus.REVIEW)
+    return ()
 
 
 def _refresh(
@@ -2283,6 +2305,8 @@ def _record_review(
         ).digest
     )
     review, _created = context.portfolio.record_review(
+        action_id=context.action_id,
+        response_digest=_response_digest(response),
         idea_id=context.idea_id,
         idea_version=snapshot.version.version,
         reviewer_role=role,
@@ -2304,6 +2328,17 @@ def _record_review(
         independence_note=response.independence_note,
         call_id=response.call_id,
     )
+    if response.call_id is not None and review.call_id != response.call_id:
+        # INV-04. Nothing this response says may reach the record unless the
+        # record is *this* response's: attaching its objections to, or
+        # applying its recommendation beside, another call's row is how a
+        # dropped review came to be applied (H4) and a re-run's objections to
+        # land on the first review (M3).
+        raise PortfolioStateError(
+            f"the review recorded for {role} belongs to {review.call_id}, not to "
+            f"the call that produced this response ({response.call_id}); "
+            f"refusing to apply an answer that has no record of its own"
+        )
     from research_os.portfolio import frontier
 
     basis = {
@@ -2336,6 +2371,17 @@ def _record_review(
         objections=asked,
     )
     return review.review_id
+
+
+def _response_digest(response: ModelResponse) -> str:
+    """What a review row records the response *was*, by digest."""
+
+    payload = response.structured if response.structured is not None else response.text
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, default=str, ensure_ascii=False).encode(
+            "utf-8"
+        )
+    ).hexdigest()
 
 
 def _try_resolve_objections(

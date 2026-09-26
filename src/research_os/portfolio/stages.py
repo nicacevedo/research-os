@@ -204,6 +204,48 @@ class TrackSnapshot:
         }
 
 
+def basis_review_ids(stage: Stage, reviews: Sequence[IdeaReview]) -> list[str]:
+    """The reviews that are part of a stage's scientific basis.
+
+    For every stage, the live reviews -- except that a meta-review's basis is
+    the record it *synthesises*: the content, the evidence and the board. Its
+    own output is not part of that record. It was, and so the basis a
+    meta-review was bought against was never the basis afterwards: its own
+    review joined ``live_reviews``, ``select_stage`` found META_REVIEW missing
+    from ``basis_stages``, and a second meta-review of the identical content,
+    evidence and board was bought -- whose answer was applied while its row
+    was dropped (H4). One helper, called by ``track._basis_for`` and by
+    :func:`snapshot_for`, so the purchase and the selector cannot disagree.
+    """
+
+    if stage is Stage.META_REVIEW:
+        return [
+            item.review_id
+            for item in reviews
+            if item.reviewer_role is not ReviewerRole.META
+        ]
+    return [item.review_id for item in reviews]
+
+
+def board_state(snapshot: TrackSnapshot) -> dict[ReviewerRole, str]:
+    """Each required board role, and whether it has a completed live review.
+
+    ``COMPLETED`` or ``MISSING``, explicitly (INV-08): a role that failed and
+    a role that was never asked are both ``MISSING``, and nothing about the
+    other roles' success changes that.
+    """
+
+    present = {item.reviewer_role for item in snapshot.live_reviews}
+    return {
+        role: ("COMPLETED" if role in present else "MISSING")
+        for role in (
+            ReviewerRole.METHODOLOGY,
+            ReviewerRole.NOVELTY,
+            ReviewerRole.SKEPTIC,
+        )
+    }
+
+
 def snapshot_for(
     store: Any,
     idea: Any,
@@ -265,7 +307,7 @@ def snapshot_for(
     basis = pdigests.basis_digest(
         content=current.content_digest,
         evidence_ids=[item.evidence_id for item in evidence],
-        review_ids=[item.review_id for item in reviews],
+        review_ids=basis_review_ids(Stage.META_REVIEW, reviews),
         stage_inputs={"stage": str(Stage.META_REVIEW)},
     )
     # The status read now, with everything else, and not the caller's copy:

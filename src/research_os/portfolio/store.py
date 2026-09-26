@@ -142,7 +142,8 @@ REVIEW_COLUMNS = (
     "recommendation, detail_artifact_id, reviewed_content_digest, "
     "reviewed_evidence_digest, packet_digest, prompt_version, call_id, provider, "
     "model, provider_family, independence_vs_origin, context_class, "
-    "independence_note, created_at"
+    "independence_note, created_at, action_id, attempt, supersedes_review_id, "
+    "response_digest"
 )
 OBJECTION_COLUMNS = (
     "objection_id, idea_id, raised_in_review, raised_at_version, objection_key, "
@@ -2525,68 +2526,42 @@ class PortfolioStore:
         recommendation: Disposition | None = None,
         detail_artifact_id: str | None = None,
         independence_note: str = "",
+        action_id: str | None = None,
+        response_digest: str | None = None,
     ) -> tuple[IdeaReview, bool]:
-        """Record one review. Returns ``(review, created)``.
+        """Record one review: the event of one reviewer call. Returns ``(review, created)``.
 
-        Idempotent on ``(idea, version, role, content digest, evidence
-        digest)``: the same reviewer asked the same question about the same
-        science twice is one review, which is what makes a replayed stage free
-        rather than expensive.
+        **Append-only, and keyed by the call** (`sql/0040`, INV-04). A replay
+        of the same call -- a resumed node, a retried transaction -- finds the
+        row that call already wrote and returns it with ``created`` false. A
+        *different* call is a different review, however similar its question:
+        it gets its own row, its own ``attempt`` at this binding, and the
+        review it follows as ``supersedes_review_id``.
+
+        This used to be idempotent on ``(idea, version, role, content digest,
+        evidence digest)`` and returned whatever row was already there. So a
+        second meta-review of an unchanged record was *applied* while its row
+        was dropped -- the idea stood VALIDATED beside the only META review on
+        file, which had declined it (H4) -- and a re-run reviewer's objections
+        were attached to the first call's review (M3). A response that
+        changes state must have a record of its own; this is where it gets one.
         """
 
-        review_id = new_idea_review_id()
-        params = {
-            "review_id": review_id,
-            "idea_id": idea_id,
-            "version": idea_version,
-            "role": str(reviewer_role),
-            "verdict": str(verdict),
-            "severity": str(severity),
-            "summary": summary,
-            "recommendation": str(recommendation) if recommendation else None,
-            "detail_artifact_id": detail_artifact_id,
-            "content": reviewed_content_digest,
-            "evidence": reviewed_evidence_digest,
-            "packet": packet_digest,
-            "prompt_version": prompt_version,
-            "call_id": call_id,
-            "provider": provider,
-            "model": model,
-            "family": provider_family,
-            "independence": str(independence_vs_origin),
-            "context": context_class,
-            "note": independence_note,
-        }
         with self._tx() as conn:
-            row = conn.execute(
-                f"""
-                insert into idea_reviews
-                    (review_id, idea_id, idea_version, reviewer_role, verdict,
-                     severity, summary, recommendation, detail_artifact_id,
-                     reviewed_content_digest, reviewed_evidence_digest,
-                     packet_digest, prompt_version, call_id, provider, model,
-                     provider_family, independence_vs_origin, context_class,
-                     independence_note)
-                values (%(review_id)s, %(idea_id)s, %(version)s, %(role)s,
-                        %(verdict)s, %(severity)s, %(summary)s, %(recommendation)s,
-                        %(detail_artifact_id)s, %(content)s, %(evidence)s,
-                        %(packet)s, %(prompt_version)s, %(call_id)s, %(provider)s,
-                        %(model)s, %(family)s, %(independence)s, %(context)s,
-                        %(note)s)
-                on conflict (idea_id, idea_version, reviewer_role,
-                             reviewed_content_digest, reviewed_evidence_digest)
-                    do nothing
-                returning {REVIEW_COLUMNS}
-                """,
-                params,
-            ).fetchone()
-            if row is not None:
-                return IdeaReview.model_validate(row), True
-            existing = conn.execute(
-                f"""
-                select {REVIEW_COLUMNS} from idea_reviews
+            if call_id is not None:
+                replayed = conn.execute(
+                    f"select {REVIEW_COLUMNS} from idea_reviews where call_id = %s",
+                    (call_id,),
+                ).fetchone()
+                if replayed is not None:
+                    return IdeaReview.model_validate(replayed), False
+            prior = conn.execute(
+                """
+                select review_id, attempt from idea_reviews
                  where idea_id = %s and idea_version = %s and reviewer_role = %s
                    and reviewed_content_digest = %s and reviewed_evidence_digest = %s
+                 order by attempt desc, created_at desc, review_id desc
+                 limit 1
                 """,
                 (
                     idea_id,
@@ -2595,6 +2570,60 @@ class PortfolioStore:
                     reviewed_content_digest,
                     reviewed_evidence_digest,
                 ),
+            ).fetchone()
+            row = conn.execute(
+                f"""
+                insert into idea_reviews
+                    (review_id, idea_id, idea_version, reviewer_role, verdict,
+                     severity, summary, recommendation, detail_artifact_id,
+                     reviewed_content_digest, reviewed_evidence_digest,
+                     packet_digest, prompt_version, call_id, provider, model,
+                     provider_family, independence_vs_origin, context_class,
+                     independence_note, action_id, attempt, supersedes_review_id,
+                     response_digest)
+                values (%(review_id)s, %(idea_id)s, %(version)s, %(role)s,
+                        %(verdict)s, %(severity)s, %(summary)s, %(recommendation)s,
+                        %(detail_artifact_id)s, %(content)s, %(evidence)s,
+                        %(packet)s, %(prompt_version)s, %(call_id)s, %(provider)s,
+                        %(model)s, %(family)s, %(independence)s, %(context)s,
+                        %(note)s, %(action_id)s, %(attempt)s, %(supersedes)s,
+                        %(response_digest)s)
+                on conflict (call_id) where call_id is not null do nothing
+                returning {REVIEW_COLUMNS}
+                """,
+                {
+                    "review_id": new_idea_review_id(),
+                    "idea_id": idea_id,
+                    "version": idea_version,
+                    "role": str(reviewer_role),
+                    "verdict": str(verdict),
+                    "severity": str(severity),
+                    "summary": summary,
+                    "recommendation": str(recommendation) if recommendation else None,
+                    "detail_artifact_id": detail_artifact_id,
+                    "content": reviewed_content_digest,
+                    "evidence": reviewed_evidence_digest,
+                    "packet": packet_digest,
+                    "prompt_version": prompt_version,
+                    "call_id": call_id,
+                    "provider": provider,
+                    "model": model,
+                    "family": provider_family,
+                    "independence": str(independence_vs_origin),
+                    "context": context_class,
+                    "note": independence_note,
+                    "action_id": action_id,
+                    "attempt": int(prior["attempt"]) + 1 if prior else 1,
+                    "supersedes": str(prior["review_id"]) if prior else None,
+                    "response_digest": response_digest,
+                },
+            ).fetchone()
+            if row is not None:
+                return IdeaReview.model_validate(row), True
+            # A concurrent replay of the same call won the insert.
+            existing = conn.execute(
+                f"select {REVIEW_COLUMNS} from idea_reviews where call_id = %s",
+                (call_id,),
             ).fetchone()
         if existing is None:  # pragma: no cover - the conflict target guarantees it
             raise PortfolioStateError(f"could not record a review of {idea_id}")

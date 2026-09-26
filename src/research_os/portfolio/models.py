@@ -816,6 +816,14 @@ class IdeaReview(_Record):
     context_class: ContextClass
     independence_note: str = ""
     created_at: datetime
+    #: A review is an event of the call that produced it (`sql/0040`, INV-04).
+    #: The action that bought the call; which attempt this is at its binding;
+    #: the earlier review of the same binding it follows, if any; and a digest
+    #: of the response it records.
+    action_id: str | None = None
+    attempt: int = 1
+    supersedes_review_id: str | None = None
+    response_digest: str | None = None
 
 
 class IdeaObjection(_Record):

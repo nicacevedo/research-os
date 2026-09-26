@@ -206,18 +206,71 @@ def test_a_review_by_a_superseded_prompt_is_not_live(
     )
 
 
-def test_recording_the_same_review_twice_is_one_review(
+def _call(portfolio: PortfolioStore) -> str:
+    from research_os.runtime.models import ModelCallStatus
+    from research_os.runtime.store import RuntimeStore
+
+    return (
+        RuntimeStore(portfolio.db)
+        .record_model_call(
+            provider="codex", role="novelty_reviewer", status=ModelCallStatus.OK
+        )
+        .call_id
+    )
+
+
+def test_recording_the_same_call_twice_is_one_review(
+    portfolio: PortfolioStore, runtime_project: str
+) -> None:
+    """A replay of one reviewer call finds the row that call already wrote.
+
+    The identity is the *call* (`sql/0040`, INV-04). It used to be the
+    binding -- idea, version, role and the two digests -- which is what let a
+    second, different call be silently folded into the first one's row.
+    """
+
+    idea, _ = seed_idea(portfolio, runtime_project)
+    call = _call(portfolio)
+    first = record_review(
+        portfolio,
+        idea_id=idea.idea_id,
+        version=1,
+        role=ReviewerRole.NOVELTY,
+        call_id=call,
+    )
+    second = record_review(
+        portfolio,
+        idea_id=idea.idea_id,
+        version=1,
+        role=ReviewerRole.NOVELTY,
+        call_id=call,
+    )
+    assert first.review_id == second.review_id
+    assert len(portfolio.list_reviews(idea_id=idea.idea_id)) == 1
+
+
+def test_two_calls_on_one_binding_are_two_reviews(
     portfolio: PortfolioStore, runtime_project: str
 ) -> None:
     idea, _ = seed_idea(portfolio, runtime_project)
     first = record_review(
-        portfolio, idea_id=idea.idea_id, version=1, role=ReviewerRole.NOVELTY
+        portfolio,
+        idea_id=idea.idea_id,
+        version=1,
+        role=ReviewerRole.NOVELTY,
+        call_id=_call(portfolio),
     )
     second = record_review(
-        portfolio, idea_id=idea.idea_id, version=1, role=ReviewerRole.NOVELTY
+        portfolio,
+        idea_id=idea.idea_id,
+        version=1,
+        role=ReviewerRole.NOVELTY,
+        call_id=_call(portfolio),
     )
-    assert first.review_id == second.review_id
-    assert len(portfolio.list_reviews(idea_id=idea.idea_id)) == 1
+    assert first.review_id != second.review_id
+    assert (first.attempt, second.attempt) == (1, 2)
+    assert second.supersedes_review_id == first.review_id
+    assert len(portfolio.list_reviews(idea_id=idea.idea_id)) == 2
 
 
 # ---------------------------------------------------------------- lineage --

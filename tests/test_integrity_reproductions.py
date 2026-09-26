@@ -26,6 +26,7 @@ from research_os.portfolio.store import PortfolioStateError, PortfolioStore
 from research_os.portfolio.track import advance_idea
 from research_os.runtime.budgets import BudgetLedger
 from research_os.runtime.db import Database
+from research_os.runtime.failures import FailureClass
 from research_os.runtime.models import BudgetScope
 from research_os.runtime.queue import WorkQueue
 from research_os.runtime.routing import ProviderCallFailedError
@@ -43,6 +44,7 @@ from tests.test_final_hardening_regressions import (
 from tests.test_final_hardening_regressions import (
     _router as _billing_router,
 )
+from tests.test_portfolio_empirical import project_repo
 from tests.test_portfolio_promotion import (
     LITERATURE_FALSIFIER,
     TerminologyAwareLiterature,
@@ -64,6 +66,7 @@ __all__ = [
     "checkpoint_tables",
     "pg_dsn",
     "portfolio",
+    "project_repo",
     "runtime_db",
     "runtime_project",
     "runtime_xdg",
@@ -510,3 +513,174 @@ def test_m1_literature_confidence_counts_searches_that_were_run(
     # The index was asked at most a couple of questions per audit; none of the
     # six the scout listed. A confidence of 1.0 is the model's claim, not a count.
     assert confidence < 1.0, (confidence, executed, _why(trace))
+
+
+# ------------------------------------------------------------------ H4 -----
+NOT_YET = {
+    "recommendation": "CONTINUE",
+    "summary": "not yet: the board's praise is thin and nothing was replicated",
+    "unresolved_disagreements": [],
+}
+PROMOTE = {
+    "recommendation": "VALIDATED",
+    "summary": "all three reviewers were satisfied",
+    "unresolved_disagreements": [],
+}
+
+
+class SecondOpinionMeta(TwoPathRouter):
+    """A meta-reviewer that declines on its first call and promotes after."""
+
+    meta_calls: int = 0
+
+    def complete(self, request: Any) -> Any:  # type: ignore[override]
+        if str(request.role) == "meta_reviewer":
+            type(self).meta_calls += 1
+            answer = NOT_YET if type(self).meta_calls == 1 else PROMOTE
+            self.answers = {**self.answers, "meta_reviewer": answer}
+        return super().complete(request)
+
+
+def test_h4_a_declining_meta_review_is_not_reasked_on_the_same_record(
+    portfolio: PortfolioStore,
+    runtime_db: Database,
+    pg_dsn: str,
+    checkpoint_tables: str,
+    tmp_path: Path,
+    runtime_project: str,
+) -> None:
+    """H4. ``_review_revision_meta_reroll.py``, sha256
+    0ffecd21b294cdf96de981ed9140c8a90b630a38bdaa7b9ea0257e8359bf1cd9.
+    """
+
+    from research_os.portfolio.models import Disposition, ReviewerRole
+
+    idea, _ = seed_idea(portfolio, runtime_project, falsifier=LITERATURE_FALSIFIER)
+    base = _portfolio_router(runtime_db)
+    SecondOpinionMeta.meta_calls = 0
+    router = SecondOpinionMeta(answers=base.answers, store=RuntimeStore(runtime_db))
+    literature = TerminologyAwareLiterature()
+
+    trace: list[str] = []
+    for _ in range(30):
+        result = advance_idea(
+            runtime_config=make_config(pg_dsn, tmp_path / "artifacts"),
+            portfolio_config=load_config(),
+            db=runtime_db,
+            project_id=runtime_project,
+            idea_id=idea.idea_id,
+            models=router,
+            literature=literature,
+        )
+        trace.append(
+            f"{result.stage} ok={result.ok} {(result.detail or result.reason)[:80]}"
+        )
+        if portfolio.require_idea(idea.idea_id).status is IdeaStatus.VALIDATED:
+            break
+        if result.stage is None or not result.ok:
+            break
+
+    version = portfolio.require_version(idea.idea_id)
+    metas = [
+        item
+        for item in portfolio.list_reviews(
+            idea_id=idea.idea_id, idea_version=version.version
+        )
+        if item.reviewer_role is ReviewerRole.META
+    ]
+    status = portfolio.require_idea(idea.idea_id).status
+    # Nothing changed between the two meta-reviews: same content, same
+    # evidence, same three board reviews.
+    evidence_digests = {item.reviewed_evidence_digest for item in metas}
+    detail = (
+        _why(trace)
+        + f"\n  status={status} meta calls={SecondOpinionMeta.meta_calls} "
+        + f"meta review rows={[(m.call_id, str(m.recommendation)) for m in metas]} "
+        + f"evidence digests={len(evidence_digests)}"
+    )
+
+    # The defect: the idea is VALIDATED; the only META review on file for
+    # this version recommends CONTINUE; the call that recommended VALIDATED
+    # has no review row at all.
+    assert SecondOpinionMeta.meta_calls == 1 or status is not IdeaStatus.VALIDATED, (
+        "the meta-review was re-asked on an unchanged record and its second "
+        "answer promoted the idea" + detail
+    )
+    assert all(item.recommendation is not Disposition.CONTINUE for item in metas) or (
+        status is not IdeaStatus.VALIDATED
+    ), "the status is VALIDATED beside a META review that declined it" + detail
+    # And, stated directly: every meta-review call has exactly one row.
+    assert len(metas) == SecondOpinionMeta.meta_calls, detail
+
+
+# ------------------------------------------------------------------ M2 -----
+class MethodologistDownOnce(TwoPathRouter):
+    down: bool = True
+
+    def complete(self, request: Any) -> Any:  # type: ignore[override]
+        if str(request.role) == "methodology_reviewer" and type(self).down:
+            type(self).down = False
+            raise ProviderCallFailedError(
+                "session limit", failure_class=FailureClass.PROVIDER_UNAVAILABLE
+            )
+        return super().complete(request)
+
+
+def test_m2_a_board_missing_a_reviewer_is_not_a_completed_board(
+    portfolio: PortfolioStore,
+    runtime_db: Database,
+    pg_dsn: str,
+    checkpoint_tables: str,
+    tmp_path: Path,
+    runtime_project: str,
+) -> None:
+    """M2. ``_review_revision_board_mask.py``, sha256
+    35ffa40b59d4be0bcd3bdd59b6dae3a025bc75252aa6ba3faec439d565bf05f4.
+    """
+
+    from research_os.portfolio.models import ActionStatus, ReviewerRole
+
+    idea, _ = seed_idea(portfolio, runtime_project, falsifier=LITERATURE_FALSIFIER)
+    MethodologistDownOnce.down = True
+    router = MethodologistDownOnce(
+        answers=_portfolio_router(runtime_db).answers, store=RuntimeStore(runtime_db)
+    )
+    trace: list[str] = []
+    board = None
+    for _ in range(20):
+        result = advance_idea(
+            runtime_config=make_config(pg_dsn, tmp_path / "artifacts"),
+            portfolio_config=load_config(),
+            db=runtime_db,
+            project_id=runtime_project,
+            idea_id=idea.idea_id,
+            models=router,
+            literature=TerminologyAwareLiterature(),
+        )
+        trace.append(f"{result.stage} ok={result.ok} {(result.detail or '')[:70]}")
+        if result.stage is Stage.REVIEW_BOARD:
+            board = result
+            break
+        if result.stage is None or not result.ok:
+            break
+    assert board is not None, _why(trace)
+    roles = {
+        item.reviewer_role for item in portfolio.live_reviews(idea_id=idea.idea_id)
+    }
+    action = [
+        item
+        for item in portfolio.list_actions(idea_id=idea.idea_id)
+        if item.stage is Stage.REVIEW_BOARD
+    ][-1]
+    status = portfolio.require_idea(idea.idea_id).status
+    detail = (
+        _why(trace)
+        + f"\n  roles={sorted(map(str, roles))} action={action.status} status={status}"
+    )
+    assert ReviewerRole.METHODOLOGY not in roles, detail  # the precondition
+    assert action.status is not ActionStatus.SUCCEEDED, (
+        "a board with no methodology review was recorded as SUCCEEDED" + detail
+    )
+    assert status is not IdeaStatus.REVIEW, (
+        "the idea was moved to REVIEW by a board of two" + detail
+    )

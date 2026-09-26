@@ -411,7 +411,11 @@ def _validated_unmet(
         found = [item for item in reviews if item.reviewer_role is role]
         if not found:
             unmet.append(f"no live {role} review of the current version")
-        elif not any(item.verdict in NON_NEGATIVE_VERDICTS for item in found):
+        elif not all(item.verdict in NON_NEGATIVE_VERDICTS for item in found):
+            # *Every* live reading of a required role must endorse (INV-08).
+            # Reviews are one row per call now, so a role can have two live
+            # readings of one binding -- and "any" would let a re-run's PASS
+            # mask the standing REVISE it followed.
             verdicts = ", ".join(sorted({str(item.verdict) for item in found}))
             unmet.append(f"the {role} did not endorse this ({verdicts})")
 

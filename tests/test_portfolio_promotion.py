@@ -19,7 +19,7 @@ The mathematical route still needs an executed check and remains unwired --
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -605,8 +605,15 @@ def test_a_prompt_version_bump_stales_the_board_and_the_track_recovers(
     )
     assert portfolio.require_idea(idea.idea_id).status is IdeaStatus.HUMAN_READY
 
+    # A prompt bump is a new template *and* the build's current identity for
+    # it. Bumping only the second -- which this test once did -- leaves a
+    # build whose reviewer can only ever produce a review it itself calls
+    # stale; the board then honestly cannot complete (INV-08), where it used
+    # to be recorded SUCCEEDED on a review that was not live.
+    bumped = replace(pprompts.TEMPLATES["skeptic_reviewer"], version=2)
+    monkeypatch.setitem(pprompts.TEMPLATES, "skeptic_reviewer", bumped)
     monkeypatch.setitem(
-        pprompts.CURRENT_REVIEW_PROMPTS, "skeptic_reviewer", "skeptic_reviewer@2"
+        pprompts.CURRENT_REVIEW_PROMPTS, "skeptic_reviewer", bumped.identity
     )
     assert not any(
         item.reviewer_role is ReviewerRole.SKEPTIC

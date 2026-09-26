@@ -176,15 +176,26 @@ def _outcome_update(outcome: runner.StageOutcome) -> dict[str, Any]:
 
 
 def _accumulate(state: TrackState, outcome: runner.StageOutcome) -> dict[str, Any]:
-    """Fold one reviewer's cost into what the board has spent so far.
+    """Fold one reviewer's outcome into what the board has done so far.
 
     Needed only by the review board, which is three nodes. Every other stage
     sets these once.
+
+    **A failure is kept** (INV-08). Each reviewer node used to write its own
+    ``failure_class`` over the last one's, so the novelty reviewer's success
+    erased the methodology reviewer's outage and the board was recorded
+    SUCCEEDED on two readings (M2). The first failure the board saw is the
+    board's failure, whatever succeeds after it; later reviewers still run,
+    so what they answered is kept and the retry asks only the missing role.
     """
 
     update = _outcome_update(outcome)
     update["cost_usd"] = str(Decimal(state.get("cost_usd", "0")) + outcome.cost_usd)
     update["model_calls"] = int(state.get("model_calls", 0)) + outcome.model_calls
+    if state.get("failure_class") and outcome.ok:
+        update["failure_class"] = state["failure_class"]
+        update["detail"] = state.get("detail", "")
+        update["disposition"] = state.get("disposition", "")
     return update
 
 
@@ -212,10 +223,30 @@ def _reviewer_node(role: ReviewerRole):
 def finish_board(
     state: TrackState, runtime: Runtime[runner.TrackContext]
 ) -> dict[str, Any]:
+    """Close the board -- or record, explicitly, that it is not complete.
+
+    A board is complete only when every required role has a live, completed
+    review of this revision (``stages.board_state``). Otherwise nothing is
+    resolved, the idea does not move, and the stage fails with the failure a
+    reviewer reported or, if none did, with the plain statement that roles
+    are missing.
+    """
+
     context = runtime.context
     snapshot = runner.build_snapshot(context)
-    runner.finish_review_board(context, snapshot)
-    return {"disposition": str(Disposition.CONTINUE)}
+    missing = runner.finish_review_board(context, snapshot)
+    if not missing:
+        return {"disposition": str(Disposition.CONTINUE)}
+    roles = ", ".join(str(role) for role in missing)
+    prior = state.get("detail", "")
+    return {
+        "failure_class": state.get("failure_class") or str(FailureClass.UNKNOWN),
+        "detail": (
+            f"the review board is incomplete: {roles} has no completed review of "
+            f"this revision" + (f" ({prior})" if prior else "")
+        ),
+        "disposition": "",
+    }
 
 
 def conclude(
@@ -810,7 +841,7 @@ def _basis_for(
     return pdigests.basis_digest(
         content=head.content_digest,
         evidence_ids=[item.evidence_id for item in evidence],
-        review_ids=[item.review_id for item in reviews],
+        review_ids=stages.basis_review_ids(stage, reviews),
         stage_inputs={"stage": str(stage)},
     )
 
