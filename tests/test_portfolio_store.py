@@ -19,6 +19,7 @@ from research_os.portfolio.models import (
     EvidenceStrength,
     IdeaOrigin,
     IdeaStatus,
+    ObjectionTarget,
     OperationalState,
     QualityTier,
     ReviewerRole,
@@ -485,14 +486,15 @@ def test_an_objection_survives_the_revision_that_claims_nothing(
         verdict=ReviewVerdict.REJECT,
         severity=Severity.FATAL,
         summary="Theorem 3 of Tibshirani (2013) already states this.",
+        objections=[
+            (
+                Severity.FATAL,
+                ObjectionTarget.CLAIM,
+                "Theorem 3 of Tibshirani (2013) already states this.",
+            )
+        ],
     )
-    portfolio.raise_objection(
-        idea_id=idea.idea_id,
-        review_id=review.review_id,
-        raised_at_version=1,
-        severity=Severity.FATAL,
-        summary="Theorem 3 of Tibshirani (2013) already states this.",
-    )
+    del review
     portfolio.append_version(
         idea_id=idea.idea_id,
         fields=idea_fields(core_idea="the same thing said differently"),
@@ -517,14 +519,15 @@ def test_an_objection_cannot_be_resolved_by_the_role_that_raised_it(
         verdict=ReviewVerdict.REVISE,
         severity=Severity.CRITICAL,
         summary="the identification argument assumes what it proves",
+        objections=[
+            (
+                Severity.CRITICAL,
+                ObjectionTarget.CLAIM,
+                "the identification argument assumes what it proves",
+            )
+        ],
     )
-    objection, _ = portfolio.raise_objection(
-        idea_id=idea.idea_id,
-        review_id=raised_by.review_id,
-        raised_at_version=1,
-        severity=Severity.CRITICAL,
-        summary="the identification argument assumes what it proves",
-    )
+    (objection,) = portfolio.review_objections(raised_by.review_id)
     key = pdigests.objection_key("the identification argument assumes what it proves")
     portfolio.append_version(
         idea_id=idea.idea_id,
@@ -567,14 +570,15 @@ def test_an_objection_cannot_be_resolved_by_a_version_that_never_named_it(
         verdict=ReviewVerdict.REVISE,
         severity=Severity.MAJOR,
         summary="the comparison is not like for like",
+        objections=[
+            (
+                Severity.MAJOR,
+                ObjectionTarget.CLAIM,
+                "the comparison is not like for like",
+            )
+        ],
     )
-    objection, _ = portfolio.raise_objection(
-        idea_id=idea.idea_id,
-        review_id=raised_by.review_id,
-        raised_at_version=1,
-        severity=Severity.MAJOR,
-        summary="the comparison is not like for like",
-    )
+    (objection,) = portfolio.review_objections(raised_by.review_id)
     portfolio.append_version(
         idea_id=idea.idea_id,
         fields=idea_fields(title="a different title"),
@@ -592,47 +596,41 @@ def test_an_objection_cannot_be_resolved_by_a_version_that_never_named_it(
         )
 
 
-def test_reviving_an_idea_carries_its_unanswered_objections(
-    portfolio: PortfolioStore, runtime_project: str
+def test_an_objection_is_never_added_to_a_review_after_it_was_recorded(
+    portfolio: PortfolioStore, runtime_db: Database, runtime_project: str
 ) -> None:
-    dead, _ = seed_idea(portfolio, runtime_project)
+    """A review and its objections are one event (INV-04, `sql/0044`).
+
+    This file used to test ``carry_objections_forward``, which appended a
+    retired idea's objections to an *existing* review of another idea. No
+    production path ever called it, and the thing it did -- adding
+    objections to a review after the review was recorded -- is exactly what
+    the atomic event forbids: it is how a review's recorded objection set
+    stops being the set its reviewer raised. It was removed; this is the rule
+    that replaced it, held by the database whatever the code does.
+    """
+
+    idea, _ = seed_idea(portfolio, runtime_project)
     review = record_review(
         portfolio,
-        idea_id=dead.idea_id,
+        idea_id=idea.idea_id,
         version=1,
         role=ReviewerRole.FALSIFIER,
         verdict=ReviewVerdict.REJECT,
         severity=Severity.FATAL,
-        summary="the compute required exceeds any cluster by four orders of magnitude",
+        summary="infeasible",
+        objections=[(Severity.FATAL, ObjectionTarget.CLAIM, "infeasible compute")],
     )
-    portfolio.raise_objection(
-        idea_id=dead.idea_id,
-        review_id=review.review_id,
-        raised_at_version=1,
-        severity=Severity.FATAL,
-        summary="the compute required exceeds any cluster by four orders of magnitude",
-    )
-    portfolio.set_status(
-        idea_id=dead.idea_id,
-        status=IdeaStatus.REJECTED,
-        retire_reason="infeasible compute",
-    )
-
-    revived, _ = portfolio.create_idea(
-        project_id=runtime_project,
-        origin=IdeaOrigin.REVIVAL,
-        fields=idea_fields(title="the same direction, on a smaller regime"),
-        parent_idea_id=dead.idea_id,
-        edge_kind=EdgeKind.REVIVES,
-        origin_role="failure_mining_explorer",
-    )
-    carried = portfolio.carry_objections_forward(
-        from_idea_id=dead.idea_id,
-        to_idea_id=revived.idea_id,
-        review_id=review.review_id,
-    )
-    assert carried == 1
-    assert len(portfolio.open_objections(idea_id=revived.idea_id)) == 1
+    with pytest.raises(RuntimeDatabaseError, match="one event"):  # noqa: SIM117
+        with runtime_db.tx() as conn:
+            conn.execute(
+                "insert into idea_objections (objection_id, idea_id, "
+                "raised_in_review, raised_at_version, objection_key, severity, "
+                "target, summary, ordinal) values ('IOBJ-late', %s, %s, 1, 'k', "
+                "'MINOR', 'CLAIM', 'an afterthought', 1)",
+                (idea.idea_id, review.review_id),
+            )
+    assert len(portfolio.review_objections(review.review_id)) == 1
 
 
 # --------------------------------------------------------------- tracking --

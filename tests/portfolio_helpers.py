@@ -87,12 +87,16 @@ def record_review(
     call_id: str | None = None,
     summary: str = "no objection",
     recommendation: Any = None,
+    objections: Any = (),
 ) -> Any:
     """Record a review bound to the idea's *current* content and evidence.
 
     Binding to the current digests is the default because a test that wants a
     stale review should have to say so; the hazard this layer exists to avoid
     is a review that silently stops being about what it read.
+
+    ``objections`` are ``(severity, target, summary)``, recorded with the
+    review as one event (`sql/0044`); ``severity`` must be the worst of them.
     """
 
     head = store.require_version(idea_id, version)
@@ -116,6 +120,7 @@ def record_review(
         independence_vs_origin=independence,
         context_class=str(ContextClass.FROZEN_PACKET),
         call_id=call_id,
+        objections=objections,
     )
     return review
 

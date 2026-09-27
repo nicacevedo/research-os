@@ -56,6 +56,7 @@ from research_os.portfolio.models import (
     FRONTIER_CLAIM_KINDS,
     OPEN_EXPERIMENT_STATES,
     PROVENANCE_FOR_ORIGIN,
+    SEVERITY_ORDER,
     TERMINAL_IDEA_STATUSES,
     TIER_ORDER,
     ActionStatus,
@@ -144,12 +145,12 @@ REVIEW_COLUMNS = (
     "reviewed_evidence_digest, packet_digest, prompt_version, call_id, provider, "
     "model, provider_family, independence_vs_origin, context_class, "
     "independence_note, created_at, action_id, attempt, supersedes_review_id, "
-    "response_digest"
+    "response_digest, objection_count"
 )
 OBJECTION_COLUMNS = (
     "objection_id, idea_id, raised_in_review, raised_at_version, objection_key, "
     "severity, target, summary, addressed_at_version, response, resolved_by_review, "
-    "resolved_at, created_at"
+    "resolved_at, created_at, ordinal"
 )
 EXPERIMENT_COLUMNS = (
     "experiment_id, idea_id, idea_version, project_id, role, state, command, "
@@ -2559,8 +2560,27 @@ class PortfolioStore:
         independence_note: str = "",
         action_id: str | None = None,
         response_digest: str | None = None,
+        objections: Sequence[tuple[Severity, ObjectionTarget, str]] = (),
     ) -> tuple[IdeaReview, bool]:
         """Record one review: the event of one reviewer call. Returns ``(review, created)``.
+
+        **The review and every objection it raised are one event** (`sql/0044`,
+        INV-04): written in one transaction, with the review stating how many
+        objections it raised and the database refusing, at commit, a review
+        whose rows do not match. A worker that dies before the commit leaves
+        neither -- the role is simply not done -- and nothing can add an
+        objection to a review afterwards. ``objections`` are ``(severity,
+        target, summary)`` in the order the reviewer gave them; the review's
+        ``severity`` must be the worst of them, or ``NONE`` when there are
+        none, as every reviewer contract defines it.
+
+        Nothing is deduplicated across reviews. Two reviewers who raise the
+        same words raise two objections, each attributed to its own review,
+        at its own severity. This used to key objections on their normalised
+        text per version, so a later reviewer's FATAL objection worded like
+        an earlier MINOR one was silently the MINOR one, attributed to the
+        earlier review -- and the fatal-objection gate found nothing
+        (the independent review of 8e92e8c, ``FATAL_DEDUPED_AS_MINOR``).
 
         **Append-only, and keyed by the call** (`sql/0040`, INV-04). A replay
         of the same call -- a resumed node, a retried transaction -- finds the
@@ -2578,6 +2598,27 @@ class PortfolioStore:
         changes state must have a record of its own; this is where it gets one.
         """
 
+        drafts = [
+            (Severity(item[0]), ObjectionTarget(item[1]), str(item[2]))
+            for item in objections
+        ]
+        for draft_severity, _target, draft_summary in drafts:
+            if draft_severity is Severity.NONE:
+                raise PortfolioStateError(
+                    "an objection with no severity is not an objection"
+                )
+            if not draft_summary.strip():
+                raise PortfolioStateError("an objection must say what it objects to")
+        worst = max(
+            (draft[0] for draft in drafts),
+            key=lambda item: SEVERITY_ORDER[item],
+            default=Severity.NONE,
+        )
+        if Severity(severity) is not worst:
+            raise PortfolioStateError(
+                f"a review's severity is the worst of its objections: this one "
+                f"says {severity} and its objections say {worst}"
+            )
         with self._tx() as conn:
             if call_id is not None:
                 replayed = conn.execute(
@@ -2611,14 +2652,14 @@ class PortfolioStore:
                      packet_digest, prompt_version, call_id, provider, model,
                      provider_family, independence_vs_origin, context_class,
                      independence_note, action_id, attempt, supersedes_review_id,
-                     response_digest)
+                     response_digest, objection_count)
                 values (%(review_id)s, %(idea_id)s, %(version)s, %(role)s,
                         %(verdict)s, %(severity)s, %(summary)s, %(recommendation)s,
                         %(detail_artifact_id)s, %(content)s, %(evidence)s,
                         %(packet)s, %(prompt_version)s, %(call_id)s, %(provider)s,
                         %(model)s, %(family)s, %(independence)s, %(context)s,
                         %(note)s, %(action_id)s, %(attempt)s, %(supersedes)s,
-                        %(response_digest)s)
+                        %(response_digest)s, %(objection_count)s)
                 on conflict (call_id) where call_id is not null do nothing
                 returning {REVIEW_COLUMNS}
                 """,
@@ -2647,9 +2688,37 @@ class PortfolioStore:
                     "attempt": int(prior["attempt"]) + 1 if prior else 1,
                     "supersedes": str(prior["review_id"]) if prior else None,
                     "response_digest": response_digest,
+                    "objection_count": len(drafts),
                 },
             ).fetchone()
             if row is not None:
+                # The objections, in the same transaction. A failure from here
+                # to the commit rolls back the review with them, and the
+                # deferred check in `sql/0044` refuses a commit in which the
+                # rows and the count disagree.
+                for ordinal, (draft_severity, target, draft_summary) in enumerate(
+                    drafts
+                ):
+                    conn.execute(
+                        """
+                        insert into idea_objections
+                            (objection_id, idea_id, raised_in_review,
+                             raised_at_version, objection_key, severity, target,
+                             summary, ordinal)
+                        values (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        """,
+                        (
+                            new_objection_id(),
+                            idea_id,
+                            str(row["review_id"]),
+                            idea_version,
+                            pdigests.objection_key(draft_summary),
+                            str(draft_severity),
+                            str(target),
+                            draft_summary,
+                            ordinal,
+                        ),
+                    )
                 return IdeaReview.model_validate(row), True
             # A concurrent replay of the same call won the insert.
             existing = conn.execute(
@@ -2699,7 +2768,13 @@ class PortfolioStore:
           asked;
         - it is not older than ``max_age_seconds``. A parked idea unparked six
           months later has reviews nobody revisited and literature that has
-          moved.
+          moved;
+        - it is a *whole* review event: its ``objection_count`` is recorded
+          (`sql/0044`). A review from before atomic review events whose
+          objection set may be incomplete -- lost to a crash between two
+          transactions, or deduplicated into another review's row -- has a
+          null count and is never live, so no gate counts an endorsement
+          whose objections cannot be shown to be on record (INV-04, INV-08).
 
         **The last two default to this build's values, and that is deliberate.**
         They were optional once, with ``None`` meaning "skip this check", and
@@ -2749,6 +2824,7 @@ class PortfolioStore:
                    and idea_version = %(version)s
                    and reviewed_content_digest = %(content)s
                    and reviewed_evidence_digest = %(evidence)s
+                   and objection_count is not null
                    and (%(max_age)s::double precision is null
                         or created_at > now() - make_interval(secs => %(max_age)s))
                  order by created_at, review_id
@@ -2775,63 +2851,16 @@ class PortfolioStore:
         )
 
     # ---------------------------------------------------------- objections --
-    def raise_objection(
-        self,
-        *,
-        idea_id: str,
-        review_id: str,
-        raised_at_version: int,
-        severity: Severity,
-        summary: str,
-        target: ObjectionTarget = ObjectionTarget.CLAIM,
-    ) -> tuple[IdeaObjection, bool]:
-        """Record one objection against an idea. Returns ``(objection, created)``.
+    def review_objections(self, review_id: str) -> tuple[IdeaObjection, ...]:
+        """The objections one review event raised, in the order it raised them."""
 
-        Keyed by the normalised text, so the same objection raised again -- by
-        another reviewer, or at a later version after a revision claimed to
-        answer it -- is recognisably the same objection and not a new one.
-        """
-
-        if severity is Severity.NONE:
-            raise PortfolioStateError(
-                "an objection with no severity is not an objection"
-            )
-        key = pdigests.objection_key(summary)
-        objection_id = new_objection_id()
         with self._tx() as conn:
-            row = conn.execute(
-                f"""
-                insert into idea_objections
-                    (objection_id, idea_id, raised_in_review, raised_at_version,
-                     objection_key, severity, target, summary)
-                values (%(objection_id)s, %(idea_id)s, %(review_id)s, %(version)s,
-                        %(key)s, %(severity)s, %(target)s, %(summary)s)
-                on conflict (idea_id, objection_key, raised_at_version) do nothing
-                returning {OBJECTION_COLUMNS}
-                """,
-                {
-                    "objection_id": objection_id,
-                    "idea_id": idea_id,
-                    "review_id": review_id,
-                    "version": raised_at_version,
-                    "key": key,
-                    "severity": str(severity),
-                    "target": str(target),
-                    "summary": summary,
-                },
-            ).fetchone()
-            if row is not None:
-                return IdeaObjection.model_validate(row), True
-            existing = conn.execute(
+            rows = conn.execute(
                 f"select {OBJECTION_COLUMNS} from idea_objections "
-                "where idea_id = %s and objection_key = %s and raised_at_version = %s",
-                (idea_id, key, raised_at_version),
-            ).fetchone()
-        if existing is None:  # pragma: no cover
-            raise PortfolioStateError(
-                f"could not record an objection against {idea_id}"
-            )
-        return IdeaObjection.model_validate(existing), False
+                "where raised_in_review = %s order by ordinal nulls last, created_at",
+                (review_id,),
+            ).fetchall()
+        return tuple(IdeaObjection.model_validate(row) for row in rows)
 
     def open_objections(
         self, *, idea_id: str, minimum: Severity | None = None
@@ -2956,29 +2985,6 @@ class PortfolioStore:
                 },
             ).fetchone()
         return IdeaObjection.model_validate(row)
-
-    def carry_objections_forward(
-        self, *, from_idea_id: str, to_idea_id: str, review_id: str
-    ) -> int:
-        """Copy a retired idea's standing objections onto its revival or merge.
-
-        A revived idea inherits no reviews -- the binding is to a version and
-        this is a different idea -- and without this it would inherit no
-        *obligation* either, so reviving would launder a fatal objection into
-        a clean slate. Returns how many were carried.
-        """
-
-        carried = 0
-        for objection in self.open_objections(idea_id=from_idea_id):
-            _, created = self.raise_objection(
-                idea_id=to_idea_id,
-                review_id=review_id,
-                raised_at_version=1,
-                severity=objection.severity,
-                summary=objection.summary,
-            )
-            carried += int(created)
-        return carried
 
     # ------------------------------------------------------------- actions --
     def open_action(

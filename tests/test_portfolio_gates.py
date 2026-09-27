@@ -257,14 +257,15 @@ def test_a_standing_fatal_objection_blocks_promising(
         verdict=ReviewVerdict.REJECT,
         severity=Severity.FATAL,
         summary="Theorem 3 of a 2013 paper already states exactly this",
+        objections=[
+            (
+                Severity.FATAL,
+                ObjectionTarget.CLAIM,
+                "Theorem 3 of a 2013 paper already states exactly this",
+            )
+        ],
     )
-    portfolio.raise_objection(
-        idea_id=built.idea_id,
-        review_id=killer.review_id,
-        raised_at_version=1,
-        severity=Severity.FATAL,
-        summary="Theorem 3 of a 2013 paper already states exactly this",
-    )
+    del killer
     result = built.gate(requested=QualityTier.PROMISING)
     assert not result.passed
     assert any("fatal objection" in item for item in result.unmet)
@@ -473,14 +474,15 @@ def test_a_standing_critical_objection_blocks_validated(
         verdict=ReviewVerdict.PASS_WITH_OBJECTIONS,
         severity=Severity.CRITICAL,
         summary="the comparison holds only under an assumption never stated",
+        objections=[
+            (
+                Severity.CRITICAL,
+                ObjectionTarget.CLAIM,
+                "the comparison holds only under an assumption never stated",
+            )
+        ],
     )
-    portfolio.raise_objection(
-        idea_id=built.idea_id,
-        review_id=raiser.review_id,
-        raised_at_version=1,
-        severity=Severity.CRITICAL,
-        summary="the comparison holds only under an assumption never stated",
-    )
+    del raiser
     result = built.gate(requested=QualityTier.VALIDATED)
     assert not result.passed
     assert any("CRITICAL or above" in item for item in result.unmet)
@@ -520,14 +522,15 @@ def test_an_unanswered_major_objection_blocks_human_ready_only(
         verdict=ReviewVerdict.PASS_WITH_OBJECTIONS,
         severity=Severity.MAJOR,
         summary="the baseline is not tuned to the same budget",
+        objections=[
+            (
+                Severity.MAJOR,
+                ObjectionTarget.CLAIM,
+                "the baseline is not tuned to the same budget",
+            )
+        ],
     )
-    portfolio.raise_objection(
-        idea_id=built.idea_id,
-        review_id=raiser.review_id,
-        raised_at_version=1,
-        severity=Severity.MAJOR,
-        summary="the baseline is not tuned to the same budget",
-    )
+    del raiser
     result = built.gate()
     assert result.tier is QualityTier.VALIDATED
     assert any("MAJOR or above" in item for item in result.unmet)
@@ -767,15 +770,15 @@ def test_a_fatal_objection_to_the_test_still_blocks_promotion(
         verdict=ReviewVerdict.REJECT,
         severity=Severity.FATAL,
         summary="the proposed check is guaranteed by construction",
+        objections=[
+            (
+                Severity.FATAL,
+                ObjectionTarget.TEST,
+                "the proposed check is guaranteed by construction",
+            )
+        ],
     )
-    objection, _created = portfolio.raise_objection(
-        idea_id=built.idea_id,
-        review_id=killer.review_id,
-        raised_at_version=1,
-        severity=Severity.FATAL,
-        target=ObjectionTarget.TEST,
-        summary="the proposed check is guaranteed by construction",
-    )
+    (objection,) = portfolio.review_objections(killer.review_id)
     assert objection.target is ObjectionTarget.TEST
 
     result = built.gate(requested=QualityTier.PROMISING)

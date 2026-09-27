@@ -158,16 +158,19 @@ def test_a_top_idea_reports_its_strongest_objection(
             "research_os.portfolio.models", fromlist=["Severity"]
         ).Severity.MAJOR,
         summary="the baseline is not tuned to the same budget",
+        objections=[
+            (
+                __import__(
+                    "research_os.portfolio.models", fromlist=["Severity"]
+                ).Severity.MAJOR,
+                __import__(
+                    "research_os.portfolio.models", fromlist=["ObjectionTarget"]
+                ).ObjectionTarget.CLAIM,
+                "the baseline is not tuned to the same budget",
+            )
+        ],
     )
-    portfolio.raise_objection(
-        idea_id=idea.idea_id,
-        review_id=review.review_id,
-        raised_at_version=1,
-        severity=__import__(
-            "research_os.portfolio.models", fromlist=["Severity"]
-        ).Severity.MAJOR,
-        summary="the baseline is not tuned to the same budget",
-    )
+    del review
     record = _produce(runtime_db, runtime_project)
     entry = record.payload["top_ideas"][0]
     assert "not tuned" in entry["strongest_objection"]

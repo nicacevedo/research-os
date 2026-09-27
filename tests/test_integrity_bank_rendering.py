@@ -44,7 +44,9 @@ from research_os.portfolio.models import (
     EvidenceStrength,
     IdeaOrigin,
     IdeaStatus,
+    ObjectionTarget,
     ReviewerRole,
+    ReviewVerdict,
     Severity,
     Stage,
 )
@@ -136,20 +138,16 @@ def _hostile_portfolio(
         summary=f"evidence summary {payload}",
         literature_key="openalex:W1",
     )
-    review = record_review(
+    record_review(
         store,
         idea_id=ready.idea_id,
         version=2,
         role=ReviewerRole.METHODOLOGY,
+        verdict=ReviewVerdict.PASS_WITH_OBJECTIONS,
+        severity=Severity.MINOR,
         summary=f"review summary {payload}",
         model=f"model {payload}",
-    )
-    store.raise_objection(
-        idea_id=ready.idea_id,
-        review_id=review.review_id,
-        raised_at_version=2,
-        severity=Severity.MINOR,
-        summary=f"objection {payload}",
+        objections=[(Severity.MINOR, ObjectionTarget.CLAIM, f"objection {payload}")],
     )
     action = store.open_action(
         idea_id=ready.idea_id, idea_version=2, stage=Stage.FALSIFY, basis_digest="b"

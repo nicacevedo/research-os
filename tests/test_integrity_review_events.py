@@ -36,6 +36,7 @@ from research_os.portfolio.models import (
     ActionStatus,
     Disposition,
     IdeaStatus,
+    ObjectionTarget,
     ReviewerRole,
     ReviewVerdict,
     Severity,
@@ -421,6 +422,7 @@ def test_one_endorsement_does_not_mask_another_reading_of_the_same_role(
         verdict=ReviewVerdict.REVISE,
         severity=Severity.MAJOR,
         call_id=call(),
+        objections=[(Severity.MAJOR, ObjectionTarget.CLAIM, "the control is missing")],
     )
     endorse = record_review(
         portfolio,

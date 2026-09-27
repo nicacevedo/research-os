@@ -2270,12 +2270,19 @@ def _record_review(
     recommendation: Disposition | None = None,
     packet_digest: str | None = None,
 ) -> str:
-    """Write one review, its independence, and its objections.
+    """Write one review, its independence, and its objections -- as one event.
 
     The independence class is *computed here* from the two model calls, rather
     than reported by anything that could be wrong about it. A review whose call
     is the origin call raises; see
     :func:`research_os.portfolio.gates.classify_independence`.
+
+    The review and its objections go to the store in one call and so in one
+    transaction (INV-04, `sql/0044`). They used to be written separately, and
+    a worker that died between the two left a completed ``PASS_WITH_OBJECTIONS``
+    review of FATAL severity with no objection on file: the role counted as
+    done and no gate saw the fatal objection (the independent review of
+    8e92e8c, ``LOST_REVIEW_OBJECTION``).
     """
 
     from research_os.automation.providers import provider_family
@@ -2304,7 +2311,12 @@ def _record_review(
             objections=snapshot.open_objections,
         ).digest
     )
+    drafts = [
+        (entry[0], entry[1], entry[2], str(entry[3]) if len(entry) > 3 else "")
+        for entry in objections
+    ]
     review, _created = context.portfolio.record_review(
+        objections=[(severity_, target, text) for severity_, target, text, _ in drafts],
         action_id=context.action_id,
         response_digest=_response_digest(response),
         idea_id=context.idea_id,
@@ -2345,20 +2357,20 @@ def _record_review(
         ReviewerRole.FALSIFIER: RequestBasis.FALSIFIER_OBJECTION,
         ReviewerRole.REPLICATOR: RequestBasis.REPLICATION,
     }.get(role, RequestBasis.REVIEWER_CRITICISM)
-    asked: list[tuple[str, str, str]] = []
-    for entry in objections:
-        objection_severity, objection_target, objection_summary = entry[:3]
-        question = str(entry[3]) if len(entry) > 3 else ""
-        objection, _created = context.portfolio.raise_objection(
-            idea_id=context.idea_id,
-            review_id=review.review_id,
-            raised_at_version=snapshot.version.version,
-            severity=objection_severity,
-            target=objection_target,
-            summary=objection_summary,
+    # The event's own rows, in the order the reviewer gave them -- which is
+    # the order `drafts` is in, whether this call wrote them or replayed them.
+    recorded = context.portfolio.review_objections(review.review_id)
+    if len(recorded) != len(drafts):
+        raise PortfolioStateError(
+            f"the review recorded for {role} carries {len(recorded)} objection(s) "
+            f"and this response raised {len(drafts)}; refusing to act on a "
+            f"review whose objections are not its own"
         )
-        if question:
-            asked.append((objection.objection_id, objection_summary, question))
+    asked: list[tuple[str, str, str]] = [
+        (objection.objection_id, objection.summary, question)
+        for objection, (_s, _t, _text, question) in zip(recorded, drafts, strict=True)
+        if question
+    ]
     # A criticism that is also a question becomes somebody else's new idea.
     # Recorded here, where the objection is, so no later stage has to
     # remember to look for it.

@@ -360,12 +360,55 @@ def _rules_for(
     )
 
 
+def _incomplete_review_events(
+    reviews: Sequence[IdeaReview], objections: Sequence[IdeaObjection]
+) -> list[str]:
+    """Live reviews whose own objections are not all standing, named.
+
+    A live review binds the current version, and its objections were raised
+    at that version -- which nothing can resolve until a later one -- so every
+    objection it raised is still open, and the worst of them is its severity.
+    The store commits a review and its objections as one event and the
+    database refuses anything else (`sql/0044`); this is the gate reading the
+    same fact from the rows it was handed rather than trusting that it holds
+    (INV-04, INV-08). A review that fails it is not counted as anything, and
+    its recorded severity is treated as the objection it should have carried:
+    a FATAL review with its FATAL objection missing still blocks.
+    """
+
+    unmet: list[str] = []
+    for review in reviews:
+        own = [
+            item
+            for item in objections
+            if item.raised_in_review == review.review_id and item.open
+        ]
+        worst = max(
+            (item.severity for item in own),
+            key=lambda item: SEVERITY_ORDER[item],
+            default=Severity.NONE,
+        )
+        if (
+            review.objection_count is None
+            or len(own) != review.objection_count
+            or SEVERITY_ORDER[worst] != SEVERITY_ORDER[review.severity]
+        ):
+            unmet.append(
+                f"the {review.reviewer_role} review {review.review_id} recorded "
+                f"{review.severity} severity, and its objections on record do "
+                f"not match it; a review whose objections are not all on record "
+                f"is not counted"
+            )
+    return unmet
+
+
 def _promising_unmet(
     version: IdeaVersion,
     objections: Sequence[IdeaObjection],
     succeeded_stages: frozenset[Stage],
+    reviews: Sequence[IdeaReview] = (),
 ) -> list[str]:
-    unmet: list[str] = []
+    unmet: list[str] = _incomplete_review_events(reviews, objections)
     if not version.research_question.strip():
         unmet.append("no research question")
     if not version.mechanism.strip():
@@ -669,7 +712,7 @@ def evaluate(
     missing rather than as the first thing checked.
     """
 
-    promising = _promising_unmet(version, objections, succeeded_stages)
+    promising = _promising_unmet(version, objections, succeeded_stages, live_reviews)
     validated = promising + _validated_unmet(
         version, live_reviews, objections, evidence, succeeded_stages, config
     )

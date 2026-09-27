@@ -283,8 +283,7 @@ MUTANTS: tuple[Mutant, ...] = (
         "M3",
         "src/research_os/portfolio/store.py",
         """            if row is not None:
-                return IdeaReview.model_validate(row), True
-            # A concurrent replay of the same call won the insert.""",
+                # The objections, in the same transaction.""",
         """            if prior is not None:
                 return IdeaReview.model_validate(
                     conn.execute(
@@ -293,8 +292,7 @@ MUTANTS: tuple[Mutant, ...] = (
                     ).fetchone()
                 ), False
             if row is not None:
-                return IdeaReview.model_validate(row), True
-            # A concurrent replay of the same call won the insert.""",
+                # The objections, in the same transaction.""",
         (f"{V}::test_a_rerun_reviewers_objections_attach_to_its_own_review",),
         "the original defect: a later call on a binding gets the first call's row",
     ),

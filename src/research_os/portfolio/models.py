@@ -854,6 +854,11 @@ class IdeaReview(_Record):
     attempt: int = 1
     supersedes_review_id: str | None = None
     response_digest: str | None = None
+    #: How many objections this review event raised (`sql/0044`, INV-04). The
+    #: review and exactly that many objection rows commit together or not at
+    #: all. ``None`` only on a legacy row whose completeness cannot be
+    #: established, and such a review is never live.
+    objection_count: int | None = None
 
 
 class IdeaObjection(_Record):
@@ -876,6 +881,9 @@ class IdeaObjection(_Record):
     resolved_by_review: str | None = None
     resolved_at: datetime | None = None
     created_at: datetime
+    #: Its position in the review event that raised it (`sql/0044`). ``None``
+    #: on a legacy row, which stays standing like any other.
+    ordinal: int | None = None
 
     @property
     def open(self) -> bool:
