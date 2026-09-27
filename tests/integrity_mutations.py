@@ -578,8 +578,11 @@ MUTANTS: tuple[Mutant, ...] = (
         "src/research_os/runtime/routing.py",
         "                        or enforces_hard_budget_cap(self._adapters[profile.name])\n",
         "                        or True\n",
-        (f"{B2}::test_the_router_refuses_an_adapter_that_cannot_be_capped",),
-        "the router spends through an adapter that cannot be capped",
+        (
+            f"{B2}::test_the_router_refuses_an_adapter_that_cannot_be_capped",
+            f"{B2}::test_a_capped_provider_is_chosen_over_an_uncapped_one_that_could_also_serve",
+        ),
+        "the router routes to an adapter that cannot be capped",
     ),
     Mutant(
         "MUT-B2-4",

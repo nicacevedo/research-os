@@ -573,24 +573,33 @@ def test_the_gate_itself_refuses_a_live_review_missing_its_objection(
     idea, _ = seed_idea(portfolio, runtime_project)
     with runtime_db.tx() as conn:
         conn.execute("set local session_replication_role = replica")
+        # No objection at all behind a FATAL review ...
         _raw_review(conn, idea.idea_id, "IREV-hollow", 1, "FATAL")
+        # ... and a review whose one standing objection has its severity, but
+        # which raised two: the worst is on record, a second one is not.
+        _raw_review(conn, idea.idea_id, "IREV-short", 2, "FATAL")
+        _raw_objection(conn, idea.idea_id, "IREV-short", 0, "FATAL")
         conn.execute(
             "update idea_reviews set reviewed_evidence_digest = %s "
-            "where review_id = 'IREV-hollow'",
+            "where review_id in ('IREV-hollow', 'IREV-short')",
             (portfolio.evidence_digest(idea_id=idea.idea_id, idea_version=1),),
         )
     live = portfolio.live_reviews(idea_id=idea.idea_id, current_prompt_versions=None)
-    assert [item.review_id for item in live] == ["IREV-hollow"]
+    assert sorted(item.review_id for item in live) == ["IREV-hollow", "IREV-short"]
     snapshot = stages.snapshot_for(portfolio, portfolio.require_idea(idea.idea_id))
     assert snapshot is not None
     unmet = gates._promising_unmet(
-        snapshot.version, (), frozenset({Stage.NOVELTY_SCREEN}), live
+        snapshot.version,
+        portfolio.open_objections(idea_id=idea.idea_id),
+        frozenset({Stage.NOVELTY_SCREEN}),
+        live,
     )
     assert any("IREV-hollow" in item and "not counted" in item for item in unmet)
+    assert any("IREV-short" in item and "not counted" in item for item in unmet)
     result = gates.evaluate(
         version=snapshot.version,
         live_reviews=live,
-        objections=(),
+        objections=portfolio.open_objections(idea_id=idea.idea_id),
         evidence=(),
         succeeded_stages=frozenset({Stage.NOVELTY_SCREEN}),
         config=load_config(),

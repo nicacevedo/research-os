@@ -58,6 +58,7 @@ invariants:
       - tests/test_integrity_v2_budget_caps.py::test_each_of_the_five_scopes_alone_refuses_a_call_it_cannot_cover
       - tests/test_integrity_v2_budget_caps.py::test_a_timed_out_capped_call_is_charged_its_cap_and_reconciliation_is_stable
       - tests/test_integrity_v2_budget_caps.py::test_the_router_refuses_an_adapter_that_cannot_be_capped
+      - tests/test_integrity_v2_budget_caps.py::test_a_capped_provider_is_chosen_over_an_uncapped_one_that_could_also_serve
       - tests/test_integrity_v2_budget_caps.py::test_the_delegated_wrapper_refuses_an_adapter_that_cannot_be_capped
       - tests/test_integrity_v2_budget_caps.py::test_the_ledger_will_not_submit_a_cost_reservation_without_a_cap
       - tests/test_integrity_v2_budget_caps.py::test_the_database_refuses_an_uncapped_submission_whatever_the_code_does

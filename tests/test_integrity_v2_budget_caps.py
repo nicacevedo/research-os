@@ -570,3 +570,43 @@ def test_the_delegated_actions_only_ever_hand_over_wrapped_adapters() -> None:
                 registries.append(node)
         assert registries, f"{name} no longer builds a registry; update this test"
         assert all(id(call) in wrapped for call in registries), name
+
+
+def test_a_capped_provider_is_chosen_over_an_uncapped_one_that_could_also_serve(
+    runtime_db: Database, runtime_project: str, tmp_path: Path
+) -> None:
+    """The routing filter, not only the refusal behind it.
+
+    Two providers can serve the request; the uncappable one sorts first (same
+    tier, cheaper estimate). The router must route to the capped one -- an
+    adapter that cannot be capped is never a candidate for spend -- rather
+    than pick the uncappable one and refuse the call.
+    """
+
+    from research_os.runtime.artifacts import FilesystemArtifactStore
+    from research_os.runtime.routing import ModelRouter, ProviderProfile
+
+    capped = MeteredProvider(
+        name="two", family="b", responses=_responses(_priced(0.05))
+    )
+    uncapped = _Uncapped(name="one", family="a")
+    store = RuntimeStore(runtime_db)
+    router = ModelRouter(
+        adapters={"one": uncapped, "two": capped},  # type: ignore[dict-item]
+        profiles=(
+            ProviderProfile(name="one", family="a", tier=3, estimated_cost_usd=0.01),
+            ProviderProfile(name="two", family="b", tier=3, estimated_cost_usd=0.05),
+        ),
+        store=store,
+        artifacts=FilesystemArtifactStore(tmp_path / "artifacts", store=store),
+        budgets=BudgetLedger(runtime_db),
+        run_id=store.create_run(project_id=runtime_project, objective="route").run_id,
+        project_id=runtime_project,
+        failure_threshold=1_000,
+    )
+
+    response = router.complete(_request(max_cost="0.10"))
+
+    assert response.provider == "two"
+    assert uncapped.invoked == 0
+    assert capped.calls[0].max_budget_usd == pytest.approx(0.10)
