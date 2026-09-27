@@ -431,7 +431,7 @@ def _second_search(*keys: str) -> LiteratureRetrieval:
 
 
 def test_a_novelty_top_up_reading_is_not_a_second_terminology_path() -> None:
-    assert not gates._second_terminology_path(
+    assert not gates._distinct_retrieval_path(
         (*FIRST_AUDIT, *TOP_UP), (AUDIT_SEARCH, READING_SEARCH), 1
     )
 
@@ -445,11 +445,11 @@ def test_a_second_audit_that_finds_a_work_neither_search_cited_is_one() -> None:
             "openalex:W4", call="MCALL-second", minute=9, retrieval="PRET-second"
         ),
     )
-    assert gates._second_terminology_path(
+    assert gates._distinct_retrieval_path(
         (*FIRST_AUDIT, *TOP_UP, *second), (AUDIT_SEARCH, READING_SEARCH, search), 1
     )
     # And without the top-up at all, which is the ordinary case.
-    assert gates._second_terminology_path(
+    assert gates._distinct_retrieval_path(
         (*FIRST_AUDIT, *second), (AUDIT_SEARCH, search), 1
     )
 
@@ -463,7 +463,7 @@ def test_a_second_audit_that_only_refinds_the_top_ups_work_is_not_new() -> None:
             "openalex:W3", call="MCALL-second", minute=9, retrieval="PRET-second"
         ),
     )
-    assert not gates._second_terminology_path(
+    assert not gates._distinct_retrieval_path(
         (*FIRST_AUDIT, *TOP_UP, *second), (AUDIT_SEARCH, READING_SEARCH, search), 1
     )
 
@@ -581,7 +581,7 @@ def test_the_top_up_does_not_carry_an_idea_to_human_ready_on_a_thin_index(
     )
     # The top-up did its own job: VALIDATED's source count is now met.
     assert len(gates._distinct_literature_keys(evidence)) == 3
-    assert not gates._second_terminology_path(
+    assert not gates._distinct_retrieval_path(
         evidence,
         portfolio.list_retrievals(idea_id=idea.idea_id, idea_version=version.version),
         1,
@@ -704,7 +704,7 @@ def test_a_work_the_index_merged_is_one_source_and_not_a_new_one(
 
     evidence = portfolio.list_evidence(idea_id=idea.idea_id, idea_version=1)
     assert gates._distinct_literature_keys(evidence) == {PUBLISHED, "openalex:W20"}
-    assert not gates._second_terminology_path(
+    assert not gates._distinct_retrieval_path(
         evidence, portfolio.list_retrievals(idea_id=idea.idea_id, idea_version=1), 1
     )
     # The stage machine counts what the gate counts, or the tick and the

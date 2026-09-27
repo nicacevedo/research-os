@@ -1089,7 +1089,7 @@ def run_literature_audit(
     if not second_path:
         _begin_investigating(context)
     return StageOutcome.succeeded(
-        ("second terminology path: " if second_path else "")
+        ("distinct retrieval path: " if second_path else "")
         + f"{recorded} matrix row(s) from {len(set(audit.source_keys))} retrieved "
         f"source(s), over {len(searches)} executed search(es)",
         disposition=Disposition.CONTINUE,

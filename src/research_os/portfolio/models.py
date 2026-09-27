@@ -780,7 +780,7 @@ class RetrievalPurpose(StrEnum):
     #: and every retry of it.
     AUDIT = "audit"
     #: ``REPLICATE``'s search on the core idea and the claimed difference: the
-    #: only purpose that can be a second terminology path.
+    #: only purpose that can be a distinct executed retrieval path (INV-05).
     SECOND_PATH = "second_path"
     #: A literature request's search, answered by a verified reading.
     READING = "reading"

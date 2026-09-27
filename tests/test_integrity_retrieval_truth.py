@@ -145,7 +145,7 @@ def _second(**overrides: Any) -> LiteratureRetrieval:
 def _met(
     retrievals: tuple[LiteratureRetrieval, ...], evidence: tuple[IdeaEvidence, ...]
 ) -> bool:
-    return gates._second_terminology_path(evidence, retrievals, 1)
+    return gates._distinct_retrieval_path(evidence, retrievals, 1)
 
 
 # ----------------------------------------------------------- the control ----

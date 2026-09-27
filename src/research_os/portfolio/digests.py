@@ -45,6 +45,7 @@ OBJECTION_KEY_VERSION = "pidea-objection-v1"
 EVIDENCE_SET_DIGEST_VERSION = "pidea-evidence-set-v1"
 RETRIEVAL_QUERY_DIGEST_VERSION = "pidea-retrieval-query-v1"
 RETRIEVAL_RESULT_DIGEST_VERSION = "pidea-retrieval-result-v1"
+RETRIEVAL_TERMS_DIGEST_VERSION = "pidea-retrieval-terms-v1"
 
 #: The fields of an idea version that are scientifically material, in the order
 #: they appear in the specification. Declared as data rather than written into
@@ -354,17 +355,74 @@ def evidence_set_digest(evidence_ids: Iterable[str]) -> str:
 
 
 def retrieval_query_digest(query: str) -> str:
-    """The identity of a search's *words*, for telling two terminology paths apart.
+    """The identity of a search's exact query text, up to case and whitespace.
 
-    Case and whitespace are not words: ``"Lasso  paths"`` and ``"lasso paths"``
-    are one query asked twice, and a second path that differed from the first
-    only in capitalisation looked nowhere new. Anything else -- a different
-    term, a different order -- is a different query, which is deliberately
-    generous: whether the *results* are different is checked separately, on
-    what the search returned.
+    Recorded on every retrieval row (`sql/0039`) as what was asked. It is
+    **not** the distinctness rule: word order still changes it, so
+    ``lasso support overlap`` and ``overlap support lasso`` differ here -- and
+    the independent review of 8e92e8c passed a "second path" on exactly that.
+    INV-05 compares :func:`retrieval_terms` instead.
     """
 
     return _hash(RETRIEVAL_QUERY_DIGEST_VERSION, " ".join(query.lower().split()))
+
+
+def _fold_term(token: str) -> str:
+    """One trailing plural ``s`` off a word of four letters or more, unless ``ss``."""
+
+    if len(token) > 3 and token.endswith("s") and not token.endswith("ss"):
+        return token[:-1]
+    return token
+
+
+def retrieval_terms(query: str) -> tuple[str, ...]:
+    """A search's normalised content terms: what INV-05's distinctness rule compares.
+
+    Deterministic and documented, and deliberately lossy in every direction
+    that makes two searches look *more* alike: NFKC, casefold, split on
+    anything that is not a letter or digit, drop the canonical stopwords and
+    one-letter tokens, fold one trailing plural ``s``, drop duplicates, sort.
+    So order, punctuation, case, whitespace, repetition, full-width forms,
+    possessives and articles are not differences.
+
+    It is a lexical fingerprint and nothing more. Two searches whose terms
+    differ may still mean the same thing -- this cannot tell synonyms apart,
+    and nothing in Research OS claims to -- which is why INV-05 speaks of a
+    *distinct executed retrieval path*, never of independent terminology.
+    """
+
+    folded = unicodedata.normalize("NFKC", query).casefold()
+    terms = {
+        _fold_term(token)
+        for token in _NON_TOKEN.split(folded)
+        if token
+        and token not in _STOPWORDS
+        and not (len(token) == 1 and token.isalpha())
+    }
+    return tuple(sorted(terms))
+
+
+def retrieval_terms_digest(query: str) -> str:
+    """The identity of a search's normalised content terms (:func:`retrieval_terms`)."""
+
+    return _hash(RETRIEVAL_TERMS_DIGEST_VERSION, list(retrieval_terms(query)))
+
+
+def same_term(left: str, right: str) -> bool:
+    """Whether two normalised terms count as one word for INV-05.
+
+    Equal, or -- when both have at least three characters -- one a prefix of
+    the other: ``support``/``supporting``, ``overlap``/``overlapping``,
+    ``lasso``/``lassoe``. Conservative on purpose: it calls some genuinely
+    different words the same (``gene``/``general``), which can only make a
+    second path harder to establish, never easier.
+    """
+
+    if left == right:
+        return True
+    if min(len(left), len(right)) < 3:
+        return False
+    return left.startswith(right) or right.startswith(left)
 
 
 def retrieval_result_digest(keys: Iterable[str]) -> str:

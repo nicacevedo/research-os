@@ -134,7 +134,7 @@ invariants:
       - research_os.portfolio.store:PortfolioStore.fail_retrieval
       - research_os.portfolio.runner:_retrieve
       - research_os.portfolio.runner:run_literature_audit
-      - research_os.portfolio.gates:_second_terminology_path
+      - research_os.portfolio.gates:_distinct_retrieval_path
       - research_os.portfolio.litintel:answer_request
     tests:
       - tests/test_integrity_retrieval_truth.py::test_a_genuinely_separate_retrieval_path_passes
@@ -153,7 +153,7 @@ invariants:
       - tests/test_integrity_reproductions.py::test_h1_a_retried_first_audit_is_not_a_second_terminology_path
       - tests/test_integrity_reproductions.py::test_h1_one_retrieval_sampled_twice_is_not_a_second_terminology_path
       - tests/test_integrity_reproductions.py::test_m1_literature_confidence_counts_searches_that_were_run
-    mutants: [MUT-H1-1, MUT-H1-2, MUT-H1-3, MUT-H1-4, MUT-H1-5, MUT-H1-6, MUT-M1-1]
+    mutants: [MUT-H1-1, MUT-H1-2, MUT-H1-3, MUT-H1-4, MUT-H1-5, MUT-H1-6, MUT-M1-1, MUT-L2-1, MUT-L2-2, MUT-L2-3]
     pass_requires: >-
       the same search twice, a retried audit, a cached result and a claimed
       search are each refused; a genuine separate path passes; confidence

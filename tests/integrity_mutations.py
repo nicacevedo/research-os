@@ -55,6 +55,7 @@ C = "tests/test_integrity_replication_causality.py"
 P = "tests/test_integrity_budget_parks.py"
 A = "tests/test_integrity_human_authority.py"
 X = "tests/test_integrity_reproductions.py"
+L2 = "tests/test_integrity_v2_retrieval_paths.py"
 
 MUTANTS: tuple[Mutant, ...] = (
     # ------------------------------------------------------------ INV-01 --
@@ -332,10 +333,46 @@ MUTANTS: tuple[Mutant, ...] = (
         "INV-05",
         "H1",
         "src/research_os/portfolio/gates.py",
-        "        if candidate.query_digest in first_queries:\n            continue\n",
+        "        if not fresh:\n            continue\n",
         "",
-        (f"{L}::test_the_same_words_asked_again_are_not_a_different_terminology",),
-        "the same words asked again count as a different terminology",
+        (
+            f"{L}::test_the_same_words_asked_again_are_not_a_different_terminology",
+            f"{L2}::test_rev_reordered_identical_terms_are_not_a_distinct_retrieval_path",
+        ),
+        "a search with no new content term counts as a distinct path",
+    ),
+    Mutant(
+        "MUT-L2-1",
+        "INV-05",
+        "REORDERED_QUERY",
+        "src/research_os/portfolio/digests.py",
+        "    return left.startswith(right) or right.startswith(left)\n",
+        "    return False\n",
+        (f"{L2}::test_a_superficial_variant_of_the_first_path_is_not_a_second_path",),
+        "inflections sharing a stem count as new words",
+    ),
+    Mutant(
+        "MUT-L2-2",
+        "INV-05",
+        "REORDERED_QUERY",
+        "src/research_os/portfolio/digests.py",
+        "        return token[:-1]\n",
+        "        return token\n",
+        (
+            f"{L2}::test_a_superficial_variant_of_the_first_path_is_not_a_second_path",
+            f"{L2}::test_the_term_fingerprint_is_deterministic_and_order_free",
+        ),
+        "a plural is a new word",
+    ),
+    Mutant(
+        "MUT-L2-3",
+        "INV-05",
+        "REORDERED_QUERY",
+        "src/research_os/portfolio/gates.py",
+        "        term for item in first_all for term in pdigests.retrieval_terms(item.query)\n",
+        "        term for item in first for term in pdigests.retrieval_terms(item.query)\n",
+        (f"{L2}::test_a_failed_first_path_search_still_counts_as_words_already_used",),
+        "a first-path search that failed did not use its words",
     ),
     Mutant(
         "MUT-H1-4",

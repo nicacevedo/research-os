@@ -33,6 +33,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 
 from research_os.errors import ResearchOSError
+from research_os.portfolio import digests as pdigests
 from research_os.portfolio.config import PortfolioConfig
 from research_os.portfolio.models import (
     BLOCKING_SEVERITIES,
@@ -192,9 +193,11 @@ REPLICATION_RULES: dict[AdjudicationType, ReplicationRule] = {
     ),
     AdjudicationType.NOVELTY_OR_LITERATURE: ReplicationRule(
         description=(
-            "a second terminology path: a separately executed search, with "
-            "different words, that retrieved and assessed sources no search of "
-            "the first path retrieved"
+            "a distinct executed retrieval path: a separately executed, "
+            "successful search using at least one content term no first-path "
+            "search used, that retrieved and assessed a source no search of the "
+            "first path retrieved (a lexical rule, not a proof of independent "
+            "meaning)"
         ),
         kinds=frozenset({EvidenceKind.LITERATURE, EvidenceKind.REPLICATION}),
         new_literature_keys=1,
@@ -567,11 +570,13 @@ def _replication_met(
     row from a call that is not among the calls that produced the original
     work, with a job when the type demands one.
 
-    **A second terminology path**, for a literature-adjudicated idea. A
-    novelty claim is a claim about absence, and the way to verify an absence is
-    to look again with different words. So the test is over the *literature*
-    rows: at least two distinct retrieval calls, and the later ones finding
-    keys the first did not.
+    **A distinct executed retrieval path**, for a literature-adjudicated idea.
+    A novelty claim is a claim about absence, and the way to verify an absence
+    is to look again, differently. So the test is over the executed
+    retrievals: a separate successful search whose terms are not the first
+    path's, that found and had assessed a work the first path did not. What
+    "differently" can mean here is operational and lexical (INV-05); it is not
+    a judgement that the second search's meaning is independent of the first.
 
     The first version of this function applied the execution shape to both, and
     the literature case was unsatisfiable by construction: every literature
@@ -583,7 +588,7 @@ def _replication_met(
     """
 
     if rule.new_literature_keys:
-        return _second_terminology_path(evidence, retrievals, rule.new_literature_keys)
+        return _distinct_retrieval_path(evidence, retrievals, rule.new_literature_keys)
 
     # Substantive, for the same reason the evidence rule demands it: a
     # replication that measured again and could not tell is a record of
@@ -614,40 +619,50 @@ def _replication_met(
     return bool(candidates)
 
 
-def _second_terminology_path(
+def _distinct_retrieval_path(
     evidence: Sequence[IdeaEvidence],
     retrievals: Sequence[LiteratureRetrieval],
     minimum_new_keys: int,
 ) -> bool:
-    """Whether a genuinely separate search found, and assessed, new sources.
+    """Whether a distinct executed retrieval path found, and assessed, new sources.
 
-    INV-05 (``docs/ARCHITECTURE_INVARIANTS.md``), and the conservative
-    criterion stated there, over the rows of searches the system *executed*
-    (``literature_retrievals``) rather than over what any scout cited. A
-    completed retrieval ``R2`` whose purpose is ``second_path`` -- set by the
-    ``REPLICATE`` stage that ran it, never by a model -- is a second path only
-    if, against every completed first-path retrieval of the version (the
-    screen, the audit and every retry of it, the readings):
+    INV-05 (``docs/ARCHITECTURE_INVARIANTS.md``), over the rows of searches the
+    system *executed* (``literature_retrievals``) rather than over anything a
+    scout cited or a model claimed. A completed retrieval ``R2`` whose purpose
+    is ``second_path`` -- set by the ``REPLICATE`` stage that ran it, never by
+    a model -- qualifies only if, against the first-path searches of the
+    version (the screen, the audit and every retry of it, the readings):
 
-    1. it is its own execution: owned by a different action;
-    2. it used different words: its normalised query digest matches none;
-    3. it retrieved something different: its result digest matches none, so
-       an identical or cached result reused under new words is not a path;
+    1. it is its own successful execution: completed, and owned by an action
+       that ran no completed first-path search;
+    2. it used **at least one content term no first-path search used**: of
+       its normalised terms (:func:`research_os.portfolio.digests.retrieval_terms`)
+       at least one is :func:`~research_os.portfolio.digests.same_term` as no
+       term of any first-path search, *including* ones that failed -- so word
+       order, punctuation, case, whitespace, repetition, plurals, stopwords
+       and inflections sharing a stem are not new words, and neither is a
+       recombination of words the first path already used;
+    3. it retrieved something different: its result digest matches no
+       completed first-path search, so an identical or cached result reused
+       under new words is not a path;
     4. it retrieved at least ``minimum_new_keys`` works no first-path search
        retrieved and no reading cited, *and* its own audit assessed them:
        evidence rows bound to ``R2`` cite them.
 
-    What the frozen gate compared was the keys two scouts *cited*. So two
-    byte-identical retrievals passed when the second scout happened to cite a
-    work the first left out of its matrix, and a retried first audit was a
-    "second path" of its own -- the final adversarial review reproduced both
-    (H1). Citing different papers from the same search satisfies none of the
-    four conditions above. Evidence with no ``retrieval_id`` -- every row
-    written before `sql/0039` -- names no search, and so is no path at all.
+    Condition 2 replaced a comparison of query digests over case and
+    whitespace only, which let ``overlap support lasso`` be a "different
+    terminology" from ``lasso support overlap`` (the independent review of
+    8e92e8c). It is a conservative lexical rule and it establishes only what
+    it says: two executions, some different words, new sources assessed. It
+    does not establish that the second search meant something independent of
+    the first, and nothing that renders this gate says it does.
     """
 
     completed = [
         item for item in retrievals if item.status is RetrievalStatus.COMPLETED
+    ]
+    first_all = [
+        item for item in retrievals if item.purpose is not RetrievalPurpose.SECOND_PATH
     ]
     first = [
         item for item in completed if item.purpose is not RetrievalPurpose.SECOND_PATH
@@ -670,13 +685,20 @@ def _second_terminology_path(
         and item.claim_id
         and item.literature_key
     }
-    first_queries = {item.query_digest for item in first}
+    used_terms = {
+        term for item in first_all for term in pdigests.retrieval_terms(item.query)
+    }
     first_results = {item.result_digest for item in first}
     first_actions = {item.action_id for item in first if item.action_id}
     for candidate in second:
         if not candidate.action_id or candidate.action_id in first_actions:
             continue
-        if candidate.query_digest in first_queries:
+        fresh = [
+            term
+            for term in pdigests.retrieval_terms(candidate.query)
+            if not any(pdigests.same_term(term, used) for used in used_terms)
+        ]
+        if not fresh:
             continue
         if candidate.result_digest in first_results:
             continue

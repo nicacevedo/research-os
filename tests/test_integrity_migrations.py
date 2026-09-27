@@ -145,7 +145,7 @@ def test_the_integrity_migrations_upgrade_live_0036_data(throwaway_dsn: str) -> 
         (evidence,) = store.list_evidence(idea_id=IDEA)
         assert evidence.retrieval_id is None
         assert store.list_retrievals(idea_id=IDEA) == ()
-        assert not gates._second_terminology_path((evidence,), (), 1)
+        assert not gates._distinct_retrieval_path((evidence,), (), 1)
 
         # 0040 -- two calls on one binding are two rows; the first is attempt 1.
         first = record_review(store, idea_id=IDEA, version=1, role=ReviewerRole.SKEPTIC)
