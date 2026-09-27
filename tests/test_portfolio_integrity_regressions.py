@@ -1054,7 +1054,7 @@ def _measured(
     return context
 
 
-def test_a_replication_that_reproduces_the_number_is_judged_by_its_receipt(
+def test_a_replication_that_reproduces_the_number_is_judged_by_its_trusted_chain(
     portfolio: PortfolioStore,
     runtime_db: Database,
     runtime_project: str,
@@ -1064,14 +1064,14 @@ def test_a_replication_that_reproduces_the_number_is_judged_by_its_receipt(
     """Seeds 5 and 14 give the same number from this program.
 
     This test used to assert INSUFFICIENT because the replication's output
-    bytes were identical to the primary's. Byte identity is not evidence
-    either way, which is what the final adversarial review of 37e8afe showed
-    from the other side (H6): a timestamp makes the bytes differ without the
-    seed ever being used. What decides independence is whether the variation
-    reached the computation (INV-07), and this program reports the seed it
-    used -- so seed 14 *was* consumed, the replication is an independent
-    execution, and it agrees with the primary exactly. The same scenario
-    without a receipt is INSUFFICIENT; see
+    bytes were identical to the primary's -- and then, after H6, SUPPORTS
+    because the program reported the seed it used. Neither bytes nor a
+    program's report are evidence (the independent review of 8e92e8c). What
+    decides it (INV-07) is the runner's receipts -- seed 14 was delivered to
+    a separate execution -- and the researcher's attestation, in this
+    fixture's declaration, that the computation uses the seed. So the
+    replication counts and agrees with the primary exactly. The same
+    scenario without the attestation is INSUFFICIENT; see
     ``tests/test_integrity_replication_causality.py``.
     """
 
@@ -1091,7 +1091,9 @@ def test_a_replication_that_reproduces_the_number_is_judged_by_its_receipt(
     document = _json.loads(
         context.artifacts.get_text(step.experiment.analysis_artifact_id)
     )
-    assert document["replication"]["independence"]["verified"] is True
+    independence = document["replication"]["independence"]
+    assert independence["counts_as_independent_replication"] is True
+    assert independence["perturbation_validity"] == "ATTESTED_BY_RESEARCHER"
     assert document["replication"]["agreement"]["identical_scientific_values"] is True
 
     other = _measured(

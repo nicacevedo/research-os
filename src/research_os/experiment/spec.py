@@ -82,6 +82,28 @@ class CommandSpec(BaseModel):
     Named rather than expressed, so a check is something the controller knows
     how to do rather than something a configuration file can describe in code.
     """
+    perturbation_attestation: list[str] = Field(default_factory=list)
+    """What the researcher attests this command's computation actually uses.
+
+    ``docs/ARCHITECTURE_INVARIANTS.md`` INV-07. Research OS can prove that a
+    replication's configuration was *delivered* to a separate execution --
+    its runner built the argument vector and the environment, and records
+    them in a receipt no program writes. It cannot prove that arbitrary code
+    used a delivered value in its mathematics: a program can read ``--seed``
+    and ignore it. So for a replication that varies something to count as a
+    scientifically valid perturbation, the person who wrote the program
+    attests which of its inputs the computation depends on:
+
+    - ``seeds`` -- the design seeds, delivered as ``RESEARCH_OS_SEED_<n>``;
+    - the name of a declared parameter;
+    - ``implementation`` -- this command independently implements the
+      quantity another declared command measures, so running it instead is a
+      replication by a different implementation.
+
+    Frozen into a replication's manifest when it runs. It is an attestation,
+    recorded as one: a false one is outside what Research OS can detect, and
+    no record calls an attested perturbation proven.
+    """
 
     @field_validator("name")
     @classmethod
@@ -177,6 +199,15 @@ class CommandSpec(BaseModel):
             _assert_relative(output, "an output path")
         if self.working_directory is not None:
             _assert_relative(self.working_directory, "a working directory")
+        attested = list(self.perturbation_attestation)
+        if len(set(attested)) != len(attested):
+            raise ValueError("perturbation_attestation must not repeat an entry")
+        unknown = sorted(set(attested) - declared - {"seeds", "implementation"})
+        if unknown:
+            raise ValueError(
+                "perturbation_attestation may name `seeds`, `implementation` or a "
+                "declared parameter; these are none of them: " + ", ".join(unknown)
+            )
         return self
 
     def parameter(self, name: str) -> ParameterSpec:

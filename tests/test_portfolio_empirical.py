@@ -85,8 +85,9 @@ out = pathlib.Path(sys.argv[sys.argv.index("--out") + 1])
 out.parent.mkdir(parents=True, exist_ok=True)
 # A deterministic "measurement": the overlap falls as the seed rises, so a
 # test can choose which side of a preregistered threshold it lands on. The
-# program reports the seed it used -- the execution receipt a replication's
-# independence rests on (docs/ARCHITECTURE_INVARIANTS.md, INV-07).
+# `execution_receipt` it writes is domain metadata and nothing more: Research
+# OS reads no program output as provenance (INV-02, INV-07). That the seed
+# reaches the computation is attested by `perturbation_attestation` below.
 out.write_text(json.dumps({
     "summary": {"overlap": 0.9 - 0.1 * (seed % 9)},
     "execution_receipt": {"seeds": [seed], "parameters": {"seed": seed}},
@@ -139,6 +140,7 @@ projects:
         outputs: []
         timeout_seconds: 120
         checks: ["outputs_exist"]
+        perturbation_attestation: ["seeds", "seed"]
 
       sweep:
         name: sweep
@@ -2117,12 +2119,32 @@ def test_an_inconclusive_replication_does_not_count_as_verification(
         )
         return portfolio.list_evidence(idea_id=idea_id, idea_version=1)
 
-    inconclusive = _row(EvidenceStrength.INCONCLUSIVE)
-    assert not _replication_met(rule, inconclusive, {"origin-call"})
+    from research_os.portfolio.models import ReplicationProvenance
 
-    # The positive control: the same row, with a conclusion in it, counts.
+    def _trusted(rows: tuple) -> tuple:
+        return tuple(
+            ReplicationProvenance(
+                evidence_id=row.evidence_id,
+                assessment_id=f"RASM-{row.evidence_id}",
+                legacy=False,
+                configuration_independent=True,
+                perturbation_attested=True,
+                chain_intact=True,
+            )
+            for row in rows
+        )
+
+    inconclusive = _row(EvidenceStrength.INCONCLUSIVE)
+    assert not _replication_met(
+        rule, inconclusive, {"origin-call"}, (), _trusted(inconclusive)
+    )
+
+    # The positive control: the same row, with a conclusion in it, counts --
+    # on a trusted, admissible replication chain (INV-07, INV-08), and not
+    # on the row alone.
     both = _row(EvidenceStrength.SUPPORTS)
-    assert _replication_met(rule, both, {"origin-call"})
+    assert _replication_met(rule, both, {"origin-call"}, (), _trusted(both))
+    assert not _replication_met(rule, both, {"origin-call"})
 
 
 def test_the_catalogue_names_the_input_files_that_exist(

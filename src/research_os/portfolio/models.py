@@ -799,6 +799,106 @@ class RetrievalStatus(StrEnum):
     FAILED = "FAILED"
 
 
+class ExecutionReceipt(_Record):
+    """One execution, as Research OS's own runner observed it (`sql/0046`).
+
+    Written by :func:`research_os.portfolio.provenance.write_receipt` from the
+    argument vector and environment the runner delivered, the inputs it
+    materialised, the code identity and the output digests it hashed when the
+    process exited -- never from anything a program printed. The document
+    itself is the content-addressed artifact ``receipt_artifact_id``; these
+    columns are its digests. Immutable (INV-02, INV-07).
+    """
+
+    receipt_id: str
+    job_id: str
+    experiment_id: str
+    idea_id: str
+    idea_version: int
+    role: ExperimentRole
+    action_id: str | None = None
+    run_id: str | None = None
+    work_id: str | None = None
+    command: str
+    command_digest: str
+    spec_digest: str
+    base_commit: str
+    delivered_digest: str
+    inputs_digest: str
+    outputs_digest: str
+    exit_code: int | None = None
+    manifest_artifact_id: str | None = None
+    manifest_digest: str | None = None
+    parent_receipt_id: str | None = None
+    receipt_artifact_id: str
+    created_at: datetime
+
+
+class ReplicationAssessment(_Record):
+    """What one replication reading established, three findings kept apart.
+
+    ``configuration_independent`` is proved from two trusted receipts: a
+    separate execution was delivered a configuration that differs from its
+    parent's in what the frozen manifest says it varies.
+    ``perturbation_attested`` is never proved: it records that the researcher's
+    declaration, frozen in the manifest, attests the computation uses a varied
+    input. ``agrees``/``identical_values`` compare the scientific readings.
+    A ``legacy`` row is pre-`sql/0046` evidence kept as history, and neither.
+    """
+
+    assessment_id: str
+    evidence_id: str
+    experiment_id: str | None = None
+    idea_id: str
+    idea_version: int
+    legacy: bool = False
+    receipt_id: str | None = None
+    parent_receipt_id: str | None = None
+    parent_experiment_id: str | None = None
+    parent_evidence_id: str | None = None
+    parent_analysis_artifact_id: str | None = None
+    manifest_artifact_id: str | None = None
+    manifest_digest: str | None = None
+    analysis_artifact_id: str | None = None
+    configuration_independent: bool
+    perturbation_attested: bool
+    varied: tuple[str, ...] = ()
+    attested: tuple[str, ...] = ()
+    unattested: tuple[str, ...] = ()
+    agrees: bool | None = None
+    identical_values: bool | None = None
+    basis: str
+    created_at: datetime
+
+
+class ReplicationProvenance(_Record):
+    """A replication assessment as a readiness gate reads it (INV-07, INV-08).
+
+    Built by :func:`research_os.portfolio.provenance.replication_provenance`,
+    which re-verifies the whole chain against what is stored *now* -- every
+    digest re-hashed, the evidence, both receipts, the manifest and the
+    current experiment rows bound to one another -- and says what, if
+    anything, broke. The gate itself decides admissibility from these fields.
+    """
+
+    evidence_id: str
+    assessment_id: str
+    legacy: bool
+    configuration_independent: bool
+    perturbation_attested: bool
+    chain_intact: bool
+    problems: tuple[str, ...] = ()
+
+    @property
+    def admissible(self) -> bool:
+        return (
+            not self.legacy
+            and self.chain_intact
+            and self.configuration_independent
+            and self.perturbation_attested
+        )
+
+
 class LiteratureRetrieval(_Record):
     """One literature search the system actually executed (`sql/0039`)."""
 
@@ -1222,6 +1322,7 @@ ENUM_CONSTRAINTS: dict[str, frozenset[str]] = {
     ),
     "idea_objections_target_ck": frozenset(s.value for s in ObjectionTarget),
     "idea_experiments_role_ck": frozenset(s.value for s in ExperimentRole),
+    "execution_receipts_role_ck": frozenset(s.value for s in ExperimentRole),
     "idea_experiments_state_ck": frozenset(s.value for s in ExperimentState),
     "idea_experiments_conclusion_ck": frozenset(s.value for s in EmpiricalConclusion),
     "scientific_contracts_role_ck": frozenset(s.value for s in ExperimentRole),

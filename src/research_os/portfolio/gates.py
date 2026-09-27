@@ -50,6 +50,7 @@ from research_os.portfolio.models import (
     IdeaVersion,
     LiteratureRetrieval,
     QualityTier,
+    ReplicationProvenance,
     RetrievalPurpose,
     RetrievalStatus,
     ReviewVerdict,
@@ -506,6 +507,7 @@ def _human_ready_unmet(
     objections: Sequence[IdeaObjection],
     evidence: Sequence[IdeaEvidence],
     retrievals: Sequence[LiteratureRetrieval] = (),
+    replications: Sequence[ReplicationProvenance] = (),
 ) -> list[str]:
     unmet: list[str] = []
     _, _, replication_rules = _rules_for(version)
@@ -537,7 +539,7 @@ def _human_ready_unmet(
         if call
     }
     for rule in replication_rules:
-        if not _replication_met(rule, evidence, origin_calls, retrievals):
+        if not _replication_met(rule, evidence, origin_calls, retrievals, replications):
             unmet.append(f"no second-line verification: {rule.description}")
     if not replication_rules:
         unmet.append(
@@ -561,6 +563,7 @@ def _replication_met(
     evidence: Sequence[IdeaEvidence],
     origin_calls: set[str | None],
     retrievals: Sequence[LiteratureRetrieval] = (),
+    replications: Sequence[ReplicationProvenance] = (),
 ) -> bool:
     """Whether the second-line verification this type requires actually exists.
 
@@ -616,6 +619,21 @@ def _replication_met(
         ]
     if rule.requires_execution:
         candidates = [item for item in candidates if item.job_id]
+        # **An executed replication counts only on its trusted chain**, read
+        # here and not inferred from a row existing (INV-07, INV-08). The
+        # frozen gate took any REPLICATION row with a job: a 0036-era row
+        # with no manifest and no receipt passed after upgrade, and so did
+        # one whose manifest had been repointed after the fact (the
+        # independent review of 8e92e8c). A candidate now needs a replication
+        # assessment that is not legacy, whose chain -- evidence, both
+        # runner-written receipts, the frozen manifest, the current
+        # replication and primary rows -- re-verifies as it stands, which
+        # proved configuration independence, and on which the researcher's
+        # declaration attested the perturbation.
+        admissible = {
+            record.evidence_id for record in replications if record.admissible
+        }
+        candidates = [item for item in candidates if item.evidence_id in admissible]
     return bool(candidates)
 
 
@@ -725,6 +743,7 @@ def evaluate(
     config: PortfolioConfig,
     requested: QualityTier = QualityTier.HUMAN_READY,
     retrievals: Sequence[LiteratureRetrieval] = (),
+    replications: Sequence[ReplicationProvenance] = (),
 ) -> GateResult:
     """What this idea's rows permit.
 
@@ -739,7 +758,7 @@ def evaluate(
         version, live_reviews, objections, evidence, succeeded_stages, config
     )
     human_ready = validated + _human_ready_unmet(
-        version, live_reviews, objections, evidence, retrievals
+        version, live_reviews, objections, evidence, retrievals, replications
     )
 
     if not human_ready:

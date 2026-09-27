@@ -709,11 +709,20 @@ def test_h6_a_seed_ignoring_rerun_with_a_timestamp_is_not_a_replication(
     portfolio: PortfolioStore,
     runtime_db: Database,
     runtime_project: str,
+    runtime_xdg: Any,
     project_repo: Path,
     tmp_path: Path,
 ) -> None:
     """H6. ``_review_evidence_replication.py``, sha256
     e6e584d505c35e4d623b3d5b335864c5544d052766ca0bb98ac60db0816dc667.
+
+    What distinguishes the two runs, as far as anything but the program's
+    author can know, is a timestamp. The frozen gate read the differing bytes
+    as independence. Since the independent review of 8e92e8c the question is
+    answered by the runner's receipts (the seed was delivered) plus the
+    researcher's attestation that the computation uses it -- so the
+    reproduction removes the fixture's attestation: with only bytes and a
+    delivered seed to go on, this is not a replication.
     """
 
     from research_os.portfolio.models import (
@@ -724,6 +733,13 @@ def test_h6_a_seed_ignoring_rerun_with_a_timestamp_is_not_a_replication(
     from tests.test_portfolio_empirical import _advance
     from tests.test_portfolio_integrity_regressions import _measured
 
+    config = Path(str(runtime_xdg)).parent / "config" / "experiments.yaml"
+    config.write_text(
+        config.read_text(encoding="utf-8").replace(
+            '        perturbation_attestation: ["seeds", "seed"]\n', ""
+        ),
+        encoding="utf-8",
+    )
     context = _measured(
         portfolio,
         runtime_db,

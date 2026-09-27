@@ -1,29 +1,32 @@
-"""INV-07 -- a replication is independent only if its variation reached the computation.
+"""INV-07 -- what a replication establishes, and what it cannot.
 
-The HIGH finding this file closes (final adversarial review of 37e8afe, H6):
-``empirical._byte_identical_primary`` was the only guard against "the
-variation did not reach the measurement", and it compared whole-file
-digests. A replication whose program ignored its new seed but stamped a
-timestamp produced different bytes and the same measurement, and was
+Two rounds of findings shaped this file.
+
+**H6** (final adversarial review of 37e8afe): whole-file output digests were
+the only guard against "the variation did not reach the measurement", so a
+replication whose program ignored its new seed but stamped a timestamp was
 recorded as an independent REPLICATION with SUPPORTS.
 
-The repair separates two questions the byte comparison conflated:
+**The independent review of 8e92e8c**: the repair made independence rest on an
+``execution_receipt`` the *program* wrote into its own output. A program that
+ignored its seed and echoed it into a receipt was accepted (Case C), and a
+model-composed plan could carry such a receipt through for a program to echo.
 
-1. **execution independence** -- established only by the computation's own
-   consumption receipt (``empirical.RECEIPT_KEY``), checked against an
-   execution manifest frozen before the replication ran;
-2. **agreement** -- the replication's reading against the primary's, on the
-   scientific values the frozen analysis read, recorded separately.
+What is established now (``docs/ARCHITECTURE_INVARIANTS.md`` INV-07), three
+findings kept apart:
 
-The four cases the brief names, each with a real subprocess:
+1. **configuration independence** -- proved, from receipts the Research OS
+   runner wrote (``portfolio/provenance.py``): a separate execution, bound to
+   a manifest frozen before it ran, was delivered a configuration that differs
+   from its parent's in what the manifest says it varies;
+2. **perturbation validity** -- *attested*, never proved: the researcher's
+   ``perturbation_attestation`` in ``experiments.yaml``, frozen into the
+   manifest, says the computation uses what was varied. Nothing a program
+   writes is read as this, or as anything else;
+3. **agreement** -- the scientific readings compared, recorded beside.
 
-- the seed changes in the manifest and the program ignores it: not independent;
-- timestamps differ but the computation is identical because the variable
-  was ignored: not independent;
-- the specified seed is consumed and the scientific values are identical:
-  independent, and agreeing;
-- a genuinely independent execution with a different result: independent,
-  and the disagreement recorded separately.
+A replication counts only with (1) and (2). Every case below runs a real
+subprocess.
 """
 
 from __future__ import annotations
@@ -57,6 +60,8 @@ __all__ = [
     "runtime_xdg",
 ]
 
+ATTESTATION = '        perturbation_attestation: ["seeds", "seed"]\n'
+
 _HEAD = """\
 import json, pathlib, sys, time
 seed = int(sys.argv[sys.argv.index("--seed") + 1])
@@ -76,29 +81,41 @@ out.write_text(json.dumps({
 """
 )
 
-#: Uses the seed and reports what it used.
-REPORTS_WHAT_IT_USED = (
+#: Case C: ignores the seed and *claims* to have used it, in the very object
+#: the first repair trusted.
+ECHOES_THE_SEED_IT_IGNORES = (
     _HEAD
     + """\
 out.write_text(json.dumps({
-    "summary": {"overlap": 0.9 - 0.1 * (seed % 9)},
-    "meta": {"finished_at": time.time_ns()},
+    "summary": {"overlap": 0.4},
     "execution_receipt": {"seeds": [seed], "parameters": {"seed": seed}},
 }))
 """
 )
 
-#: Ignores the seed it was given, uses 5, and says so honestly.
-USES_A_FIXED_SEED = (
+#: Uses the seed, and says nothing about it.
+USES_THE_SEED = (
     _HEAD
     + """\
-used = 5
 out.write_text(json.dumps({
-    "summary": {"overlap": 0.9 - 0.1 * (used % 9)},
-    "execution_receipt": {"parameters": {"seed": used}},
+    "summary": {"overlap": 0.9 - 0.1 * (seed % 9)},
+    "meta": {"finished_at": time.time_ns()},
 }))
 """
 )
+
+
+def _config(runtime_xdg: Any) -> Path:
+    return Path(str(runtime_xdg)).parent / "config" / "experiments.yaml"
+
+
+def _unattest(runtime_xdg: Any) -> None:
+    """The same declaration with no perturbation attestation."""
+
+    path = _config(runtime_xdg)
+    text = path.read_text(encoding="utf-8")
+    assert ATTESTATION in text
+    path.write_text(text.replace(ATTESTATION, ""), encoding="utf-8")
 
 
 def _replicate(context: Any) -> Any:
@@ -121,32 +138,53 @@ def _replication_rows(portfolio: PortfolioStore, context: Any) -> list[Any]:
     ]
 
 
-# -------------------------------------------------------- not independent ---
-@pytest.mark.parametrize("project_repo", [IGNORES_THE_SEED], indirect=True)
-def test_a_seed_the_program_ignores_is_not_an_independent_execution(
+def _measure(
     portfolio: PortfolioStore,
     runtime_db: Database,
     runtime_project: str,
     project_repo: Path,
     tmp_path: Path,
-) -> None:
-    """Cases 1 and 2: the manifest varies the seed; timestamps differ; nothing else does."""
-
-    context = _measured(
+    *,
+    seed: int = 14,
+) -> Any:
+    return _measured(
         portfolio,
         runtime_db,
         runtime_project,
         project_repo,
         tmp_path,
-        replication_seed=14,
+        replication_seed=seed,
     )
+
+
+# ------------------------------------------------- not a valid perturbation --
+@pytest.mark.parametrize("project_repo", [IGNORES_THE_SEED], indirect=True)
+def test_without_an_attestation_a_delivered_seed_is_not_a_valid_perturbation(
+    portfolio: PortfolioStore,
+    runtime_db: Database,
+    runtime_project: str,
+    runtime_xdg: Any,
+    project_repo: Path,
+    tmp_path: Path,
+) -> None:
+    """H6's program: the seed is delivered, ignored, and the bytes differ.
+
+    Configuration independence is proved -- the runner delivered seed 14 to a
+    separate execution -- and that is all. With nothing attesting that the
+    computation uses the seed, this is not a replication; the differing
+    bytes were never the question.
+    """
+
+    _unattest(runtime_xdg)
+    context = _measure(portfolio, runtime_db, runtime_project, project_repo, tmp_path)
     step = _replicate(context)
     assert step.conclusion is EmpiricalConclusion.INSUFFICIENT, step.detail
     document = _analysis(context, step)
     independence = document["replication"]["independence"]
-    assert independence["verified"] is False
-    assert "no execution receipt" in independence["basis"]
-    # The bytes did differ -- and that was never the question.
+    assert independence["configuration_independent"] is True
+    assert independence["perturbation_validity"] == "UNATTESTED"
+    assert independence["counts_as_independent_replication"] is False
+    assert set(independence["unattested"]) == {"seeds", "parameter seed"}
     primary = context.portfolio.get_experiment(
         idea_id=context.idea_id, idea_version=1, role=ExperimentRole.PRIMARY
     )
@@ -154,74 +192,86 @@ def test_a_seed_the_program_ignores_is_not_an_independent_execution(
     assert {o["sha256"] for o in theirs["outputs"]} != {
         o["sha256"] for o in document["outputs"]
     }
-    # Agreement is still recorded, separately: the same number was read.
-    agreement = document["replication"]["agreement"]
-    assert agreement["identical_scientific_values"] is True
+    assert document["replication"]["agreement"]["identical_scientific_values"] is True
     rows = _replication_rows(portfolio, context)
     assert [row.strength for row in rows] == [EvidenceStrength.INCONCLUSIVE], rows
 
 
-@pytest.mark.parametrize("project_repo", [USES_A_FIXED_SEED], indirect=True)
-def test_a_receipt_reporting_the_primarys_seed_is_a_contradiction(
+@pytest.mark.parametrize("project_repo", [ECHOES_THE_SEED_IT_IGNORES], indirect=True)
+def test_a_receipt_a_program_writes_is_never_provenance(
     portfolio: PortfolioStore,
     runtime_db: Database,
     runtime_project: str,
+    runtime_xdg: Any,
     project_repo: Path,
     tmp_path: Path,
 ) -> None:
-    """Neighbour: the program is honest that it did not use what it was given."""
+    """The first repair's evidence, presented again, and read as nothing."""
 
-    context = _measured(
-        portfolio,
-        runtime_db,
-        runtime_project,
-        project_repo,
-        tmp_path,
-        replication_seed=14,
-    )
+    _unattest(runtime_xdg)
+    context = _measure(portfolio, runtime_db, runtime_project, project_repo, tmp_path)
     step = _replicate(context)
     assert step.conclusion is EmpiricalConclusion.INSUFFICIENT, step.detail
     independence = _analysis(context, step)["replication"]["independence"]
-    assert independence["verified"] is False
-    assert (
-        independence["contradicted"]
-        and "parameter seed" in independence["contradicted"][0]
-    )
-    assert "did not reach it" in independence["basis"]
+    assert independence["counts_as_independent_replication"] is False
+    assert "execution_receipt" not in json.dumps(independence)
 
 
-# ------------------------------------------------------------ independent ---
-@pytest.mark.parametrize("project_repo", [REPORTS_WHAT_IT_USED], indirect=True)
-def test_a_consumed_seed_with_identical_values_is_independent_and_agrees(
+# ------------------------------------ what an attestation does, and doesn't --
+@pytest.mark.parametrize("project_repo", [ECHOES_THE_SEED_IT_IGNORES], indirect=True)
+def test_case_c_an_attested_seed_the_program_ignores_is_attested_not_proven(
     portfolio: PortfolioStore,
     runtime_db: Database,
     runtime_project: str,
     project_repo: Path,
     tmp_path: Path,
 ) -> None:
-    """Case 3: seeds 5 and 14 give the same overlap -- and the receipt shows 14 was used."""
+    """The review's Case C, with the researcher's attestation in place.
 
-    context = _measured(
-        portfolio,
-        runtime_db,
-        runtime_project,
-        project_repo,
-        tmp_path,
-        replication_seed=14,
-    )
+    Research OS proves the seed was delivered to a separate execution; the
+    researcher's declaration says the computation uses it; this program does
+    not. That is outside what any generic runtime can detect, and the record
+    says exactly so: the perturbation is ``ATTESTED_BY_RESEARCHER``, the
+    unproved part is written down, and the identical values are recorded
+    beside it for a person to read.
+    """
+
+    context = _measure(portfolio, runtime_db, runtime_project, project_repo, tmp_path)
     step = _replicate(context)
     assert step.conclusion is EmpiricalConclusion.SUPPORTS, step.detail
     replication = _analysis(context, step)["replication"]
-    assert replication["independence"]["verified"] is True
-    assert set(replication["independence"]["consumed"]) == {"seeds", "parameter seed"}
+    independence = replication["independence"]
+    assert independence["configuration_independent"] is True
+    assert independence["perturbation_validity"] == "ATTESTED_BY_RESEARCHER"
+    assert "not" in independence["what_is_not_proved"]
+    assert "attested, not proved" in independence["basis"]
+    assert replication["agreement"]["identical_scientific_values"] is True
+
+
+@pytest.mark.parametrize("project_repo", [USES_THE_SEED], indirect=True)
+def test_a_used_seed_with_identical_values_is_independent_and_agrees(
+    portfolio: PortfolioStore,
+    runtime_db: Database,
+    runtime_project: str,
+    project_repo: Path,
+    tmp_path: Path,
+) -> None:
+    """Seeds 5 and 14 give the same overlap from a program that uses them."""
+
+    context = _measure(portfolio, runtime_db, runtime_project, project_repo, tmp_path)
+    step = _replicate(context)
+    assert step.conclusion is EmpiricalConclusion.SUPPORTS, step.detail
+    replication = _analysis(context, step)["replication"]
+    assert replication["independence"]["counts_as_independent_replication"] is True
+    assert set(replication["independence"]["attested"]) == {"seeds", "parameter seed"}
     assert replication["agreement"]["agrees"] is True
     assert replication["agreement"]["identical_scientific_values"] is True
     (row,) = _replication_rows(portfolio, context)
     assert row.strength is EvidenceStrength.SUPPORTS
-    assert "independent execution" in row.summary and "agrees" in row.summary
+    assert "independent replication" in row.summary and "agrees" in row.summary
 
 
-@pytest.mark.parametrize("project_repo", [REPORTS_WHAT_IT_USED], indirect=True)
+@pytest.mark.parametrize("project_repo", [USES_THE_SEED], indirect=True)
 def test_an_independent_execution_that_disagrees_is_recorded_as_both(
     portfolio: PortfolioStore,
     runtime_db: Database,
@@ -229,20 +279,15 @@ def test_an_independent_execution_that_disagrees_is_recorded_as_both(
     project_repo: Path,
     tmp_path: Path,
 ) -> None:
-    """Case 4: seed 1 gives 0.8 against the primary's 0.4 -- independent, disagreeing."""
+    """Seed 1 gives 0.8 against the primary's 0.4 -- independent, disagreeing."""
 
-    context = _measured(
-        portfolio,
-        runtime_db,
-        runtime_project,
-        project_repo,
-        tmp_path,
-        replication_seed=1,
+    context = _measure(
+        portfolio, runtime_db, runtime_project, project_repo, tmp_path, seed=1
     )
     step = _replicate(context)
     assert step.conclusion is EmpiricalConclusion.CONTRADICTS, step.detail
     replication = _analysis(context, step)["replication"]
-    assert replication["independence"]["verified"] is True
+    assert replication["independence"]["counts_as_independent_replication"] is True
     assert replication["agreement"]["agrees"] is False
     assert replication["agreement"]["identical_scientific_values"] is False
     (row,) = _replication_rows(portfolio, context)
@@ -250,8 +295,8 @@ def test_an_independent_execution_that_disagrees_is_recorded_as_both(
     assert "disagrees" in row.summary
 
 
-# ------------------------------------------------------ the frozen manifest --
-@pytest.mark.parametrize("project_repo", [REPORTS_WHAT_IT_USED], indirect=True)
+# ------------------------------------------ the manifest and the receipts ----
+@pytest.mark.parametrize("project_repo", [USES_THE_SEED], indirect=True)
 def test_the_manifest_is_frozen_before_the_replication_runs(
     portfolio: PortfolioStore,
     runtime_db: Database,
@@ -259,14 +304,7 @@ def test_the_manifest_is_frozen_before_the_replication_runs(
     project_repo: Path,
     tmp_path: Path,
 ) -> None:
-    context = _measured(
-        portfolio,
-        runtime_db,
-        runtime_project,
-        project_repo,
-        tmp_path,
-        replication_seed=14,
-    )
+    context = _measure(portfolio, runtime_db, runtime_project, project_repo, tmp_path)
     step = _replicate(context)
     experiment = step.experiment
     assert experiment.execution_manifest_artifact_id
@@ -276,11 +314,16 @@ def test_the_manifest_is_frozen_before_the_replication_runs(
     primary = context.portfolio.get_experiment(
         idea_id=context.idea_id, idea_version=1, role=ExperimentRole.PRIMARY
     )
+    parent_receipt = context.portfolio.receipt_for_job(primary.job_id)
+    assert manifest["schema"] == "portfolio-replication-manifest-v2"
     assert manifest["parent"]["experiment_id"] == primary.experiment_id
-    assert manifest["parent"]["spec_digest"] == primary.spec_digest
+    assert manifest["parent"]["receipt_id"] == parent_receipt.receipt_id
+    assert manifest["parent"]["evidence_id"] == primary.evidence_id
+    assert manifest["parent"]["analysis_artifact_id"] == primary.analysis_artifact_id
     assert manifest["execution"]["spec_digest"] == experiment.spec_digest
     assert manifest["execution"]["job_id"] == experiment.job_id
     assert manifest["code"]["base_commit"] and manifest["code"]["command"] == "measure"
+    assert manifest["capability"]["perturbation_attestation"] == ["seed", "seeds"]
     assert manifest["independence_variables"] == {
         "seeds": {"primary": [5], "replication": [14]},
         "parameters": {"seed": {"primary": "5", "replication": "14"}},
@@ -297,71 +340,35 @@ def test_the_manifest_is_frozen_before_the_replication_runs(
     )
 
 
-# ------------------------------------------------------------- unit level ---
-class _Artifacts:
-    def __init__(self, blobs: dict[str, bytes]) -> None:
-        self.blobs = blobs
-
-    def get_bytes(self, digest: str) -> bytes:
-        return self.blobs[digest]
-
-
-class _Context:
-    def __init__(self, blobs: dict[str, bytes]) -> None:
-        self.artifacts = _Artifacts(blobs)
-
-
-def test_a_receipt_a_model_composed_input_could_carry_is_refused(
+@pytest.mark.parametrize("project_repo", [USES_THE_SEED], indirect=True)
+def test_the_runner_writes_each_receipt_from_what_it_delivered(
+    portfolio: PortfolioStore,
+    runtime_db: Database,
+    runtime_project: str,
+    project_repo: Path,
     tmp_path: Path,
 ) -> None:
-    """A program that echoes its plan would echo a model-written receipt too."""
+    from research_os.portfolio import provenance
 
-    import hashlib
-
-    from research_os.runtime.interfaces import ExecutionSpec
-
-    plan = json.dumps({"ratios": [1, 2], "execution_receipt": {"seeds": [14]}}).encode()
-    digest = hashlib.sha256(plan).hexdigest()
-    output = json.dumps(
-        {"summary": {"spread": 1}, "execution_receipt": {"seeds": [14]}}
+    context = _measure(portfolio, runtime_db, runtime_project, project_repo, tmp_path)
+    step = _replicate(context)
+    replication = step.experiment
+    receipt = context.portfolio.receipt_for_job(replication.job_id)
+    document = provenance.verified_receipt(context.artifacts, receipt)
+    assert document["written_by"] == provenance.RECEIPT_WRITER
+    argv = document["delivered"]["argv"]
+    assert argv[argv.index("--seed") + 1] == "14"
+    assert document["delivered"]["env"]["RESEARCH_OS_SEED_0"] == "14"
+    assert document["execution_id"] == replication.job_id
+    analysis = _analysis(context, step)
+    assert analysis["execution_receipt"]["receipt_id"] == receipt.receipt_id
+    recorded = {path: sha for path, sha, _size in document["outputs"]}
+    assert {o["path"]: o["sha256"] for o in analysis["outputs"]}.items() <= (
+        recorded.items()
     )
-    (tmp_path / "out.json").write_text(output)
-    analysis = empirical.Analysis(
-        conclusion=EmpiricalConclusion.SUPPORTS,
-        summary="x",
-        outputs=(
-            ("out.json", hashlib.sha256(output.encode()).hexdigest(), len(output)),
-        ),
-    )
-    spec = ExecutionSpec(
-        name="x", argv=("x",), cwd=str(tmp_path), inputs=(("plan.json", digest),)
-    )
-    receipt, why = empirical._receipt(
-        _Context({digest: plan}), tmp_path, analysis, spec
-    )
-    assert receipt is None and "model-composed input" in why
-    clean = ExecutionSpec(name="x", argv=("x",), cwd=str(tmp_path))
-    receipt, where = empirical._receipt(_Context({}), tmp_path, analysis, clean)
-    assert receipt == {"seeds": [14]} and where == "out.json"
-
-
-def test_a_replication_with_no_frozen_manifest_is_not_independent(
-    tmp_path: Path,
-) -> None:
-    class _NoManifest:
-        spec_digest = "d"
-        execution_manifest_artifact_id = None
-
-    verdict = empirical.assess_independence(
-        _Context({}),
-        _NoManifest(),  # type: ignore[arg-type]
-        analysis=empirical.Analysis(
-            conclusion=EmpiricalConclusion.SUPPORTS, summary="x"
-        ),
-        spec=None,  # type: ignore[arg-type]
-        workspace=tmp_path,
-    )
-    assert not verdict.verified and "no execution manifest" in verdict.basis
+    parent = context.portfolio.get_receipt(receipt.parent_receipt_id)
+    assert parent is not None and parent.role is ExperimentRole.PRIMARY
+    assert parent.job_id != receipt.job_id
 
 
 def test_the_independence_variables_are_the_frozen_differences_only() -> None:

@@ -46,6 +46,7 @@ from research_os.portfolio.ids import (
     new_objection_id,
     new_portfolio_digest_id,
     new_provenance_id,
+    new_replication_assessment_id,
     new_request_id,
     new_retrieval_id,
     new_seed_id,
@@ -68,6 +69,7 @@ from research_os.portfolio.models import (
     EmpiricalConclusion,
     EvidenceKind,
     EvidenceStrength,
+    ExecutionReceipt,
     ExperimentRole,
     ExperimentState,
     FrontierRequest,
@@ -94,6 +96,7 @@ from research_os.portfolio.models import (
     ProvenanceBasis,
     QualityDimensions,
     QualityTier,
+    ReplicationAssessment,
     RequestBasis,
     RequestKind,
     RequestState,
@@ -164,6 +167,20 @@ EXPERIMENT_COLUMNS = (
     "evidence_id, failure_class, detail, attempts, origin_call_id, "
     "prompt_version, contract_id, created_at, updated_at, "
     "execution_manifest_artifact_id"
+)
+RECEIPT_COLUMNS = (
+    "receipt_id, job_id, experiment_id, idea_id, idea_version, role, action_id, "
+    "run_id, work_id, command, command_digest, spec_digest, base_commit, "
+    "delivered_digest, inputs_digest, outputs_digest, exit_code, "
+    "manifest_artifact_id, manifest_digest, parent_receipt_id, "
+    "receipt_artifact_id, created_at"
+)
+ASSESSMENT_COLUMNS = (
+    "assessment_id, evidence_id, experiment_id, idea_id, idea_version, legacy, "
+    "receipt_id, parent_receipt_id, parent_experiment_id, parent_evidence_id, "
+    "parent_analysis_artifact_id, manifest_artifact_id, manifest_digest, "
+    "analysis_artifact_id, configuration_independent, perturbation_attested, "
+    "varied, attested, unattested, agrees, identical_values, basis, created_at"
 )
 CONTRACT_COLUMNS = (
     "contract_id, project_id, idea_id, idea_version, role, kind, state, "
@@ -1458,6 +1475,7 @@ class PortfolioStore:
         analysis_artifact_id: str,
         conclusion: EmpiricalConclusion,
         detail: str,
+        assessment: Mapping[str, Any] | None = None,
     ) -> tuple[IdeaExperiment, str]:
         """The evidence row and ``INTERPRETED``, in one transaction.
 
@@ -1468,6 +1486,11 @@ class PortfolioStore:
         the same version -- which was then measured and read too. One
         transaction, with the experiment locked, so either both happened or
         neither did; and an experiment that already names evidence keeps it.
+
+        ``assessment`` is a replication's :class:`ReplicationAssessment`
+        fields (`sql/0046`), written in the same transaction and bound to the
+        evidence row, so a replication reading never exists without the
+        record of what it did and did not establish.
         """
 
         with self._tx() as conn:
@@ -1483,6 +1506,44 @@ class PortfolioStore:
                 evidence_id = self._insert_evidence(conn, **dict(evidence))[
                     "evidence_id"
                 ]
+            if assessment is not None:
+                fields = dict(assessment)
+                conn.execute(
+                    """
+                    insert into replication_assessments
+                        (assessment_id, evidence_id, experiment_id, idea_id,
+                         idea_version, legacy, receipt_id, parent_receipt_id,
+                         parent_experiment_id, parent_evidence_id,
+                         parent_analysis_artifact_id, manifest_artifact_id,
+                         manifest_digest, analysis_artifact_id,
+                         configuration_independent, perturbation_attested,
+                         varied, attested, unattested, agrees, identical_values,
+                         basis)
+                    values (%(assessment_id)s, %(evidence_id)s, %(experiment_id)s,
+                            %(idea_id)s, %(idea_version)s, false, %(receipt_id)s,
+                            %(parent_receipt_id)s, %(parent_experiment_id)s,
+                            %(parent_evidence_id)s, %(parent_analysis_artifact_id)s,
+                            %(manifest_artifact_id)s, %(manifest_digest)s,
+                            %(analysis_artifact_id)s,
+                            %(configuration_independent)s,
+                            %(perturbation_attested)s, %(varied)s, %(attested)s,
+                            %(unattested)s, %(agrees)s, %(identical_values)s,
+                            %(basis)s)
+                    on conflict (evidence_id) do nothing
+                    """,
+                    {
+                        **fields,
+                        "assessment_id": new_replication_assessment_id(),
+                        "evidence_id": evidence_id,
+                        "experiment_id": experiment_id,
+                        "idea_id": current["idea_id"],
+                        "idea_version": current["idea_version"],
+                        "analysis_artifact_id": analysis_artifact_id,
+                        "varied": jsonb(list(fields.get("varied") or ())),
+                        "attested": jsonb(list(fields.get("attested") or ())),
+                        "unattested": jsonb(list(fields.get("unattested") or ())),
+                    },
+                )
             row = conn.execute(
                 f"""
                 update idea_experiments
@@ -1707,8 +1768,72 @@ class PortfolioStore:
                 ).fetchall()
         return tuple(IdeaExperiment.model_validate(row) for row in rows)
 
+    # ------------------------------------------------ trusted provenance --
+    def record_execution_receipt(self, **fields: Any) -> ExecutionReceipt:
+        """Write one execution's trusted receipt (`sql/0046`). Once, ever.
+
+        Called only by the runner, from what it observed; the database
+        refuses a receipt that does not describe the experiment it names, a
+        parent that is not a primary execution of the same idea version, and
+        any later change or removal.
+        """
+
+        with self._tx() as conn:
+            row = conn.execute(
+                f"""
+                insert into execution_receipts
+                    (receipt_id, job_id, experiment_id, idea_id, idea_version,
+                     role, action_id, run_id, work_id, command, command_digest,
+                     spec_digest, base_commit, delivered_digest, inputs_digest,
+                     outputs_digest, exit_code, manifest_artifact_id,
+                     manifest_digest, parent_receipt_id, receipt_artifact_id)
+                values (%(receipt_id)s, %(job_id)s, %(experiment_id)s,
+                        %(idea_id)s, %(idea_version)s, %(role)s, %(action_id)s,
+                        %(run_id)s, %(work_id)s, %(command)s, %(command_digest)s,
+                        %(spec_digest)s, %(base_commit)s, %(delivered_digest)s,
+                        %(inputs_digest)s, %(outputs_digest)s, %(exit_code)s,
+                        %(manifest_artifact_id)s, %(manifest_digest)s,
+                        %(parent_receipt_id)s, %(receipt_artifact_id)s)
+                returning {RECEIPT_COLUMNS}
+                """,
+                {**fields, "role": str(fields["role"])},
+            ).fetchone()
+        return ExecutionReceipt.model_validate(row)
+
+    def receipt_for_job(self, job_id: str) -> ExecutionReceipt | None:
+        with self._tx() as conn:
+            row = conn.execute(
+                f"select {RECEIPT_COLUMNS} from execution_receipts where job_id = %s",
+                (job_id,),
+            ).fetchone()
+        return ExecutionReceipt.model_validate(row) if row else None
+
+    def get_receipt(self, receipt_id: str) -> ExecutionReceipt | None:
+        with self._tx() as conn:
+            row = conn.execute(
+                f"select {RECEIPT_COLUMNS} from execution_receipts "
+                "where receipt_id = %s",
+                (receipt_id,),
+            ).fetchone()
+        return ExecutionReceipt.model_validate(row) if row else None
+
+    def replication_assessments(
+        self, *, idea_id: str, idea_version: int
+    ) -> tuple[ReplicationAssessment, ...]:
+        with self._tx() as conn:
+            rows = conn.execute(
+                f"select {ASSESSMENT_COLUMNS} from replication_assessments "
+                "where idea_id = %s and idea_version = %s order by created_at",
+                (idea_id, idea_version),
+            ).fetchall()
+        return tuple(ReplicationAssessment.model_validate(row) for row in rows)
+
     def set_execution_manifest(self, experiment_id: str, *, artifact_id: str) -> None:
-        """Record a replication's frozen execution manifest (`sql/0041`, INV-07)."""
+        """Record a replication's frozen execution manifest (`sql/0041`, INV-07).
+
+        Refused by the database once the execution has a result (`sql/0046`):
+        a changed configuration is a new execution, never a repointed one.
+        """
 
         with self._tx() as conn:
             conn.execute(

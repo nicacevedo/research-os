@@ -34,6 +34,8 @@ PROVENANCE_ID_RE = re.compile(r"^IPRV-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$")
 CLAIM_ID_RE = re.compile(r"^PLCL-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$")
 SYNTHESIS_ID_RE = re.compile(r"^PSYN-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$")
 RETRIEVAL_ID_RE = re.compile(r"^PRET-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$")
+EXECUTION_RECEIPT_ID_RE = re.compile(r"^XRCT-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$")
+REPLICATION_ASSESSMENT_ID_RE = re.compile(r"^RASM-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$")
 
 #: Every id pattern this package mints, so a test can assert none of them can
 #: match a capsule id and none can match another runtime id.
@@ -52,6 +54,8 @@ ID_PATTERNS: dict[str, re.Pattern[str]] = {
     "literature_claim": CLAIM_ID_RE,
     "synthesis": SYNTHESIS_ID_RE,
     "literature_retrieval": RETRIEVAL_ID_RE,
+    "execution_receipt": EXECUTION_RECEIPT_ID_RE,
+    "replication_assessment": REPLICATION_ASSESSMENT_ID_RE,
 }
 
 
@@ -126,6 +130,14 @@ def new_provenance_id(*, moment: datetime | None = None) -> str:
 
 def new_retrieval_id(*, moment: datetime | None = None) -> str:
     return new_id("PRET", moment=moment)
+
+
+def new_execution_receipt_id(*, moment: datetime | None = None) -> str:
+    return new_id("XRCT", moment=moment)
+
+
+def new_replication_assessment_id(*, moment: datetime | None = None) -> str:
+    return new_id("RASM", moment=moment)
 
 
 def track_thread_id(run_id: str) -> str:

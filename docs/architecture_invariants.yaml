@@ -2,52 +2,88 @@
 #
 # Every enforcement point is `module:qualname` and must resolve to a real
 # symbol; every test is `path::function` and must exist; every mutant must be
-# defined in tests/integrity_mutations.py and still apply. The prose document
-# is the explanation; this file is what tests/test_architecture_invariants.py
-# holds to account, so a rename that orphans an invariant fails the suite.
-schema: research-os-architecture-invariants-v1
+# defined in tests/integrity_mutations.py and still apply; every finding must
+# map to an invariant and a reproduction, and where its frozen evidence is on
+# this machine its bytes must hash to what is recorded here. The prose
+# document is the explanation; this file is what
+# tests/test_architecture_invariants.py holds to account, so a rename that
+# orphans an invariant fails the suite.
+#
+# It is traceability metadata, not proof. That a test is listed says where a
+# property is demonstrated; whether it is demonstrated is the test's job, and
+# whether the tests bite is the mutation harness's.
+schema: research-os-architecture-invariants-v2
 spec: docs/ARCHITECTURE_INVARIANTS.md
-evidence: ~/.local/state/research-os-qualification/37e8afe00877c8afa613cc0942120342735c7f73/evidence/60-part-e-review
+evidence:
+  part-e: ~/.local/state/research-os-qualification/37e8afe00877c8afa613cc0942120342735c7f73/evidence/60-part-e-review
+  independent-review: ~/.local/state/research-os-qualification/8e92e8c8ed4df1187aa3e28b8292a4a4d81eee58/independent-review
 
 invariants:
   - id: INV-01
     title: Budget authority
-    threat: unknown external spend treated as zero and its authority handed back
-    findings: [H5]
+    threat: >-
+      external spend beyond a person's ceiling -- unknown spend treated as zero,
+      or an estimate reserved in front of a provider nothing caps
+    findings: [H5, R1]
     enforced_by:
       - research_os.runtime.budgets:BudgetLedger.reserve
       - research_os.runtime.budgets:BudgetLedger.mark_submitted
+      - research_os.runtime.budgets:BudgetLedger.settle
       - research_os.runtime.budgets:BudgetLedger.settle_unknown
       - research_os.runtime.budgets:BudgetLedger.reconcile_stale
+      - research_os.runtime.budgets:provider_cap
       - research_os.runtime.routing:ModelRouter.complete
+      - research_os.runtime.routing:ModelRouter.route
+      - research_os.runtime.routing:ModelRouter._eligible
       - research_os.runtime.spend:BudgetedProvider.invoke
+      - research_os.runtime.spend:DelegatedSpendAuthority.authorize
+      - research_os.runtime.actions.coding:_controller
+      - research_os.runtime.actions.proposals:_controller
+      - research_os.automation.providers:enforces_hard_budget_cap
       - research_os.automation.providers:ClaudeCodeProvider.invoke
     tests:
       - tests/test_integrity_budget_authority.py::test_timed_out_calls_do_not_hand_back_their_ceiling_in_any_scope
       - tests/test_integrity_budget_authority.py::test_a_reported_failure_cost_still_settles_at_what_was_reported
       - tests/test_integrity_budget_authority.py::test_the_real_adapter_says_a_timed_out_cli_was_invoked
       - tests/test_integrity_budget_authority.py::test_the_real_adapter_says_an_unexecutable_cli_was_not_invoked
-      - tests/test_integrity_budget_authority.py::test_a_cli_that_cannot_be_executed_is_released_every_time
-      - tests/test_integrity_budget_authority.py::test_an_adapter_that_raises_after_it_was_handed_the_call_is_charged
       - tests/test_integrity_budget_authority.py::test_death_before_submission_is_released
       - tests/test_integrity_budget_authority.py::test_death_after_submission_is_charged_in_full
-      - tests/test_integrity_budget_authority.py::test_after_a_charged_crash_the_next_call_is_refused
       - tests/test_integrity_budget_authority.py::test_settlement_is_idempotent
+      - tests/test_integrity_budget_authority.py::test_an_undeclared_timeout_is_charged_the_default_ceiling_it_was_capped_at
       - tests/test_integrity_budget_authority.py::test_a_delegated_call_that_timed_out_is_charged_and_the_next_refused
-      - tests/test_integrity_budget_authority.py::test_a_delegated_call_that_never_started_is_released
+      - tests/test_integrity_v2_budget_caps.py::test_rev_delegated_call_reaches_the_provider_capped_at_its_reservation
+      - tests/test_integrity_v2_budget_caps.py::test_rev_objective_call_with_no_declared_ceiling_is_capped
+      - tests/test_integrity_v2_budget_caps.py::test_rev_lost_settlements_cannot_hide_spend_beyond_any_of_five_ceilings
+      - tests/test_integrity_v2_budget_caps.py::test_two_uncertain_calls_cannot_both_be_authorised_the_same_final_ceiling
+      - tests/test_integrity_v2_budget_caps.py::test_each_of_the_five_scopes_alone_refuses_a_call_it_cannot_cover
+      - tests/test_integrity_v2_budget_caps.py::test_a_timed_out_capped_call_is_charged_its_cap_and_reconciliation_is_stable
+      - tests/test_integrity_v2_budget_caps.py::test_the_router_refuses_an_adapter_that_cannot_be_capped
+      - tests/test_integrity_v2_budget_caps.py::test_the_delegated_wrapper_refuses_an_adapter_that_cannot_be_capped
+      - tests/test_integrity_v2_budget_caps.py::test_the_ledger_will_not_submit_a_cost_reservation_without_a_cap
+      - tests/test_integrity_v2_budget_caps.py::test_the_database_refuses_an_uncapped_submission_whatever_the_code_does
+      - tests/test_integrity_v2_budget_caps.py::test_only_the_router_builds_a_provider_invocation_in_the_autonomous_layers
+      - tests/test_integrity_v2_budget_caps.py::test_the_delegated_actions_only_ever_hand_over_wrapped_adapters
+      - tests/test_runtime_delegated_budget.py::test_every_delegated_call_is_handed_its_reservation_as_a_hard_cap
+      - tests/test_runtime_delegated_budget.py::test_a_provider_that_bills_past_its_cap_is_recorded_and_marked
+      - tests/test_final_hardening_regressions.py::test_a_request_that_declares_no_ceiling_is_capped_at_the_default_ceiling
+      - tests/test_final_hardening_regressions.py::test_a_call_the_provider_stopped_at_its_ceiling_is_charged_and_is_not_an_outage
       - tests/test_integrity_reproductions.py::test_h5_timed_out_calls_are_not_each_authorised_the_whole_ceiling_again
-      - tests/test_integrity_migrations.py::test_the_integrity_migrations_upgrade_live_0036_data
-    mutants: [MUT-H5-1, MUT-H5-2, MUT-H5-3, MUT-H5-4, MUT-H5-5, MUT-H5-6]
+      - tests/test_integrity_v2_migrations.py::test_legacy_state_fails_closed_after_upgrading_to_the_head
+    mutants: [MUT-H5-1, MUT-H5-2, MUT-H5-3, MUT-H5-4, MUT-H5-5, MUT-H5-6, MUT-B2-1, MUT-B2-2, MUT-B2-3, MUT-B2-4, MUT-B2-5, MUT-B2-6]
     pass_requires: >-
-      one timed-out call and no more under a ceiling that covers one, in all
-      five scopes; process death before submission released and after
-      submission, during processing and after the response charged in full;
-      repeated reconciliation changing nothing
+      every spend-bearing call reaches its provider with a provider-enforced
+      cap no greater than its reservation, persisted with the submission; an
+      adapter that cannot be capped refused before anything is reserved; the
+      reviewer's delegated, objective and lost-settlement routes bounded in
+      all five scopes; unknown spend charged in full; reconciliation
+      idempotent
 
   - id: INV-02
     title: Evidence ownership
-    threat: model text read as system-computed structure or evidence
-    findings: [H2, M1]
+    threat: >-
+      model- or program-authored content read as system-computed structure,
+      evidence or execution provenance
+    findings: [H2, M1, R2]
     enforced_by:
       - research_os.portfolio.curator:_untrusted
       - research_os.portfolio.curator:_Page.render
@@ -55,7 +91,9 @@ invariants:
       - research_os.portfolio.curator:render_bank
       - research_os.portfolio.curator:_provenance
       - research_os.portfolio.runner:executed_searches
-      - research_os.portfolio.empirical:_receipt
+      - research_os.portfolio.provenance:write_receipt
+      - research_os.portfolio.provenance:verified_receipt
+      - research_os.portfolio.store:PortfolioStore.record_execution_receipt
     tests:
       - tests/test_integrity_bank_rendering.py::test_no_model_field_changes_the_structure_of_any_page
       - tests/test_integrity_bank_rendering.py::test_the_true_computed_header_is_still_there
@@ -63,17 +101,23 @@ invariants:
       - tests/test_integrity_bank_rendering.py::test_a_page_refuses_a_value_line_that_begins_like_structure
       - tests/test_integrity_reproductions.py::test_h2_the_human_ready_page_cannot_carry_a_forged_provenance_header
       - tests/test_integrity_reproductions.py::test_h2_the_idea_page_cannot_carry_a_forged_reviews_section
-      - tests/test_integrity_replication_causality.py::test_a_receipt_a_model_composed_input_could_carry_is_refused
-    mutants: [MUT-H2-1, MUT-H2-2, MUT-H2-3, MUT-H2-4, MUT-H6-3]
+      - tests/test_integrity_replication_causality.py::test_a_receipt_a_program_writes_is_never_provenance
+      - tests/test_integrity_replication_causality.py::test_the_runner_writes_each_receipt_from_what_it_delivered
+      - tests/test_integrity_v2_replication_provenance.py::test_rev_a_model_composed_escaped_receipt_is_never_provenance
+      - tests/test_integrity_v2_replication_provenance.py::test_rev_a_receipt_of_another_run_or_parent_is_refused_by_the_database
+      - tests/test_integrity_v2_replication_provenance.py::test_trusted_provenance_rows_are_never_changed_or_removed
+    mutants: [MUT-H2-1, MUT-H2-2, MUT-H2-3, MUT-H2-4, MUT-H6-3, MUT-R2-6]
     pass_requires: >-
       every adversarial payload in every model-authored field leaves every
-      page's headings, header lines and table cells exactly what the records
-      alone determine
+      page's structure what the records alone determine; the only execution
+      receipt is the one the runner writes from what it observed; no program
+      output, however composed or escaped, is read as provenance; a receipt
+      cannot be bound to another run or parent, changed or removed
 
   - id: INV-03
     title: Action uniqueness
     threat: a live stage declared dead on age and bought again; a late result landing
-    findings: [H3]
+    findings: [H3, R9]
     enforced_by:
       - research_os.portfolio.track:advance_idea
       - research_os.portfolio.track:_run_owned_stage
@@ -103,15 +147,19 @@ invariants:
     pass_requires: >-
       a stage past the old grace period with a live owner is not reclaimed; a
       killed worker becomes reclaimable only when its lease truly expires; a
-      duplicate purchase starts nothing; a late result from an attempt that
-      lost ownership writes no row
+      duplicate purchase starts nothing and the loser of an insert race is
+      told it lost; a late result from an attempt that lost ownership writes
+      no row
 
   - id: INV-04
     title: Durable scientific decisions
-    threat: an answer applied while its record is dropped or reused
-    findings: [H4, M3]
+    threat: >-
+      an answer applied while its record is dropped or reused, or a review
+      recorded without all of the objections it raised
+    findings: [H4, M3, R3, R4]
     enforced_by:
       - research_os.portfolio.store:PortfolioStore.record_review
+      - research_os.portfolio.store:PortfolioStore.review_objections
       - research_os.portfolio.runner:_record_review
       - research_os.portfolio.runner:run_meta_review
       - research_os.portfolio.stages:basis_review_ids
@@ -122,15 +170,31 @@ invariants:
       - tests/test_integrity_review_events.py::test_a_rerun_reviewers_objections_attach_to_its_own_review
       - tests/test_integrity_review_events.py::test_a_replay_of_one_call_is_one_review_and_one_set_of_objections
       - tests/test_integrity_reproductions.py::test_h4_a_declining_meta_review_is_not_reasked_on_the_same_record
-    mutants: [MUT-H4-1, MUT-H4-2, MUT-H4-3]
+      - tests/test_integrity_v2_review_events.py::test_rev_a_later_fatal_objection_is_not_folded_into_an_earlier_minor_one
+      - tests/test_integrity_v2_review_events.py::test_rev_a_crash_before_the_objections_leaves_no_review_at_all
+      - tests/test_integrity_v2_review_events.py::test_rev_a_rerun_objection_with_the_same_words_is_attributed_to_the_rerun
+      - tests/test_integrity_v2_review_events.py::test_fatal_first_then_minor_keeps_both_and_the_fatal_blocks
+      - tests/test_integrity_v2_review_events.py::test_every_objection_of_one_review_is_recorded_in_order
+      - tests/test_integrity_v2_review_events.py::test_a_replay_of_the_same_call_writes_nothing_twice
+      - tests/test_integrity_v2_review_events.py::test_a_replay_that_disagrees_with_its_record_is_refused
+      - tests/test_integrity_v2_review_events.py::test_a_meta_review_retry_keeps_each_calls_disagreements_as_its_own
+      - tests/test_integrity_v2_review_events.py::test_a_severity_that_is_not_the_worst_objection_is_refused_before_anything_is_written
+      - tests/test_integrity_v2_review_events.py::test_a_review_committed_without_its_objections_is_refused_at_commit
+      - tests/test_integrity_v2_review_events.py::test_what_a_review_and_its_objections_said_cannot_be_rewritten
+      - tests/test_portfolio_store.py::test_an_objection_is_never_added_to_a_review_after_it_was_recorded
+    mutants: [MUT-H4-1, MUT-H4-2, MUT-H4-3, MUT-V3-1, MUT-V3-2, MUT-V3-5]
     pass_requires: >-
-      an unchanged record is synthesised once; every meta-review call has
-      exactly one row naming it; a re-run's objections attach to its own review
+      a review and all of its objections commit together or not at all, at
+      the database; no objection is deduplicated across reviews; a crash
+      before the commit leaves no review; an unchanged record is synthesised
+      once; every call has exactly one review row naming it
 
   - id: INV-05
     title: Retrieval truth
-    threat: a model's claim of a search counted as a search
-    findings: [H1, M1]
+    threat: >-
+      a model's claim of a search counted as a search, or a superficial
+      rewording of one executed search counted as a distinct path
+    findings: [H1, M1, R7]
     enforced_by:
       - research_os.portfolio.store:PortfolioStore.begin_retrieval
       - research_os.portfolio.store:PortfolioStore.complete_retrieval
@@ -138,6 +202,8 @@ invariants:
       - research_os.portfolio.runner:_retrieve
       - research_os.portfolio.runner:run_literature_audit
       - research_os.portfolio.gates:_distinct_retrieval_path
+      - research_os.portfolio.digests:retrieval_terms
+      - research_os.portfolio.digests:same_term
       - research_os.portfolio.litintel:answer_request
     tests:
       - tests/test_integrity_retrieval_truth.py::test_a_genuinely_separate_retrieval_path_passes
@@ -156,100 +222,162 @@ invariants:
       - tests/test_integrity_reproductions.py::test_h1_a_retried_first_audit_is_not_a_second_terminology_path
       - tests/test_integrity_reproductions.py::test_h1_one_retrieval_sampled_twice_is_not_a_second_terminology_path
       - tests/test_integrity_reproductions.py::test_m1_literature_confidence_counts_searches_that_were_run
+      - tests/test_integrity_v2_retrieval_paths.py::test_rev_reordered_identical_terms_are_not_a_distinct_retrieval_path
+      - tests/test_integrity_v2_retrieval_paths.py::test_a_superficial_variant_of_the_first_path_is_not_a_second_path
+      - tests/test_integrity_v2_retrieval_paths.py::test_a_recombination_of_first_path_words_is_not_a_second_path
+      - tests/test_integrity_v2_retrieval_paths.py::test_a_failed_first_path_search_still_counts_as_words_already_used
+      - tests/test_integrity_v2_retrieval_paths.py::test_a_materially_different_term_set_with_new_assessed_work_passes
+      - tests/test_integrity_v2_retrieval_paths.py::test_new_terms_with_no_newly_assessed_work_are_not_a_path
+      - tests/test_integrity_v2_retrieval_paths.py::test_new_terms_from_the_same_execution_are_not_a_path
+      - tests/test_integrity_v2_retrieval_paths.py::test_the_term_fingerprint_is_deterministic_and_order_free
     mutants: [MUT-H1-1, MUT-H1-2, MUT-H1-3, MUT-H1-4, MUT-H1-5, MUT-H1-6, MUT-M1-1, MUT-L2-1, MUT-L2-2, MUT-L2-3]
     pass_requires: >-
-      the same search twice, a retried audit, a cached result and a claimed
-      search are each refused; a genuine separate path passes; confidence
+      the same search twice, a retried audit, a cached result, a claimed
+      search and every superficial rewording (order, punctuation, case,
+      whitespace, repetition, plurals, stopwords, shared stems, recombined
+      first-path words) each refused; a separate successful search with a new
+      content term that found and had assessed a new work passes; confidence
       cannot be raised by prose
 
   - id: INV-06
-    title: Contract before result
-    threat: a rule chosen or changed after its answer is known
-    findings: []
+    title: Contract before result, and frozen ancestry
+    threat: >-
+      a rule or a replication's configuration chosen or changed after its
+      answer is known, or evidence surviving a change to what it descends from
+    findings: [R6]
     enforced_by:
       - research_os.portfolio.empirical:_preregistered
       - research_os.portfolio.empirical:_verified_contract
       - research_os.portfolio.store:PortfolioStore.freeze_contract
       - research_os.portfolio.empirical:freeze_replication_manifest
+      - research_os.portfolio.store:PortfolioStore.set_execution_manifest
+      - research_os.portfolio.empirical:interpret
+      - research_os.portfolio.provenance:workspace_outputs_match
+      - research_os.portfolio.provenance:replication_provenance
     tests:
       - tests/test_portfolio_scientific_contract.py::test_the_analysis_is_frozen_first_and_the_designer_never_sees_its_thresholds
       - tests/test_portfolio_scientific_contract.py::test_the_database_refuses_an_edit_to_a_frozen_contract
       - tests/test_portfolio_scientific_contract.py::test_a_tampered_contract_is_refused_at_interpretation_when_the_trigger_is_bypassed
       - tests/test_portfolio_empirical.py::test_a_specification_that_changed_after_preregistration_does_not_run
       - tests/test_integrity_replication_causality.py::test_the_manifest_is_frozen_before_the_replication_runs
-    mutants: [MUT-H6-4]
+      - tests/test_integrity_v2_replication_provenance.py::test_rev_a_manifest_cannot_be_repointed_once_its_execution_has_a_result
+      - tests/test_integrity_v2_replication_provenance.py::test_a_stale_receipt_from_another_execution_does_not_bind_the_reading
+      - tests/test_integrity_v2_replication_provenance.py::test_a_parent_result_that_changed_breaks_the_downstream_chain
+      - tests/test_integrity_v2_replication_provenance.py::test_an_artifact_whose_bytes_changed_breaks_the_chain
+      - tests/test_integrity_v2_replication_provenance.py::test_an_output_swapped_after_the_execution_is_refused_before_it_is_read
+    mutants: [MUT-H6-4, MUT-R2-3, MUT-R2-4, MUT-R2-5]
     pass_requires: >-
-      the existing contract, provenance and mutation suites passing unchanged,
-      and the replication manifest frozen before its execution
+      the existing contract, lineage and mutation suites passing; the
+      replication manifest frozen before its execution and refused a new
+      pointer once the execution has a result; the chain from contract and
+      manifest to evidence re-verified at readiness, so a repointed manifest,
+      a stale or foreign execution, a changed parent result, a changed
+      artifact or an output swapped before reading breaks it
 
   - id: INV-07
-    title: Replication causality
-    threat: byte inequality read as causal independence
-    findings: [H6]
+    title: Replication -- configuration independence, perturbation validity, agreement
+    threat: >-
+      a second run read as an independent replication on evidence that cannot
+      establish it: differing bytes, or a program's report of what it used
+    findings: [H6, R2, R5]
     enforced_by:
       - research_os.portfolio.empirical:independence_variables
       - research_os.portfolio.empirical:freeze_replication_manifest
-      - research_os.portfolio.empirical:assess_independence
+      - research_os.portfolio.provenance:assess_replication
       - research_os.portfolio.empirical:assess_agreement
       - research_os.portfolio.empirical:interpret
+      - research_os.experiment.spec:CommandSpec
     tests:
-      - tests/test_integrity_replication_causality.py::test_a_seed_the_program_ignores_is_not_an_independent_execution
-      - tests/test_integrity_replication_causality.py::test_a_receipt_reporting_the_primarys_seed_is_a_contradiction
-      - tests/test_integrity_replication_causality.py::test_a_consumed_seed_with_identical_values_is_independent_and_agrees
+      - tests/test_integrity_replication_causality.py::test_without_an_attestation_a_delivered_seed_is_not_a_valid_perturbation
+      - tests/test_integrity_replication_causality.py::test_a_receipt_a_program_writes_is_never_provenance
+      - tests/test_integrity_replication_causality.py::test_case_c_an_attested_seed_the_program_ignores_is_attested_not_proven
+      - tests/test_integrity_replication_causality.py::test_a_used_seed_with_identical_values_is_independent_and_agrees
       - tests/test_integrity_replication_causality.py::test_an_independent_execution_that_disagrees_is_recorded_as_both
-      - tests/test_integrity_replication_causality.py::test_a_replication_with_no_frozen_manifest_is_not_independent
       - tests/test_integrity_replication_causality.py::test_the_independence_variables_are_the_frozen_differences_only
       - tests/test_integrity_reproductions.py::test_h6_a_seed_ignoring_rerun_with_a_timestamp_is_not_a_replication
+      - tests/test_integrity_v2_replication_provenance.py::test_rev_a_program_echoing_its_ignored_seed_is_not_a_replication
+      - tests/test_integrity_v2_replication_provenance.py::test_a_genuine_separate_execution_counts_whether_or_not_it_agrees
+      - tests/test_integrity_v2_replication_provenance.py::test_a_variation_the_runner_did_not_deliver_is_not_configuration_independence
+      - tests/test_integrity_v2_replication_provenance.py::test_a_delivered_attested_variation_is_independent_at_the_unit_level
+      - tests/test_integrity_v2_replication_provenance.py::test_an_attestation_naming_nothing_declared_is_refused_at_declaration
     mutants: [MUT-H6-1, MUT-H6-2, MUT-H6-3, MUT-H6-4]
     pass_requires: >-
-      the four cases: an ignored seed and a timestamp-only difference are not
-      independent; a consumed seed with identical values is independent and
-      agrees; an independent execution that disagrees is recorded as both
+      configuration independence only from two runner-written receipts that
+      show the frozen variation delivered to a separate execution;
+      perturbation validity only from the researcher's attestation frozen in
+      the manifest, recorded as attested and never as proved; agreement
+      recorded separately; an ignored-seed rerun is not a replication without
+      an attestation, and with one is recorded as exactly that
 
   - id: INV-08
-    title: Evidence completeness
-    threat: a mandatory failure masked by another stage's success
-    findings: [M2, H1]
+    title: Evidence completeness, read by the gates themselves
+    threat: >-
+      a mandatory failure masked by another stage's success, or readiness
+      inferred from a row existing rather than from the trusted objects behind it
+    findings: [M2, H1, R3, R4, R5]
     enforced_by:
       - research_os.portfolio.track:_accumulate
       - research_os.portfolio.track:finish_board
       - research_os.portfolio.runner:finish_review_board
+      - research_os.portfolio.runner:_evaluate
       - research_os.portfolio.stages:board_state
+      - research_os.portfolio.store:PortfolioStore.live_reviews
+      - research_os.portfolio.gates:_promising_unmet
       - research_os.portfolio.gates:_validated_unmet
+      - research_os.portfolio.gates:_human_ready_unmet
+      - research_os.portfolio.gates:_incomplete_review_events
+      - research_os.portfolio.gates:_replication_met
+      - research_os.portfolio.gates:evaluate
+      - research_os.portfolio.gates:permit
     tests:
       - tests/test_integrity_review_events.py::test_a_board_missing_any_reviewer_is_not_complete_and_says_which
       - tests/test_integrity_review_events.py::test_a_reviewer_answering_with_a_superseded_prompt_does_not_complete_it
       - tests/test_integrity_review_events.py::test_one_endorsement_does_not_mask_another_reading_of_the_same_role
       - tests/test_integrity_reproductions.py::test_m2_a_board_missing_a_reviewer_is_not_a_completed_board
-    mutants: [MUT-M2-1, MUT-M2-2, MUT-M2-3]
+      - tests/test_integrity_v2_review_events.py::test_a_legacy_review_whose_objections_may_be_incomplete_is_never_live
+      - tests/test_integrity_v2_review_events.py::test_the_gate_itself_refuses_a_live_review_missing_its_objection
+      - tests/test_integrity_v2_review_events.py::test_a_review_from_a_superseded_prompt_is_not_live_and_its_objection_stands
+      - tests/test_integrity_v2_review_events.py::test_a_stale_review_stops_counting_and_its_fatal_objection_still_blocks
+      - tests/test_portfolio_gates.py::test_an_executed_replication_row_without_a_trusted_chain_is_not_verification
+      - tests/test_integrity_v2_migrations.py::test_upgraded_0036_replication_evidence_cannot_satisfy_the_current_gate
+    mutants: [MUT-M2-1, MUT-M2-2, MUT-M2-3, MUT-R2-1, MUT-R2-2, MUT-V3-3, MUT-V3-4]
     pass_requires: >-
       a board missing a reviewer is not complete and does not move the idea;
-      a re-run endorsement does not mask a standing negative review
+      a re-run endorsement does not mask a standing negative review; a live
+      review whose objections are not all on record is not counted; the
+      replication gate counts only an evidence row whose trusted chain it
+      re-verifies as admissible, and legacy evidence never
 
   - id: INV-09
     title: Capability honesty
     threat: a missing capability papered over with something that looks like evidence
-    findings: []
+    findings: [R2]
     enforced_by:
       - research_os.portfolio.runner:run_literature_audit
-      - research_os.portfolio.empirical:assess_independence
+      - research_os.portfolio.provenance:assess_replication
       - research_os.portfolio.empirical:submit
+      - research_os.portfolio.empirical:freeze_replication_manifest
+      - research_os.runtime.routing:BudgetCapUnavailableError
     tests:
       - tests/test_portfolio_literature_intel.py::test_no_literature_source_is_a_reported_capability_not_an_answer
       - tests/test_portfolio_empirical.py::test_a_host_with_no_executor_refuses_rather_than_reasoning_about_the_result
       - tests/test_portfolio_empirical.py::test_a_host_that_cannot_contain_refuses_rather_than_running_uncontained
       - tests/test_portfolio_scientific_contract.py::test_an_undeclared_capability_is_refused_and_the_contract_is_kept
       - tests/test_runtime_actions.py::test_an_untestable_hypothesis_is_a_valid_answer
-      - tests/test_integrity_replication_causality.py::test_a_seed_the_program_ignores_is_not_an_independent_execution
+      - tests/test_integrity_replication_causality.py::test_without_an_attestation_a_delivered_seed_is_not_a_valid_perturbation
+      - tests/test_integrity_v2_replication_provenance.py::test_a_replication_of_a_primary_with_no_receipt_is_refused_before_it_runs
+      - tests/test_integrity_v2_budget_caps.py::test_the_router_refuses_an_adapter_that_cannot_be_capped
     mutants: [MUT-H6-1]
     pass_requires: >-
-      the existing refusal tests passing unchanged, and a replication with no
-      receipt recorded INSUFFICIENT with its reason
+      the existing refusal tests passing; a replication with no attested
+      perturbation recorded INSUFFICIENT with its reason; a replication of a
+      primary with no trusted receipt refused before it runs; an uncappable
+      provider a capability refusal, never spend
 
   - id: INV-10
     title: Human authority
     threat: the machine raises its own ceiling, resumes itself, or promotes its own work
-    findings: [M4]
+    findings: [M4, R8]
     enforced_by:
       - research_os.portfolio.tick:_revive_budget_parks
       - research_os.portfolio.tick:_never_allocatable
@@ -273,20 +401,35 @@ invariants:
       - tests/test_integrity_v2_parks_and_races.py::test_a_legacy_park_is_revived_by_no_ceiling_and_says_a_person_decides
       - tests/test_integrity_v2_parks_and_races.py::test_model_prose_naming_a_lineage_room_status_revives_nothing
       - tests/test_integrity_v2_parks_and_races.py::test_a_structural_lineage_room_park_still_resumes_at_its_recorded_status
-    mutants: [MUT-M4-1, MUT-M4-2, MUT-INV10-1]
+      - tests/test_integrity_v2_migrations.py::test_legacy_state_fails_closed_after_upgrading_to_the_head
+    mutants: [MUT-M4-1, MUT-M4-2, MUT-M4-3, MUT-INV10-1]
     pass_requires: >-
-      the authority suites passing, no autonomous module able to write a
-      bound, mark a ceiling a person's or lift a person's blocks, and a
-      budget park revived only by a ceiling a person raised
+      the authority suites passing; a budget park revived only by a ceiling a
+      person raised; a legacy park with no structural reason revived by
+      nothing autonomous and shown as a person's decision; no revival read
+      from model-writable prose
 
 findings:
-  - {id: H1, invariants: [INV-05, INV-08], evidence_file: _review_litcur_second_path.py, evidence_sha256: 8b1a8998b6d8b8a99e8defecba018f368f290e5d266fed0861f073dd974959e7, reproduction: tests/test_integrity_reproductions.py::test_h1_one_retrieval_sampled_twice_is_not_a_second_terminology_path}
-  - {id: H2, invariants: [INV-02], evidence_file: _review_litcur_bank_forgery.py, evidence_sha256: 116ca73d3fe6a2f1888c5a83a39825ad418f73e9c3c9bcda4d4e8532396b05cb, reproduction: tests/test_integrity_reproductions.py::test_h2_the_human_ready_page_cannot_carry_a_forged_provenance_header}
-  - {id: H3, invariants: [INV-03], evidence_file: _review_revision_audit_retry.py, evidence_sha256: ce281e4720a1b758c990b32f4ae9f04ac76ea6d13f8c5a69cafaf1b48e9dfddb, reproduction: tests/test_integrity_reproductions.py::test_h3_a_live_stage_with_a_leased_work_item_is_not_reclaimed_as_a_crash}
-  - {id: H4, invariants: [INV-04], evidence_file: _review_revision_meta_reroll.py, evidence_sha256: 0ffecd21b294cdf96de981ed9140c8a90b630a38bdaa7b9ea0257e8359bf1cd9, reproduction: tests/test_integrity_reproductions.py::test_h4_a_declining_meta_review_is_not_reasked_on_the_same_record}
-  - {id: H5, invariants: [INV-01], evidence_file: _review_budget_timeout.py, evidence_sha256: 8c96a1040485f0aed902d24e3257e0007bfd0f09549f0c5ef7b629a71bb856e5, reproduction: tests/test_integrity_reproductions.py::test_h5_timed_out_calls_are_not_each_authorised_the_whole_ceiling_again}
-  - {id: H6, invariants: [INV-07], evidence_file: _review_evidence_replication.py, evidence_sha256: e6e584d505c35e4d623b3d5b335864c5544d052766ca0bb98ac60db0816dc667, reproduction: tests/test_integrity_reproductions.py::test_h6_a_seed_ignoring_rerun_with_a_timestamp_is_not_a_replication}
-  - {id: M1, invariants: [INV-05, INV-02], evidence_file: _review_litcur_queries.py, evidence_sha256: 4027c09bfae7ab58fdb9b027e09fba39b891a76ab55ed74efb981ef26707ac1a, reproduction: tests/test_integrity_reproductions.py::test_m1_literature_confidence_counts_searches_that_were_run}
-  - {id: M2, invariants: [INV-08], evidence_file: _review_revision_board_mask.py, evidence_sha256: 35ffa40b59d4be0bcd3bdd59b6dae3a025bc75252aa6ba3faec439d565bf05f4, reproduction: tests/test_integrity_reproductions.py::test_m2_a_board_missing_a_reviewer_is_not_a_completed_board}
-  - {id: M3, invariants: [INV-04], evidence_file: null, evidence_sha256: null, reproduction: tests/test_integrity_review_events.py::test_a_rerun_reviewers_objections_attach_to_its_own_review}
-  - {id: M4, invariants: [INV-10], evidence_file: _review_budget_parked.py, evidence_sha256: cbff327b2205d74854c1765d0ef3cb8cff7f48fba405f236710066fe7955c970, reproduction: tests/test_integrity_reproductions.py::test_m4_raising_the_ceiling_the_record_names_revisits_the_idea}
+  # The final adversarial review of 37e8afe (Part E).
+  - {id: H1, invariants: [INV-05, INV-08], evidence: part-e, evidence_file: _review_litcur_second_path.py, evidence_sha256: 8b1a8998b6d8b8a99e8defecba018f368f290e5d266fed0861f073dd974959e7, reproduction: tests/test_integrity_reproductions.py::test_h1_one_retrieval_sampled_twice_is_not_a_second_terminology_path}
+  - {id: H2, invariants: [INV-02], evidence: part-e, evidence_file: _review_litcur_bank_forgery.py, evidence_sha256: 116ca73d3fe6a2f1888c5a83a39825ad418f73e9c3c9bcda4d4e8532396b05cb, reproduction: tests/test_integrity_reproductions.py::test_h2_the_human_ready_page_cannot_carry_a_forged_provenance_header}
+  - {id: H3, invariants: [INV-03], evidence: part-e, evidence_file: _review_revision_audit_retry.py, evidence_sha256: ce281e4720a1b758c990b32f4ae9f04ac76ea6d13f8c5a69cafaf1b48e9dfddb, reproduction: tests/test_integrity_reproductions.py::test_h3_a_live_stage_with_a_leased_work_item_is_not_reclaimed_as_a_crash}
+  - {id: H4, invariants: [INV-04], evidence: part-e, evidence_file: _review_revision_meta_reroll.py, evidence_sha256: 0ffecd21b294cdf96de981ed9140c8a90b630a38bdaa7b9ea0257e8359bf1cd9, reproduction: tests/test_integrity_reproductions.py::test_h4_a_declining_meta_review_is_not_reasked_on_the_same_record}
+  - {id: H5, invariants: [INV-01], evidence: part-e, evidence_file: _review_budget_timeout.py, evidence_sha256: 8c96a1040485f0aed902d24e3257e0007bfd0f09549f0c5ef7b629a71bb856e5, reproduction: tests/test_integrity_reproductions.py::test_h5_timed_out_calls_are_not_each_authorised_the_whole_ceiling_again}
+  - {id: H6, invariants: [INV-07], evidence: part-e, evidence_file: _review_evidence_replication.py, evidence_sha256: e6e584d505c35e4d623b3d5b335864c5544d052766ca0bb98ac60db0816dc667, reproduction: tests/test_integrity_reproductions.py::test_h6_a_seed_ignoring_rerun_with_a_timestamp_is_not_a_replication}
+  - {id: M1, invariants: [INV-05, INV-02], evidence: part-e, evidence_file: _review_litcur_queries.py, evidence_sha256: 4027c09bfae7ab58fdb9b027e09fba39b891a76ab55ed74efb981ef26707ac1a, reproduction: tests/test_integrity_reproductions.py::test_m1_literature_confidence_counts_searches_that_were_run}
+  - {id: M2, invariants: [INV-08], evidence: part-e, evidence_file: _review_revision_board_mask.py, evidence_sha256: 35ffa40b59d4be0bcd3bdd59b6dae3a025bc75252aa6ba3faec439d565bf05f4, reproduction: tests/test_integrity_reproductions.py::test_m2_a_board_missing_a_reviewer_is_not_a_completed_board}
+  - {id: M3, invariants: [INV-04], evidence: independent-review, evidence_file: test_adversarial.py, evidence_sha256: fa3102961086156fa7f7b3543d5d4330ffe2d90d170cccff8a144528b0108dcb, reproduction: tests/test_integrity_v2_review_events.py::test_rev_a_rerun_objection_with_the_same_words_is_attributed_to_the_rerun}
+  - {id: M4, invariants: [INV-10], evidence: part-e, evidence_file: _review_budget_parked.py, evidence_sha256: cbff327b2205d74854c1765d0ef3cb8cff7f48fba405f236710066fe7955c970, reproduction: tests/test_integrity_reproductions.py::test_m4_raising_the_ceiling_the_record_names_revisits_the_idea}
+  # The independent adversarial review of 8e92e8c (INDEPENDENT_INTEGRITY_REVIEW_FAIL).
+  # Every case is in its harness, test_adversarial.py; the markers are the
+  # names it printed into adversarial.log.
+  - {id: R1, invariants: [INV-01], evidence: independent-review, evidence_file: test_adversarial.py, evidence_sha256: fa3102961086156fa7f7b3543d5d4330ffe2d90d170cccff8a144528b0108dcb, markers: [DELEGATED_OVERRUN, OBJECTIVE_OVERRUN, UNCAPPED_LOST_SETTLEMENT], reproduction: tests/test_integrity_v2_budget_caps.py::test_rev_lost_settlements_cannot_hide_spend_beyond_any_of_five_ceilings}
+  - {id: R2, invariants: [INV-02, INV-07, INV-09], evidence: independent-review, evidence_file: test_adversarial.py, evidence_sha256: fa3102961086156fa7f7b3543d5d4330ffe2d90d170cccff8a144528b0108dcb, markers: [INTEGRATED_MODEL_RECEIPT_FORGERY, ESCAPED_INPUT_RECEIPT, FALSE_RECEIPT], reproduction: tests/test_integrity_v2_replication_provenance.py::test_rev_a_model_composed_escaped_receipt_is_never_provenance}
+  - {id: R3, invariants: [INV-04, INV-08], evidence: independent-review, evidence_file: test_adversarial.py, evidence_sha256: fa3102961086156fa7f7b3543d5d4330ffe2d90d170cccff8a144528b0108dcb, markers: [FATAL_DEDUPED_AS_MINOR], reproduction: tests/test_integrity_v2_review_events.py::test_rev_a_later_fatal_objection_is_not_folded_into_an_earlier_minor_one}
+  - {id: R4, invariants: [INV-04, INV-08], evidence: independent-review, evidence_file: test_adversarial.py, evidence_sha256: fa3102961086156fa7f7b3543d5d4330ffe2d90d170cccff8a144528b0108dcb, markers: [LOST_REVIEW_OBJECTION], reproduction: tests/test_integrity_v2_review_events.py::test_rev_a_crash_before_the_objections_leaves_no_review_at_all}
+  - {id: R5, invariants: [INV-07, INV-08], evidence: independent-review, evidence_file: test_adversarial.py, evidence_sha256: fa3102961086156fa7f7b3543d5d4330ffe2d90d170cccff8a144528b0108dcb, markers: [LEGACY_REPLICATION], reproduction: tests/test_integrity_v2_migrations.py::test_upgraded_0036_replication_evidence_cannot_satisfy_the_current_gate}
+  - {id: R6, invariants: [INV-06, INV-07], evidence: independent-review, evidence_file: test_adversarial.py, evidence_sha256: fa3102961086156fa7f7b3543d5d4330ffe2d90d170cccff8a144528b0108dcb, markers: [REPOINTED_MANIFEST, WRONG_PARENT_STALE_RECEIPT], reproduction: tests/test_integrity_v2_replication_provenance.py::test_rev_a_manifest_cannot_be_repointed_once_its_execution_has_a_result}
+  - {id: R7, invariants: [INV-05], evidence: independent-review, evidence_file: test_adversarial.py, evidence_sha256: fa3102961086156fa7f7b3543d5d4330ffe2d90d170cccff8a144528b0108dcb, markers: [REORDERED_QUERY], reproduction: tests/test_integrity_v2_retrieval_paths.py::test_rev_reordered_identical_terms_are_not_a_distinct_retrieval_path}
+  - {id: R8, invariants: [INV-10], evidence: independent-review, evidence_file: test_adversarial.py, evidence_sha256: fa3102961086156fa7f7b3543d5d4330ffe2d90d170cccff8a144528b0108dcb, markers: [LEGACY_BUDGET_PARK], reproduction: tests/test_integrity_v2_parks_and_races.py::test_a_legacy_park_is_revived_by_no_ceiling_and_says_a_person_decides}
+  - {id: R9, invariants: [INV-03], evidence: independent-review, evidence_file: test_adversarial.py, evidence_sha256: fa3102961086156fa7f7b3543d5d4330ffe2d90d170cccff8a144528b0108dcb, markers: [SIMULTANEOUS_OWNERS], reproduction: tests/test_integrity_v2_parks_and_races.py::test_the_scheduler_that_loses_the_insert_race_is_told_it_lost}

@@ -672,6 +672,14 @@ def command_set_digest(commands: Mapping[str, Any]) -> str:
                     }
                     for item in getattr(spec, "parameters", ())
                 ],
+                # Only when present, so a declaration written before INV-07's
+                # attestation keeps the digest it always had -- and adding one
+                # reads as the capability change it is.
+                **(
+                    {"perturbation_attestation": sorted(attested)}
+                    if (attested := list(getattr(spec, "perturbation_attestation", ())))
+                    else {}
+                ),
             }
         )
     return _digest("pcommands-v1", payload)

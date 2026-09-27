@@ -29,6 +29,7 @@ from research_os.portfolio.models import (
     IdeaVersion,
     ObjectionTarget,
     QualityTier,
+    ReplicationProvenance,
     ReviewerRole,
     ReviewVerdict,
     Severity,
@@ -84,18 +85,44 @@ class Built:
         stages: frozenset[Stage] = ALL_STAGES,
         requested: QualityTier = QualityTier.HUMAN_READY,
         config: PortfolioConfig | None = None,
+        trusted_replications: bool = True,
     ):
+        """Evaluate the rows; the replication rows' chains stand in as verified.
+
+        These tests are about the gate's arithmetic over rows. A replication
+        row inserted here has no runner-written receipts behind it, so the
+        admissible provenance record the gate requires (INV-07, INV-08) is
+        supplied for it -- unless ``trusted_replications`` is false, which is
+        what a row with no trusted chain gets in production.
+        """
+
         head = self.store.require_version(self.idea_id, self.version)
+        evidence = self.store.list_evidence(
+            idea_id=self.idea_id, idea_version=self.version
+        )
+        replications = tuple(
+            ReplicationProvenance(
+                evidence_id=row.evidence_id,
+                assessment_id=f"RASM-test-{row.evidence_id}",
+                legacy=False,
+                configuration_independent=True,
+                perturbation_attested=True,
+                chain_intact=True,
+            )
+            for row in evidence
+            if trusted_replications
+            and row.kind is EvidenceKind.REPLICATION
+            and row.job_id
+        )
         return evaluate(
             version=head,
             live_reviews=self.store.live_reviews(idea_id=self.idea_id),
             objections=self.store.open_objections(idea_id=self.idea_id),
-            evidence=self.store.list_evidence(
-                idea_id=self.idea_id, idea_version=self.version
-            ),
+            evidence=evidence,
             succeeded_stages=stages,
             config=config or _config(),
             requested=requested,
+            replications=replications,
         )
 
 
@@ -811,6 +838,60 @@ def test_a_complete_empirical_idea_reaches_human_ready(
     result = built.gate()
     assert result.unmet == (), result.unmet
     assert result.tier is QualityTier.HUMAN_READY
+
+
+def test_an_executed_replication_row_without_a_trusted_chain_is_not_verification(
+    portfolio: PortfolioStore, runtime_db: Database, runtime_project: str
+) -> None:
+    """INV-07/INV-08: the gate reads the trusted chain, not the row's existence.
+
+    The same complete empirical idea as the positive control above, with its
+    replication row's provenance absent, legacy, broken or merely
+    configuration-independent without an attested perturbation: none of them
+    is second-line verification, and HUMAN_READY is unmet.
+    """
+
+    built = _build(
+        portfolio,
+        runtime_db,
+        runtime_project,
+        adjudication=[AdjudicationType.EMPIRICAL],
+    )
+    result = built.gate(trusted_replications=False)
+    assert result.tier is QualityTier.VALIDATED
+    assert any("second-line verification" in item for item in result.unmet)
+
+    (row,) = [
+        item
+        for item in portfolio.list_evidence(idea_id=built.idea_id, idea_version=1)
+        if item.kind is EvidenceKind.REPLICATION
+    ]
+    head = portfolio.require_version(built.idea_id, 1)
+    base = {
+        "evidence_id": row.evidence_id,
+        "assessment_id": "RASM-x",
+        "legacy": False,
+        "configuration_independent": True,
+        "perturbation_attested": True,
+        "chain_intact": True,
+    }
+    for broken in (
+        {"legacy": True},
+        {"chain_intact": False, "problems": ("the manifest was repointed",)},
+        {"perturbation_attested": False},
+        {"configuration_independent": False},
+        {"evidence_id": "IEVD-some-other-row"},
+    ):
+        result = evaluate(
+            version=head,
+            live_reviews=portfolio.live_reviews(idea_id=built.idea_id),
+            objections=portfolio.open_objections(idea_id=built.idea_id),
+            evidence=portfolio.list_evidence(idea_id=built.idea_id, idea_version=1),
+            succeeded_stages=ALL_STAGES,
+            config=_config(),
+            replications=(ReplicationProvenance(**{**base, **broken}),),
+        )
+        assert result.tier is QualityTier.VALIDATED, broken
 
 
 def test_a_refuted_measurement_is_disclosed_even_though_it_gates_the_same(

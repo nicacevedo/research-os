@@ -2519,8 +2519,13 @@ def _merge_dimensions(
 
 
 def _evaluate(context: TrackContext) -> gates.GateResult:
+    from research_os.portfolio import provenance
+
     store = context.portfolio
     version = store.require_version(context.idea_id)
+    evidence = store.list_evidence(
+        idea_id=context.idea_id, idea_version=version.version
+    )
     return gates.evaluate(
         version=version,
         live_reviews=store.live_reviews(
@@ -2529,15 +2534,22 @@ def _evaluate(context: TrackContext) -> gates.GateResult:
             max_age_seconds=context.config.thresholds.review_max_age_seconds,
         ),
         objections=store.open_objections(idea_id=context.idea_id),
-        evidence=store.list_evidence(
-            idea_id=context.idea_id, idea_version=version.version
-        ),
+        evidence=evidence,
         succeeded_stages=store.succeeded_stages_for_version(
             idea_id=context.idea_id, idea_version=version.version
         ),
         config=context.config,
         retrievals=store.list_retrievals(
             idea_id=context.idea_id, idea_version=version.version
+        ),
+        # The trusted replication chains, re-verified now (INV-07, INV-08):
+        # the gate reads these, not the mere presence of a replication row.
+        replications=provenance.replication_provenance(
+            store,
+            context.artifacts,
+            idea_id=context.idea_id,
+            idea_version=version.version,
+            evidence=evidence,
         ),
     )
 

@@ -2656,6 +2656,7 @@ def submit(context: Any, experiment: IdeaExperiment) -> ExperimentStep:
     Everything this returns is a fact about machinery.
     """
 
+    from research_os.portfolio import provenance
     from research_os.runtime.actions.coding import (
         _describe_drift,
         canonical_fingerprint,
@@ -2804,13 +2805,17 @@ def submit(context: Any, experiment: IdeaExperiment) -> ExperimentStep:
         # a replay months later the same measurement: the bytes come from
         # the digest the preregistration names, or nothing runs.
         _materialise_inputs(context, spec, workspace=workspace)
+        manifest: tuple[str, str] | None = None
+        parent: dict[str, Any] | None = None
         if experiment.role is ExperimentRole.REPLICATION:
             # Frozen here -- the workspace exists, so its base commit is
             # known, and the executor has not been called -- so what this
             # replication was meant to vary is on record before its result.
-            freeze_replication_manifest(
+            manifest_id, parent = freeze_replication_manifest(
                 context, experiment, spec=spec, workspace=workspace, job_id=job_id
             )
+            manifest = (manifest_id, manifest_id)
+        base_commit = _workspace_commit(workspace)
         # **The run directory is not the workspace.** It is the runtime's
         # immutable directory under the data home, holding the frozen
         # manifest and the logs -- and it has to be somewhere else, because
@@ -2862,6 +2867,32 @@ def submit(context: Any, experiment: IdeaExperiment) -> ExperimentStep:
             contained=handle.contained,
             containment=str(handle.containment),
             wall_clock_seconds=wall_clock_seconds,
+        )
+        # The trusted receipt, from what the runner observed, the moment the
+        # process has exited and before anything else can touch the
+        # workspace (INV-02, INV-07, `sql/0046`): the execution, the
+        # configuration it was delivered, its inputs, the code identity, and
+        # the digest of every declared output as it stands now. A reading
+        # later refuses any output that differs from these digests, and no
+        # program output is ever read into a receipt.
+        provenance.write_receipt(
+            context,
+            experiment,
+            spec=spec,
+            job_id=job_id,
+            declared=declared_commands(context.project_id).get(experiment.command),
+            base_commit=base_commit,
+            outcome={
+                "executor": executor_name,
+                "finished": bool(handle.finished),
+                "exit_code": handle.exit_code,
+                "contained": bool(handle.contained),
+                "containment": str(handle.containment),
+                "wall_clock_seconds": wall_clock_seconds,
+            },
+            outputs=_collect(workspace, spec.outputs),
+            manifest=manifest,
+            parent=parent,
         )
         after = canonical_fingerprint(repository, owned_ref_prefixes=owned)
         if escaped(before, after):
@@ -3308,6 +3339,8 @@ def interpret(context: Any, experiment: IdeaExperiment) -> ExperimentStep:
     rather than a second reading of one experiment.
     """
 
+    from research_os.portfolio import provenance
+
     job = context.runtime.get_external_job(experiment.job_id or "")
     if job is None:
         return _operational(
@@ -3383,6 +3416,33 @@ def interpret(context: Any, experiment: IdeaExperiment) -> ExperimentStep:
             ),
             FailureClass.ARTIFACT_MISSING,
         )
+    # The runner's trusted receipt of this execution (INV-02, `sql/0046`).
+    # Without one -- an execution recovered after a crash before the runner
+    # recorded it, or one from before receipts -- nothing the runner observed
+    # vouches for these outputs, and the reading is refused rather than
+    # taken from whatever the workspace holds now.
+    receipt = context.portfolio.receipt_for_job(job.job_id)
+    if receipt is None:
+        return _operational(
+            context,
+            experiment,
+            (
+                f"{job.job_id} has no trusted Research OS execution receipt: the "
+                f"runner did not record its configuration and outputs when it "
+                f"exited, so what it produced cannot be established. A retry is "
+                f"a new execution with its own receipt."
+            ),
+            FailureClass.ARTIFACT_MISSING,
+        )
+    try:
+        receipt_document = provenance.verified_receipt(context.artifacts, receipt)
+    except provenance.ProvenanceError as exc:
+        return _operational(
+            context,
+            experiment,
+            f"the execution receipt of {job.job_id} does not verify: {exc}",
+            FailureClass.ARTIFACT_MISSING,
+        )
 
     contract_result: Any = None
     if verified is not None:
@@ -3397,40 +3457,57 @@ def interpret(context: Any, experiment: IdeaExperiment) -> ExperimentStep:
             spec=spec,
             exit_code=job.exit_code,
         )
-    # **A replication is an independent execution only on evidence that its
-    # variation reached the computation** (INV-07). Whole-file digests used to
-    # decide it, so a replication whose program ignored its new seed but wrote
-    # a timestamp was recorded REPLICATION/SUPPORTS (H6). Independence is now
-    # the receipt -- the computation's own report of what it consumed --
-    # checked against the manifest frozen before it ran; agreement with the
-    # primary is assessed separately, on the values the analysis read.
+    # Every output the reading hashed must be exactly what the runner hashed
+    # when the process exited. A file replaced in the workspace in between --
+    # by a lingering process, by anything -- is not the measurement the
+    # receipt records, and the reading is refused (INV-02, INV-06).
+    changed = provenance.workspace_outputs_match(receipt_document, analysis.outputs)
+    if changed:
+        return _operational(
+            context,
+            experiment,
+            (
+                f"outputs changed between the execution and its reading: "
+                f"{', '.join(changed)} no longer match the digests the runner "
+                f"recorded at exit, so the reading would not be of this "
+                f"execution's result"
+            ),
+            FailureClass.POLICY_REFUSED,
+        )
+    # **A replication counts as independent only on the trusted chain**
+    # (INV-07). The first round took the program's own `execution_receipt`
+    # from its output; a model-composed plan carried one through, escaped,
+    # and a program that ignored its seed echoed it (the independent review
+    # of 8e92e8c). What is established now comes from the runner's receipts
+    # and the manifest frozen before the run: configuration independence is
+    # *proved*; that the computation uses what was varied is only ever the
+    # researcher's *attestation*; agreement is recorded beside both.
     read_conclusion = analysis.conclusion
-    independence: Independence | None = None
+    finding: provenance.ReplicationFinding | None = None
     if (
         experiment.role is ExperimentRole.REPLICATION
         and analysis.conclusion in _READ_CONCLUSIONS
     ):
-        independence = assess_independence(
-            context, experiment, analysis=analysis, spec=spec, workspace=workspace
+        finding = provenance.assess_replication(
+            context.portfolio, context.artifacts, experiment, receipt
         )
-        if independence.verified:
+        if finding.independent:
             analysis = replace(
                 analysis,
-                notes=(*analysis.notes, f"independent execution: {independence.basis}"),
+                notes=(*analysis.notes, f"independent replication: {finding.basis}"),
             )
         else:
             analysis = replace(
                 analysis,
                 conclusion=EmpiricalConclusion.INSUFFICIENT,
                 summary=(
-                    f"the replication's independence is not established: "
-                    f"{independence.basis}. A second execution not shown to have "
-                    f"consumed its own configuration is not an independent "
-                    f"reading. (Read as {read_conclusion}: {analysis.summary})"
+                    f"the replication does not count as an independent "
+                    f"replication: {finding.basis}. (Read as {read_conclusion}: "
+                    f"{analysis.summary})"
                 ),
                 notes=(
                     *analysis.notes,
-                    f"independence unverified: {independence.basis}",
+                    f"not an independent replication: {finding.basis}",
                 ),
             )
     stored = _store_outputs(context, experiment, workspace=workspace, analysis=analysis)
@@ -3455,24 +3532,62 @@ def interpret(context: Any, experiment: IdeaExperiment) -> ExperimentStep:
             "design_digest": verified.contract.design_digest,
         }
         document["analysis_result"] = contract_result.record()
+    document["execution_receipt"] = {
+        "receipt_id": receipt.receipt_id,
+        "artifact_id": receipt.receipt_artifact_id,
+        "written_by": "the Research OS runner",
+    }
+    assessment: dict[str, Any] | None = None
     if experiment.role is ExperimentRole.REPLICATION:
         agreement = assess_agreement(
             context, experiment, conclusion=read_conclusion, document=document
         )
         document["replication"] = {
             "execution_manifest_artifact_id": experiment.execution_manifest_artifact_id,
+            "receipt_id": receipt.receipt_id,
+            "parent_receipt_id": receipt.parent_receipt_id,
             "independence": (
-                independence.record()
-                if independence is not None
+                finding.record()
+                if finding is not None
                 else {
-                    "verified": False,
+                    "configuration_independent": False,
+                    "perturbation_validity": "UNATTESTED",
+                    "counts_as_independent_replication": False,
                     "basis": "the reading concluded nothing, so independence was "
                     "not assessed",
                 }
             ),
             "agreement": agreement,
         }
-        if independence is not None and independence.verified:
+        chain = dict(finding.chain) if finding is not None else {}
+        assessment = {
+            "receipt_id": chain.get("receipt_id", receipt.receipt_id),
+            "parent_receipt_id": chain.get(
+                "parent_receipt_id", receipt.parent_receipt_id
+            ),
+            "parent_experiment_id": chain.get("parent_experiment_id"),
+            "parent_evidence_id": chain.get("parent_evidence_id"),
+            "parent_analysis_artifact_id": chain.get("parent_analysis_artifact_id"),
+            "manifest_artifact_id": chain.get(
+                "manifest_artifact_id", receipt.manifest_artifact_id
+            ),
+            "manifest_digest": chain.get("manifest_digest", receipt.manifest_digest),
+            "configuration_independent": bool(
+                finding and finding.configuration_independent
+            ),
+            "perturbation_attested": bool(finding and finding.perturbation_attested),
+            "varied": finding.varied if finding else (),
+            "attested": finding.attested if finding else (),
+            "unattested": finding.unattested if finding else (),
+            "agrees": agreement.get("agrees"),
+            "identical_values": agreement.get("identical_scientific_values"),
+            "basis": (
+                finding.basis
+                if finding is not None
+                else "the reading concluded nothing, so independence was not assessed"
+            ),
+        }
+        if finding is not None and finding.independent:
             analysis = replace(
                 analysis,
                 notes=(
@@ -3552,6 +3667,7 @@ def interpret(context: Any, experiment: IdeaExperiment) -> ExperimentStep:
         analysis_artifact_id=ref.artifact_id,
         conclusion=analysis.conclusion,
         detail=analysis.summary[:2000],
+        assessment=assessment,
     )
     release_workspace(updated, repository=Path(context.repo_path))
     return ExperimentStep(
@@ -3689,23 +3805,6 @@ _READ_CONCLUSIONS: frozenset[EmpiricalConclusion] = frozenset(
 )
 
 
-#: The key under which a declared command reports what it actually consumed.
-#:
-#: A top-level object in any JSON output the run collects::
-#:
-#:     {"execution_receipt": {"seeds": [14],
-#:                            "parameters": {"seed": 14},
-#:                            "inputs": {"plans/p.json": "<sha256>"}}}
-#:
-#: Written by the researcher's own program -- the one trusted to compute the
-#: measurement -- and never by a model: a receipt found inside a
-#: model-composed input is refused (INV-02, INV-07).
-RECEIPT_KEY = "execution_receipt"
-
-#: How large an output may be for its receipt to be read.
-MAX_RECEIPT_BYTES = 16 * 1024 * 1024
-
-
 def _document(context: Any, artifact_id: str | None) -> dict[str, Any] | None:
     if not artifact_id:
         return None
@@ -3738,7 +3837,7 @@ def independence_variables(
     command that differs between the specification the primary ran and the
     one the replication was about to run. This is the *intended*
     perturbation; whether it reached the computation is a separate question,
-    answered by :func:`assess_independence`.
+    answered by :func:`research_os.portfolio.provenance.assess_replication`.
     """
 
     first, second = primary.get("spec") or {}, replication.get("spec") or {}
@@ -3780,53 +3879,96 @@ def freeze_replication_manifest(
     spec: ExecutionSpec,
     workspace: Path,
     job_id: str,
-) -> str:
-    """Freeze what a replication is, before it runs. Returns the artifact id.
+) -> tuple[str, dict[str, Any]]:
+    """Freeze what a replication is, before it runs. Returns ``(artifact id, parent)``.
 
-    INV-07 (``docs/ARCHITECTURE_INVARIANTS.md``). The parent result and its
-    specification, the code identity (the workspace's base commit and the
-    declared command), the immutable inputs, the environment, the intended
-    independence variables and the execution identity -- stored by content
-    hash and recorded on the experiment (`sql/0041`) before the executor is
-    called, so what the replication was *meant* to be cannot be restated
-    after its result exists.
+    INV-06/INV-07 (``docs/ARCHITECTURE_INVARIANTS.md``). The parent result --
+    its experiment, its *trusted receipt*, its evidence row and its analysis
+    -- the code identity (the workspace's base commit and the declared
+    command, with the researcher's declaration and its perturbation
+    attestation), the immutable inputs and which parameter composed each,
+    the environment, the configuration the runner is about to deliver, the
+    intended independence variables and the execution identity: stored by
+    content hash and recorded on the experiment (`sql/0041`) before the
+    executor is called, so what the replication was *meant* to be cannot be
+    restated after its result exists. The database refuses to repoint it
+    once the execution has a result (`sql/0046`).
+
+    Refused when the primary has no trusted receipt -- one interpreted before
+    receipts existed -- because a replication of a result whose execution
+    Research OS never observed can establish no independence from it.
     """
+
+    from research_os.portfolio import provenance
 
     primary = context.portfolio.get_experiment(
         idea_id=experiment.idea_id,
         idea_version=experiment.idea_version,
         role=ExperimentRole.PRIMARY,
     )
-    theirs = _document(
-        context, primary.preregistration_artifact_id if primary else None
+    parent_receipt = (
+        context.portfolio.receipt_for_job(primary.job_id)
+        if primary is not None and primary.job_id
+        else None
     )
+    if (
+        primary is None
+        or primary.state is not ExperimentState.INTERPRETED
+        or not primary.evidence_id
+        or parent_receipt is None
+    ):
+        raise EmpiricalError(
+            "the primary measurement has no trusted Research OS execution receipt "
+            "(it was run before receipts existed, or never finished), so a "
+            "replication of it cannot be shown to be a separate execution of a "
+            "different configuration. A new idea version gets a fresh primary.",
+            failure_class=FailureClass.CAPABILITY_DENIED,
+        )
+    theirs = _document(context, primary.preregistration_artifact_id)
     mine = _document(context, experiment.preregistration_artifact_id) or {}
-    parent_analysis = _document(
-        context, primary.analysis_artifact_id if primary else None
-    )
+    parent_analysis = _document(context, primary.analysis_artifact_id)
+    declared = declared_commands(context.project_id).get(experiment.command)
+    identity = provenance.command_identity(declared) if declared is not None else {}
+    parent = {
+        "experiment_id": primary.experiment_id,
+        "receipt_id": parent_receipt.receipt_id,
+        "job_id": primary.job_id,
+        "evidence_id": primary.evidence_id,
+        "spec_digest": primary.spec_digest,
+        "variation_digest": primary.variation_digest,
+        "contract_id": primary.contract_id,
+        "preregistration_artifact_id": primary.preregistration_artifact_id,
+        "analysis_artifact_id": primary.analysis_artifact_id,
+        "base_commit": (parent_analysis or {}).get("base_commit"),
+    }
     manifest = {
-        "schema": "portfolio-replication-manifest-v1",
+        "schema": provenance.MANIFEST_SCHEMA,
         "experiment_id": experiment.experiment_id,
         "idea_id": experiment.idea_id,
         "idea_version": experiment.idea_version,
-        "parent": None
-        if primary is None
-        else {
-            "experiment_id": primary.experiment_id,
-            "spec_digest": primary.spec_digest,
-            "variation_digest": primary.variation_digest,
-            "contract_id": primary.contract_id,
-            "preregistration_artifact_id": primary.preregistration_artifact_id,
-            "analysis_artifact_id": primary.analysis_artifact_id,
-            "base_commit": (parent_analysis or {}).get("base_commit"),
-        },
+        "parent": parent,
         "code": {
             "base_commit": _workspace_commit(workspace),
             "command": mine.get("command"),
             "argv": list(spec.argv),
         },
+        "capability": {
+            "command": experiment.command,
+            "declaration": identity,
+            "command_digest": provenance.digest(identity),
+            # The researcher's, frozen here: what they attest the computation
+            # uses. Never proof that it does (INV-07).
+            "perturbation_attestation": list(
+                identity.get("perturbation_attestation") or ()
+            ),
+        },
         "inputs": [list(item) for item in spec.inputs],
+        "generated_inputs": [
+            {"parameter": item.get("parameter"), "path": item.get("path")}
+            for item in mine.get("generated_inputs") or ()
+        ],
         "environment": dict(spec.environment),
+        "delivered": provenance.delivered_configuration(spec),
         "execution": {
             "spec_digest": experiment.spec_digest,
             "variation_digest": experiment.variation_digest,
@@ -3842,211 +3984,12 @@ def freeze_replication_manifest(
         json.dumps(manifest, indent=2, sort_keys=True, ensure_ascii=False),
         media_type="application/json",
         role=f"idea_replication_manifest:{experiment.experiment_id}",
-        producer="portfolio.empirical.replication_manifest@1",
+        producer="portfolio.empirical.replication_manifest@2",
     )
     context.portfolio.set_execution_manifest(
         experiment.experiment_id, artifact_id=ref.artifact_id
     )
-    return str(ref.artifact_id)
-
-
-@dataclass(frozen=True, slots=True)
-class Independence:
-    """Whether a replication is an independent execution, and on what evidence."""
-
-    verified: bool
-    basis: str
-    consumed: tuple[str, ...] = ()
-    unverified: tuple[str, ...] = ()
-    contradicted: tuple[str, ...] = ()
-
-    def record(self) -> dict[str, Any]:
-        return {
-            "verified": self.verified,
-            "basis": self.basis,
-            "consumed": list(self.consumed),
-            "unverified": list(self.unverified),
-            "contradicted": list(self.contradicted),
-        }
-
-
-def _receipt(
-    context: Any, workspace: Path, analysis: Analysis, spec: ExecutionSpec
-) -> tuple[dict[str, Any] | None, str]:
-    """The run's own report of what it consumed, or why there is none to trust."""
-
-    for _path, digest in spec.inputs:
-        try:
-            composed = context.artifacts.get_bytes(digest)
-        except ResearchOSError:
-            continue
-        if RECEIPT_KEY.encode("utf-8") in composed:
-            return None, (
-                f"a model-composed input carries the key {RECEIPT_KEY!r}, so any "
-                f"receipt in the output could be the model's and not the "
-                f"program's"
-            )
-    for relative, digest, size in analysis.outputs:
-        if size > MAX_RECEIPT_BYTES:
-            continue
-        data = _read_recorded(
-            workspace, relative, digest=digest, max_bytes=MAX_RECEIPT_BYTES
-        )
-        if isinstance(data, str):
-            continue
-        try:
-            document = json.loads(data)
-        except (ValueError, UnicodeDecodeError):
-            continue
-        if isinstance(document, dict) and isinstance(document.get(RECEIPT_KEY), dict):
-            return dict(document[RECEIPT_KEY]), relative
-    return None, "the command reported no execution receipt in any output it wrote"
-
-
-def assess_independence(
-    context: Any,
-    experiment: IdeaExperiment,
-    *,
-    analysis: Analysis,
-    spec: ExecutionSpec,
-    workspace: Path,
-) -> Independence:
-    """Whether the intended variation demonstrably reached the computation.
-
-    INV-07. Different output bytes prove nothing -- a replication whose
-    program ignored its new seed was recorded as independent because a
-    timestamp in its output differed from the primary's (H6). The evidence
-    this accepts, and nothing weaker:
-
-    - a **consumption receipt** (:data:`RECEIPT_KEY`) in which the
-      computation itself reports the seeds, parameters and input digests it
-      used. Each intended variable it reports must equal the replication's
-      value; at least one must be reported; a reported value that is the
-      primary's is a contradiction and fails the whole assessment;
-    - for a replication that runs a *different declared command*, the
-      execution record: the system itself launched the other program.
-
-    Whether the result agrees with the primary's is separate
-    (:func:`assess_agreement`): an independent execution that reproduces the
-    primary's number exactly is a replication that agrees.
-    """
-
-    manifest = _document(
-        context, getattr(experiment, "execution_manifest_artifact_id", None)
-    )
-    if manifest is None:
-        return Independence(
-            verified=False,
-            basis="no execution manifest was frozen for this replication, so what "
-            "it was meant to vary is not on record",
-        )
-    execution = manifest.get("execution") or {}
-    if execution.get("spec_digest") != experiment.spec_digest:
-        return Independence(
-            verified=False,
-            basis="the frozen execution manifest names a different specification "
-            "from the one that ran",
-        )
-    variables = dict(manifest.get("independence_variables") or {})
-    if not variables:
-        return Independence(
-            verified=False,
-            basis="the replication's specification differs from the primary's in "
-            "no seed, parameter, composed input or command",
-        )
-    if "command" in variables and not (
-        {"seeds", "parameters", "inputs"} & set(variables)
-    ):
-        return Independence(
-            verified=True,
-            basis=(
-                f"a different declared command ran "
-                f"({variables['command']['replication']} rather than "
-                f"{variables['command']['primary']}), by the executor's own record"
-            ),
-            consumed=("command",),
-        )
-    receipt, where = _receipt(context, workspace, analysis, spec)
-    if receipt is None:
-        intended = ", ".join(sorted(set(variables) - {"command"}))
-        return Independence(
-            verified=False,
-            basis=(
-                f"{where}, so whether the replication's {intended} reached the "
-                f"computation cannot be established; different output bytes are "
-                f"not that evidence"
-            ),
-            unverified=tuple(sorted(set(variables) - {"command"})),
-        )
-    consumed: list[str] = []
-    unverified: list[str] = []
-    contradicted: list[str] = []
-    if "seeds" in variables:
-        reported = receipt.get("seeds")
-        wanted = list(variables["seeds"]["replication"])
-        if reported is None:
-            unverified.append("seeds")
-        elif [int(item) for item in reported] == wanted:
-            consumed.append("seeds")
-        else:
-            contradicted.append(f"seeds (reported {reported}, intended {wanted})")
-    reported_parameters = receipt.get("parameters") or {}
-    for name, values in dict(variables.get("parameters") or {}).items():
-        if name not in reported_parameters:
-            unverified.append(f"parameter {name}")
-            continue
-        value = reported_parameters[name]
-        shown = (
-            json.dumps(value, sort_keys=True)
-            if isinstance(value, Mapping)
-            else str(value)
-        )
-        if shown == values["replication"]:
-            consumed.append(f"parameter {name}")
-        else:
-            contradicted.append(
-                f"parameter {name} (reported {shown}, intended {values['replication']})"
-            )
-    reported_inputs = receipt.get("inputs") or {}
-    for path, values in dict(variables.get("inputs") or {}).items():
-        if path not in reported_inputs:
-            unverified.append(f"input {path}")
-        elif str(reported_inputs[path]) == values["replication"]:
-            consumed.append(f"input {path}")
-        else:
-            contradicted.append(f"input {path}")
-    if "command" in variables:
-        consumed.append("command")
-    if contradicted:
-        return Independence(
-            verified=False,
-            basis=(
-                f"the computation reported in {where} that it consumed something "
-                f"other than the replication's configuration: "
-                f"{'; '.join(contradicted)}. The variation did not reach it."
-            ),
-            consumed=tuple(consumed),
-            unverified=tuple(unverified),
-            contradicted=tuple(contradicted),
-        )
-    if not consumed:
-        return Independence(
-            verified=False,
-            basis=(
-                f"the receipt in {where} reports none of the variables the "
-                f"replication was meant to vary ({', '.join(unverified)})"
-            ),
-            unverified=tuple(unverified),
-        )
-    return Independence(
-        verified=True,
-        basis=(
-            f"the computation reported in {where} that it consumed the "
-            f"replication's {', '.join(consumed)}"
-        ),
-        consumed=tuple(consumed),
-        unverified=tuple(unverified),
-    )
+    return str(ref.artifact_id), parent
 
 
 def _scientific_values(document: Mapping[str, Any] | None) -> dict[str, Any] | None:
