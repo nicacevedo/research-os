@@ -784,7 +784,7 @@ requirements and never removes them.
 |---|---|---|
 | `mathematical` | a `derivation` evidence row, **and** at least one machine-checkable artifact: an executed counterexample search with an `external_jobs` row and a spec digest | an independent derivation by a `replicator` that did not read the first, **or** a second executed search under a different parameterisation |
 | `empirical` | an `experiment` evidence row naming an `external_jobs` row, and its interpretation bound to a stored preregistration | a second execution with its own `ExecutionSpec` digest, differing in seed or implementation |
-| `novelty_or_literature` | `novelty_min_sources` distinct retrieved literature keys and a novelty matrix | a second terminology path: a separately executed, recorded search (`literature_retrievals`) with different words and a different result that retrieved, and assessed, works no first-path search retrieved -- the criterion in `docs/ARCHITECTURE_INVARIANTS.md` INV-05 |
+| `novelty_or_literature` | `novelty_min_sources` distinct retrieved literature keys and a novelty matrix | a distinct executed retrieval path: a separately executed, successful, recorded search (`literature_retrievals`) with at least one normalised content term no first-path search used and a different result, that retrieved, and had assessed, works no first-path search retrieved -- the operational, lexical rule in `docs/ARCHITECTURE_INVARIANTS.md` INV-05, which does not establish independent meaning |
 | `diagnostic` | an `inspection` or `code` evidence row naming an artifact | an independent checker or an alternate implementation |
 | `mixed` | the union over its components | the union over its components |
 | `undetermined` | cannot reach `VALIDATED`; the gate says so and names the missing falsifier | — |
@@ -1877,17 +1877,18 @@ measurement to a contract of another idea version, role or kind (0035), and
 the application refuses to run or read one under anything but the
 preregistered contract of its own role.
 
-**Replication must be independent.** A replication that differs from its
-primary only in resources or time limit is refused. Whether one that differs
-in a seed, a parameter, a composed input or a command is an *independent
-execution* is decided by evidence that the variation reached the computation
--- the program's own execution receipt, checked against a manifest frozen
-before the replication ran -- and never by comparing output bytes, which a
-timestamp makes differ without the seed ever being used
-(`docs/ARCHITECTURE_INVARIANTS.md` INV-07). Without that evidence the
-replication is INSUFFICIENT whatever it concluded; with it, agreement with the
-primary is recorded separately, and an exact agreement is still a
-replication.
+**Replication must be independent -- and says how far that is known.** A
+replication that differs from its primary only in resources or time limit is
+refused. One that differs in a seed, a parameter, a composed input or a
+command is judged on three separate findings (`docs/ARCHITECTURE_INVARIANTS.md`
+INV-07): *configuration independence*, proved from the execution receipts
+Research OS's runner writes -- a separate execution was delivered the
+variation a manifest froze before it ran; *perturbation validity*, which no
+generic runtime can prove and which is only ever the researcher's attestation
+on the declared command; and *agreement*, recorded beside both. Never output
+bytes, which a timestamp makes differ, and never anything the program reports
+about itself. Without the first two the replication is INSUFFICIENT whatever
+it concluded; an exact agreement is still a replication.
 
 **Readings older than the frontier.** A measurement read before frontier
 requests existed raised none, so after migration its idea was parked with

@@ -201,45 +201,61 @@ Unobserved is `unknown`, never a number.
 
 A report that guesses gets quoted later as a measurement.
 
-## Replications and the execution receipt
+## Replications: what is proved, what is attested
 
 A replication is a second execution meant to differ from the first in a seed,
-a parameter, a composed input or a command. It counts as an **independent
-execution** only on evidence that the difference reached the computation
-(`docs/ARCHITECTURE_INVARIANTS.md`, INV-07). Different output bytes are not
-that evidence: a program that ignores its new seed but writes a timestamp
-produces different bytes and the same measurement.
+a parameter, a composed input or a command. `docs/ARCHITECTURE_INVARIANTS.md`
+INV-07 judges it on three separate findings, and claims each only as far as it
+can be established.
 
-Before a replication runs, Research OS freezes an execution manifest -- the
-parent experiment, the code identity, the inputs, the environment, and the
-independence variables, i.e. everything that differs from the primary's
-frozen specification. The evidence it then accepts is the program's own
-**execution receipt**: a top-level `execution_receipt` object in any JSON
-output the command writes, reporting what it actually used:
+**Configuration independence -- proved.** Before a replication runs, Research
+OS freezes an execution manifest: the parent experiment, the parent's trusted
+receipt, evidence and analysis, the code identity, the declared command, the
+inputs, the configuration about to be delivered, and the independence
+variables -- everything that differs from the primary's frozen specification.
+When each execution's process exits, Research OS's own runner writes an
+**execution receipt** from what it observed: the job, the argument vector,
+environment and seeds it delivered, the inputs it materialised, the code
+identity, and the digest of every declared output. The replication is
+configuration-independent when the two receipts show a separate execution was
+delivered exactly the variation the manifest froze. Nothing a program writes
+is read into a receipt: an `execution_receipt` object in a program's output
+is domain metadata, never provenance (the independent review of `8e92e8c`
+passed a model-composed receipt through a program that echoed it).
 
-```json
-{
-  "summary": {"overlap": 0.4},
-  "execution_receipt": {
-    "seeds": [14],
-    "parameters": {"seed": 14},
-    "inputs": {"plans/sweep.json": "<sha256 of the bytes it read>"}
-  }
-}
+**Perturbation validity -- attested, never proved.** Whether the computation
+*uses* what was varied is something no generic runtime can establish: a
+program can read `--seed` and ignore it. The researcher who wrote the program
+attests it, in the command's declaration:
+
+```yaml
+      fit-model:
+        name: fit-model
+        argv: ["uv", "run", "python", "-m", "myproject.fit", "--seed", "{seed}"]
+        parameters:
+          - name: seed
+            type: integer
+            required: true
+        perturbation_attestation: ["seeds", "seed"]
 ```
 
-Each reported value must equal the replication's intended one; at least one
-intended variable must be reported; a reported value that is the primary's
-is a contradiction. A replication that runs a *different declared command*
-needs no receipt: the executor itself launched the other program. A receipt
-found inside a model-composed input is refused.
+Entries are `seeds` (the design seeds, delivered as `RESEARCH_OS_SEED_<n>`),
+the name of a declared parameter, or `implementation` (this command
+independently implements what another declared command measures). The
+attestation is frozen into the manifest when the replication runs, and the
+record calls the perturbation `ATTESTED_BY_RESEARCHER` -- never proven. A
+false attestation is outside what Research OS can detect.
 
-A command that writes no receipt still runs, and its replication is recorded
-`INSUFFICIENT` with the reason -- a capability-limited state, not a finding
-about the idea. Declared commands that support replication should therefore
-report the configuration they consumed. Whether the replication *agrees* with
-the primary is assessed separately, on the values the frozen analysis read,
-and recorded beside it.
+**Agreement** -- the replication's reading against the primary's, on the
+values the frozen analysis read -- is recorded beside both, whatever it is.
+
+A replication counts as an independent replication only when it is
+configuration-independent *and* its variation is attested. Otherwise it is
+recorded `INSUFFICIENT` with the reason -- a capability-limited state, not a
+finding about the idea. Declared commands that support replication should
+therefore attest the inputs their computation genuinely depends on. A primary
+measured before execution receipts existed cannot be replicated
+independently; its replication is refused before it runs.
 
 ## Isolation
 

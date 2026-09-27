@@ -222,23 +222,42 @@ report.
 | dimension | enforcement |
 |---|---|
 | `model_calls` | reserved before the call, settled after. A call cannot happen without capacity |
-| `model_cost_usd` | a call that declares `max_cost_usd` reserves **that whole ceiling** against run, project, system and any scope it names (the portfolio names its idea and lineage, `sql/0036`) before it starts, is refused if any of them cannot cover it, and is capped at the same number by the provider; settled at the provider's reported cost, including a failure the provider billed. A call that declares nothing reserves the profile's estimate -- see below. **A call whose cost is unknown is charged its whole reservation** -- see "unknown spend" below |
+| `model_cost_usd` | every call reserves its ceiling -- the `max_cost_usd` it declares, or `budgets.DEFAULT_CALL_CEILING_USD` (0.50) when it declares none -- against run, project, system and any scope it names (the portfolio names its idea and lineage, `sql/0036`) before it starts, is refused if any of them cannot cover it, and **hands the provider the same number as its hard cap on every call** (`sql/0043` records the cap with the submission and refuses one without it). Settled at the provider's reported cost, including a failure the provider billed. **A call whose cost is unknown is charged its whole reservation** -- see "unknown spend" below |
 | `external_jobs` | reserved before submission |
 | `work_items` | reserved before a local experiment |
 | `wall_clock_seconds` | **charged after the fact**, per cycle entry |
 
-**What the cost ceiling does and does not promise.** No provider quotes a
-price before it bills, so a hard monetary bound needs something that stops the
-spend. For a call that declares a ceiling there are two: the ledger will not let
-it *start* unless every applicable budget can cover the whole ceiling, and the
-Claude CLI is invoked with `--max-budget-usd` at the same number. The CLI checks
-that cap after each model response, so the response in progress when the cap is
-crossed completes and is billed -- the call ends as `error_max_budget_usd`,
-recorded at what it cost, classified `BUDGET_EXHAUSTED` (terminal; never retried,
-never counted against the provider's health). A ceiling can therefore be exceeded
-by the part of **one model response** per concurrently running call that crosses
-its own per-call cap, and that excess is recorded exactly. It is not exceeded by
-whole calls, or by a call that should never have started.
+**What the cost ceiling does and does not promise** (`docs/ARCHITECTURE_INVARIANTS.md`,
+INV-01). No provider quotes a price before it bills, so a hard monetary bound
+needs something that stops the spend, and every spend-bearing call has two:
+the ledger will not let it *start* unless every applicable budget can cover
+its whole ceiling, and the provider is handed that same ceiling as its cap --
+the router passes `max_budget_usd` on every call, and the delegated-spend
+wrapper replaces a controller's uncapped request with a capped one. An adapter
+that cannot be handed a provider-enforced cap (it does not declare
+`hard_budget_cap`) is refused with `PROVIDER_HARD_BUDGET_CAP_UNAVAILABLE`, a
+capability refusal, before anything is reserved. So the sum of what providers
+are authorised to spend never exceeds what is reserved, and that never exceeds
+any scope's limit.
+
+The one residual is the provider's own enforcement. The Claude CLI checks
+`--max-budget-usd` after each model response, so the response in progress
+when the cap is crossed completes and is billed -- the call ends as
+`error_max_budget_usd`, recorded at what it cost, classified `BUDGET_EXHAUSTED`
+(terminal; never retried, never counted against the provider's health). If
+what it reports exceeds the reservation, the ledger charges what it reported
+and marks the settlement `reported_over_reservation`. That, and only that,
+is how actual billing can pass a ceiling, and it is never hidden.
+
+Until the independent review of `8e92e8c`, calls that declared no ceiling --
+the objective cycle's graph nodes and actions -- reserved the profile's 0.05
+USD *estimate* and reached the provider uncapped, and the delegated
+controllers reserved a ratcheting 0.50 estimate and passed no cap either. The
+review ran a 1.20 USD call under a 1.00 USD ceiling in every scope, and two
+such calls whose settlement was lost were charged 1.00 while 2.40 was billed.
+An estimate is not authorisation; a cap is. A delegated coding or proposal
+call that needs more than its 0.50 cap is now stopped by the provider and its
+action fails `BUDGET_EXHAUSTED`, visibly.
 
 **Unknown spend fails closed** (`docs/ARCHITECTURE_INVARIANTS.md`, INV-01).
 A reservation is taken *pending* and marked submitted (`sql/0037`) in the last
@@ -259,12 +278,10 @@ An outage the provider reports is unaffected: the CLI's error envelope carries
 
 Every call the discovery portfolio makes declares a ceiling (its stage's, its
 explorer's, its follow-up's). The objective cycle's graph nodes and actions do
-not: they reserve the provider profile's estimate (0.05 USD), which is an
-estimate and not a bound, and a project ceiling can be overshot by one such
-call's actual cost -- recorded, and seen by the next reservation. The delegated
-controllers (`runtime/spend.py`) reserve a ratcheting per-call ceiling and do not
-pass it to the provider, because a coding session is many turns of tool use;
-their residual is stated in that module.
+not, and get the default per-call ceiling, reserved and capped the same way.
+The delegated controllers (`runtime/spend.py`) reserve the same per-call
+ceiling and hand it to the provider; a coding session is many turns of tool
+use, and one that needs more than its ceiling is stopped at it.
 
 Wall clock is the exception and it is worth being explicit. Nothing interrupts a
 running graph on elapsed time; a cycle's duration is bounded by the per-call and
@@ -992,7 +1009,10 @@ a budget and a report. `charge_delegated_spend` keeps the provenance rows it
 alone can write and becomes a reconciliation for calls the authority did not
 see. The residual is that no provider quotes a price before it bills, so one
 call can exceed its ceiling; the ceiling then ratchets to the largest observed
-cost, bounding the excess by one call rather than repeating it.
+cost, bounding the excess by one call rather than repeating it. *(Superseded
+by the second integrity round: the provider is now handed the reservation as
+its hard cap, an uncappable adapter is refused, and the ratchet is gone --
+§8a and `docs/ARCHITECTURE_INVARIANTS.md` INV-01.)*
 
 ## 15b. What the third adversarial review found, and what was left open
 
