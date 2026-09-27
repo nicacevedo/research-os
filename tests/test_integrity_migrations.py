@@ -24,7 +24,7 @@ from __future__ import annotations
 from decimal import Decimal
 
 from research_os.portfolio import gates
-from research_os.portfolio.models import IdeaStatus, ReviewerRole
+from research_os.portfolio.models import IdeaStatus, ParkReason, ReviewerRole
 from research_os.portfolio.store import OWNER_DEAD, PortfolioStore
 from research_os.runtime.budgets import BudgetLedger, Dimension
 from research_os.runtime.db import Database
@@ -155,11 +155,13 @@ def test_the_integrity_migrations_upgrade_live_0036_data(throwaway_dsn: str) -> 
         assert first.review_id != second.review_id
         assert (first.attempt, second.attempt) == (1, 2)
 
-        # 0041 / 0042 -- nullable, and consistent with every existing row.
+        # 0041 / 0042 -- nullable, and consistent with every existing row;
+        # 0045 then marks the unstructured legacy park `legacy_unknown`, which
+        # nothing autonomous revives (tests/test_integrity_v2_migrations.py).
         parked = store.require_idea(PARKED)
         assert parked.status is IdeaStatus.PARKED
         assert (parked.park_reason, parked.park_stage, parked.resume_status) == (
-            None,
+            ParkReason.LEGACY_UNKNOWN,
             None,
             None,
         )

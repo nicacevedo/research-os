@@ -105,7 +105,12 @@ from research_os.portfolio.models import (
     Stage,
     Synthesis,
 )
-from research_os.runtime.db import Database, RuntimeDatabaseError, jsonb
+from research_os.runtime.db import (
+    Database,
+    RuntimeDatabaseError,
+    TransientDatabaseError,
+    jsonb,
+)
 from research_os.runtime.failures import FailureClass
 from research_os.runtime.interfaces import Independence
 from research_os.runtime.locks import LockClass, lock_key
@@ -3022,6 +3027,56 @@ class PortfolioStore:
         """
 
         action_id = new_idea_action_id()
+        try:
+            return self._open_action(
+                action_id,
+                idea_id=idea_id,
+                idea_version=idea_version,
+                stage=stage,
+                basis_digest=basis_digest,
+                utility=utility,
+                work_id=work_id,
+                thread_id=thread_id,
+                run_id=run_id,
+                attempt=attempt,
+                lease_owner=lease_owner,
+                executor=executor,
+            )
+        except TransientDatabaseError:
+            raise
+        except RuntimeDatabaseError as exc:
+            # Two schedulers can both find no ACTIVE action -- the `for
+            # update` locks nothing when there is no row -- and both insert;
+            # the partial unique index lets exactly one commit. The loser's
+            # constraint violation is the same lost race as the check above,
+            # and the independent review of 8e92e8c saw it leak out as a raw
+            # database error. Which constraint it was is answered by looking,
+            # as `create_experiment` does, not by matching a message.
+            if "idea_actions_active_idx" not in str(exc):
+                raise
+            winner = self.active_action(idea_id)
+            raise ActiveTrackExistsError(
+                f"{idea_id} already has "
+                f"{winner.action_id if winner else 'another action'} in flight "
+                f"(a concurrent purchase won the race)"
+            ) from None
+
+    def _open_action(
+        self,
+        action_id: str,
+        *,
+        idea_id: str,
+        idea_version: int,
+        stage: Stage,
+        basis_digest: str,
+        utility: Decimal | float | None,
+        work_id: str | None,
+        thread_id: str | None,
+        run_id: str | None,
+        attempt: int | None,
+        lease_owner: str | None,
+        executor: str | None,
+    ) -> IdeaAction:
         with self._tx() as conn:
             busy = conn.execute(
                 f"select {ACTION_COLUMNS} from idea_actions "

@@ -59,6 +59,7 @@ from research_os.portfolio.models import (
     EvidenceKind,
     EvidenceStrength,
     IdeaStatus,
+    ParkReason,
     PortfolioIdea,
 )
 from research_os.portfolio.store import PortfolioStore
@@ -413,6 +414,13 @@ def render_idea(store: PortfolioStore, idea: PortfolioIdea) -> str:
         page.field("why it stopped", idea.retire_reason)
     if idea.revisit_if:
         page.field("revisit if", idea.revisit_if)
+    if idea.park_reason is ParkReason.LEGACY_UNKNOWN:
+        # Trusted text: the revisit sentence above was written before park
+        # reasons were structural, and nothing will act on it (`sql/0045`).
+        page.text(
+            "- revival: parked before park reasons were recorded structurally; "
+            "no ceiling or lineage change revives it, and a person decides"
+        )
     page.blank()
 
     for version in store.list_versions(idea.idea_id):

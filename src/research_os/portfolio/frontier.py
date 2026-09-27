@@ -371,16 +371,18 @@ def revive_for_lineage_room(
         project_id=project_id, statuses=[IdeaStatus.PARKED], limit=500
     )
     for idea in sorted(parked, key=lambda item: (item.updated_at, item.idea_id)):
-        condition = idea.revisit_if or ""
-        if not condition.startswith(LINEAGE_ROOM):
+        # The structural reason and the recorded resume status, never the
+        # prose. This used to parse `revisit_if` for the LINEAGE_ROOM prefix
+        # and the status after it -- and `revisit_if` is model-writable (the
+        # discover stage writes a model's `minimum_decisive_action` there), so
+        # a model that wrote "room in its lineage to branch; resumes as
+        # PROMISING" could have an idea revived at a status it named.
+        if idea.park_reason is not ParkReason.LINEAGE_ROOM:
+            continue
+        resume = idea.resume_status
+        if resume is None or resume not in _UNSETTLED:
             continue
         if counts.get(idea.lineage_root, 0) + 2 > ceiling:
-            continue
-        try:
-            resume = IdeaStatus(condition[len(LINEAGE_ROOM) :].strip())
-        except ValueError:
-            continue
-        if resume not in _UNSETTLED:
             continue
         applied = store.set_status(
             idea_id=idea.idea_id,

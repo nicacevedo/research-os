@@ -78,6 +78,7 @@ invariants:
       - research_os.portfolio.track:advance_idea
       - research_os.portfolio.track:_run_owned_stage
       - research_os.portfolio.store:PortfolioStore.open_action
+      - research_os.portfolio.store:PortfolioStore._open_action
       - research_os.portfolio.store:PortfolioStore._owner_state
       - research_os.portfolio.store:PortfolioStore.stale_actions
       - research_os.portfolio.store:PortfolioStore.reclaim_dead_actions
@@ -96,7 +97,9 @@ invariants:
       - tests/test_integrity_action_ownership.py::test_a_killed_worker_is_reclaimed_after_its_lease_truly_expires
       - tests/test_integrity_action_ownership.py::test_after_a_restart_the_retry_takes_over_the_dead_owner_at_once
       - tests/test_integrity_reproductions.py::test_h3_a_live_stage_with_a_leased_work_item_is_not_reclaimed_as_a_crash
-    mutants: [MUT-H3-1, MUT-H3-2, MUT-H3-3, MUT-H3-4, MUT-H3-5]
+      - tests/test_integrity_v2_parks_and_races.py::test_the_scheduler_that_loses_the_insert_race_is_told_it_lost
+      - tests/test_integrity_v2_parks_and_races.py::test_a_failure_that_is_not_the_race_is_not_disguised_as_one
+    mutants: [MUT-H3-1, MUT-H3-2, MUT-H3-3, MUT-H3-4, MUT-H3-5, MUT-O2-1]
     pass_requires: >-
       a stage past the old grace period with a live owner is not reclaimed; a
       killed worker becomes reclaimable only when its lease truly expires; a
@@ -250,6 +253,7 @@ invariants:
     enforced_by:
       - research_os.portfolio.tick:_revive_budget_parks
       - research_os.portfolio.tick:_never_allocatable
+      - research_os.portfolio.frontier:revive_for_lineage_room
       - research_os.portfolio.store:PortfolioStore.set_status
     tests:
       - tests/test_integrity_human_authority.py::test_no_autonomous_module_writes_a_portfolio_bound
@@ -266,6 +270,9 @@ invariants:
       - tests/test_integrity_budget_parks.py::test_a_park_for_any_other_reason_is_not_revived_by_a_ceiling
       - tests/test_integrity_budget_parks.py::test_a_park_reason_does_not_outlive_its_park
       - tests/test_integrity_reproductions.py::test_m4_raising_the_ceiling_the_record_names_revisits_the_idea
+      - tests/test_integrity_v2_parks_and_races.py::test_a_legacy_park_is_revived_by_no_ceiling_and_says_a_person_decides
+      - tests/test_integrity_v2_parks_and_races.py::test_model_prose_naming_a_lineage_room_status_revives_nothing
+      - tests/test_integrity_v2_parks_and_races.py::test_a_structural_lineage_room_park_still_resumes_at_its_recorded_status
     mutants: [MUT-M4-1, MUT-M4-2, MUT-INV10-1]
     pass_requires: >-
       the authority suites passing, no autonomous module able to write a

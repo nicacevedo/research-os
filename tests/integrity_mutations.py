@@ -56,6 +56,7 @@ P = "tests/test_integrity_budget_parks.py"
 A = "tests/test_integrity_human_authority.py"
 X = "tests/test_integrity_reproductions.py"
 L2 = "tests/test_integrity_v2_retrieval_paths.py"
+P2 = "tests/test_integrity_v2_parks_and_races.py"
 
 MUTANTS: tuple[Mutant, ...] = (
     # ------------------------------------------------------------ INV-01 --
@@ -462,6 +463,16 @@ MUTANTS: tuple[Mutant, ...] = (
         "        if False:\n            # Frozen here",
         (f"{C}::test_the_manifest_is_frozen_before_the_replication_runs",),
         "no execution manifest is frozen before a replication runs",
+    ),
+    Mutant(
+        "MUT-O2-1",
+        "INV-03",
+        "SIMULTANEOUS_OWNERS",
+        "src/research_os/portfolio/store.py",
+        '            if "idea_actions_active_idx" not in str(exc):\n                raise\n',
+        "            raise\n",
+        (f"{P2}::test_the_scheduler_that_loses_the_insert_race_is_told_it_lost",),
+        "the losing scheduler sees a raw database error",
     ),
     # ------------------------------------------------------------ INV-08 --
     Mutant(

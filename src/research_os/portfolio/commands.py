@@ -44,6 +44,7 @@ from research_os.portfolio.models import (
     IdeaAction,
     IdeaStatus,
     OperationalState,
+    ParkReason,
     PortfolioIdea,
     PortfolioStatus,
 )
@@ -675,6 +676,11 @@ def _list(args: argparse.Namespace, statuses: list[IdeaStatus] | None) -> int:
                 _print(f"    why it stopped: {idea.retire_reason}")
             if idea.revisit_if:
                 _print(f"    revisit if: {idea.revisit_if}")
+            if idea.park_reason is ParkReason.LEGACY_UNKNOWN:
+                _print(
+                    "    revival: legacy park with no structural reason; no ceiling "
+                    "or lineage change revives it -- a person decides"
+                )
             if idea.status in {IdeaStatus.VALIDATED, IdeaStatus.HUMAN_READY}:
                 _print(_provenance_line(store, idea))
     return EXIT_OK

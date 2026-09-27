@@ -646,6 +646,11 @@ class ParkReason(StrEnum):
     LINEAGE_SPEND_CEILING = "lineage_spend_ceiling"
     NOVELTY_FLOOR = "novelty_floor"
     LINEAGE_ROOM = "lineage_room"
+    #: Parked before reasons were structural (`sql/0045`), with nothing that
+    #: establishes what would revive it: its revisit text is model-writable
+    #: prose and no stage or resume status was recorded. Fails closed -- no
+    #: ceiling or lineage change revives it -- and a person decides.
+    LEGACY_UNKNOWN = "legacy_unknown"
 
 
 #: The park reasons a raised spend ceiling can lift, and nothing else can.
