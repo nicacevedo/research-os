@@ -318,15 +318,22 @@ def _describe_drift(before: dict[str, str], after: dict[str, str]) -> str:
     return ", ".join(changed[:12]) + ("..." if len(changed) > 12 else "")
 
 
-def _controller(context: CycleContext, *, autonomy: str, authority: Any = None) -> Any:
+def _controller(
+    context: CycleContext, *, autonomy: str, authority: DelegatedSpendAuthority
+) -> Any:
     """Build a v1 automation controller with this machine's providers.
 
     ``authority`` wraps every adapter so each model call this pipeline makes
-    reserves runtime budget before it happens and settles after. The controller
-    is unchanged and unaware: it was handed a registry and calls ``invoke`` on
+    reserves runtime budget before it happens, hands the provider that
+    reservation as its hard cap, and settles after. The controller is
+    unchanged and unaware: it was handed a registry and calls ``invoke`` on
     it, which is exactly why the registry is where the budget belongs. A
     reservation the ledger refuses raises ``BudgetExceededError``, which this
     controller already treats as a terminal run failure.
+
+    **Required**, and it used to be optional: with no authority the adapters
+    were the plain ones, and an unwrapped adapter is spend no reservation and
+    no cap governs (INV-01). There is no runtime caller without a ledger.
 
     The one thing the runtime overrides is containment. At high autonomy
     nobody is watching, and the pipeline runs a project's acceptance commands
@@ -346,9 +353,7 @@ def _controller(context: CycleContext, *, autonomy: str, authority: Any = None) 
     from research_os.automation.controller import AutomationController
 
     del context
-    providers = provider_registry()
-    if authority is not None:
-        providers = authority.wrap(providers)
+    providers = authority.wrap(provider_registry())
     return AutomationController(
         providers=providers,
         config=load_config(),
@@ -370,6 +375,10 @@ def failure_class_for(reason: str | None) -> FailureClass:
     """
 
     reason = (reason or "").lower()
+    if "provider_hard_budget_cap_unavailable" in reason:
+        # Before "budget": the adapter cannot be capped, which is a missing
+        # capability a person installs, not a ceiling that ran out (INV-01).
+        return FailureClass.CAPABILITY_DENIED
     if "budget" in reason:
         return FailureClass.BUDGET_EXHAUSTED
     if "scope" in reason or "symlink" in reason:

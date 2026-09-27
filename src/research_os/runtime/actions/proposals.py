@@ -257,15 +257,18 @@ def reconcile_reserved_proposal(
     }
 
 
-def _controller(context: CycleContext, *, authority: Any = None) -> Any:
+def _controller(context: CycleContext, *, authority: DelegatedSpendAuthority) -> Any:
     """A v1 proposal controller whose providers answer to the runtime's budget.
 
     ``authority`` wraps every adapter, so each call this controller makes
-    reserves runtime capacity *before* it happens and settles afterwards. The
-    controller is unchanged and unaware: it was given a registry and it calls
-    ``invoke`` on it, which is precisely why the registry is where the budget
-    belongs. Without one -- a caller with no runtime ledger -- the adapters are
-    the plain ones.
+    reserves runtime capacity *before* it happens, is handed that reservation
+    as its provider's hard cap, and settles afterwards. The controller is
+    unchanged and unaware: it was given a registry and it calls ``invoke`` on
+    it, which is precisely why the registry is where the budget belongs.
+
+    **Required** (INV-01). It used to default to none, and "without one the
+    adapters are the plain ones" was an uncapped, unreserved path into a
+    provider that no runtime caller needed.
     """
 
     from research_os.automation.commands import provider_registry
@@ -274,9 +277,7 @@ def _controller(context: CycleContext, *, authority: Any = None) -> Any:
     from research_os.proposal.controller import ProposalController
 
     del context
-    providers = provider_registry()
-    if authority is not None:
-        providers = authority.wrap(providers)
+    providers = authority.wrap(provider_registry())
     return ProposalController(
         providers=providers,
         config=load_config(),

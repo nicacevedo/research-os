@@ -12,9 +12,14 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import ClassVar
 
 from research_os.automation.models import ProviderProbe, Role
-from research_os.automation.providers import InvocationRequest, InvocationResult
+from research_os.automation.providers import (
+    BUDGET_EXHAUSTED_SUBTYPE,
+    InvocationRequest,
+    InvocationResult,
+)
 
 
 @dataclass
@@ -40,13 +45,24 @@ class ScriptedResponse:
 
 @dataclass
 class FakeProvider:
-    """A scripted provider. Records every request it was given."""
+    """A scripted provider. Records every request it was given.
+
+    It declares ``hard_budget_cap`` and, like a provider that enforces one,
+    never bills past the ``max_budget_usd`` it is handed: a scripted response
+    that would cost more comes back as the provider stopping at its cap
+    (``error_max_budget_usd``, billed exactly the cap). ``honours_cap=False``
+    makes it a provider that overshoots its cap and reports what it billed --
+    the case the ledger marks ``reported_over_reservation``.
+    """
+
+    hard_budget_cap: ClassVar[bool] = True
 
     name: str = "fake"
     family: str = "fake-family"
     available: bool = True
     responses: dict[str, list[ScriptedResponse]] = field(default_factory=dict)
     calls: list[InvocationRequest] = field(default_factory=list)
+    honours_cap: bool = True
 
     def probe(self) -> ProviderProbe:
         return ProviderProbe(
@@ -63,6 +79,27 @@ class FakeProvider:
     def invoke(self, request: InvocationRequest) -> InvocationResult:
         self.calls.append(request)
         response = self._next(request.role)
+        cap = request.max_budget_usd
+        if (
+            self.honours_cap
+            and cap is not None
+            and response.total_cost_usd is not None
+            and response.total_cost_usd > cap
+        ):
+            return InvocationResult(
+                argv=(self.name, "--fake"),
+                exit_code=1,
+                timed_out=False,
+                stdout=json.dumps(
+                    {"is_error": True, "subtype": BUDGET_EXHAUSTED_SUBTYPE}
+                ),
+                stderr="",
+                resolved_model=request.model,
+                session_id="fake-session",
+                total_cost_usd=cap,
+                error=BUDGET_EXHAUSTED_SUBTYPE,
+                budget_exhausted=True,
+            )
         if response.write_files or response.delete_files or response.create_symlinks:
             if request.read_only:
                 raise AssertionError(

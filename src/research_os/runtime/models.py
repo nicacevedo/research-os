@@ -203,6 +203,11 @@ class SettlementBasis(StrEnum):
 
     #: The provider reported what the call cost.
     REPORTED = "reported"
+    #: The provider reported *more* than the reservation, which was also the
+    #: hard cap it was handed (INV-01, `sql/0043`). Charged at what it
+    #: reported, and distinguishable, because it is a provider that did not
+    #: stop where it was told to.
+    REPORTED_OVER_RESERVATION = "reported_over_reservation"
     #: A spend that happened and reported no number; the reservation stands.
     ESTIMATE = "estimate"
     #: The work was submitted and its outcome is unknown -- a timeout, a kill,
@@ -518,6 +523,10 @@ class Reservation(_Record):
     submitted_at: datetime | None = None
     #: Which rule closed it; see :class:`research_os.runtime.budgets.SettlementBasis`.
     settlement_basis: str | None = None
+    #: The hard cap the provider was handed when a ``model_cost_usd``
+    #: reservation was submitted (`sql/0043`), never more than ``amount``.
+    #: ``None`` on every other dimension and on rows from before the rule.
+    provider_cap_usd: Decimal | None = None
 
 
 class Schedule(_Record):

@@ -42,6 +42,7 @@ from research_os.automation.providers import (
     InvocationResult,
 )
 from research_os.runtime.budgets import (
+    DEFAULT_CALL_CEILING_USD,
     BudgetExhaustedError,
     BudgetLedger,
     Dimension,
@@ -49,7 +50,7 @@ from research_os.runtime.budgets import (
 )
 from research_os.runtime.db import Database
 from research_os.runtime.models import BudgetScope, ReservationStatus
-from research_os.runtime.routing import ProviderCallFailedError, ProviderProfile
+from research_os.runtime.routing import ProviderCallFailedError
 from research_os.runtime.spend import BudgetedProvider, DelegatedSpendAuthority
 from research_os.runtime.store import RuntimeStore
 from tests.fake_providers import FakeProvider, ScriptedResponse
@@ -269,6 +270,7 @@ def test_a_cli_that_cannot_be_executed_is_released_every_time(
 class _Raises:
     name = "one"
     family = "a"
+    hard_budget_cap = True
 
     def __init__(self, exc: BaseException) -> None:
         self.exc = exc
@@ -473,7 +475,7 @@ def test_settlement_is_idempotent(runtime_db: Database, runtime_project: str) ->
         amount=CAP,
         pending=True,
     )
-    ledger.mark_submitted((grant,))
+    ledger.mark_submitted((grant,), provider_cap=CAP)
     ledger.settle_unknown((grant,))
     ledger.settle_unknown((grant,))
     ledger.settle(grant, actual=Decimal("0.05"))
@@ -486,6 +488,7 @@ def test_settlement_is_idempotent(runtime_db: Database, runtime_project: str) ->
 class _TimedOut:
     name = "claude"
     family = "anthropic"
+    hard_budget_cap = True
 
     def __init__(self, *, invoked: bool = True) -> None:
         self.invoked = invoked
@@ -565,10 +568,15 @@ def test_a_delegated_call_that_never_started_is_released(
     assert record.spent == 0 and record.reserved == 0
 
 
-def test_the_router_profile_estimate_is_charged_for_an_undeclared_timeout(
+def test_an_undeclared_timeout_is_charged_the_default_ceiling_it_was_capped_at(
     runtime_db: Database, tmp_path: Path, runtime_project: str
 ) -> None:
-    """A call that declared no ceiling is charged the reservation it did take."""
+    """A call that declared no ceiling is charged the reservation it did take.
+
+    That reservation is the runtime's default per-call ceiling, and the
+    provider was handed the same number as its hard cap -- no longer a 0.05
+    profile *estimate* with no cap behind it (INV-01).
+    """
 
     provider = FakeProvider(name="one", family="a", responses=_responses(_timeout()))
     router = _router(
@@ -577,5 +585,8 @@ def test_the_router_profile_estimate_is_charged_for_an_undeclared_timeout(
     ledger = _five_ceilings(runtime_db, router._run_id, runtime_project)
     with pytest.raises(ProviderCallFailedError):
         router.complete(_request(max_cost=None))
-    estimate = Decimal(str(ProviderProfile(name="x", family="y").estimated_cost_usd))
-    assert _cost(ledger, BudgetScope.PROJECT, runtime_project).spent == estimate
+    assert provider.calls[0].max_budget_usd == float(DEFAULT_CALL_CEILING_USD)
+    assert (
+        _cost(ledger, BudgetScope.PROJECT, runtime_project).spent
+        == DEFAULT_CALL_CEILING_USD
+    )

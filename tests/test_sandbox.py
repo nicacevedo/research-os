@@ -184,9 +184,20 @@ def test_high_autonomy_requires_containment(tmp_path: Path) -> None:
     lower = build_executors(config, project_id=None, autonomy="medium")
     assert lower["local"].sandbox_mode is not SandboxMode.REQUIRED  # type: ignore[union-attr]
 
-    controller = _controller(None, autonomy="high")  # type: ignore[arg-type]
+    from research_os.runtime.spend import DelegatedSpendAuthority
+
+    authority = DelegatedSpendAuthority(
+        budgets=None,  # type: ignore[arg-type]
+        run_id="RRUN-x",
+        project_id="p",
+        action="edit_in_worktree",
+    )
+    controller = _controller(None, autonomy="high", authority=authority)  # type: ignore[arg-type]
     assert controller.sandbox_mode is SandboxMode.REQUIRED
-    assert _controller(None, autonomy="medium").sandbox_mode is None  # type: ignore[arg-type]
+    assert (
+        _controller(None, autonomy="medium", authority=authority).sandbox_mode  # type: ignore[arg-type]
+        is None
+    )
 
 
 # ----------------------------------------------------- the argv it builds ----

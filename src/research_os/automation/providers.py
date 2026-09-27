@@ -15,12 +15,13 @@ about even if its prompt is subverted.
 from __future__ import annotations
 
 import json
+import math
 import shutil
 import subprocess
 from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, ClassVar, Protocol
 
 from research_os.automation.models import (
     READ_ONLY_TOOLS,
@@ -78,14 +79,28 @@ class InvocationRequest:
     #: The most this invocation is authorised to spend, in USD, or ``None``.
     #:
     #: The runtime reserves this amount against every applicable budget before
-    #: invoking, so the provider is asked to stop at the same number. A
-    #: provider that bills after each model response can only stop *between*
-    #: responses, so the one in progress when the cap is crossed completes and
-    #: is billed: the cap bounds a call to its ceiling plus one response, not
-    #: to its ceiling. ``docs/RUNTIME.md`` §8a states that residual.
+    #: invoking, so the provider is told to stop at the same number. **Every
+    #: invocation the autonomous runtime makes carries one** (INV-01): the
+    #: router and the delegated-spend wrapper refuse to hand a provider a call
+    #: without a cap no greater than its reservation, and refuse an adapter
+    #: that cannot pass one (:func:`enforces_hard_budget_cap`). ``None`` is
+    #: left for the human-driven v1 commands, which hold no monetary
+    #: reservation at all. How finely a provider honours its cap is the
+    #: provider's own enforcement; ``docs/RUNTIME.md`` §8a records what the
+    #: Claude CLI does.
     max_budget_usd: float | None = None
 
     def __post_init__(self) -> None:
+        if self.max_budget_usd is not None and not (
+            math.isfinite(self.max_budget_usd) and self.max_budget_usd > 0
+        ):
+            # A cap of zero, a negative one or NaN is not a bound a provider
+            # can enforce -- NaN compares false with everything, so a ledger
+            # check against it would pass. Refused where every adapter passes.
+            raise ValueError(
+                f"max_budget_usd must be a positive finite amount, not "
+                f"{self.max_budget_usd!r}"
+            )
         if self.access is None:
             derived = Access.CONTEXT_ONLY if self.read_only else Access.ISOLATED_WRITE
             object.__setattr__(self, "access", derived)
@@ -164,7 +179,14 @@ class InvocationResult:
 
 
 class ProviderAdapter(Protocol):
-    """The whole provider contract: say what you can do, then do one thing."""
+    """The whole provider contract: say what you can do, then do one thing.
+
+    An adapter may also declare ``hard_budget_cap = True``: that it hands the
+    provider ``InvocationRequest.max_budget_usd`` as a limit *the provider
+    itself* enforces. It is not part of the structural protocol, so an adapter
+    that says nothing is read as unable to cap -- and the autonomous runtime
+    will not spend through it (:func:`enforces_hard_budget_cap`).
+    """
 
     name: str
     family: str
@@ -172,6 +194,24 @@ class ProviderAdapter(Protocol):
     def probe(self) -> ProviderProbe: ...
 
     def invoke(self, request: InvocationRequest) -> InvocationResult: ...
+
+
+#: The refusal code for spend a provider could not be made to bound (INV-01).
+PROVIDER_HARD_BUDGET_CAP_UNAVAILABLE = "PROVIDER_HARD_BUDGET_CAP_UNAVAILABLE"
+
+
+def enforces_hard_budget_cap(adapter: object) -> bool:
+    """Whether ``adapter`` passes a provider-enforced spend cap on every call.
+
+    Read from a declaration rather than inferred, and absent means *no*: an
+    adapter nobody examined is exactly the one whose spend nothing bounds.
+    The Claude CLI adapter declares it because it always passes
+    ``--max-budget-usd`` when a request carries a cap, and its probe refuses
+    a CLI whose ``--help`` does not document that flag. A wrapper that
+    delegates to another adapter reports that adapter's answer.
+    """
+
+    return getattr(adapter, "hard_budget_cap", False) is True
 
 
 @dataclass
@@ -196,6 +236,11 @@ class ClaudeCodeProvider:
     name: str = "claude"
     family: str = "anthropic"
     executable: str = "claude"
+    #: ``--max-budget-usd`` is passed whenever a request carries a cap, and the
+    #: probe refuses a CLI that does not document it. The CLI checks the cap
+    #: after each model response -- the granularity is the provider's, and
+    #: ``docs/RUNTIME.md`` §8a states what that leaves open.
+    hard_budget_cap: ClassVar[bool] = True
 
     def probe(self) -> ProviderProbe:
         path = shutil.which(self.executable)
@@ -465,6 +510,8 @@ class MissingProvider:
 
     name: str
     family: str = field(default="")
+    #: There is nothing here to pass a cap to.
+    hard_budget_cap: ClassVar[bool] = False
 
     def __post_init__(self) -> None:
         if not self.family:

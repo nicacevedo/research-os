@@ -59,6 +59,7 @@ def test_reserving_reduces_available_before_anything_is_spent(
         scope_id="r1",
         dimension=Dimension.MODEL_COST_USD,
         amount=4,
+        pending=True,
     )
     budget = ledger.get(
         scope=BudgetScope.RUN, scope_id="r1", dimension=Dimension.MODEL_COST_USD
@@ -81,7 +82,9 @@ def test_settling_moves_the_hold_into_spend(ledger: BudgetLedger) -> None:
         scope_id="r1",
         dimension=Dimension.MODEL_COST_USD,
         amount=4,
+        pending=True,
     )
+    ledger.mark_submitted((grant,), provider_cap=Decimal(4))
     ledger.settle(grant, actual=Decimal("2.5"))
     budget = ledger.get(
         scope=BudgetScope.RUN, scope_id="r1", dimension=Dimension.MODEL_COST_USD
@@ -106,7 +109,9 @@ def test_an_unreported_cost_settles_at_the_estimate(ledger: BudgetLedger) -> Non
         scope_id="r1",
         dimension=Dimension.MODEL_COST_USD,
         amount=3,
+        pending=True,
     )
+    ledger.mark_submitted((grant,), provider_cap=Decimal(3))
     ledger.settle(grant, actual=None)
     budget = ledger.get(
         scope=BudgetScope.RUN, scope_id="r1", dimension=Dimension.MODEL_COST_USD
@@ -289,7 +294,9 @@ def test_a_crashed_workers_submitted_reservation_is_charged_not_released(
         scope_id="r1",
         dimension=Dimension.MODEL_COST_USD,
         amount=4,
+        pending=True,
     )
+    ledger.mark_submitted((grant,), provider_cap=Decimal(4))
     with runtime_db.tx() as conn:
         conn.execute(
             "update budget_reservations set created_at = now() - interval '2 hours' "
@@ -516,6 +523,7 @@ def test_a_delegated_spend_is_recorded_even_past_the_limit(
             scope_id=run.run_id,
             dimension=Dimension.MODEL_COST_USD,
             amount=Decimal("0.10"),
+            pending=True,
         )
 
 

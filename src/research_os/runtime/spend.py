@@ -30,27 +30,34 @@ registry. A wrapped adapter reserves before the call and settles after it:
 
 ```text
 authorize()  -> 1 MODEL_CALLS, and a per-call MODEL_COST_USD ceiling, HELD
-   provider runs
+submitted()  -> marked handed-over, with the cap the provider is about to get
+   provider runs, told to stop at that same ceiling
 settle(cost) -> HELD becomes SETTLED at the reported cost
 ```
 
 A reservation the ledger refuses raises :class:`BudgetExceededError` *before*
-the provider is invoked, which is what makes the cap hard rather than
-retrospective. It is an ``AutomationError`` on purpose: both controllers
-already fail a run on one, terminally, and
+the provider is invoked. It is an ``AutomationError`` on purpose: both
+controllers already fail a run on one, terminally, and
 ``coding.failure_class_for`` maps a reason containing "budget" onto
 ``BUDGET_EXHAUSTED``, which is not repaired. A budget that retries is not a
 budget.
 
-**The residual, stated plainly.** No provider quotes a price before it bills,
-so a single call can cost more than the per-call ceiling reserved for it. The
-overrun is then *recorded* -- ``settle`` charges the actual -- and the next
-``authorize`` sees it, so the excess is bounded by one call rather than by the
-whole run. The ceiling also ratchets: it is the configured value or the largest
-cost this authority has actually observed, whichever is larger, so a run whose
-first call costs 3 USD reserves 3 USD for its second. What cannot be promised
-is that the *first* expensive call is refused, and nothing that bills after the
-fact can promise it.
+**The provider is capped at the reservation** (INV-01). The request the
+controller built is handed on with ``max_budget_usd`` set to the reserved
+ceiling (or to the controller's own cap, if that is smaller), so the provider
+itself stops where the ledger's authority ends. An adapter that cannot be
+capped -- one that does not declare ``hard_budget_cap`` -- is refused with
+``PROVIDER_HARD_BUDGET_CAP_UNAVAILABLE`` before anything is reserved.
+
+What this replaced, and why it had to go: the first version reserved a 0.50
+USD estimate, passed no cap, and let a 1.20 USD call settle past a 1.00 USD
+run, project and system ceiling -- "recorded, and seen by the next
+reservation", which is a ledger that is true about an overrun it authorised.
+It also *ratcheted* the next reservation up to the largest cost observed, a
+correction for a provider nothing bounded. With a cap there is nothing to
+ratchet toward, so the ceiling is fixed: a delegated call that needs more than
+it is stopped by the provider and the action fails ``BUDGET_EXHAUSTED``,
+visibly.
 
 **Crashes and unknown outcomes.** A worker that dies between ``authorize`` and
 ``settle`` leaves a HELD reservation, which ``available`` already excludes --
@@ -70,34 +77,47 @@ about a registry of adapters and a budget.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from typing import Any
 
 from research_os.automation.providers import (
+    PROVIDER_HARD_BUDGET_CAP_UNAVAILABLE,
     InvocationRequest,
     InvocationResult,
     ProviderAdapter,
+    enforces_hard_budget_cap,
 )
 from research_os.errors import BudgetExceededError
 from research_os.runtime.budgets import (
+    DEFAULT_CALL_CEILING_USD,
     BudgetExhaustedError,
     BudgetLedger,
     Dimension,
     Grant,
     SettlementBasis,
+    provider_cap,
 )
 
 LOG = logging.getLogger("research_os.runtime.spend")
 
-#: What one delegated model call is assumed to cost until one is observed.
-#:
-#: A number, because a reservation needs one and no provider will quote. Chosen
-#: above the observed mean of the pilots (0.13 USD/call over twelve calls) by
-#: enough that ordinary calls are not refused, and low enough that a 6 USD run
-#: budget authorises roughly a dozen rather than two. The ratchet below is what
-#: handles the case where it is wrong.
-DEFAULT_PER_CALL_CEILING_USD = Decimal("0.50")
+#: What one delegated model call is authorised to spend: reserved, and handed
+#: to the provider as its hard cap. The runtime-wide per-call ceiling
+#: (``budgets.DEFAULT_CALL_CEILING_USD``), under the name this module has
+#: always exported.
+DEFAULT_PER_CALL_CEILING_USD = DEFAULT_CALL_CEILING_USD
+
+
+class ProviderBudgetCapUnavailableError(BudgetExceededError):
+    """A delegated call through an adapter that cannot be held to a hard cap.
+
+    ``PROVIDER_HARD_BUDGET_CAP_UNAVAILABLE`` (INV-01), raised before anything
+    is reserved. A :class:`BudgetExceededError` so both delegated controllers
+    fail the run on it terminally, as they already do for a refused budget --
+    retrying cannot give an adapter a cap it does not have.
+    """
+
+    code = PROVIDER_HARD_BUDGET_CAP_UNAVAILABLE
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,10 +155,12 @@ class DelegatedSpendAuthority:
     unknown_usd: Decimal = field(default_factory=lambda: Decimal(0), init=False)
     refusals: int = field(default=0, init=False)
     largest_call_usd: Decimal = field(default_factory=lambda: Decimal(0), init=False)
-    """The most expensive single call settled here, and the reservation floor.
+    """The most expensive single call settled here. Observed, never authority.
 
-    The ratchet. Without it a run whose calls cost 3 USD each would reserve
-    0.50 every time and discover the overrun once per call.
+    It used to be the reservation floor -- a ratchet towards what an uncapped
+    provider had actually billed. Every call is capped at the reservation now,
+    so a value above ``per_call_ceiling_usd`` means a provider billed past its
+    cap, which the ledger records as ``reported_over_reservation``.
     """
 
     # ------------------------------------------------------------ reserving --
@@ -152,7 +174,7 @@ class DelegatedSpendAuthority:
         runtime's own router learned that the hard way and this follows it.
         """
 
-        ceiling = max(self.per_call_ceiling_usd, self.largest_call_usd)
+        ceiling = Decimal(str(self.per_call_ceiling_usd))
         calls: tuple[Grant, ...] = ()
         cost: tuple[Grant, ...] = ()
         try:
@@ -193,10 +215,12 @@ class DelegatedSpendAuthority:
             raise
         return Authorization(calls=calls, cost=cost, reserved_usd=ceiling)
 
-    def submitted(self, grant: Authorization) -> None:
-        """Record that the call is being handed to the provider now."""
+    def submitted(self, grant: Authorization, *, cap: float) -> None:
+        """Record that the call is being handed to the provider now, and its cap."""
 
-        self.budgets.mark_submitted(grant.calls + grant.cost)
+        self.budgets.mark_submitted(
+            grant.calls + grant.cost, provider_cap=Decimal(str(cap))
+        )
 
     def not_invoked(self, grant: Authorization) -> None:
         """The provider provably never started: nothing was spent.
@@ -233,8 +257,8 @@ class DelegatedSpendAuthority:
         self.largest_call_usd = max(self.largest_call_usd, spent)
         if spent > grant.reserved_usd:
             LOG.warning(
-                "a delegated %s call cost %s against a %s reservation; the next "
-                "call reserves the larger amount",
+                "a delegated %s call reported %s against a %s reservation that "
+                "was also its provider cap: the provider billed past its cap",
                 self.action,
                 spent,
                 grant.reserved_usd,
@@ -288,15 +312,35 @@ class BudgetedProvider:
     def probe(self) -> Any:
         return self.inner.probe()
 
+    @property
+    def hard_budget_cap(self) -> bool:
+        return enforces_hard_budget_cap(self.inner)
+
     def invoke(self, request: InvocationRequest) -> InvocationResult:
+        if not enforces_hard_budget_cap(self.inner):
+            # Before anything is reserved: an estimate reserved in front of a
+            # provider nothing can stop is not authority (INV-01).
+            self.authority.refusals += 1
+            raise ProviderBudgetCapUnavailableError(
+                f"{PROVIDER_HARD_BUDGET_CAP_UNAVAILABLE}: the {self.name} adapter "
+                f"cannot hand its provider a hard spend cap, so the runtime "
+                f"refused a delegated {self.authority.action} model call before "
+                f"it was made"
+            )
         grant = self.authority.authorize()
+        # The provider is told to stop where the reservation ends -- or where
+        # the controller's own cap does, if that is lower. Never above it.
+        cap = provider_cap(grant.reserved_usd)
+        if request.max_budget_usd is not None:
+            cap = min(cap, float(request.max_budget_usd))
         try:
-            self.authority.submitted(grant)
+            capped = replace(request, max_budget_usd=cap)
+            self.authority.submitted(grant, cap=cap)
         except BaseException:
             self.authority.not_invoked(grant)
             raise
         try:
-            result = self.inner.invoke(request)
+            result = self.inner.invoke(capped)
         except NotImplementedError:
             # An adapter with no implementation raises before anything runs.
             self.authority.not_invoked(grant)

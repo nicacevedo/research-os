@@ -25,6 +25,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import ClassVar
 
 from research_os.automation.providers import InvocationRequest, InvocationResult
 from research_os.runtime.artifacts import FilesystemArtifactStore
@@ -50,6 +51,8 @@ def die() -> None:
 
 @dataclass
 class DyingProvider:
+    hard_budget_cap: ClassVar[bool] = True
+
     name: str = "doomed"
     family: str = "doomed-family"
 
@@ -76,7 +79,7 @@ class DyingProvider:
 
 
 if boundary == "before_submission":
-    BudgetLedger.mark_submitted = lambda self, grants: die()  # type: ignore[method-assign]
+    BudgetLedger.mark_submitted = lambda self, grants, **kw: die()  # type: ignore[method-assign]
 if boundary == "after_response":
     BudgetLedger.settle_all = lambda self, grants, **kw: die()  # type: ignore[method-assign]
 

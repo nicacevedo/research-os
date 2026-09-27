@@ -62,7 +62,12 @@ from research_os.portfolio.stages import snapshot_for
 from research_os.portfolio.store import PortfolioStore
 from research_os.portfolio.track import _basis_for, advance_idea
 from research_os.runtime.artifacts import FilesystemArtifactStore
-from research_os.runtime.budgets import BudgetExhaustedError, BudgetLedger, Dimension
+from research_os.runtime.budgets import (
+    DEFAULT_CALL_CEILING_USD,
+    BudgetExhaustedError,
+    BudgetLedger,
+    Dimension,
+)
 from research_os.runtime.db import Database
 from research_os.runtime.interfaces import (
     Capability,
@@ -184,10 +189,15 @@ def _project_cost(ledger: BudgetLedger, project_id: str) -> Any:
 def test_a_failed_call_the_provider_billed_for_is_charged_to_the_ceiling(
     runtime_db: Database, tmp_path: Path, runtime_project: str
 ) -> None:
-    """The Claude CLI's ``is_error`` envelope still carries ``total_cost_usd``."""
+    """The Claude CLI's ``is_error`` envelope still carries ``total_cost_usd``.
+
+    Billed within the cap the call was handed (the default per-call ceiling,
+    since this request declares none): a failure that cost 0.30 is charged
+    0.30, not released and not rounded up to its reservation.
+    """
 
     ledger = _explicit_ceiling(runtime_db, runtime_project, "10.00")
-    router, _ = _billing_router(
+    router, provider = _billing_router(
         runtime_db,
         tmp_path,
         project_id=runtime_project,
@@ -195,15 +205,16 @@ def test_a_failed_call_the_provider_billed_for_is_charged_to_the_ceiling(
             structured=None,
             exit_code=1,
             error="error_max_structured_output_retries",
-            total_cost_usd=3.00,
+            total_cost_usd=0.30,
         ),
     )
 
     with pytest.raises(ProviderCallFailedError):
         router.complete(_request())
 
+    assert provider.calls[0].max_budget_usd == float(DEFAULT_CALL_CEILING_USD)
     budget = _project_cost(ledger, runtime_project)
-    assert budget.spent == Decimal("3.00")
+    assert budget.spent == Decimal("0.30")
     assert budget.reserved == 0
     # The provenance row says what it cost, not only that it failed.
     (call,) = [
@@ -211,13 +222,20 @@ def test_a_failed_call_the_provider_billed_for_is_charged_to_the_ceiling(
         for item in RuntimeStore(runtime_db).list_model_calls(limit=10)
         if item.status is ModelCallStatus.FAILED
     ]
-    assert Decimal(str(call.cost_usd)) == Decimal("3.00")
+    assert Decimal(str(call.cost_usd)) == Decimal("0.30")
 
 
 def test_billed_failures_cannot_spend_past_an_explicit_ceiling(
     runtime_db: Database, tmp_path: Path, runtime_project: str
 ) -> None:
-    """The reproduction: ten calls, 9.00 USD billed, 0.00 recorded, under 1.00."""
+    """The reproduction: ten calls, 9.00 USD billed, 0.00 recorded, under 1.00.
+
+    With every call capped at the reservation it took (INV-01), the ceiling
+    now holds without the one-call overshoot this test used to pin: when the
+    first reservation was a 0.05 estimate with no cap behind it, a second
+    0.90 failure fitted in the 0.10 left and took the project to 1.80. Each
+    call now reserves, and is capped at, the 0.50 default ceiling.
+    """
 
     ledger = _explicit_ceiling(runtime_db, runtime_project, "1.00")
     router, provider = _billing_router(
@@ -225,7 +243,7 @@ def test_billed_failures_cannot_spend_past_an_explicit_ceiling(
         tmp_path,
         project_id=runtime_project,
         response=ScriptedResponse(
-            structured=None, exit_code=1, error="error_max_turns", total_cost_usd=0.90
+            structured=None, exit_code=1, error="error_max_turns", total_cost_usd=0.45
         ),
     )
 
@@ -238,11 +256,10 @@ def test_billed_failures_cannot_spend_past_an_explicit_ceiling(
             break
 
     budget = _project_cost(ledger, runtime_project)
-    # 0.90 is charged, 0.10 is left, the 0.05 estimate still fits, and the
-    # second 0.90 is charged: the overshoot is one call, the ceiling holds.
+    # 0.45 + 0.45 charged; 0.10 left cannot cover a third 0.50 cap.
     assert len(provider.calls) == 2
-    assert budget.spent == Decimal("1.80")
-    assert budget.exhausted
+    assert budget.spent == Decimal("0.90")
+    assert budget.spent <= budget.limit_value
 
 
 def test_a_failed_call_that_reports_no_cost_is_charged_in_full(

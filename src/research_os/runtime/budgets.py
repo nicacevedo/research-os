@@ -27,7 +27,7 @@ Hence:
 
 ```text
 reserve(amount, pending=True)  -> HELD, not submitted; `available` drops now
-mark_submitted()               -> HELD, submitted: the outcome is now unknown
+mark_submitted(provider_cap)   -> HELD, submitted: the outcome is now unknown
 settle(actual)                 -> SETTLED at a reported cost
 settle_unknown()               -> SETTLED at the whole amount: no report exists
 release()                      -> RELEASED, only on evidence nothing was spent
@@ -36,6 +36,17 @@ release()                      -> RELEASED, only on evidence nothing was spent
 and the reconciler follows the same rule for a worker that never came back:
 a reservation that was never submitted is released, and one that was is
 settled at its whole amount, because its outcome is exactly what nobody knows.
+
+**Charging the whole reservation is only a bound if the provider was bound
+too** (INV-01). A worker that dies after the provider answered is charged its
+reservation; if the provider had been allowed to spend more than that, the
+ledger would record less than was billed and the ceiling would silently stop
+binding. So a ``model_cost_usd`` reservation cannot be marked submitted without
+the provider-enforced cap it was handed, no greater than its amount --
+recorded on the row (``provider_cap_usd``, ``sql/0043``) and refused by the
+database otherwise. The sum of what providers were *authorised* to spend is
+then never more than what was reserved, and what was reserved is never more
+than any scope's limit.
 
 **Exhaustion is a destination, not an error to retry.** A budget that retries is
 not a budget. ``FailureClass.BUDGET_EXHAUSTED`` is terminal, and a run whose
@@ -51,6 +62,7 @@ a run that is already going.
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import StrEnum
@@ -73,8 +85,18 @@ BUDGET_COLUMNS = (
 )
 RESERVATION_COLUMNS = (
     "reservation_id, budget_id, work_id, amount, status, created_at, settled_at, "
-    "submitted_at, settlement_basis"
+    "submitted_at, settlement_basis, provider_cap_usd"
 )
+
+#: What one model call may cost when its caller declared no ceiling of its own.
+#:
+#: Not an estimate: it is reserved against every applicable scope *and* handed
+#: to the provider as its hard cap, so it is exactly what the call is
+#: authorised to spend. Chosen above the pilots' observed mean (0.13 USD over
+#: twelve calls) by enough that ordinary calls fit, and low enough that a 6 USD
+#: run authorises about a dozen rather than two. A call that needs more is
+#: stopped by the provider at this number and fails ``BUDGET_EXHAUSTED``.
+DEFAULT_CALL_CEILING_USD = Decimal("0.50")
 
 
 class Dimension(StrEnum):
@@ -92,6 +114,21 @@ class Dimension(StrEnum):
     EXTERNAL_JOBS = "external_jobs"
     WORK_ITEMS = "work_items"
     EXTERNAL_CALLS = "external_calls"
+
+
+def provider_cap(amount: Decimal) -> float:
+    """``amount`` as the float a provider adapter carries, never above it.
+
+    ``InvocationRequest.max_budget_usd`` is a float, and a float's decimal
+    rendering can sit a hair above the decimal it came from. A cap that is
+    one ulp over its reservation is a cap over its reservation, so the value
+    is stepped down until its rendering is not.
+    """
+
+    value = float(amount)
+    while value > 0 and Decimal(str(value)) > amount:
+        value = math.nextafter(value, 0.0)
+    return value
 
 
 class BudgetError(ResearchOSError):
@@ -240,6 +277,17 @@ class BudgetLedger:
         wanted = Decimal(str(amount))
         if wanted < 0:
             raise BudgetError(f"cannot reserve a negative amount ({wanted})")
+        if dimension is Dimension.MODEL_COST_USD and not pending:
+            # Money is handed to a provider only through `mark_submitted`,
+            # with the cap the provider is given (INV-01). A cost reservation
+            # that is "submitted from the moment it exists" would have no cap
+            # on record, and the database refuses it (`sql/0043`); saying so
+            # here names the rule instead of a trigger.
+            raise BudgetError(
+                "a model_cost_usd reservation is taken pending and submitted "
+                "with the provider cap it authorises; it cannot be submitted "
+                "at creation"
+            )
         with self._db.tx() as conn:
             budget = conn.execute(
                 f"select {BUDGET_COLUMNS} from budgets "
@@ -366,7 +414,12 @@ class BudgetLedger:
         return tuple(taken)
 
     # ------------------------------------------------------------ submitting --
-    def mark_submitted(self, grants: tuple[Grant, ...]) -> None:
+    def mark_submitted(
+        self,
+        grants: tuple[Grant, ...],
+        *,
+        provider_cap: Decimal | float | None = None,
+    ) -> None:
         """Record, durably, that these reservations' work is being handed over.
 
         Called immediately before the external call and never after it: from
@@ -374,17 +427,43 @@ class BudgetLedger:
         provider reports, and nothing may release it without a report that
         says it was not spent. A crash *before* it leaves a reservation the
         reconciler may hand back, because the work provably never started.
+
+        ``provider_cap`` is the hard limit the provider is being handed, and a
+        ``model_cost_usd`` reservation is refused submission without one no
+        greater than its own amount (INV-01) -- here, before anything is
+        written, and again by the database (``sql/0043``). That is what makes
+        charging the reservation on an unknown outcome an upper bound on what
+        was billed, rather than a guess.
         """
 
+        cap = Decimal(str(provider_cap)) if provider_cap is not None else None
+        for grant in grants:
+            if grant.dimension is not Dimension.MODEL_COST_USD:
+                continue
+            if cap is None or not cap.is_finite() or cap <= 0 or cap > grant.amount:
+                raise BudgetError(
+                    f"refusing to submit a {grant.amount} USD reservation for "
+                    f"{grant.scope}:{grant.scope_id} with provider cap {cap}: "
+                    f"a spend-bearing call is handed to a provider only with a "
+                    f"hard cap no greater than what was reserved for it"
+                )
         ids = [grant.reservation_id for grant in grants if grant.reservation_id]
         if not ids:
             return
+        capped = [
+            grant.reservation_id
+            for grant in grants
+            if grant.reservation_id and grant.dimension is Dimension.MODEL_COST_USD
+        ]
         with self._db.tx() as conn:
             conn.execute(
-                "update budget_reservations set submitted_at = now() "
-                "where reservation_id = any(%s) and status = 'HELD' "
+                "update budget_reservations "
+                "set submitted_at = now(), "
+                "    provider_cap_usd = case when reservation_id = any(%(capped)s) "
+                "                            then %(cap)s else provider_cap_usd end "
+                "where reservation_id = any(%(ids)s) and status = 'HELD' "
                 "and submitted_at is null",
-                (ids,),
+                {"ids": ids, "capped": capped, "cap": cap},
             )
 
     # ------------------------------------------------------------- settling --
@@ -411,8 +490,25 @@ class BudgetLedger:
             return
         spent = Decimal(str(actual)) if actual is not None else grant.amount
         recorded = basis or (
-            SettlementBasis.REPORTED if actual is not None else SettlementBasis.ESTIMATE
+            SettlementBasis.ESTIMATE
+            if actual is None
+            else SettlementBasis.REPORTED_OVER_RESERVATION
+            if spent > grant.amount
+            else SettlementBasis.REPORTED
         )
+        if recorded is SettlementBasis.REPORTED_OVER_RESERVATION:
+            # The provider billed more than the cap it was handed, which was
+            # this reservation. Recorded at what it said -- the money is gone
+            # -- and marked, so a provider that does not honour its cap is a
+            # row a person can find rather than a number that looks ordinary.
+            LOG.warning(
+                "%s:%s settled at %s against a %s reservation: the provider "
+                "reported more than the hard cap it was given",
+                grant.scope,
+                grant.scope_id,
+                spent,
+                grant.amount,
+            )
         with self._db.tx() as conn:
             row = conn.execute(
                 """

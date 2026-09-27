@@ -42,7 +42,12 @@ from research_os.portfolio.models import (
 from research_os.portfolio.store import PortfolioStore
 from research_os.portfolio.track import advance_idea
 from research_os.runtime.artifacts import FilesystemArtifactStore
-from research_os.runtime.budgets import BudgetExhaustedError, BudgetLedger, Dimension
+from research_os.runtime.budgets import (
+    DEFAULT_CALL_CEILING_USD,
+    BudgetExhaustedError,
+    BudgetLedger,
+    Dimension,
+)
 from research_os.runtime.db import Database
 from research_os.runtime.interfaces import (
     Capability,
@@ -260,19 +265,39 @@ def test_the_whole_ceiling_is_held_while_the_call_runs_and_the_provider_is_cappe
     assert budget.reserved == 0
 
 
-def test_a_request_that_declares_no_ceiling_is_not_capped(
+def test_a_request_that_declares_no_ceiling_is_capped_at_the_default_ceiling(
     runtime_db: Database, tmp_path: Path, runtime_project: str
 ) -> None:
-    """The documented residual, pinned: no declared ceiling, no invented one."""
+    """No declared ceiling is not no ceiling (INV-01).
 
-    provider = FakeProvider(name="one", family="a", responses=_responses(_ok(0.02)))
+    This test used to pin the opposite -- "no declared ceiling, no invented
+    one" -- and that residual is how the independent review of 8e92e8c ran a
+    1.20 USD objective-cycle call under a 1.00 USD ceiling in every scope. An
+    undeclared call now reserves the runtime's per-call ceiling and hands the
+    provider the same number as its hard cap.
+    """
+
+    ledger = _ceiling(runtime_db, BudgetScope.PROJECT, runtime_project, "5.00")
+    provider = ObservingProvider(
+        runtime_db,
+        runtime_project,
+        name="one",
+        family="a",
+        responses=_responses(_ok(0.02)),
+    )
     router = _router(
         runtime_db, tmp_path, project_id=runtime_project, provider=provider
     )
 
     router.complete(_request(max_cost=None))
 
-    assert provider.calls[0].max_budget_usd is None
+    assert provider.calls[0].max_budget_usd == pytest.approx(
+        float(DEFAULT_CALL_CEILING_USD)
+    )
+    assert provider.held_at_invoke == [DEFAULT_CALL_CEILING_USD]
+    assert _budget(ledger, BudgetScope.PROJECT, runtime_project).spent == Decimal(
+        "0.02"
+    )
 
 
 def test_a_call_the_provider_stopped_at_its_ceiling_is_charged_and_is_not_an_outage(
@@ -288,6 +313,10 @@ def test_a_call_the_provider_stopped_at_its_ceiling_is_charged_and_is_not_an_out
     provider = FakeProvider(
         name="one",
         family="a",
+        # The Claude CLI checks its cap between model responses, so the one in
+        # progress when the cap is crossed completes and is billed. Modelled
+        # here as a provider that reports a little past its cap.
+        honours_cap=False,
         responses=_responses(
             ScriptedResponse(
                 structured=None,
@@ -307,9 +336,17 @@ def test_a_call_the_provider_stopped_at_its_ceiling_is_charged_and_is_not_an_out
 
     assert isinstance(caught.value, BudgetExhaustedError)
     budget = _budget(ledger, BudgetScope.PROJECT, runtime_project)
-    # The overrun of one response is recorded, not hidden.
+    # The provider's overshoot of its own cap is recorded at what it billed,
+    # and marked as exactly that -- not hidden, and not an ordinary settlement.
     assert budget.spent == Decimal("0.43")
     assert budget.reserved == 0
+    with runtime_db.tx() as conn:
+        (basis,) = conn.execute(
+            "select distinct r.settlement_basis from budget_reservations r "
+            "join budgets b on b.budget_id = r.budget_id "
+            "where b.dimension = 'model_cost_usd'"
+        ).fetchall()
+    assert basis["settlement_basis"] == "reported_over_reservation"
     (call,) = RuntimeStore(runtime_db).list_model_calls(limit=10)
     assert call.status is ModelCallStatus.FAILED
     assert Decimal(str(call.cost_usd)) == Decimal("0.43")
@@ -1675,6 +1712,7 @@ def test_a_queued_item_carries_one_unit_of_exposure_until_it_runs(
         dimension=Dimension.MODEL_COST_USD,
         amount=ceiling,
         work_id=item.work_id,
+        pending=True,
     )
     assert authority() == Decimal("1.00") - ceiling, "running: the held call, not both"
 

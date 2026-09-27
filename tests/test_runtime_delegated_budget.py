@@ -31,7 +31,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
@@ -52,6 +52,8 @@ from research_os.runtime.store import RuntimeStore
 @dataclass
 class PricedProvider:
     """A provider that bills a fixed amount and counts how often it was asked."""
+
+    hard_budget_cap: ClassVar[bool] = True
 
     name: str = "fake"
     family: str = "fake"
@@ -240,28 +242,77 @@ def test_a_provider_that_reports_no_cost_is_charged_its_reservation(
     assert auth.unknown_usd == DEFAULT_PER_CALL_CEILING_USD
 
 
-def test_the_ceiling_ratchets_to_the_largest_observed_call(
+def test_every_delegated_call_is_handed_its_reservation_as_a_hard_cap(
     budgeted: dict[str, Any],
 ) -> None:
-    """No provider quotes a price, so the first expensive call cannot be refused.
+    """The provider is told to stop where the ledger's authority ends (INV-01).
 
-    What can be bounded is the *second*: a call that cost 0.90 raises the
-    reservation for the next one from the 0.50 default to 0.90, so the overrun
-    is bounded by one call rather than repeated for the length of the run.
+    This test used to pin a *ratchet*: a 0.90 USD call under a 0.50 USD
+    reservation was settled past it and raised the next reservation, because
+    nothing told the provider to stop. The provider is now handed the
+    reservation as ``max_budget_usd``, and a smaller cap the controller asked
+    for is kept.
+    """
+
+    seen: list[float | None] = []
+
+    @dataclass
+    class Recording(PricedProvider):
+        def invoke(self, request: InvocationRequest) -> InvocationResult:
+            seen.append(request.max_budget_usd)
+            return super().invoke(request)
+
+    auth = authority(budgeted)
+    wrapped = BudgetedProvider(inner=Recording(price=0.10), authority=auth)
+    wrapped.invoke(request())
+    smaller = InvocationRequest(
+        role=Role.PLANNER,
+        prompt="p",
+        cwd=Path("/tmp"),
+        read_only=True,
+        timeout_seconds=1,
+        max_budget_usd=0.25,
+    )
+    wrapped.invoke(smaller)
+    assert seen == [float(DEFAULT_PER_CALL_CEILING_USD), 0.25]
+    with budgeted["db"].tx() as conn:
+        caps = conn.execute(
+            "select r.provider_cap_usd, r.amount from budget_reservations r "
+            "join budgets b on b.budget_id = r.budget_id "
+            "where b.dimension = 'model_cost_usd' order by r.created_at"
+        ).fetchall()
+    assert [Decimal(row["provider_cap_usd"]) for row in caps] == [
+        DEFAULT_PER_CALL_CEILING_USD,
+        Decimal("0.25"),
+    ]
+    assert all(row["provider_cap_usd"] <= row["amount"] for row in caps)
+
+
+def test_a_provider_that_bills_past_its_cap_is_recorded_and_marked(
+    budgeted: dict[str, Any],
+) -> None:
+    """The residual that is the provider's, not the ledger's: recorded, marked.
+
+    A provider that honours its cap cannot bill 0.90 against a 0.50 cap. One
+    that does anyway is charged what it reported -- the money is gone -- and
+    the row says ``reported_over_reservation``; the next reservation is not
+    raised to match, because nothing about an overshoot authorises the next
+    call to spend more.
     """
 
     auth = authority(budgeted)
     provider = PricedProvider(price=0.90)
     wrapped = BudgetedProvider(inner=provider, authority=auth)
-
-    assert auth.largest_call_usd == 0
     wrapped.invoke(request())
     assert auth.largest_call_usd == Decimal("0.90")
-    assert auth.largest_call_usd > DEFAULT_PER_CALL_CEILING_USD
-
-    # 1.00 limit, 0.90 already spent, and the next reservation now asks for
-    # 0.90 rather than 0.50 -- so it is refused instead of authorising a second
-    # call that would take the run to 1.80.
+    with budgeted["db"].tx() as conn:
+        (row,) = conn.execute(
+            "select r.settlement_basis from budget_reservations r "
+            "join budgets b on b.budget_id = r.budget_id "
+            "where b.dimension = 'model_cost_usd'"
+        ).fetchall()
+    assert row["settlement_basis"] == "reported_over_reservation"
+    # 1.00 limit, 0.90 spent: the next 0.50 reservation does not fit.
     with pytest.raises(BudgetExceededError):
         wrapped.invoke(request())
     assert provider.calls == 1
@@ -377,7 +428,7 @@ def test_a_worker_that_dies_after_submitting_is_charged_in_full(
 
     auth = authority(budgeted)
     grant = auth.authorize()
-    auth.submitted(grant)
+    auth.submitted(grant, cap=float(grant.reserved_usd))
     del grant  # the process dies here, mid-call
 
     released = budgeted["ledger"].reconcile_stale(older_than_seconds=-1)

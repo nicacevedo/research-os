@@ -65,7 +65,10 @@ from research_os.runtime.models import (
     WorkStatus,
 )
 from research_os.runtime.queue import WorkQueue
-from research_os.runtime.routing import IndependenceUnavailableError
+from research_os.runtime.routing import (
+    BudgetCapUnavailableError,
+    IndependenceUnavailableError,
+)
 from research_os.runtime.store import RuntimeStore
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -589,9 +592,12 @@ def _run_owned_stage(
     except StaleExecutionError as exc:
         _lost_ownership(runtime_store, run.run_id, exc)
         raise
-    except IndependenceUnavailableError as exc:
+    except (IndependenceUnavailableError, BudgetCapUnavailableError) as exc:
         # A deployment fact, not a defect, and the taxonomy has a member for
-        # it. `IndependenceUnavailableError` is a sibling of
+        # it. `BudgetCapUnavailableError` is the same kind of fact: no
+        # provider that could answer can be held to a hard spend cap
+        # (INV-01), and what is missing is an adapter a person installs.
+        # The comment below is about the first of the two. `IndependenceUnavailableError` is a sibling of
         # `ProviderCallFailedError` rather than a subclass, so no stage
         # handler caught it and it reached the catch-all below as UNKNOWN --
         # which `_terminal_for` maps to FATAL_INFRASTRUCTURE_ERROR and
@@ -606,7 +612,11 @@ def _run_owned_stage(
             run.run_id,
             action_id=action_id,
             status=ActionStatus.FAILED,
-            detail=f"required review independence is unavailable here: {exc}",
+            detail=(
+                f"required review independence is unavailable here: {exc}"
+                if isinstance(exc, IndependenceUnavailableError)
+                else f"no provider here can be held to a hard spend cap: {exc}"
+            ),
             failure_class=str(FailureClass.CAPABILITY_DENIED),
             operational_state=_operational_for(str(FailureClass.CAPABILITY_DENIED)),
         )

@@ -44,19 +44,23 @@ from decimal import Decimal
 from research_os.automation.models import Role as AutomationRole
 from research_os.automation.models import RoleSetting
 from research_os.automation.providers import (
+    PROVIDER_HARD_BUDGET_CAP_UNAVAILABLE,
     InvocationRequest,
     ProviderAdapter,
+    enforces_hard_budget_cap,
     probe_registry,
     provider_family,
 )
 from research_os.errors import ResearchOSError
 from research_os.runtime.artifacts import FilesystemArtifactStore
 from research_os.runtime.budgets import (
+    DEFAULT_CALL_CEILING_USD,
     BudgetExhaustedError,
     BudgetLedger,
     Dimension,
     Grant,
     SettlementBasis,
+    provider_cap,
 )
 from research_os.runtime.failures import FailureClass
 from research_os.runtime.interfaces import (
@@ -149,6 +153,24 @@ class CallCeilingReachedError(BudgetExhaustedError):
     The spend is real and is already settled at the provider's reported cost
     when this is raised; the scope named is the call's run.
     """
+
+
+class BudgetCapUnavailableError(RoutingError):
+    """No provider that could serve this call can be held to a hard spend cap.
+
+    ``PROVIDER_HARD_BUDGET_CAP_UNAVAILABLE`` (INV-01). Raised before anything
+    is reserved or invoked: an adapter that does not declare
+    ``hard_budget_cap`` -- one that cannot hand its provider a limit the
+    provider itself enforces -- is never given spend-bearing work, because an
+    estimate reserved in front of an unbounded provider is not authority. Not
+    a downgrade and not a retry: nothing changes by asking again, and the
+    remedy is a provider adapter that can be capped, which a person installs.
+    The daemon reads ``failure_class`` and makes it a capability refusal.
+    """
+
+    code = PROVIDER_HARD_BUDGET_CAP_UNAVAILABLE
+    failure_class = FailureClass.CAPABILITY_DENIED
+    attempted = False
 
 
 class IndependenceUnavailableError(RoutingError):
@@ -291,6 +313,10 @@ class ProviderProfile:
     capabilities: frozenset[Capability] = field(
         default_factory=lambda: frozenset(Capability)
     )
+    #: Orders candidates within a tier, cheapest first, and nothing else. It
+    #: is never reserved and never authorises a call: what a call may spend is
+    #: its declared ceiling or ``budgets.DEFAULT_CALL_CEILING_USD``, handed to
+    #: the provider as a hard cap (INV-01).
     estimated_cost_usd: float = 0.05
 
 
@@ -431,7 +457,9 @@ class ModelRouter:
         return setting.model or profile.model, setting.effort
 
     # --------------------------------------------------------------- routing --
-    def _eligible(self, request: ModelRequest) -> tuple[ProviderProfile, ...]:
+    def _eligible(
+        self, request: ModelRequest, *, capped_only: bool = True
+    ) -> tuple[ProviderProfile, ...]:
         """Every profile that *could* serve this request, health aside.
 
         Split out from :meth:`_candidates` so that "no provider can do this"
@@ -439,6 +467,11 @@ class ModelRouter:
         The second has a deadline attached and the first does not, and a retry
         policy that cannot tell them apart either waits forever for a provider
         that will never exist or gives up on one that is back in four minutes.
+
+        ``capped_only`` excludes an adapter that cannot hand its provider a
+        hard spend cap (INV-01): every call this router makes spends, so such
+        an adapter can serve none of them. :meth:`route` asks again without
+        the filter only to say *why* nothing is eligible.
         """
 
         floor = MINIMUM_TIER[request.criticality]
@@ -450,6 +483,10 @@ class ModelRouter:
                     if profile.name in self._adapters
                     and request.capability in profile.capabilities
                     and profile.tier >= floor
+                    and (
+                        not capped_only
+                        or enforces_hard_budget_cap(self._adapters[profile.name])
+                    )
                 ),
                 key=lambda profile: (-profile.tier, profile.estimated_cost_usd),
             )
@@ -483,6 +520,20 @@ class ModelRouter:
         """
 
         candidates = self._candidates(request)
+        if (
+            not candidates
+            and not self._eligible(request)
+            and (self._eligible(request, capped_only=False))
+        ):
+            uncapped = ", ".join(
+                profile.name for profile in self._eligible(request, capped_only=False)
+            )
+            raise BudgetCapUnavailableError(
+                f"{PROVIDER_HARD_BUDGET_CAP_UNAVAILABLE}: {request.role} needs "
+                f"{request.capability}, and the only providers that offer it "
+                f"({uncapped}) cannot be handed a provider-enforced spend cap. "
+                f"Refusing rather than spending against an estimate."
+            )
         if not candidates:
             floor = MINIMUM_TIER[request.criticality]
             # No invocation happens on this path, so ``attempted=False``: the
@@ -631,28 +682,40 @@ class ModelRouter:
         routed = self.route(request)
         profile = routed.profile
         adapter = self._adapters[profile.name]
+        if not enforces_hard_budget_cap(adapter):  # pragma: no cover - route filters
+            raise BudgetCapUnavailableError(
+                f"{PROVIDER_HARD_BUDGET_CAP_UNAVAILABLE}: {profile.name} cannot be "
+                f"handed a provider-enforced spend cap"
+            )
 
-        # The authority this call needs, taken *before* it starts. A request
-        # that declares a ceiling reserves the whole ceiling -- against run,
-        # project, system and any scope the request names -- so a call cannot
-        # begin unless every applicable budget can cover the most it is
-        # allowed to cost, and the provider is told to stop there. It used to
-        # reserve the profile's 0.05 estimate whatever the request declared,
-        # so an explicit ceiling with 0.06 left authorised a 2.50 call, and a
-        # hostile review reproduced the overshoot.
+        # The authority this call needs, taken *before* it starts, and the
+        # one number that is both reserved and handed to the provider as its
+        # hard cap (INV-01). A request that declares a ceiling reserves the
+        # whole ceiling -- against run, project, system and any scope the
+        # request names -- so a call cannot begin unless every applicable
+        # budget can cover the most it is allowed to cost. A request that
+        # declares none gets the router's default per-call ceiling, reserved
+        # and capped the same way.
         #
-        # A request that declares nothing still reserves the estimate. That is
-        # not a bound and `docs/RUNTIME.md` §8a says which callers do it.
-        declared = (
+        # What this replaced: an undeclared request reserved the profile's
+        # 0.05 USD *estimate* and reached the provider with no cap at all, so
+        # a 1.20 USD objective-cycle call settled against a 1.00 USD run,
+        # project and system ceiling -- the independent review of 8e92e8c
+        # reproduced it. An estimate is not authorisation; a cap is.
+        cost_amount = (
             Decimal(str(request.max_cost_usd))
             if request.max_cost_usd is not None
-            else None
+            else DEFAULT_CALL_CEILING_USD
         )
-        cost_amount = (
-            declared
-            if declared is not None
-            else Decimal(str(profile.estimated_cost_usd))
-        )
+        if not cost_amount.is_finite() or cost_amount <= 0:
+            raise BudgetExhaustedError(
+                f"{request.role} declares a ceiling of {request.max_cost_usd} USD; "
+                f"a call authorised to spend nothing cannot be made",
+                dimension=Dimension.MODEL_COST_USD,
+                scope=BudgetScope.RUN,
+                scope_id=self._run_id,
+            )
+        cap = provider_cap(cost_amount)
         extra = tuple(
             (BudgetScope(scope), scope_id) for scope, scope_id in request.budget_scopes
         )
@@ -710,10 +773,16 @@ class ModelRouter:
             # invocation belongs under the release, and a line added below the
             # guard is how it comes back.
             model, effort = self._model_and_effort(request, profile)
-            # The last statement before the provider is asked, durably. After
-            # it, a crash leaves reservations the reconciler charges in full;
-            # before it, reservations it may hand back.
-            self._budgets.mark_submitted(grants + cost_grants)
+            # The last statement before the provider is asked, durably, and
+            # with the cap it is about to be handed -- which the ledger and
+            # the database both refuse to record above the reservation. After
+            # it, a crash leaves reservations the reconciler charges in full,
+            # and because the provider could not bill more than the cap, that
+            # charge is an upper bound on what was spent; before it,
+            # reservations it may hand back.
+            self._budgets.mark_submitted(
+                grants + cost_grants, provider_cap=Decimal(str(cap))
+            )
         except BaseException:
             self._budgets.release_all(cost_grants, basis=SettlementBasis.NOT_INVOKED)
             self._budgets.release_all(grants, basis=SettlementBasis.NOT_INVOKED)
@@ -733,9 +802,9 @@ class ModelRouter:
                     json_schema=dict(request.json_schema)
                     if request.json_schema
                     else None,
-                    # The same number that was reserved, so the provider stops
-                    # where the ledger's authority ends.
-                    max_budget_usd=float(declared) if declared is not None else None,
+                    # Never absent and never above what was reserved, so the
+                    # provider stops where the ledger's authority ends.
+                    max_budget_usd=cap,
                 )
             )
         except Exception as exc:
@@ -836,14 +905,14 @@ class ModelRouter:
                     prompt_ref=prompt_ref,
                     output_ref=output_ref,
                     latency_ms=latency,
-                    error=f"stopped at its {declared} USD ceiling: {detail}",
+                    error=f"stopped at its {cost_amount} USD ceiling: {detail}",
                     tokens_in=result.input_tokens,
                     tokens_out=result.output_tokens,
                     cost=result.total_cost_usd,
                     resolved_model=result.resolved_model,
                 )
                 raise CallCeilingReachedError(
-                    f"{request.role} needed more than the {declared} USD it was "
+                    f"{request.role} needed more than the {cost_amount} USD it was "
                     f"authorised for; {profile.name} stopped it at "
                     f"{result.total_cost_usd} USD (call {call_id})",
                     dimension=Dimension.MODEL_COST_USD,

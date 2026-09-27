@@ -321,12 +321,13 @@ class ModelRequest:
     #: can record exactly which inputs produced which output.
     context_refs: tuple[ArtifactRef, ...] = ()
     json_schema: Mapping[str, Any] | None = None
-    #: The most this one call is authorised to cost. When set, the router
-    #: reserves exactly this against every applicable ceiling *before* the
-    #: call and refuses the call if any of them cannot cover it, and it asks
-    #: the provider to stop there too. ``None`` reserves the provider
-    #: profile's estimate, which is an estimate and not a bound -- see
-    #: ``docs/RUNTIME.md`` §8a for which callers still do that.
+    #: The most this one call is authorised to cost. The router reserves
+    #: exactly this against every applicable ceiling *before* the call,
+    #: refuses the call if any of them cannot cover it, and hands the same
+    #: number to the provider as its hard cap (INV-01). ``None`` means the
+    #: router's default per-call ceiling
+    #: (``budgets.DEFAULT_CALL_CEILING_USD``), reserved and capped the same
+    #: way -- never an estimate with no cap behind it.
     max_cost_usd: float | None = None
     timeout_seconds: int = 600
     #: Further budget scopes this call's spend counts against, beyond the

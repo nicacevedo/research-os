@@ -112,7 +112,9 @@ MUTANTS: tuple[Mutant, ...] = (
         "INV-01",
         "H5",
         "src/research_os/runtime/routing.py",
-        "            self._budgets.mark_submitted(grants + cost_grants)\n",
+        "            self._budgets.mark_submitted(\n"
+        "                grants + cost_grants, provider_cap=Decimal(str(cap))\n"
+        "            )\n",
         "            pass\n",
         (f"{B}::test_death_after_submission_is_charged_in_full",),
         "submission is never recorded, so a crash mid-call looks unsubmitted",

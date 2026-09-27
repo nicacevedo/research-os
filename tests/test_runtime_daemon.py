@@ -366,12 +366,14 @@ def test_a_stale_reservation_is_reconciled_failing_closed(
         dimension=Dimension.MODEL_COST_USD,
         limit_value=10,
     )
-    budgets.reserve(
+    submitted = budgets.reserve(
         scope=BudgetScope.RUN,
         scope_id="r1",
         dimension=Dimension.MODEL_COST_USD,
         amount=4,
+        pending=True,
     )
+    budgets.mark_submitted((submitted,), provider_cap=Decimal(4))
     budgets.reserve(
         scope=BudgetScope.RUN,
         scope_id="r1",
