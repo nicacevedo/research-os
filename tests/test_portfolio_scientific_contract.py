@@ -344,7 +344,9 @@ cells = [
     {"size": s, "difficulty": d, "iterations": 10 + 2*s + 3*d + 0.5*s*d}
     for s in plan["sizes"] for d in plan["difficulties"]
 ]
-# The receipt: the plan this run actually read, by content hash (INV-07).
+# Domain metadata only: Research OS reads no program output as provenance
+# (INV-02, INV-07). That the plan reaches the computation -- it does: every
+# cell is computed from it -- is the declaration's `perturbation_attestation`.
 out.write_text(json.dumps({
     "cells": cells,
     "execution_receipt": {"inputs": {given: hashlib.sha256(raw).hexdigest()}},
@@ -393,6 +395,7 @@ projects:
         outputs: ["results/grid.json"]
         timeout_seconds: {timeout}
         checks: []
+        perturbation_attestation: ["plan"]
 """
 
 
