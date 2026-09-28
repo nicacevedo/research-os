@@ -87,7 +87,13 @@ def _digest(version: str, payload: Any) -> str:
 
 # ------------------------------------------------------------- analysis --
 def analysis_payload(spec: AnalysisSpec) -> dict[str, Any]:
-    return spec.model_dump(mode="json")
+    payload = spec.model_dump(mode="json")
+    # Present only when stated, so an analysis frozen before the field existed
+    # rebuilds to the digest it was frozen under -- the rule `spec_digest`
+    # applies to composed inputs.
+    if not payload.get("population"):
+        payload.pop("population", None)
+    return payload
 
 
 def analysis_digest(spec: AnalysisSpec) -> str:
@@ -685,6 +691,25 @@ def command_set_digest(commands: Mapping[str, Any]) -> str:
     return _digest("pcommands-v1", payload)
 
 
+def capability_set_digest(
+    commands: Mapping[str, Any], *, manifest: str | None = None
+) -> str:
+    """What decides whether a blocked contract is worth asking about again.
+
+    The declared commands, and -- for a project whose repository declares a
+    capability manifest -- that manifest's identity: a newly committed
+    capability is as much a change of what can be measured as a newly
+    declared command. ``None`` (no manifest) is exactly
+    :func:`command_set_digest`, so every contract blocked before capabilities
+    existed keeps the digest it was blocked under.
+    """
+
+    base = command_set_digest(commands)
+    if manifest is None:
+        return base
+    return _digest("pcapabilities-v1", {"commands": base, "manifest": manifest})
+
+
 __all__ = [
     "CONTRACT_SCHEMA",
     "IMPLEMENTATION_FIELDS",
@@ -694,6 +719,7 @@ __all__ = [
     "analysis_document",
     "analysis_lines",
     "capability_request_from_analysis",
+    "capability_set_digest",
     "command_set_digest",
     "contract_digest",
     "contract_document",

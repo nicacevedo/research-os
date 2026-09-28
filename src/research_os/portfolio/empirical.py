@@ -53,6 +53,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from research_os import capability as capabilities
 from research_os.automation.filescope import (
     contained_file,
     open_contained,
@@ -60,7 +61,7 @@ from research_os.automation.filescope import (
 )
 from research_os.errors import ExperimentSpecError, ResearchOSError
 from research_os.experiment.generated import GeneratedInput
-from research_os.portfolio import scicontract
+from research_os.portfolio import scicontract, sciencechain
 from research_os.portfolio.contracts import (
     AnalysisSpec,
     ContractError,
@@ -82,6 +83,9 @@ from research_os.portfolio.models import (
     ExperimentState,
     IdeaExperiment,
     IdeaVersion,
+    PrimaryOutcome,
+    ScienceObject,
+    ScienceObjectKind,
     ScientificContract,
 )
 from research_os.portfolio.prompts import TEMPLATES as PORTFOLIO_TEMPLATES
@@ -1537,6 +1541,7 @@ def ensure_analysis(
     role: ExperimentRole = ExperimentRole.PRIMARY,
     previous: IdeaExperiment | None = None,
     commands: Mapping[str, Any] | None = None,
+    capability_catalogue: Sequence[str] = (),
 ) -> ExperimentStep | HeldContract:
     """The live contract for this idea version and role, its analysis frozen.
 
@@ -1609,7 +1614,11 @@ def ensure_analysis(
         return _inherit_analysis(context, version, previous=previous)
 
     template = _analysis_designer()
-    catalogue = (
+    # Under a capability manifest the typed catalogue is the whole of what the
+    # analysis designer is shown: those observables are the only ones that
+    # exist, and a command's raw outputs listed beside them would be an
+    # invitation to name one resolution must then refuse.
+    catalogue = list(capability_catalogue) or (
         command_catalogue(
             commands,
             repository=Path(context.repo_path) if context.repo_path else None,
@@ -1816,6 +1825,408 @@ def row_rule(spec: AnalysisSpec, contract_id: str) -> dict[str, Any] | None:
     }
 
 
+# ------------------------------------------------------ the science chain --
+def capability_manifest(
+    context: Any,
+) -> tuple[capabilities.LoadedManifest | None, str | None]:
+    """The science repository's committed capability manifest, or why it is unusable.
+
+    Read from the canonical checkout's HEAD commit -- Git's object store, not
+    a working tree -- and pinned: that commit becomes the plan's code commit,
+    and the execution's workspace is cut from it.
+    """
+
+    if context.repo_path is None:
+        return None, None
+    try:
+        return capabilities.load_committed(Path(context.repo_path)), None
+    except ResearchOSError as exc:
+        return None, str(exc)
+
+
+def _manifest_identity(
+    loaded: capabilities.LoadedManifest | None, error: str | None
+) -> str | None:
+    if loaded is not None:
+        return loaded.sha256
+    if error is not None:
+        return "invalid:" + hashlib.sha256(error.encode("utf-8")).hexdigest()
+    return None
+
+
+def _analysis_resolution(
+    context: Any,
+    analysis: AnalysisSpec,
+    *,
+    loaded: capabilities.LoadedManifest | None,
+    error: str | None,
+    commands: Mapping[str, Any],
+) -> capabilities.Resolution:
+    """Can any declared capability produce what this frozen analysis reads?"""
+
+    limited = capabilities.CapabilityStatus.CAPABILITY_LIMITED
+    if error is not None:
+        return capabilities.Resolution(
+            limited,
+            unmet=(capabilities.Unmet("capability manifest", error),),
+        )
+    if not analysis.analysable:
+        return capabilities.Resolution(
+            limited,
+            unmet=(
+                capabilities.Unmet(
+                    "observables",
+                    "the frozen analysis identifies no observable any declared "
+                    "capability produces: " + analysis.unanalysable_reason,
+                ),
+            ),
+        )
+    return capabilities.resolve(
+        capabilities.Requirements(
+            observables=sciencechain.requirements_from_analysis(analysis),
+            max_seconds=int(context.config.bounds.max_experiment_seconds),
+        ),
+        loaded=loaded,
+        commands=commands,
+    )
+
+
+def _capability_limited(
+    context: Any,
+    contract: ScientificContract,
+    *,
+    resolution: capabilities.Resolution,
+    current: str,
+    cost_usd: str,
+    model_calls: int,
+) -> ExperimentStep:
+    """Record CAPABILITY_LIMITED, keep the frozen analysis, and say exactly why."""
+
+    summary = resolution.summary()
+    request = {
+        "derived_by": "research_os.capability.resolve",
+        "purpose": summary,
+        "unmet": [item.rendered() for item in resolution.unmet],
+        "resolution": resolution.record(),
+    }
+    context.portfolio.block_contract_on_capability(
+        contract.contract_id,
+        capability_request=request,
+        command_set_digest=current,
+        detail=summary[:2000],
+    )
+    sciencechain.record_outcome(
+        context,
+        state=PrimaryOutcome.CAPABILITY_LIMITED,
+        reason="capability_unresolved",
+        role=contract.role,
+        idea_id=contract.idea_id,
+        idea_version=contract.idea_version,
+        contract_id=contract.contract_id,
+        detail=resolution.record(),
+    )
+    return ExperimentStep(
+        ok=False,
+        detail=f"{summary} [contract {contract.contract_id}]",
+        failure_class=FailureClass.CAPABILITY_DENIED,
+        cost_usd=cost_usd,
+        model_calls=model_calls,
+    )
+
+
+def _capability_commands(
+    commands: Mapping[str, Any], loaded: capabilities.LoadedManifest | None
+) -> dict[str, Any]:
+    """The declared commands that back a declared capability."""
+
+    if loaded is None:
+        return {}
+    return {
+        name: spec
+        for name, spec in commands.items()
+        if loaded.manifest.by_command(name) is not None
+    }
+
+
+def _plan_identity(plan: ScienceObject | None) -> dict[str, Any] | None:
+    if plan is None:
+        return None
+    return {
+        "plan_digest": plan.object_digest,
+        "design_digest": plan.parent_digest,
+        "capability_ref": plan.capability_ref,
+        "capability_digest": plan.capability_digest,
+    }
+
+
+def _perturbation_tokens(variables: Mapping[str, Any]) -> tuple[str, ...]:
+    """A replication's intended variation, in the attestation vocabulary."""
+
+    tokens: list[str] = []
+    if "seeds" in variables:
+        tokens.append("seeds")
+    tokens.extend(str(name) for name in dict(variables.get("parameters") or {}))
+    for path in dict(variables.get("inputs") or {}):
+        # A composed input's path is `<param>-<sha16>.json`: the parameter
+        # that composed it is what was varied.
+        tokens.append(str(path).rsplit("/", 1)[-1].rsplit("-", 1)[0])
+    if "command" in variables:
+        tokens.append("implementation")
+    return tuple(dict.fromkeys(tokens))
+
+
+def _freeze_science_chain(
+    context: Any,
+    *,
+    version: IdeaVersion,
+    role: ExperimentRole,
+    contract: ScientificContract,
+    analysis: AnalysisSpec,
+    proposed: DesignSpecification,
+    spec: ExecutionSpec,
+    frozen_inputs: Sequence[GeneratedInput],
+    loaded: capabilities.LoadedManifest,
+    commands: Mapping[str, Any],
+    previous: IdeaExperiment | None,
+) -> ScienceObject | ExperimentStep:
+    """Contract, then design, then the capability binding, then the plan. In that order.
+
+    Each object is frozen before the next is built, and the database refuses
+    one whose parent is missing, of the wrong kind or frozen later. The
+    binding between design and plan is resolved by code against the committed
+    manifest; a design whose command, parameters or -- for a replication --
+    variation no declared capability supports gets no plan, and nothing runs.
+    """
+
+    from research_os.portfolio import provenance
+
+    contract_object = sciencechain.freeze(
+        context,
+        ScienceObjectKind.CONTRACT,
+        sciencechain.contract_payload(
+            project_id=context.project_id, version=version, analysis=analysis
+        ),
+    )
+    parent_design: str | None = None
+    perturbations: tuple[str, ...] = ()
+    if role is ExperimentRole.REPLICATION:
+        parent_plan = context.portfolio.get_science_object(
+            previous.plan_digest if previous is not None else None
+        )
+        if previous is None or parent_plan is None:
+            resolution = capabilities.Resolution(
+                capabilities.CapabilityStatus.CAPABILITY_LIMITED,
+                unmet=(
+                    capabilities.Unmet(
+                        "primary plan",
+                        "the primary was not measured under a frozen execution "
+                        "plan, so a replication of it cannot be bound to one; a "
+                        "new idea version gets a fresh primary",
+                    ),
+                ),
+            )
+            return _plan_refused(context, contract, resolution, retry=False)
+        parent_design = parent_plan.parent_digest
+        primary_record = _document(context, previous.preregistration_artifact_id) or {}
+        mine = {
+            "spec": _spec_record(spec),
+            "command": proposed.command,
+            "command_parameters": dict(spec_parameters(spec, proposed)),
+        }
+        perturbations = _perturbation_tokens(
+            independence_variables(primary_record, mine)
+        )
+    composed = {item.parameter: item.sha256 for item in frozen_inputs}
+    design_object = sciencechain.freeze(
+        context,
+        ScienceObjectKind.DESIGN,
+        sciencechain.design_payload(
+            contract_digest=contract_object.object_digest,
+            project_id=context.project_id,
+            version=version,
+            role=role,
+            analysis=analysis,
+            design=proposed,
+            composed=composed,
+            seeds=spec.seeds,
+            parent_design_digest=parent_design,
+        ),
+        parent=contract_object.object_digest,
+    )
+    resolution = capabilities.resolve(
+        capabilities.Requirements(
+            observables=sciencechain.requirements_from_analysis(analysis),
+            command=proposed.command,
+            parameters={
+                str(name): str(value)
+                for name, value in dict(proposed.command_parameters).items()
+                if not isinstance(value, dict | list)
+            },
+            perturbations=perturbations,
+            max_seconds=int(context.config.bounds.max_experiment_seconds),
+        ),
+        loaded=loaded,
+        commands=commands,
+    )
+    if not resolution.executable:
+        # The analysis-level resolution passed, so some capability can answer
+        # the question: what failed is this design's choice. A redesign can
+        # fix a wrong command or parameter, and a variation the capability
+        # does not attest -- unless it attests none at all, which no redesign
+        # can change.
+        chosen = loaded.manifest.by_command(proposed.command)
+        hopeless = role is ExperimentRole.REPLICATION and (
+            chosen is None or not chosen.replication.perturbations
+        )
+        return _plan_refused(context, contract, resolution, retry=not hopeless)
+    binding = resolution.binding
+    assert binding is not None
+    inputs, missing = capabilities.input_digests(
+        Path(context.repo_path), commit=binding.commit, capability=binding.capability
+    )
+    if missing:
+        return _plan_refused(
+            context,
+            contract,
+            capabilities.Resolution(
+                capabilities.CapabilityStatus.CAPABILITY_LIMITED, unmet=tuple(missing)
+            ),
+            retry=False,
+        )
+    declared = commands[proposed.command]
+    digest = spec_digest(spec)
+    return sciencechain.freeze(
+        context,
+        ScienceObjectKind.PLAN,
+        sciencechain.plan_payload(
+            design_digest=design_object.object_digest,
+            contract_digest=contract_object.object_digest,
+            project_id=context.project_id,
+            version=version,
+            role=role,
+            binding=binding,
+            command_identity=provenance.command_identity(declared),
+            spec=spec,
+            spec_digest=digest,
+            variation_digest=variation_digest(spec),
+            parameters=spec_parameters(spec, proposed),
+            input_artifacts=inputs,
+        ),
+        parent=design_object.object_digest,
+        capability=(binding.capability.ref, binding.digest),
+        spec_digest=digest,
+    )
+
+
+def _plan_refused(
+    context: Any,
+    contract: ScientificContract,
+    resolution: capabilities.Resolution,
+    *,
+    retry: bool,
+) -> ExperimentStep:
+    """No plan: record CAPABILITY_LIMITED, and say whether a redesign could help."""
+
+    sciencechain.record_outcome(
+        context,
+        state=PrimaryOutcome.CAPABILITY_LIMITED,
+        reason="design_not_executable",
+        role=contract.role,
+        idea_id=contract.idea_id,
+        idea_version=contract.idea_version,
+        contract_id=contract.contract_id,
+        detail=resolution.record(),
+    )
+    return ExperimentStep(
+        ok=False,
+        detail=f"{resolution.summary()} [contract {contract.contract_id}]",
+        failure_class=(
+            FailureClass.MODEL_OUTPUT_INVALID
+            if retry
+            else FailureClass.CAPABILITY_DENIED
+        ),
+    )
+
+
+def _verified_chain(
+    context: Any, experiment: IdeaExperiment
+) -> sciencechain.VerifiedChain:
+    """An experiment's frozen chain, re-derived against its verified contract."""
+
+    verified = _verified_contract(context, experiment)
+    version = context.portfolio.require_version(
+        experiment.idea_id, experiment.idea_version
+    )
+    return sciencechain.verify_plan(
+        context.portfolio,
+        context.artifacts,
+        experiment,
+        version=version,
+        analysis=verified.analysis,
+    )
+
+
+def _verify_input_artifacts(chain: sciencechain.VerifiedChain, workspace: Path) -> None:
+    """Every immutable input the plan froze is byte-identical in the workspace."""
+
+    for path, sha in (chain.plan.payload.get("inputs") or {}).get("artifacts") or ():
+        data = read_contained(workspace, str(path), max_bytes=MAX_COLLECTED_BYTES)
+        if data is None or hashlib.sha256(data).hexdigest() != sha:
+            raise EmpiricalError(
+                f"the input artifact {path} in the workspace is not the one the "
+                f"execution plan froze at {chain.code_commit[:12]}",
+                failure_class=FailureClass.MISSING_SCIENTIFIC_AUTHORITY,
+            )
+
+
+def _record_failure_outcome(
+    context: Any,
+    experiment: IdeaExperiment,
+    failure_class: FailureClass,
+    *,
+    detail: str,
+    job_id: str | None,
+) -> None:
+    """The outcome of an execution that produced no reading, when it has one.
+
+    Never allowed to mask the failure it records: an outcome that cannot be
+    written is logged, and the operational disposition stands.
+    """
+
+    state = sciencechain.FAILURE_OUTCOME.get(failure_class)
+    if state is None or not experiment.plan_digest:
+        return
+    # The current job's receipt only: one named by this call, or the job of an
+    # execution that has run and is being read. A failure before a new job
+    # started is not about the previous attempt's execution.
+    current = job_id or (
+        experiment.job_id
+        if experiment.state in {ExperimentState.COMPLETED, ExperimentState.RUNNING}
+        else None
+    )
+    receipt = context.portfolio.receipt_for_job(current) if current else None
+    try:
+        sciencechain.record_outcome(
+            context,
+            state=state,
+            reason=str(failure_class),
+            role=experiment.role,
+            idea_id=experiment.idea_id,
+            idea_version=experiment.idea_version,
+            contract_id=experiment.contract_id,
+            experiment=experiment,
+            receipt=receipt if receipt is not None else None,
+            detail={"detail": detail[:2000]},
+        )
+    except ResearchOSError as exc:  # pragma: no cover - logged, never masks
+        LOG.error(
+            "could not record the %s outcome of %s: %s",
+            state,
+            experiment.experiment_id,
+            exc,
+        )
+
+
 def design(
     context: Any,
     version: IdeaVersion,
@@ -1841,6 +2252,13 @@ def design(
     """
 
     commands = declared_commands(context.project_id)
+    # The science repository's capability manifest, committed at the canonical
+    # HEAD (docs/SCIENCE_EXECUTION.md). Present -- or present and invalid --
+    # means every execution of this project is bound to a declared capability
+    # through a frozen contract, design and plan; absent means the pre-v1
+    # route, whose evidence no v1 gate accepts.
+    loaded, manifest_error = capability_manifest(context)
+    governed = loaded is not None or manifest_error is not None
     replication = role is ExperimentRole.REPLICATION
     if replication and previous is None:  # pragma: no cover - the caller always has one
         raise EmpiricalError(
@@ -1848,7 +2266,12 @@ def design(
             failure_class=FailureClass.CODE_EXCEPTION,
         )
     held = ensure_analysis(
-        context, version, role=role, previous=previous, commands=commands
+        context,
+        version,
+        role=role,
+        previous=previous,
+        commands=commands,
+        capability_catalogue=capabilities.catalogue_lines(loaded, commands),
     )
     if isinstance(held, ExperimentStep):
         return held
@@ -1872,7 +2295,9 @@ def design(
         # contract recorded rather than designing anything twice.
         return _recover_execution(context, verified)
 
-    current_commands = scicontract.command_set_digest(commands)
+    current_commands = scicontract.capability_set_digest(
+        commands, manifest=_manifest_identity(loaded, manifest_error)
+    )
     if (
         contract.state is ContractState.BLOCKED_CAPABILITY
         and contract.command_set_digest == current_commands
@@ -1891,6 +2316,23 @@ def design(
             cost_usd=analysis_cost,
             model_calls=analysis_calls,
         )
+    if governed:
+        # Mechanically, before any design is asked for: does a declared
+        # capability produce every observable the frozen analysis reads, with
+        # every field it reads, typed as it reads them? A model cannot answer
+        # this, and cannot make the answer yes.
+        resolution = _analysis_resolution(
+            context, analysis, loaded=loaded, error=manifest_error, commands=commands
+        )
+        if not resolution.executable:
+            return _capability_limited(
+                context,
+                contract,
+                resolution=resolution,
+                current=current_commands,
+                cost_usd=analysis_cost,
+                model_calls=analysis_calls,
+            )
     if not commands:
         reason = (
             "no experiment commands are declared for this project, so there is "
@@ -1920,10 +2362,17 @@ def design(
         # threshold the analysis froze from it.
         "idea": scicontract.withhold_thresholds(_idea_block(version), analysis),
         "analysis_requirements": scicontract.requirements_block(analysis),
-        "declared_commands": command_catalogue(
-            commands,
-            repository=Path(context.repo_path) if context.repo_path else None,
-        ),
+        "declared_commands": [
+            # Under a manifest, only the commands that back a declared
+            # capability: any other gets no plan, so offering it would only
+            # spend a design on a refusal.
+            *command_catalogue(
+                _capability_commands(commands, loaded) if governed else commands,
+                repository=Path(context.repo_path) if context.repo_path else None,
+            ),
+            *([""] if governed else []),
+            *capabilities.catalogue_lines(loaded, commands),
+        ],
     }
     if replication:
         assert previous is not None
@@ -2062,6 +2511,26 @@ def design(
                 model_calls=calls,
             )
 
+    plan: ScienceObject | None = None
+    if governed:
+        assert loaded is not None  # an invalid manifest was refused above
+        frozen = _freeze_science_chain(
+            context,
+            version=version,
+            role=role,
+            contract=contract,
+            analysis=analysis,
+            proposed=proposed,
+            spec=spec,
+            frozen_inputs=frozen_inputs,
+            loaded=loaded,
+            commands=commands,
+            previous=previous,
+        )
+        if isinstance(frozen, ExperimentStep):
+            return replace(frozen, cost_usd=cost, model_calls=calls)
+        plan = frozen
+
     composed = {item.parameter: item.sha256 for item in frozen_inputs}
     design_record = scicontract.design_payload(proposed, spec=spec, composed=composed)
     design_hash = scicontract.design_digest(design_record)
@@ -2144,6 +2613,7 @@ def design(
         design_hash=design_hash,
         analysis=analysis,
         rule_summary=rule_summary,
+        science=_plan_identity(plan),
     )
     prereg_ref = context.artifacts.put_text(
         json.dumps(
@@ -2169,6 +2639,7 @@ def design(
             "workspace_path": str(workspace),
             "preregistration_artifact_id": prereg_ref.artifact_id,
             "implementation": scicontract.implementation_fields(spec),
+            **({"plan_digest": plan.object_digest} if plan is not None else {}),
         },
         provenance=provenance,
         parent_contract_digest=parent_digest,
@@ -2213,6 +2684,7 @@ def design(
             experiment_id=experiment_id,
             prompt_version=template.identity,
             contract_id=contract.contract_id,
+            plan_digest=plan.object_digest if plan is not None else None,
         )
     except DuplicateExperimentError as exc:
         return ExperimentStep(
@@ -2253,8 +2725,10 @@ def _preregistration_record(
     analysis: AnalysisSpec,
     rule_summary: Mapping[str, Any] | None,
     repair_of: str | None = None,
+    science: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
+        **({"science": dict(science)} if science else {}),
         "schema": "portfolio-preregistration-v2",
         "experiment_id": experiment_id,
         "idea_id": version.idea_id,
@@ -2345,6 +2819,9 @@ def _recover_execution(
         experiment_id=experiment_id,
         prompt_version=contract.design_prompt or "",
         contract_id=contract.contract_id,
+        plan_digest=str(execution["plan_digest"])
+        if execution.get("plan_digest")
+        else None,
     )
     return ExperimentStep(
         ok=True,
@@ -2513,7 +2990,9 @@ def owned_refs(experiment: IdeaExperiment) -> tuple[str, ...]:
     return (owned_ref_prefix(_worktree_run_id(experiment.experiment_id)),)
 
 
-def ensure_workspace(experiment: IdeaExperiment, *, repository: Path) -> Path:
+def ensure_workspace(
+    experiment: IdeaExperiment, *, repository: Path, base_commit: str | None = None
+) -> Path:
     """The disposable worktree this experiment runs in, created if it is absent.
 
     Idempotent on purpose. Creating a Git worktree is irreversible in the
@@ -2534,7 +3013,8 @@ def ensure_workspace(experiment: IdeaExperiment, *, repository: Path) -> Path:
     from research_os.errors import WorktreeError
 
     target = Path(experiment.workspace_path)
-    base = head_commit(repository) if has_commits(repository) else ""
+    # ``base_commit`` is a frozen plan's code commit; without one, HEAD.
+    base = base_commit or (head_commit(repository) if has_commits(repository) else "")
     if target.exists():
         assert_isolated(
             _worktree_record(experiment, base_commit=base),
@@ -2672,6 +3152,15 @@ def submit(context: Any, experiment: IdeaExperiment) -> ExperimentStep:
         # OPERATIONALLY_FAILED with the reason on it, which is where a person
         # looks.
         return _operational(context, experiment, str(exc), exc.failure_class)
+    # A plan-bound execution runs only if its whole frozen chain -- contract,
+    # design, capability binding, plan -- re-verifies now, against the
+    # contract row it was derived from (docs/SCIENCE_EXECUTION.md).
+    chain: sciencechain.VerifiedChain | None = None
+    if experiment.plan_digest:
+        try:
+            chain = _verified_chain(context, experiment)
+        except (sciencechain.ChainError, EmpiricalError) as exc:
+            return _operational(context, experiment, str(exc), exc.failure_class)
     # Local, and only local, and that is a statement about what this build
     # has rather than a limit of the design. `SlurmExecutor` exists, the
     # objective cycle submits to it, and it is unvalidated -- no `sbatch` on
@@ -2702,6 +3191,14 @@ def submit(context: Any, experiment: IdeaExperiment) -> ExperimentStep:
             project_id=context.project_id,
         )
     except BudgetExhaustedError as exc:
+        if experiment.plan_digest:
+            _record_failure_outcome(
+                context,
+                experiment,
+                FailureClass.BUDGET_EXHAUSTED,
+                detail=str(exc),
+                job_id=None,
+            )
         return ExperimentStep(
             ok=False,
             detail=str(exc),
@@ -2798,13 +3295,21 @@ def submit(context: Any, experiment: IdeaExperiment) -> ExperimentStep:
                     f"and could not be removed, so a clean run cannot be taken",
                     failure_class=FailureClass.EXECUTOR_FAILED,
                 )
-        workspace = ensure_workspace(experiment, repository=repository)
+        # A plan-bound execution runs the code commit its plan froze -- the
+        # commit whose capability manifest was bound -- whatever HEAD is now.
+        workspace = ensure_workspace(
+            experiment,
+            repository=repository,
+            base_commit=chain.code_commit if chain is not None else None,
+        )
         # Composed inputs are written from the artifact store rather than
         # from anything this process still holds in memory, and rehashed on
         # the way in. That is what makes a retry, a resume after a crash and
         # a replay months later the same measurement: the bytes come from
         # the digest the preregistration names, or nothing runs.
         _materialise_inputs(context, spec, workspace=workspace)
+        if chain is not None:
+            _verify_input_artifacts(chain, workspace)
         manifest: tuple[str, str] | None = None
         parent: dict[str, Any] | None = None
         if experiment.role is ExperimentRole.REPLICATION:
@@ -2812,10 +3317,22 @@ def submit(context: Any, experiment: IdeaExperiment) -> ExperimentStep:
             # known, and the executor has not been called -- so what this
             # replication was meant to vary is on record before its result.
             manifest_id, parent = freeze_replication_manifest(
-                context, experiment, spec=spec, workspace=workspace, job_id=job_id
+                context,
+                experiment,
+                spec=spec,
+                workspace=workspace,
+                job_id=job_id,
+                chain=chain,
             )
             manifest = (manifest_id, manifest_id)
         base_commit = _workspace_commit(workspace)
+        if chain is not None and base_commit != chain.code_commit:
+            raise EmpiricalError(
+                f"the workspace is at {base_commit[:12]} and the execution plan "
+                f"froze {chain.code_commit[:12]}; nothing runs code its plan "
+                f"did not bind",
+                failure_class=FailureClass.MISSING_SCIENTIFIC_AUTHORITY,
+            )
         # **The run directory is not the workspace.** It is the runtime's
         # immutable directory under the data home, holding the frozen
         # manifest and the logs -- and it has to be somewhere else, because
@@ -2893,6 +3410,15 @@ def submit(context: Any, experiment: IdeaExperiment) -> ExperimentStep:
             outputs=_collect(workspace, spec.outputs),
             manifest=manifest,
             parent=parent,
+            science=(
+                {
+                    **chain.digests(),
+                    "code_commit": chain.code_commit,
+                    "result_artifact": chain.result_path,
+                }
+                if chain is not None
+                else None
+            ),
         )
         after = canonical_fingerprint(repository, owned_ref_prefixes=owned)
         if escaped(before, after):
@@ -3310,6 +3836,9 @@ def _operational(
                 outputs=tuple(keep),
             ),
         )
+    _record_failure_outcome(
+        context, experiment, failure_class, detail=detail, job_id=job_id
+    )
     updated = context.portfolio.update_experiment(
         experiment.experiment_id,
         state=ExperimentState.OPERATIONALLY_FAILED,
@@ -3395,11 +3924,14 @@ def interpret(context: Any, experiment: IdeaExperiment) -> ExperimentStep:
         )
 
     verified: scicontract.VerifiedContract | None = None
+    chain: sciencechain.VerifiedChain | None = None
     try:
         spec, rule = _preregistered(context, experiment)
         if experiment.contract_id:
             verified = _verified_contract(context, experiment)
-    except EmpiricalError as exc:
+        if experiment.plan_digest:
+            chain = _verified_chain(context, experiment)
+    except (EmpiricalError, sciencechain.ChainError) as exc:
         # The same disposition `submit` gives it: the row records why and no
         # evidence is written. A rule that does not match its preregistration
         # is not a crashed stage, it is a measurement nobody may read.
@@ -3444,8 +3976,37 @@ def interpret(context: Any, experiment: IdeaExperiment) -> ExperimentStep:
             FailureClass.ARTIFACT_MISSING,
         )
 
+    # A plan-bound execution's result is validated against its capability's
+    # declaration *before* anything reads it: the receipt names it, the bytes
+    # are the ones hashed at exit, it is strict JSON, it satisfies the
+    # declared schema and holds every bound observable. A result that does
+    # not is INVALID_EVIDENCE and is never read under the decision rule.
+    result_check: sciencechain.ResultCheck | None = None
+    if chain is not None:
+        if receipt.plan_digest != chain.plan.digest:
+            return _operational(
+                context,
+                experiment,
+                (
+                    f"the receipt of {job.job_id} names plan {receipt.plan_digest} "
+                    f"and the experiment realises {chain.plan.digest}"
+                ),
+                FailureClass.MISSING_SCIENTIFIC_AUTHORITY,
+            )
+        result_check = sciencechain.validate_result(
+            chain,
+            workspace=workspace,
+            recorded_outputs=receipt_document.get("outputs") or (),
+        )
     contract_result: Any = None
-    if verified is not None:
+    if result_check is not None and not result_check.ok:
+        analysis = Analysis(
+            conclusion=EmpiricalConclusion.INSUFFICIENT,
+            summary=f"INVALID_EVIDENCE: {result_check.detail}",
+            outputs=_collect(workspace, spec.outputs),
+            notes=(f"result validation failed: {result_check.reason}",),
+        )
+    elif verified is not None:
         analysis, contract_result = analyse_contract(
             verified=verified, workspace=workspace, spec=spec, exit_code=job.exit_code
         )
@@ -3510,6 +4071,37 @@ def interpret(context: Any, experiment: IdeaExperiment) -> ExperimentStep:
                     f"not an independent replication: {finding.basis}",
                 ),
             )
+    # **The outcome is computed here, by ordinary code, and recorded before
+    # the reading** -- bound to the frozen contract, design and plan, the
+    # capability, the runner's receipt and the validated result's digest. A
+    # crash between the two leaves an outcome the retry finds (one per
+    # receipt), never a reading without one. For a replication it is the
+    # frozen rule's reading of its own result; independence is the separate
+    # finding recorded beside it.
+    outcome = None
+    if chain is not None and result_check is not None:
+        state, reason = sciencechain.reading_outcome(read_conclusion, result_check)
+        outcome = sciencechain.record_outcome(
+            context,
+            state=state,
+            reason=reason,
+            role=experiment.role,
+            idea_id=experiment.idea_id,
+            idea_version=experiment.idea_version,
+            contract_id=experiment.contract_id,
+            experiment=experiment,
+            chain=chain,
+            receipt=receipt,
+            result=result_check,
+            estimate=sciencechain.estimate_of(
+                contract_result.record() if contract_result is not None else None
+            ),
+            detail={
+                "conclusion_of_the_rule": str(read_conclusion),
+                "summary": analysis.summary[:2000],
+                "independence": finding.record() if finding is not None else None,
+            },
+        )
     stored = _store_outputs(context, experiment, workspace=workspace, analysis=analysis)
     document = analysis.record(
         experiment=experiment,
@@ -3531,7 +4123,18 @@ def interpret(context: Any, experiment: IdeaExperiment) -> ExperimentStep:
             "analysis_digest": verified.contract.analysis_digest,
             "design_digest": verified.contract.design_digest,
         }
-        document["analysis_result"] = contract_result.record()
+        document["analysis_result"] = (
+            contract_result.record() if contract_result is not None else None
+        )
+    if chain is not None:
+        document["science"] = {
+            **chain.digests(),
+            "code_commit": chain.code_commit,
+            "result": result_check.record() if result_check is not None else None,
+            "outcome_id": outcome.outcome_id if outcome is not None else None,
+            "outcome": str(outcome.state) if outcome is not None else None,
+            "outcome_reason": outcome.reason if outcome is not None else None,
+        }
     document["execution_receipt"] = {
         "receipt_id": receipt.receipt_id,
         "artifact_id": receipt.receipt_artifact_id,
@@ -3879,6 +4482,7 @@ def freeze_replication_manifest(
     spec: ExecutionSpec,
     workspace: Path,
     job_id: str,
+    chain: sciencechain.VerifiedChain | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """Freeze what a replication is, before it runs. Returns ``(artifact id, parent)``.
 
@@ -3952,16 +4556,7 @@ def freeze_replication_manifest(
             "command": mine.get("command"),
             "argv": list(spec.argv),
         },
-        "capability": {
-            "command": experiment.command,
-            "declaration": identity,
-            "command_digest": provenance.digest(identity),
-            # The researcher's, frozen here: what they attest the computation
-            # uses. Never proof that it does (INV-07).
-            "perturbation_attestation": list(
-                identity.get("perturbation_attestation") or ()
-            ),
-        },
+        "capability": _manifest_capability(experiment, identity, chain),
         "inputs": [list(item) for item in spec.inputs],
         "generated_inputs": [
             {"parameter": item.get("parameter"), "path": item.get("path")}
@@ -3979,6 +4574,7 @@ def freeze_replication_manifest(
         "independence_variables": (
             independence_variables(theirs, mine) if theirs is not None else {}
         ),
+        **({"science": chain.digests()} if chain is not None else {}),
     }
     ref = context.artifacts.put_text(
         json.dumps(manifest, indent=2, sort_keys=True, ensure_ascii=False),
@@ -3990,6 +4586,51 @@ def freeze_replication_manifest(
         experiment.experiment_id, artifact_id=ref.artifact_id
     )
     return str(ref.artifact_id), parent
+
+
+def _manifest_capability(
+    experiment: IdeaExperiment,
+    identity: Mapping[str, Any],
+    chain: sciencechain.VerifiedChain | None,
+) -> dict[str, Any]:
+    """What a replication's manifest freezes about its capability and attestation.
+
+    For an execution no plan governs, the declared command and the
+    ``perturbation_attestation`` of its ``experiments.yaml`` entry, as INV-07
+    always froze them. For a plan-bound execution, the researcher's
+    attestation is the capability's: the perturbations its committed
+    declaration says the computation uses, each with the researcher's
+    statement of how -- pinned by the capability digest in the plan. Either
+    way it is frozen before the run and recorded as attested, never proved.
+    """
+
+    block: dict[str, Any] = {
+        "command": experiment.command,
+        "declaration": dict(identity),
+        "command_digest": _provenance_digest(identity),
+        # The researcher's, frozen here: what they attest the computation
+        # uses. Never proof that it does (INV-07).
+        "perturbation_attestation": list(
+            identity.get("perturbation_attestation") or ()
+        ),
+    }
+    if chain is not None:
+        attested = chain.capability.replication.perturbations
+        block["perturbation_attestation"] = [item.token for item in attested]
+        block["attestation_source"] = {
+            "kind": "capability",
+            "ref": chain.capability.ref,
+            "digest": chain.plan.row.capability_digest,
+            "plan_digest": chain.plan.digest,
+            "statements": {item.token: item.description for item in attested},
+        }
+    return block
+
+
+def _provenance_digest(value: Any) -> str:
+    from research_os.portfolio import provenance
+
+    return provenance.digest(value)
 
 
 def _scientific_values(document: Mapping[str, Any] | None) -> dict[str, Any] | None:
@@ -4497,6 +5138,39 @@ def repair_implementation(
             "repair_of": experiment.experiment_id,
         }
     )
+    # A plan-bound execution's repair is a new plan of the same design and
+    # capability binding: the implementation fields and the workspace are in
+    # the plan, so a repaired execution is a new identity, never the old one
+    # with a different time limit.
+    plan: ScienceObject | None = None
+    if experiment.plan_digest:
+        try:
+            chain = _verified_chain(context, experiment)
+        except sciencechain.ChainError as exc:
+            raise EmpiricalError(str(exc), failure_class=exc.failure_class) from None
+        payload = dict(chain.plan.payload)
+        payload["configuration"] = {
+            **dict(payload.get("configuration") or {}),
+            "cwd": repaired.cwd,
+        }
+        payload["implementation"] = {
+            "timeout_seconds": int(repaired.timeout_seconds),
+            "resources": dict(sorted(dict(repaired.resources).items())),
+        }
+        payload["spec_digest"] = digest
+        payload["variation_digest"] = variation
+        plan = sciencechain.freeze(
+            context,
+            ScienceObjectKind.PLAN,
+            payload,
+            parent=chain.design.digest,
+            capability=(
+                str(chain.plan.row.capability_ref),
+                str(chain.plan.row.capability_digest),
+            ),
+            spec_digest=digest,
+        )
+        record["science"] = _plan_identity(plan)
     ref = context.artifacts.put_text(
         json.dumps(
             record, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False
@@ -4524,6 +5198,7 @@ def repair_implementation(
         experiment_id=new_id,
         prompt_version=experiment.prompt_version,
         contract_id=experiment.contract_id,
+        plan_digest=plan.object_digest if plan is not None else None,
         supersedes=(
             experiment.experiment_id,
             (

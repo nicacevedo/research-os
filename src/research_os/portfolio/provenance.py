@@ -140,6 +140,7 @@ def write_receipt(
     outputs: Sequence[tuple[str, str, int]],
     manifest: tuple[str, str] | None = None,
     parent: Mapping[str, Any] | None = None,
+    science: Mapping[str, Any] | None = None,
 ) -> ExecutionReceipt:
     """Record, from the runner's own observation, what one execution was.
 
@@ -148,6 +149,13 @@ def write_receipt(
     field comes from the runner -- the spec it built, the job it launched, the
     digests it computed -- and nothing comes from what the program wrote
     except the output *digests*, which are hashes of bytes, not claims.
+
+    ``science`` is a plan-bound execution's frozen chain
+    (``docs/SCIENCE_EXECUTION.md``): the contract, design and plan digests,
+    the capability and its digest, the code commit and the result artifact
+    the plan names. The runner writes it from the verified chain it ran, and
+    the row carries the plan digest, which the database checks is the
+    experiment's (`sql/0047`).
     """
 
     identity = command_identity(declared)
@@ -189,6 +197,7 @@ def write_receipt(
             else {"artifact_id": manifest[0], "digest": manifest[1]}
         ),
         "parent": dict(parent) if parent is not None else None,
+        **({"science": dict(science)} if science is not None else {}),
     }
     ref = context.artifacts.put_bytes(
         canonical(document),
@@ -218,6 +227,7 @@ def write_receipt(
         manifest_digest=manifest[1] if manifest else None,
         parent_receipt_id=(parent or {}).get("receipt_id"),
         receipt_artifact_id=str(ref.artifact_id),
+        plan_digest=(science or {}).get("plan_digest"),
     )
 
 
@@ -282,6 +292,7 @@ def verified_receipt(artifacts: Any, row: ExecutionReceipt) -> dict[str, Any]:
             (document.get("parent") or {}).get("receipt_id"),
             row.parent_receipt_id,
         ),
+        ("plan", (document.get("science") or {}).get("plan_digest"), row.plan_digest),
     )
     for what, found, wanted in checks:
         if found != wanted:

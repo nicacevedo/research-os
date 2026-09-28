@@ -1233,6 +1233,12 @@ class AnalysisSpec(_Contract):
     unanalysable_reason: str = _shown(MAX_SUMMARY_CHARS, default="")
     #: The quantity the idea is about, in words.
     estimand: str = _shown(MAX_STATEMENT_CHARS, default="")
+    #: The population or target the estimand is about -- which instances,
+    #: regimes or systems a conclusion would speak for. Part of the frozen
+    #: scientific contract (``docs/SCIENCE_EXECUTION.md``). Omitted from the
+    #: analysis digest when empty, so every analysis frozen before it existed
+    #: keeps the digest it was frozen under.
+    population: str = _shown(MAX_STATEMENT_CHARS, default="")
     #: What a SUPPORTS conclusion would mean about the idea, in words.
     target_claim: str = _shown(MAX_STATEMENT_CHARS, default="")
     observables: tuple[Observable, ...] = ()
@@ -1260,7 +1266,7 @@ class AnalysisSpec(_Contract):
             return stripped
         return stripped[: MAX_SUMMARY_CHARS - 14].rstrip() + " [clipped]"
 
-    @field_validator("estimand", "target_claim")
+    @field_validator("estimand", "target_claim", "population")
     @classmethod
     def _statement(cls, value: str) -> str:
         stripped = value.strip()
@@ -1402,7 +1408,7 @@ class AnalysisSpec(_Contract):
             for item in (self.success, self.failure)
             if item.threshold not in {0.0, 1.0}
         }
-        texts = [self.estimand, self.target_claim]
+        texts = [self.estimand, self.target_claim, self.population]
         texts += [item.description for item in self.observables]
         texts += [item.name.replace("_", " ") for item in self.reductions]
         for text in texts:
@@ -1619,6 +1625,10 @@ class DesignSpecification(_Contract):
     #: Replication only: what this second measurement varies, and how.
     variation_kind: str = _shown(MAX_STATEMENT_CHARS, default="")
     variation_detail: str = _shown(MAX_SUMMARY_CHARS, default="")
+    #: How many independent repetitions of each design point the parameters
+    #: realise. Recorded in the frozen experimental design; not hashed into
+    #: the legacy design digest, which predates it.
+    repetitions: int | None = Field(default=None, ge=1, le=1000)
 
     @field_validator("command")
     @classmethod
