@@ -1,0 +1,262 @@
+# Research OS v1 -- the live qualification contract.
+#
+# Machine-readable and frozen. `research_os.portfolio.qualification` evaluates
+# it read-only against one project's runtime database and one evidence
+# directory, and `researchctl portfolio qualification` prints the verdict.
+#
+# FREEZE RULE. The sha256 of this file is pinned in
+# tests/test_qualification_spec.py, so no mandatory criterion changes without a
+# visible change to that test. When a live qualification starts, its zero-state
+# snapshot records this file's sha256; the evaluator refuses to evaluate against
+# a spec whose digest differs from the one recorded at the start. Mandatory
+# criteria therefore cannot change once the live qualification has begun.
+#
+# A gate is MANDATORY (all must pass for V1_QUALIFIED) or ADVISORY (reported,
+# never blocking). `check` says how a gate is decided:
+#   automated -- read from the runtime database and artifact store, by code;
+#   evidence  -- a named file in the evidence directory, checked for markers;
+#   both      -- both must hold.
+# Nothing here is decided by a model.
+
+schema: research-os-qualification-v1
+spec_id: research-os-v1
+version: 1
+frozen: true
+statement: >-
+  One zero-state project, registered against a science repository that
+  declares typed capabilities, runs the autonomous portfolio unseeded under a
+  budget a person set. The qualification passes when, from records the system
+  wrote itself, an idea it originated went through deduplication,
+  falsification, executed literature retrieval and curation; got a frozen
+  scientific contract, a frozen experimental design, a mechanical capability
+  binding and a frozen execution plan; was executed by the trusted runner with
+  a receipt, a validated result and a system-computed outcome; was replicated
+  by a separate trusted execution with an assessment; was reviewed by a
+  complete board and a meta-review whose readiness the deterministic gate
+  decided; produced a recursive follow-up; and did all of it inside budget
+  authority, repository isolation and containment, on a provenance chain that
+  re-verifies end to end.
+verdicts:
+  pass: V1_QUALIFIED
+  fail: NOT_QUALIFIED
+evidence_files:
+  zero_state: 00-zero-state.json
+  containment_audit: 03-containment-audit.txt
+  isolation: 50-isolation.txt
+
+mandatory:
+  - id: Q01
+    name: zero_state_environment
+    title: Zero-state environment
+    requirement: >-
+      At the start the project had no ideas, runs, model calls, contracts,
+      experiments, science objects, outcomes or spend, and the snapshot
+      recorded this specification's sha256.
+    check: evidence
+    evidence: {file: 00-zero-state.json, produced_by: "researchctl portfolio qualification PROJECT --snapshot-zero-state DIR"}
+
+  - id: Q02
+    name: unseeded_origination
+    title: Unseeded independent idea origination
+    requirement: >-
+      At least one depth-0 idea originated autonomously (a blind, literature or
+      failure-mining explorer); no researcher seed exists for the project and
+      no idea has origin RESEARCHER_SEED.
+    check: automated
+
+  - id: Q03
+    name: idea_provenance
+    title: Idea provenance
+    requirement: Every idea of the project has at least one provenance record.
+    check: automated
+
+  - id: Q04
+    name: deduplication
+    title: Deduplication
+    requirement: At least one DEDUP stage succeeded.
+    check: automated
+
+  - id: Q05
+    name: falsification
+    title: Falsification
+    requirement: At least one FALSIFY stage succeeded.
+    check: automated
+
+  - id: Q06
+    name: executed_literature_retrieval
+    title: Executed literature retrieval
+    requirement: At least one literature retrieval was executed and completed.
+    check: automated
+
+  - id: Q07
+    name: curation_prioritization
+    title: Curation and prioritization
+    requirement: >-
+      The Curator published the bank (a recorded bank commit) and the allocator
+      bought at least one stage with a recorded utility.
+    check: automated
+
+  - id: Q08
+    name: frozen_scientific_contract
+    title: Frozen scientific contract
+    requirement: At least one CONTRACT science object is frozen.
+    check: automated
+
+  - id: Q09
+    name: frozen_experimental_design
+    title: Frozen experimental design
+    requirement: At least one DESIGN science object is frozen, realising a contract.
+    check: automated
+
+  - id: Q10
+    name: capability_resolution
+    title: Successful capability resolution
+    requirement: >-
+      At least one PLAN science object is frozen -- a plan exists only for an
+      EXECUTABLE binding to a declared capability.
+    check: automated
+
+  - id: Q11
+    name: frozen_execution_plan
+    title: Frozen execution plan
+    requirement: At least one experiment realises a frozen plan.
+    check: automated
+
+  - id: Q12
+    name: real_scientific_execution
+    title: At least one real scientific execution
+    requirement: >-
+      At least one plan-bound PRIMARY execution completed with exit code 0.
+    check: automated
+
+  - id: Q13
+    name: trusted_execution_receipt
+    title: Trusted execution receipt
+    requirement: >-
+      Every plan-bound receipt re-verifies (bytes re-hash, fields match the
+      row) and at least one exists.
+    check: automated
+
+  - id: Q14
+    name: validated_result_artifact
+    title: Validated result artifact
+    requirement: >-
+      At least one outcome records a result that passed its capability's
+      declared schema.
+    check: automated
+
+  - id: Q15
+    name: deterministic_primary_outcome
+    title: Deterministic primary outcome
+    requirement: >-
+      At least one PRIMARY outcome is SUPPORTED, REFUTED or INCONCLUSIVE,
+      system-computed, on an intact science chain.
+    check: automated
+
+  - id: Q16
+    name: real_replication
+    title: Real replication
+    requirement: At least one plan-bound REPLICATION execution completed with exit code 0.
+    check: automated
+
+  - id: Q17
+    name: trusted_replication_receipt
+    title: Trusted replication receipt
+    requirement: >-
+      At least one replication receipt re-verifies and names its frozen
+      manifest and its parent's receipt.
+    check: automated
+
+  - id: Q18
+    name: replication_assessment
+    title: Replication assessment
+    requirement: >-
+      At least one replication assessment is non-legacy, configuration
+      independent (VERIFIED) and attested (ATTESTED), on a chain that
+      re-verifies now; agreement (MEASURED) is recorded.
+    check: automated
+
+  - id: Q19
+    name: complete_review_board
+    title: Complete current scientific review board
+    requirement: >-
+      At least one idea has live methodology, novelty and skeptic reviews of
+      its current version, each with its objections complete.
+    check: automated
+
+  - id: Q20
+    name: meta_review_readiness
+    title: Meta-review and readiness decision
+    requirement: >-
+      At least one META_REVIEW stage succeeded with a disposition the
+      deterministic gate permitted, and its meta review is recorded.
+    check: automated
+
+  - id: Q21
+    name: recursive_child
+    title: Recursive follow-up
+    requirement: >-
+      At least one idea of depth >= 1 descends from an autonomously originated
+      idea.
+    check: automated
+
+  - id: Q22
+    name: budget_authority
+    title: Budget and request authority integrity
+    requirement: >-
+      Every submitted cost reservation carries a provider cap no greater than
+      its amount; no explicit ceiling a person set was overspent except by a
+      provider-reported overshoot, recorded as such.
+    check: automated
+
+  - id: Q23
+    name: repository_isolation
+    title: Repository and capsule isolation
+    requirement: >-
+      No experiment workspace or branch is left in the science repository,
+      and the isolation evidence records the canonical checkout clean and its
+      capsule unchanged.
+    check: both
+    evidence: {file: 50-isolation.txt, markers: ["git status: clean", "capsule unchanged: true"]}
+
+  - id: Q24
+    name: containment
+    title: Containment
+    requirement: >-
+      Every completed execution ran contained, and the host containment audit
+      held with no failure.
+    check: both
+    evidence: {file: 03-containment-audit.txt, markers: ["PASS  containment_available"], forbidden: ["FAIL "]}
+
+  - id: Q25
+    name: complete_provenance_chain
+    title: Complete immutable provenance and evidence chain
+    requirement: >-
+      One idea version carries all of it at once: an admissible primary
+      science chain, an admissible replication science chain and replication
+      provenance, a complete board and a succeeded meta review.
+    check: automated
+
+advisory:
+  - id: A01
+    name: second_provider
+    title: Second model provider
+    requirement: At least two provider families answered model calls.
+    check: automated
+  - id: A02
+    name: human_ready
+    title: HUMAN_READY reached
+    requirement: At least one idea reached HUMAN_READY through the gate.
+    check: automated
+  - id: A03
+    name: second_empirical_domain
+    title: Second empirical domain
+    requirement: A second science repository with its own capabilities was qualified.
+    check: evidence
+    evidence: {file: A03-second-domain.txt, markers: ["V1_QUALIFIED"]}
+  - id: A04
+    name: mathematical_track
+    title: Mathematical-research track
+    requirement: A mathematical idea reached VALIDATED on a derivation and an executed check.
+    check: evidence
+    evidence: {file: A04-mathematical-track.txt, markers: ["VALIDATED"]}

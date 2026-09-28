@@ -49,6 +49,21 @@ def add_experiment_parser(subparsers: argparse._SubParsersAction) -> None:
     commands.add_argument("project", metavar="PROJECT", help="Project id or path.")
     commands.add_argument("--config", help="Path to an experiment config file.")
 
+    capabilities = actions.add_parser(
+        "capabilities",
+        help=(
+            "Check the project's committed research-capabilities.yaml against "
+            "the host's declared commands. Read-only."
+        ),
+    )
+    capabilities.add_argument("project", metavar="PROJECT", help="Project id or path.")
+    capabilities.add_argument("--config", help="Path to an experiment config file.")
+    capabilities.add_argument(
+        "--commit",
+        default=None,
+        help="Read the manifest at this commit (default HEAD).",
+    )
+
     scheduler = actions.add_parser(
         "scheduler", help="Report whether a job could be submitted from this machine."
     )
@@ -120,6 +135,7 @@ def dispatch(args: argparse.Namespace) -> int:
         return EXIT_OK
     handlers = {
         "commands": _commands,
+        "capabilities": _capabilities,
         "scheduler": _scheduler,
         "run": _run,
         "show": _show,
@@ -138,6 +154,45 @@ def _commands(args: argparse.Namespace) -> int:
     project_id, _ = _project(args.project)
     print(render_command_list(config, project_id), end="")
     return EXIT_OK
+
+
+def _capabilities(args: argparse.Namespace) -> int:
+    """Each declared capability, its digest, and whether the host can run it.
+
+    ``docs/SCIENCE_EXECUTION.md``. Exit 0 when a manifest is committed and every
+    capability in it matches a host command; 1 otherwise, with the reason.
+    """
+
+    from research_os import capability
+
+    config = _config(args)
+    project_id, path = _project(args.project)
+    commands = dict(config.for_project(project_id).commands) if project_id else {}
+    try:
+        loaded = capability.load_committed(path, commit=args.commit)
+    except capability.CapabilityError as exc:
+        print(f"invalid: {exc}")
+        return EXIT_ERROR
+    if loaded is None:
+        print(
+            f"{path} commits no {capability.MANIFEST_PATH}: its executions run the "
+            f"pre-v1 route, whose evidence no v1 gate accepts"
+        )
+        return EXIT_ERROR
+    print(
+        f"manifest   {capability.MANIFEST_PATH} at {loaded.commit} (sha256 {loaded.sha256})"
+    )
+    usable = True
+    for item in loaded.manifest.capabilities:
+        unmet = capability.check_against_command(item, commands)
+        usable = usable and not unmet
+        print(
+            f"{item.ref:24} {'OK' if not unmet else 'NOT USABLE'}  command {item.command}"
+        )
+        print(f"    digest {capability.capability_digest(item)}")
+        for problem in unmet:
+            print(f"    - {problem.rendered()}")
+    return EXIT_OK if usable else EXIT_ERROR
 
 
 def _scheduler(args: argparse.Namespace) -> int:

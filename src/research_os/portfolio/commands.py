@@ -108,6 +108,35 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     )
     digest.add_argument("--json", action="store_true", dest="as_json")
 
+    qualification = actions.add_parser(
+        "qualification",
+        help=(
+            "Evaluate the frozen Research OS v1 qualification specification "
+            "against a project, read-only; or take its zero-state snapshot or "
+            "isolation report."
+        ),
+    )
+    qualification.add_argument("project", nargs="?", default=None)
+    qualification.add_argument(
+        "--evidence", type=Path, default=None, help="the evidence directory"
+    )
+    qualification.add_argument(
+        "--snapshot-zero-state",
+        action="store_true",
+        help="write 00-zero-state.json into --evidence (before the run starts)",
+    )
+    qualification.add_argument(
+        "--isolation-report",
+        action="store_true",
+        help="write 50-isolation.txt into --evidence (after the run)",
+    )
+    qualification.add_argument(
+        "--expect-spec-digest",
+        default=None,
+        help="refuse unless the specification still has this sha256",
+    )
+    qualification.add_argument("--json", action="store_true", dest="as_json")
+
     ideas = subparsers.add_parser(
         "ideas", help="Inspect autonomous discovery candidates."
     )
@@ -154,6 +183,7 @@ def dispatch_portfolio(args: argparse.Namespace) -> int:
         "pause": _pause,
         "resume": _resume,
         "digest": _digest,
+        "qualification": _qualification,
     }[command](args)
 
 
@@ -441,6 +471,65 @@ def _enable(args: argparse.Namespace) -> int:
         f"`researchctl portfolio pause {project}` stops allocation."
     )
     return EXIT_OK
+
+
+def _qualification(args: argparse.Namespace) -> int:
+    """The v1 qualification contract, decided by code. Writes only evidence files."""
+
+    from research_os.portfolio import qualification
+    from research_os.runtime.artifacts import FilesystemArtifactStore
+
+    evidence: Path | None = args.evidence
+    with _database() as db:
+        project, repo = _resolve_project(args.project, db)
+        if args.snapshot_zero_state or args.isolation_report:
+            if evidence is None:
+                raise ResearchOSError("--evidence names where the file is written")
+            evidence.mkdir(parents=True, exist_ok=True)
+        if args.snapshot_zero_state:
+            target = evidence / "00-zero-state.json"
+            if target.exists():
+                raise ResearchOSError(
+                    f"{target} exists; a zero-state snapshot is taken once, at the start"
+                )
+            snapshot = qualification.zero_state_snapshot(
+                db, project_id=project, repo_path=repo
+            )
+            target.write_text(json.dumps(snapshot, indent=2, sort_keys=True) + "\n")
+            _print(json.dumps(snapshot, indent=2, sort_keys=True))
+            nonzero = {k: v for k, v in snapshot["counts"].items() if v}
+            return EXIT_ERROR if nonzero else EXIT_OK
+        if args.isolation_report:
+            zero = json.loads((evidence / "00-zero-state.json").read_text())
+            text = qualification.isolation_report(zero_state=zero, repo_path=repo)
+            (evidence / "50-isolation.txt").write_text(text)
+            _print(text)
+            return EXIT_OK
+        config = load_runtime_config()
+        report = qualification.evaluate(
+            db,
+            project_id=project,
+            artifacts=FilesystemArtifactStore(
+                config.artifacts_root, store=RuntimeStore(db)
+            ),
+            evidence_dir=evidence,
+            repo_path=repo,
+            expect_spec_digest=args.expect_spec_digest,
+        )
+    record = report.record()
+    if getattr(args, "as_json", False):
+        _print(json.dumps(record, indent=2, sort_keys=True))
+    else:
+        _print(
+            f"{record['verdict']}  {record['mandatory_passed']}/"
+            f"{record['mandatory_total']} mandatory  spec {record['spec_digest'][:16]}"
+        )
+        for gate in record["gates"]:
+            _print(
+                f"  {gate['status']:4}  {gate['id']} {gate['tier'][:3]} "
+                f"{gate['name']}: {gate['detail']}"
+            )
+    return EXIT_OK if record["verdict"] == "V1_QUALIFIED" else EXIT_ERROR
 
 
 def _status(args: argparse.Namespace) -> int:

@@ -661,6 +661,7 @@ def test_every_command_that_takes_a_project_uses_the_one_resolver() -> None:
         "_pause",
         "_resume",
         "_digest",
+        "_qualification",
         "_list",
         "_seed_add",
         "_seed_list",
