@@ -2519,7 +2519,7 @@ def _merge_dimensions(
 
 
 def _evaluate(context: TrackContext) -> gates.GateResult:
-    from research_os.portfolio import provenance
+    from research_os.portfolio import provenance, sciencechain
 
     store = context.portfolio
     version = store.require_version(context.idea_id)
@@ -2545,6 +2545,16 @@ def _evaluate(context: TrackContext) -> gates.GateResult:
         # The trusted replication chains, re-verified now (INV-07, INV-08):
         # the gate reads these, not the mere presence of a replication row.
         replications=provenance.replication_provenance(
+            store,
+            context.artifacts,
+            idea_id=context.idea_id,
+            idea_version=version.version,
+            evidence=evidence,
+        ),
+        # The science chains behind every executed row, re-verified now: the
+        # frozen contract, design and plan, the capability binding, the
+        # receipt, the validated result and the system-computed outcome.
+        science_chains=sciencechain.science_chains(
             store,
             context.artifacts,
             idea_id=context.idea_id,

@@ -25,13 +25,16 @@ from research_os.portfolio.models import (
     Disposition,
     EvidenceKind,
     EvidenceStrength,
+    ExperimentRole,
     IdeaOrigin,
     IdeaVersion,
     ObjectionTarget,
+    PrimaryOutcome,
     QualityTier,
     ReplicationProvenance,
     ReviewerRole,
     ReviewVerdict,
+    ScienceChain,
     Severity,
     Stage,
 )
@@ -86,6 +89,7 @@ class Built:
         requested: QualityTier = QualityTier.HUMAN_READY,
         config: PortfolioConfig | None = None,
         trusted_replications: bool = True,
+        trusted_chains: bool = True,
     ):
         """Evaluate the rows; the replication rows' chains stand in as verified.
 
@@ -94,6 +98,10 @@ class Built:
         admissible provenance record the gate requires (INV-07, INV-08) is
         supplied for it -- unless ``trusted_replications`` is false, which is
         what a row with no trusted chain gets in production.
+
+        The same for the science chains behind executed experiment and
+        replication rows (docs/SCIENCE_EXECUTION.md): an admissible record is
+        supplied for each unless ``trusted_chains`` is false.
         """
 
         head = self.store.require_version(self.idea_id, self.version)
@@ -123,7 +131,52 @@ class Built:
             config=config or _config(),
             requested=requested,
             replications=replications,
+            science_chains=trusted_science_chains(evidence) if trusted_chains else (),
         )
+
+
+def trusted_science_chains(evidence) -> tuple[ScienceChain, ...]:
+    """An admissible science chain for every executed experiment and replication row.
+
+    Its outcome is the row's direction, and a replication agrees with the
+    primary when their directions match -- what the real records would say.
+    """
+
+    outcome = {
+        EvidenceStrength.SUPPORTS: PrimaryOutcome.SUPPORTED,
+        EvidenceStrength.CONTRADICTS: PrimaryOutcome.REFUTED,
+    }
+    primary = next(
+        (
+            outcome.get(row.strength)
+            for row in evidence
+            if row.kind is EvidenceKind.EXPERIMENT and row.job_id
+        ),
+        None,
+    )
+    chains = []
+    for row in evidence:
+        if not row.job_id or row.kind not in {
+            EvidenceKind.EXPERIMENT,
+            EvidenceKind.REPLICATION,
+        }:
+            continue
+        replication = row.kind is EvidenceKind.REPLICATION
+        chains.append(
+            ScienceChain(
+                evidence_id=row.evidence_id,
+                role=ExperimentRole.REPLICATION
+                if replication
+                else ExperimentRole.PRIMARY,
+                outcome=outcome.get(row.strength, PrimaryOutcome.INCONCLUSIVE),
+                capability_ref="test.capability@1",
+                chain_intact=True,
+                agrees_with_primary=(
+                    outcome.get(row.strength) == primary if replication else None
+                ),
+            )
+        )
+    return tuple(chains)
 
 
 def _build(
@@ -890,6 +943,9 @@ def test_an_executed_replication_row_without_a_trusted_chain_is_not_verification
             succeeded_stages=ALL_STAGES,
             config=_config(),
             replications=(ReplicationProvenance(**{**base, **broken}),),
+            science_chains=trusted_science_chains(
+                portfolio.list_evidence(idea_id=built.idea_id, idea_version=1)
+            ),
         )
         assert result.tier is QualityTier.VALIDATED, broken
 
@@ -934,3 +990,130 @@ def test_an_agreeing_replication_says_nothing_about_disagreement(
     result = built.gate()
     assert not any("refuted this idea" in note for note in result.notes)
     assert not any("did not agree" in note for note in result.notes)
+
+
+# ------------------------------------------------- the science chain (v1) --
+def test_an_empirical_measurement_without_a_science_chain_does_not_validate(
+    portfolio: PortfolioStore, runtime_db: Database, runtime_project: str
+) -> None:
+    """docs/SCIENCE_EXECUTION.md: the gate reads the chain behind the row.
+
+    The same complete empirical idea as the positive control, with the
+    science chain behind its measurement absent, broken, bound to no
+    capability, or ending in an outcome that is not decisive: an executed
+    row with a job is not enough, and VALIDATED is unmet with the reason.
+    """
+
+    built = _build(
+        portfolio,
+        runtime_db,
+        runtime_project,
+        adjudication=[AdjudicationType.EMPIRICAL],
+    )
+    result = built.gate(trusted_chains=False)
+    assert result.tier is QualityTier.PROMISING
+    assert any("verified science chain" in item for item in result.unmet), result.unmet
+
+    evidence = portfolio.list_evidence(idea_id=built.idea_id, idea_version=1)
+    chains = trusted_science_chains(evidence)
+    head = portfolio.require_version(built.idea_id, 1)
+    (primary,) = [item for item in chains if item.role is ExperimentRole.PRIMARY]
+    for broken in (
+        {"chain_intact": False, "problems": ("the plan names a different design",)},
+        {"capability_ref": None},
+        {"outcome": PrimaryOutcome.INCONCLUSIVE},
+        {"outcome": PrimaryOutcome.INVALID_EVIDENCE},
+        {"outcome": None},
+        {"evidence_id": "IEVD-some-other-row"},
+    ):
+        altered = tuple(
+            item.model_copy(update=broken) if item is primary else item
+            for item in chains
+        )
+        result = evaluate(
+            version=head,
+            live_reviews=portfolio.live_reviews(idea_id=built.idea_id),
+            objections=portfolio.open_objections(idea_id=built.idea_id),
+            evidence=evidence,
+            succeeded_stages=ALL_STAGES,
+            config=_config(),
+            replications=tuple(
+                ReplicationProvenance(
+                    evidence_id=row.evidence_id,
+                    assessment_id="RASM-x",
+                    legacy=False,
+                    configuration_independent=True,
+                    perturbation_attested=True,
+                    chain_intact=True,
+                )
+                for row in evidence
+                if row.kind is EvidenceKind.REPLICATION
+            ),
+            science_chains=altered,
+        )
+        assert result.tier is QualityTier.PROMISING, broken
+        assert any("verified science chain" in item for item in result.unmet), broken
+
+
+def test_a_replication_needs_its_own_science_chain_for_human_ready(
+    portfolio: PortfolioStore, runtime_db: Database, runtime_project: str
+) -> None:
+    built = _build(
+        portfolio,
+        runtime_db,
+        runtime_project,
+        adjudication=[AdjudicationType.EMPIRICAL],
+    )
+    evidence = portfolio.list_evidence(idea_id=built.idea_id, idea_version=1)
+    head = portfolio.require_version(built.idea_id, 1)
+    chains = tuple(
+        item.model_copy(update={"chain_intact": False, "problems": ("x",)})
+        if item.role is ExperimentRole.REPLICATION
+        else item
+        for item in trusted_science_chains(evidence)
+    )
+    result = evaluate(
+        version=head,
+        live_reviews=portfolio.live_reviews(idea_id=built.idea_id),
+        objections=portfolio.open_objections(idea_id=built.idea_id),
+        evidence=evidence,
+        succeeded_stages=ALL_STAGES,
+        config=_config(),
+        replications=tuple(
+            ReplicationProvenance(
+                evidence_id=row.evidence_id,
+                assessment_id="RASM-x",
+                legacy=False,
+                configuration_independent=True,
+                perturbation_attested=True,
+                chain_intact=True,
+            )
+            for row in evidence
+            if row.kind is EvidenceKind.REPLICATION
+        ),
+        science_chains=chains,
+    )
+    assert result.tier is QualityTier.VALIDATED
+    assert any("second-line verification" in item for item in result.unmet)
+
+
+def test_a_measured_disagreement_is_disclosed_and_is_not_a_bar(
+    portfolio: PortfolioStore, runtime_db: Database, runtime_project: str
+) -> None:
+    """MEASURED is recorded beside VERIFIED and ATTESTED, and gates nothing.
+
+    A replication whose system-computed outcome is not its primary's is a
+    finding a person should read; the gate says so in a note, as it says a
+    refutation, and leaves what it means to that person.
+    """
+
+    built = _build(
+        portfolio,
+        runtime_db,
+        runtime_project,
+        adjudication=[AdjudicationType.EMPIRICAL],
+        primary_strength=EvidenceStrength.CONTRADICTS,
+    )
+    result = built.gate()
+    assert result.tier is QualityTier.HUMAN_READY
+    assert any(note.startswith("MEASURED:") for note in result.notes), result.notes

@@ -328,6 +328,8 @@ invariants:
       - research_os.portfolio.gates:_human_ready_unmet
       - research_os.portfolio.gates:_incomplete_review_events
       - research_os.portfolio.gates:_replication_met
+      - research_os.portfolio.gates:_science_chain_met
+      - research_os.portfolio.sciencechain:science_chains
       - research_os.portfolio.gates:evaluate
       - research_os.portfolio.gates:permit
     tests:
@@ -340,6 +342,8 @@ invariants:
       - tests/test_integrity_v2_review_events.py::test_a_review_from_a_superseded_prompt_is_not_live_and_its_objection_stands
       - tests/test_integrity_v2_review_events.py::test_a_stale_review_stops_counting_and_its_fatal_objection_still_blocks
       - tests/test_portfolio_gates.py::test_an_executed_replication_row_without_a_trusted_chain_is_not_verification
+      - tests/test_portfolio_gates.py::test_an_empirical_measurement_without_a_science_chain_does_not_validate
+      - tests/test_portfolio_gates.py::test_a_replication_needs_its_own_science_chain_for_human_ready
       - tests/test_integrity_v2_migrations.py::test_upgraded_0036_replication_evidence_cannot_satisfy_the_current_gate
     mutants: [MUT-M2-1, MUT-M2-2, MUT-M2-3, MUT-R2-1, MUT-R2-2, MUT-V3-3, MUT-V3-4]
     pass_requires: >-

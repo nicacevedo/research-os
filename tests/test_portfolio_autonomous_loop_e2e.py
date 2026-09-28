@@ -65,8 +65,10 @@ from research_os.runtime.store import RuntimeStore
 from tests.portfolio_helpers import idea_fields
 from tests.runtime_graph_helpers import ScriptedRouter, make_config
 from tests.runtime_helpers import pg_dsn, runtime_db, runtime_project, runtime_xdg
+from tests.test_portfolio_empirical import declare_capabilities
 from tests.test_portfolio_frontier import (
     EMPIRICAL_FALSIFIER,
+    GRID_CAPABILITIES,
     _analysis,
     _design,
     _matrix,
@@ -395,6 +397,10 @@ def test_the_autonomous_loop_runs_end_to_end_through_the_control_plane(
 ) -> None:
     from research_os.portfolio import extensions as portfolio_extensions
 
+    # The v1 route: the science repository declares what `grid` produces, so
+    # every measurement is bound to that capability through a frozen
+    # contract, design and plan, and the gates read that chain.
+    declare_capabilities(grid_repo, GRID_CAPABILITIES)
     router = _router(runtime_db)
     daemon = _plane(runtime_db, pg_dsn, tmp_path, grid_repo, router, monkeypatch)
     monkeypatch.setattr(portfolio_extensions, "_literature", lambda: Corpus())

@@ -54,6 +54,7 @@ from research_os.portfolio.models import (
     RetrievalPurpose,
     RetrievalStatus,
     ReviewVerdict,
+    ScienceChain,
     Severity,
     Stage,
 )
@@ -104,6 +105,11 @@ class EvidenceRule:
     execution_kinds: frozenset[EvidenceKind] = frozenset()
     #: Distinct retrieved literature keys required.
     literature_keys: int = 0
+    #: The executed evidence must stand on a verified science chain: a frozen
+    #: contract, design and capability-bound plan, the runner's receipt of
+    #: that plan's execution, a result validated against the capability's
+    #: schema and a decisive system-computed outcome (docs/SCIENCE_EXECUTION.md).
+    requires_science_chain: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,6 +125,10 @@ class ReplicationRule:
     requires_distinct_source: bool = True
     #: Literature keys the replication must add that the original did not have.
     new_literature_keys: int = 0
+    #: The replication must stand on its own verified science chain. Whether
+    #: its outcome agrees with the primary's is MEASURED and disclosed, and --
+    #: like the direction of evidence -- is not a bar (see ``evaluate``).
+    requires_science_chain: bool = False
 
 
 #: What each adjudication type must show before ``VALIDATED``.
@@ -148,6 +158,7 @@ EVIDENCE_RULES: dict[AdjudicationType, EvidenceRule] = {
         kinds=frozenset({EvidenceKind.EXPERIMENT}),
         requires_execution=True,
         execution_kinds=frozenset({EvidenceKind.EXPERIMENT}),
+        requires_science_chain=True,
     ),
     AdjudicationType.NOVELTY_OR_LITERATURE: EvidenceRule(
         description="retrieved primary sources, not recollection of them",
@@ -187,10 +198,11 @@ REPLICATION_RULES: dict[AdjudicationType, ReplicationRule] = {
     AdjudicationType.EMPIRICAL: ReplicationRule(
         description=(
             "a second execution with its own specification digest, differing in "
-            "seed or in implementation"
+            "seed or in implementation, on its own verified science chain"
         ),
         kinds=frozenset({EvidenceKind.REPLICATION}),
         requires_execution=True,
+        requires_science_chain=True,
     ),
     AdjudicationType.NOVELTY_OR_LITERATURE: ReplicationRule(
         description=(
@@ -339,6 +351,50 @@ def _executed(evidence: Sequence[IdeaEvidence], kinds: frozenset[EvidenceKind]) 
     return any(item.kind in kinds and item.job_id for item in evidence)
 
 
+def _science_chain_met(
+    evidence: Sequence[IdeaEvidence],
+    chains: Sequence[ScienceChain],
+    kinds: frozenset[EvidenceKind],
+) -> tuple[bool, str]:
+    """Whether executed evidence of these kinds stands on a verified science chain.
+
+    Read by the gate from the chains ``sciencechain.science_chains``
+    re-verified *now* (INV-08, ``docs/SCIENCE_EXECUTION.md``): a substantive
+    row naming an execution counts only when the chain behind it is intact,
+    bound to a declared capability, and ends in a decisive system-computed
+    outcome. A row from an execution no capability plan governed -- the
+    pre-v1 route, where a model named the observables -- never counts, and
+    neither does one whose upstream contract, design or plan was replaced.
+    Returns whether it is met and, when it is not, the first reason.
+    """
+
+    by_evidence = {item.evidence_id: item for item in chains}
+    rows = [
+        item
+        for item in evidence
+        if item.kind in kinds
+        and item.job_id
+        and item.strength in {EvidenceStrength.SUPPORTS, EvidenceStrength.CONTRADICTS}
+    ]
+    reasons: list[str] = []
+    for row in rows:
+        chain = by_evidence.get(row.evidence_id)
+        if chain is not None and chain.admissible:
+            return True, ""
+        if chain is None:
+            reasons.append(f"{row.evidence_id}: no science chain was read for it")
+        else:
+            reasons.append(
+                f"{row.evidence_id}: "
+                + (
+                    "; ".join(chain.problems)
+                    if chain.problems
+                    else f"its outcome is {chain.outcome or 'not recorded'}"
+                )
+            )
+    return False, (reasons[0] if reasons else "no executed, substantive row")
+
+
 def _rules_for(
     version: IdeaVersion,
 ) -> tuple[
@@ -438,6 +494,7 @@ def _validated_unmet(
     evidence: Sequence[IdeaEvidence],
     succeeded_stages: frozenset[Stage],
     config: PortfolioConfig,
+    science_chains: Sequence[ScienceChain] = (),
 ) -> list[str]:
     unmet: list[str] = []
     _declared, evidence_rules, _ = _rules_for(version)
@@ -475,6 +532,17 @@ def _validated_unmet(
                 f"nothing was executed: {rule.description}. A derivation or a "
                 f"design is not a check."
             )
+        elif rule.requires_science_chain:
+            met, why = _science_chain_met(
+                evidence, science_chains, rule.execution_kinds
+            )
+            if not met:
+                unmet.append(
+                    "no measurement stands on a verified science chain (frozen "
+                    "contract, design and capability-bound plan, the runner's "
+                    "receipt, a validated result and a decisive system-computed "
+                    f"outcome): {why}"
+                )
 
     keys = _distinct_literature_keys(evidence)
     needed = config.thresholds.novelty_min_sources
@@ -508,6 +576,7 @@ def _human_ready_unmet(
     evidence: Sequence[IdeaEvidence],
     retrievals: Sequence[LiteratureRetrieval] = (),
     replications: Sequence[ReplicationProvenance] = (),
+    science_chains: Sequence[ScienceChain] = (),
 ) -> list[str]:
     unmet: list[str] = []
     _, _, replication_rules = _rules_for(version)
@@ -539,7 +608,9 @@ def _human_ready_unmet(
         if call
     }
     for rule in replication_rules:
-        if not _replication_met(rule, evidence, origin_calls, retrievals, replications):
+        if not _replication_met(
+            rule, evidence, origin_calls, retrievals, replications, science_chains
+        ):
             unmet.append(f"no second-line verification: {rule.description}")
     if not replication_rules:
         unmet.append(
@@ -564,6 +635,7 @@ def _replication_met(
     origin_calls: set[str | None],
     retrievals: Sequence[LiteratureRetrieval] = (),
     replications: Sequence[ReplicationProvenance] = (),
+    science_chains: Sequence[ScienceChain] = (),
 ) -> bool:
     """Whether the second-line verification this type requires actually exists.
 
@@ -634,6 +706,20 @@ def _replication_met(
             record.evidence_id for record in replications if record.admissible
         }
         candidates = [item for item in candidates if item.evidence_id in admissible]
+    if rule.requires_science_chain:
+        # And on its own science chain (docs/SCIENCE_EXECUTION.md): a frozen
+        # plan bound to a declared capability, the runner's receipt of its
+        # execution, a validated result and a decisive system-computed
+        # outcome. Whether that outcome agrees with the primary's is the
+        # MEASURED finding, recorded on the chain and disclosed by `evaluate`;
+        # like direction, it is not a bar, because what a replication that
+        # contradicts its primary means is a question for a person.
+        admissible_chains = {
+            chain.evidence_id for chain in science_chains if chain.admissible
+        }
+        candidates = [
+            item for item in candidates if item.evidence_id in admissible_chains
+        ]
     return bool(candidates)
 
 
@@ -744,6 +830,7 @@ def evaluate(
     requested: QualityTier = QualityTier.HUMAN_READY,
     retrievals: Sequence[LiteratureRetrieval] = (),
     replications: Sequence[ReplicationProvenance] = (),
+    science_chains: Sequence[ScienceChain] = (),
 ) -> GateResult:
     """What this idea's rows permit.
 
@@ -755,10 +842,22 @@ def evaluate(
 
     promising = _promising_unmet(version, objections, succeeded_stages, live_reviews)
     validated = promising + _validated_unmet(
-        version, live_reviews, objections, evidence, succeeded_stages, config
+        version,
+        live_reviews,
+        objections,
+        evidence,
+        succeeded_stages,
+        config,
+        science_chains,
     )
     human_ready = validated + _human_ready_unmet(
-        version, live_reviews, objections, evidence, retrievals, replications
+        version,
+        live_reviews,
+        objections,
+        evidence,
+        retrievals,
+        replications,
+        science_chains,
     )
 
     if not human_ready:
@@ -819,6 +918,17 @@ def evaluate(
     replicated = {
         item.strength for item in executed if item.kind is EvidenceKind.REPLICATION
     }
+    by_role = {
+        str(chain.role): chain.outcome for chain in science_chains if chain.admissible
+    }
+    for chain in science_chains:
+        if chain.admissible and chain.agrees_with_primary is False:
+            notes.append(
+                f"MEASURED: the replication's system-computed outcome "
+                f"({chain.outcome}) is not the primary's "
+                f"({by_role.get('PRIMARY') or 'unrecorded'}) under the "
+                f"capability's frozen comparison rule. Recorded, and not a bar."
+            )
     if primary and replicated and primary != replicated:
         notes.append(
             "the replication did not agree with the primary measurement. The "

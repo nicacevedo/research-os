@@ -106,6 +106,48 @@ projects:
         checks: []
 """
 
+#: What `grid` produces, declared by the science repository
+#: (docs/SCIENCE_EXECUTION.md). Committed by the tests that run the v1 route.
+GRID_CAPABILITIES = """\
+schema: research-os-capabilities-v1
+capabilities:
+  - id: synthetic.grid
+    version: 1
+    title: Size-by-difficulty factorial of solver effort
+    command: grid
+    result:
+      artifact: results/grid.json
+      schema:
+        type: object
+        required: [cells]
+        properties:
+          cells:
+            type: array
+            items:
+              type: object
+              required: [size, difficulty, iterations]
+              properties:
+                size: {type: number}
+                difficulty: {type: number}
+                iterations: {type: number}
+    observables:
+      - name: cells
+        kind: records
+        path: cells
+        fields:
+          - {name: size, type: number}
+          - {name: difficulty, type: number}
+          - {name: iterations, type: number, unit: pivots}
+    determinism: deterministic
+    replication:
+      perturbations:
+        - kind: parameter
+          name: plan
+          description: every cell is computed from the plan's sizes and difficulties
+    resources:
+      timeout_seconds: 60
+"""
+
 EMPIRICAL_FALSIFIER = (
     "Run the size-by-difficulty factorial and measure iteration counts; the idea "
     "is wrong if the interaction coefficient is not positive."

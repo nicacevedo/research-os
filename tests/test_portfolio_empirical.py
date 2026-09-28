@@ -50,6 +50,7 @@ from research_os.portfolio.models import (
     ExperimentState,
     IdeaOrigin,
     IdeaStatus,
+    PrimaryOutcome,
     QualityTier,
     ReviewerRole,
     Stage,
@@ -165,6 +166,74 @@ projects:
         timeout_seconds: 120
         checks: []
 """
+
+
+#: The science repository's own declaration of what `measure` and `sweep`
+#: produce (docs/SCIENCE_EXECUTION.md). Committed only by the tests that run
+#: the v1 route; without it a project runs the pre-v1 route, whose evidence no
+#: v1 gate accepts.
+MEASURE_CAPABILITIES = """\
+schema: research-os-capabilities-v1
+capabilities:
+  - id: synthetic.overlap
+    version: 1
+    title: Support overlap on a synthetic instance family
+    command: measure
+    result:
+      artifact_parameter: out
+      format: json
+      schema:
+        type: object
+        required: [summary]
+        properties:
+          summary:
+            type: object
+            required: [overlap]
+            properties:
+              overlap: {type: number, minimum: 0, maximum: 1}
+          execution_receipt:
+            type: object
+            properties:
+              seeds: {type: array, items: {type: integer}}
+              parameters:
+                type: object
+                properties:
+                  seed: {type: integer}
+    observables:
+      - name: overlap
+        kind: scalar
+        path: summary.overlap
+        type: number
+        unit: "1"
+        description: fraction of shared supports
+    determinism: seeded
+    replication:
+      perturbations:
+        - kind: seeds
+          description: the design seed is the instance seed
+        - kind: parameter
+          name: seed
+          description: the --seed argument draws the instance the overlap is measured on
+    resources:
+      timeout_seconds: 60
+"""
+
+
+def declare_capabilities(repo: Path, manifest: str = MEASURE_CAPABILITIES) -> str:
+    """Commit a capability manifest to the science repository; return the commit."""
+
+    (repo / "research-capabilities.yaml").write_text(manifest, encoding="utf-8")
+    subprocess.run(["git", "add", "research-capabilities.yaml"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-qm", "declare capabilities"], cwd=repo, check=True
+    )
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
 
 
 def _git_project(path: Path, *, script: str) -> Path:
@@ -1872,6 +1941,10 @@ def test_a_real_empirical_idea_traverses_experiment_evidence_and_review(
     from research_os.portfolio.track import advance_idea
     from research_os.runtime.interfaces import Independence
 
+    # The v1 route: the science repository declares what `measure` produces,
+    # so every execution is bound to that capability through a frozen
+    # contract, design and plan, and the gates read that chain.
+    declare_capabilities(project_repo)
     idea, _version = portfolio.create_idea(
         project_id=runtime_project,
         origin=IdeaOrigin.BLIND_EXPLORER,
@@ -1942,6 +2015,16 @@ def test_a_real_empirical_idea_traverses_experiment_evidence_and_review(
     ]
     assert replications, why
     assert replications[0].variation_digest != primary[0].variation_digest, why
+
+    # Both executions stand on their frozen chains, and each has one
+    # system-computed outcome bound to its plan, receipt and validated result.
+    assert primary[0].plan_digest and replications[0].plan_digest, why
+    outcomes = portfolio.outcomes(idea_id=idea.idea_id, idea_version=version.version)
+    read = [item for item in outcomes if item.receipt_id]
+    assert {(item.role, item.state) for item in read} == {
+        (ExperimentRole.PRIMARY, PrimaryOutcome.SUPPORTED),
+        (ExperimentRole.REPLICATION, PrimaryOutcome.SUPPORTED),
+    }, why
 
     final = portfolio.require_idea(idea.idea_id)
     assert final.status is IdeaStatus.HUMAN_READY, why
@@ -2134,16 +2217,43 @@ def test_an_inconclusive_replication_does_not_count_as_verification(
             for row in rows
         )
 
+    from research_os.portfolio.models import ScienceChain
+
+    def _chains(rows: tuple) -> tuple:
+        return tuple(
+            ScienceChain(
+                evidence_id=row.evidence_id,
+                role=ExperimentRole.REPLICATION,
+                outcome=(
+                    PrimaryOutcome.SUPPORTED
+                    if row.strength is EvidenceStrength.SUPPORTS
+                    else PrimaryOutcome.INCONCLUSIVE
+                ),
+                capability_ref="synthetic.overlap@1",
+                chain_intact=True,
+                agrees_with_primary=True,
+            )
+            for row in rows
+        )
+
     inconclusive = _row(EvidenceStrength.INCONCLUSIVE)
     assert not _replication_met(
-        rule, inconclusive, {"origin-call"}, (), _trusted(inconclusive)
+        rule,
+        inconclusive,
+        {"origin-call"},
+        (),
+        _trusted(inconclusive),
+        _chains(inconclusive),
     )
 
     # The positive control: the same row, with a conclusion in it, counts --
-    # on a trusted, admissible replication chain (INV-07, INV-08), and not
-    # on the row alone.
+    # on a trusted, admissible replication chain (INV-07, INV-08) and its own
+    # science chain, and not on the row alone.
     both = _row(EvidenceStrength.SUPPORTS)
-    assert _replication_met(rule, both, {"origin-call"}, (), _trusted(both))
+    assert _replication_met(
+        rule, both, {"origin-call"}, (), _trusted(both), _chains(both)
+    )
+    assert not _replication_met(rule, both, {"origin-call"}, (), _trusted(both))
     assert not _replication_met(rule, both, {"origin-call"})
 
 
