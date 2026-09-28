@@ -440,15 +440,17 @@ def advance_idea(
     # this process's session ends, which is how a reclaimer learns -- from
     # the server, not from a clock -- that the owner is gone. The action
     # records the lock's run and the leased work item's attempt and owner, so
-    # a stage that runs for an hour with a live owner is never declared dead.
+    # a stage that runs for an hour with a live owner is never declared dead
+    # -- and the utility the allocator bought the stage at, from the same item.
     with research_run_lock(db, run.run_id):
-        attempt, lease_owner = _lease_of(db, work_id)
+        attempt, lease_owner, utility = _lease_of(db, work_id)
         try:
             action = store.open_action(
                 idea_id=idea_id,
                 idea_version=version.version,
                 stage=stage,
                 basis_digest=basis,
+                utility=utility,
                 thread_id=run.thread_id,
                 work_id=work_id,
                 run_id=run.run_id,
@@ -758,15 +760,32 @@ def _lost_ownership(
     )
 
 
-def _lease_of(db: Database, work_id: str | None) -> tuple[int | None, str | None]:
-    """The attempt and lease owner of the work item that bought this stage."""
+def _lease_of(
+    db: Database, work_id: str | None
+) -> tuple[int | None, str | None, Decimal | None]:
+    """The attempt, lease owner and utility of the work item that bought this stage.
+
+    The utility is the one the allocator bought the stage at: the tick writes
+    it into the item's payload when it enqueues the purchase, and nothing
+    rewrites a payload's utility. It is read from that durable row, not handed
+    down or recomputed, so a retry of the item -- or a later attempt taking
+    over a dead one's action -- records the number the purchase was made at.
+    It was carried in the payload and never reached ``idea_actions.utility``,
+    which is what makes an allocation auditable (``sql/0021``) and what the
+    qualification's curation gate reads. Work that carries no utility was not
+    bought by the allocator and records none.
+    """
 
     if not work_id:
-        return None, None
+        return None, None, None
     item = WorkQueue(db).get(work_id)
-    if item is None or item.status is not WorkStatus.LEASED:
-        return None, None
-    return item.attempts, item.lease_owner
+    if item is None:
+        return None, None, None
+    raw = item.payload.get("utility")
+    utility = Decimal(str(raw)) if raw is not None else None
+    if item.status is not WorkStatus.LEASED:
+        return None, None, utility
+    return item.attempts, item.lease_owner, utility
 
 
 def _executor() -> str:
