@@ -49,6 +49,7 @@ from research_os.portfolio.ids import (
     new_replication_assessment_id,
     new_request_id,
     new_retrieval_id,
+    new_science_outcome_id,
     new_seed_id,
 )
 from research_os.portfolio.models import (
@@ -103,6 +104,9 @@ from research_os.portfolio.models import (
     RetrievalPurpose,
     ReviewerRole,
     ReviewVerdict,
+    ScienceObject,
+    ScienceObjectKind,
+    ScienceOutcome,
     ScientificContract,
     Severity,
     Stage,
@@ -166,14 +170,24 @@ EXPERIMENT_COLUMNS = (
     "decision_rule, no_rule_reason, job_id, analysis_artifact_id, conclusion, "
     "evidence_id, failure_class, detail, attempts, origin_call_id, "
     "prompt_version, contract_id, created_at, updated_at, "
-    "execution_manifest_artifact_id"
+    "execution_manifest_artifact_id, plan_digest"
 )
 RECEIPT_COLUMNS = (
     "receipt_id, job_id, experiment_id, idea_id, idea_version, role, action_id, "
     "run_id, work_id, command, command_digest, spec_digest, base_commit, "
     "delivered_digest, inputs_digest, outputs_digest, exit_code, "
     "manifest_artifact_id, manifest_digest, parent_receipt_id, "
-    "receipt_artifact_id, created_at"
+    "receipt_artifact_id, created_at, plan_digest"
+)
+SCIENCE_OBJECT_COLUMNS = (
+    "object_digest, kind, project_id, idea_id, idea_version, parent_digest, "
+    "artifact_id, capability_ref, capability_digest, spec_digest, frozen_at"
+)
+OUTCOME_COLUMNS = (
+    "outcome_id, project_id, idea_id, idea_version, role, state, reason, "
+    "contract_id, experiment_id, contract_digest, design_digest, plan_digest, "
+    "capability_ref, capability_digest, receipt_id, result_sha256, estimate, "
+    "record_artifact_id, created_at"
 )
 ASSESSMENT_COLUMNS = (
     "assessment_id, evidence_id, experiment_id, idea_id, idea_version, legacy, "
@@ -1614,6 +1628,7 @@ class PortfolioStore:
         prompt_version: str = "",
         contract_id: str | None = None,
         supersedes: tuple[str, str] | None = None,
+        plan_digest: str | None = None,
     ) -> IdeaExperiment:
         """Record the one experiment this idea version asks for in this role.
 
@@ -1667,12 +1682,12 @@ class PortfolioStore:
                          state, command, spec_digest, variation_digest,
                          workspace_path, decision_rule, no_rule_reason,
                          preregistration_artifact_id, origin_call_id,
-                         prompt_version, contract_id)
+                         prompt_version, contract_id, plan_digest)
                     values (%(experiment_id)s, %(idea_id)s, %(version)s,
                             %(project_id)s, %(role)s, 'PROPOSED', %(command)s,
                             %(spec_digest)s, %(variation_digest)s, %(workspace)s,
                             %(rule)s, %(reason)s, %(prereg)s, %(call_id)s,
-                            %(prompt_version)s, %(contract_id)s)
+                            %(prompt_version)s, %(contract_id)s, %(plan_digest)s)
                     returning {EXPERIMENT_COLUMNS}
                     """,
                     {
@@ -1691,6 +1706,7 @@ class PortfolioStore:
                         "call_id": origin_call_id,
                         "prompt_version": prompt_version,
                         "contract_id": contract_id,
+                        "plan_digest": plan_digest,
                     },
                 ).fetchone()
         except RuntimeDatabaseError:
@@ -1786,17 +1802,23 @@ class PortfolioStore:
                      role, action_id, run_id, work_id, command, command_digest,
                      spec_digest, base_commit, delivered_digest, inputs_digest,
                      outputs_digest, exit_code, manifest_artifact_id,
-                     manifest_digest, parent_receipt_id, receipt_artifact_id)
+                     manifest_digest, parent_receipt_id, receipt_artifact_id,
+                     plan_digest)
                 values (%(receipt_id)s, %(job_id)s, %(experiment_id)s,
                         %(idea_id)s, %(idea_version)s, %(role)s, %(action_id)s,
                         %(run_id)s, %(work_id)s, %(command)s, %(command_digest)s,
                         %(spec_digest)s, %(base_commit)s, %(delivered_digest)s,
                         %(inputs_digest)s, %(outputs_digest)s, %(exit_code)s,
                         %(manifest_artifact_id)s, %(manifest_digest)s,
-                        %(parent_receipt_id)s, %(receipt_artifact_id)s)
+                        %(parent_receipt_id)s, %(receipt_artifact_id)s,
+                        %(plan_digest)s)
                 returning {RECEIPT_COLUMNS}
                 """,
-                {**fields, "role": str(fields["role"])},
+                {
+                    "plan_digest": None,
+                    **fields,
+                    "role": str(fields["role"]),
+                },
             ).fetchone()
         return ExecutionReceipt.model_validate(row)
 
@@ -1827,6 +1849,183 @@ class PortfolioStore:
                 (idea_id, idea_version),
             ).fetchall()
         return tuple(ReplicationAssessment.model_validate(row) for row in rows)
+
+    # ------------------------------------------------ the science chain --
+    def freeze_science_object(
+        self,
+        *,
+        object_digest: str,
+        kind: ScienceObjectKind,
+        project_id: str,
+        idea_id: str,
+        idea_version: int,
+        artifact_id: str,
+        parent_digest: str | None = None,
+        capability_ref: str | None = None,
+        capability_digest: str | None = None,
+        spec_digest: str | None = None,
+    ) -> ScienceObject:
+        """Freeze one contract, design or plan (`sql/0047`). Idempotent by content.
+
+        The digest is the primary key, so freezing identical content twice is
+        the same object -- a replication and its primary share one frozen
+        contract -- and freezing different content is a different object. The
+        database refuses a parent of the wrong kind or idea version, or one
+        frozen after its child, and any later change.
+        """
+
+        with self._tx() as conn:
+            conn.execute(
+                """
+                insert into science_objects
+                    (object_digest, kind, project_id, idea_id, idea_version,
+                     parent_digest, artifact_id, capability_ref,
+                     capability_digest, spec_digest)
+                values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                on conflict (object_digest) do nothing
+                """,
+                (
+                    object_digest,
+                    str(kind),
+                    project_id,
+                    idea_id,
+                    idea_version,
+                    parent_digest,
+                    artifact_id,
+                    capability_ref,
+                    capability_digest,
+                    spec_digest,
+                ),
+            )
+            row = conn.execute(
+                f"select {SCIENCE_OBJECT_COLUMNS} from science_objects "
+                "where object_digest = %s",
+                (object_digest,),
+            ).fetchone()
+        found = ScienceObject.model_validate(row)
+        if (
+            found.kind is not kind
+            or found.parent_digest != parent_digest
+            or found.idea_id != idea_id
+            or found.idea_version != idea_version
+        ):  # pragma: no cover - the digest covers every one of these
+            raise PortfolioStateError(
+                f"{object_digest} is already frozen with a different identity"
+            )
+        return found
+
+    def get_science_object(self, object_digest: str | None) -> ScienceObject | None:
+        if not object_digest:
+            return None
+        with self._tx() as conn:
+            row = conn.execute(
+                f"select {SCIENCE_OBJECT_COLUMNS} from science_objects "
+                "where object_digest = %s",
+                (object_digest,),
+            ).fetchone()
+        return ScienceObject.model_validate(row) if row else None
+
+    def list_science_objects(
+        self, *, idea_id: str, idea_version: int
+    ) -> tuple[ScienceObject, ...]:
+        with self._tx() as conn:
+            rows = conn.execute(
+                f"select {SCIENCE_OBJECT_COLUMNS} from science_objects "
+                "where idea_id = %s and idea_version = %s "
+                "order by frozen_at, object_digest",
+                (idea_id, idea_version),
+            ).fetchall()
+        return tuple(ScienceObject.model_validate(row) for row in rows)
+
+    def record_outcome(self, **fields: Any) -> ScienceOutcome:
+        """Record one system-computed outcome (`sql/0047`). Never changed.
+
+        A reading of a receipt is recorded once: a second determination of the
+        same execution returns the first rather than writing a rival to it.
+        """
+
+        values = {
+            "contract_id": None,
+            "experiment_id": None,
+            "contract_digest": None,
+            "design_digest": None,
+            "plan_digest": None,
+            "capability_ref": None,
+            "capability_digest": None,
+            "receipt_id": None,
+            "result_sha256": None,
+            "estimate": None,
+            **fields,
+        }
+        values["role"] = str(values["role"])
+        values["state"] = str(values["state"])
+        values.setdefault("outcome_id", new_science_outcome_id())
+        with self._tx() as conn:
+            row = conn.execute(
+                f"""
+                insert into science_outcomes
+                    (outcome_id, project_id, idea_id, idea_version, role, state,
+                     reason, contract_id, experiment_id, contract_digest,
+                     design_digest, plan_digest, capability_ref,
+                     capability_digest, receipt_id, result_sha256, estimate,
+                     record_artifact_id)
+                values (%(outcome_id)s, %(project_id)s, %(idea_id)s,
+                        %(idea_version)s, %(role)s, %(state)s, %(reason)s,
+                        %(contract_id)s, %(experiment_id)s, %(contract_digest)s,
+                        %(design_digest)s, %(plan_digest)s, %(capability_ref)s,
+                        %(capability_digest)s, %(receipt_id)s, %(result_sha256)s,
+                        %(estimate)s, %(record_artifact_id)s)
+                on conflict do nothing
+                returning {OUTCOME_COLUMNS}
+                """,
+                values,
+            ).fetchone()
+            if row is None and values["receipt_id"]:
+                row = conn.execute(
+                    f"select {OUTCOME_COLUMNS} from science_outcomes "
+                    "where receipt_id = %s and state in "
+                    "('SUPPORTED','REFUTED','INCONCLUSIVE','INVALID_EVIDENCE')",
+                    (values["receipt_id"],),
+                ).fetchone()
+        if row is None:  # pragma: no cover - only the receipt index can conflict
+            raise PortfolioStateError("the outcome was not recorded")
+        return ScienceOutcome.model_validate(row)
+
+    def outcomes(
+        self,
+        *,
+        idea_id: str,
+        idea_version: int | None = None,
+        role: ExperimentRole | None = None,
+    ) -> tuple[ScienceOutcome, ...]:
+        clauses = ["idea_id = %s"]
+        args: list[Any] = [idea_id]
+        if idea_version is not None:
+            clauses.append("idea_version = %s")
+            args.append(idea_version)
+        if role is not None:
+            clauses.append("role = %s")
+            args.append(str(role))
+        with self._tx() as conn:
+            rows = conn.execute(
+                f"select {OUTCOME_COLUMNS} from science_outcomes where "
+                + " and ".join(clauses)
+                + " order by created_at, outcome_id",
+                tuple(args),
+            ).fetchall()
+        return tuple(ScienceOutcome.model_validate(row) for row in rows)
+
+    def outcome_for_receipt(self, receipt_id: str | None) -> ScienceOutcome | None:
+        if not receipt_id:
+            return None
+        with self._tx() as conn:
+            row = conn.execute(
+                f"select {OUTCOME_COLUMNS} from science_outcomes "
+                "where receipt_id = %s and state in "
+                "('SUPPORTED','REFUTED','INCONCLUSIVE','INVALID_EVIDENCE')",
+                (receipt_id,),
+            ).fetchone()
+        return ScienceOutcome.model_validate(row) if row else None
 
     def set_execution_manifest(self, experiment_id: str, *, artifact_id: str) -> None:
         """Record a replication's frozen execution manifest (`sql/0041`, INV-07).

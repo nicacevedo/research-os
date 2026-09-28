@@ -136,6 +136,12 @@ def new_execution_receipt_id(*, moment: datetime | None = None) -> str:
     return new_id("XRCT", moment=moment)
 
 
+def new_science_outcome_id(*, moment: datetime | None = None) -> str:
+    """A system-computed outcome (`sql/0047`)."""
+
+    return new_id("SOUT", moment=moment)
+
+
 def new_replication_assessment_id(*, moment: datetime | None = None) -> str:
     return new_id("RASM", moment=moment)
 

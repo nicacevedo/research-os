@@ -467,6 +467,58 @@ class ContractState(StrEnum):
     anything was measured. Kept as the record."""
 
 
+class ScienceObjectKind(StrEnum):
+    """The three frozen objects of the science chain (`sql/0047`).
+
+    Frozen in this order and no other: what is tested, how it is tested, and
+    how that design maps onto a declared capability. See
+    ``docs/SCIENCE_EXECUTION.md``.
+    """
+
+    CONTRACT = "CONTRACT"
+    DESIGN = "DESIGN"
+    PLAN = "PLAN"
+
+
+class PrimaryOutcome(StrEnum):
+    """The system-computed outcome of one determination. No model decides one.
+
+    Three are readings of a validated result under the frozen decision rule;
+    four say why there is no such reading, and none of those four is a
+    finding about the idea.
+    """
+
+    SUPPORTED = "SUPPORTED"
+    """The success criterion held and the failure criterion did not."""
+    REFUTED = "REFUTED"
+    """The failure criterion held and the success criterion did not."""
+    INCONCLUSIVE = "INCONCLUSIVE"
+    """The result is valid and lands in the preregistered inconclusive region:
+    both criteria, or neither, or the frozen support the statistic needs is
+    not in the data."""
+    EXECUTION_FAILED = "EXECUTION_FAILED"
+    """The execution did not complete: a crash, a timeout, a non-zero exit."""
+    CAPABILITY_LIMITED = "CAPABILITY_LIMITED"
+    """No declared capability can produce what the frozen contract reads, or
+    the host cannot run the one that could."""
+    INVALID_EVIDENCE = "INVALID_EVIDENCE"
+    """An execution happened and what it produced cannot be accepted: the
+    result artifact is missing, malformed or off its declared schema, or the
+    trusted chain behind it does not hold."""
+    BUDGET_LIMITED = "BUDGET_LIMITED"
+    """A budget a person set could not cover the next step."""
+
+
+#: The outcomes that read a result under the frozen rule. Only these carry a
+#: complete chain, and only SUPPORTED and REFUTED are decisive.
+READ_OUTCOMES: frozenset[PrimaryOutcome] = frozenset(
+    {PrimaryOutcome.SUPPORTED, PrimaryOutcome.REFUTED, PrimaryOutcome.INCONCLUSIVE}
+)
+DECISIVE_OUTCOMES: frozenset[PrimaryOutcome] = frozenset(
+    {PrimaryOutcome.SUPPORTED, PrimaryOutcome.REFUTED}
+)
+
+
 class RequestKind(StrEnum):
     """What a frontier request asks the portfolio for."""
 
@@ -832,6 +884,9 @@ class ExecutionReceipt(_Record):
     parent_receipt_id: str | None = None
     receipt_artifact_id: str
     created_at: datetime
+    #: The frozen execution plan this execution realised (`sql/0047`), or
+    #: ``None`` for an execution no plan governs.
+    plan_digest: str | None = None
 
 
 class ReplicationAssessment(_Record):
@@ -896,6 +951,82 @@ class ReplicationProvenance(_Record):
             and self.chain_intact
             and self.configuration_independent
             and self.perturbation_attested
+        )
+
+
+class ScienceObject(_Record):
+    """One frozen contract, design or plan (`sql/0047`). Content-addressed.
+
+    ``object_digest`` is ``<kind prefix>:<artifact_id>``: the artifact holds
+    the canonical bytes of the object and its id is their sha256, so the row
+    and the bytes cannot disagree without one of them failing to re-hash.
+    """
+
+    object_digest: str
+    kind: ScienceObjectKind
+    project_id: str
+    idea_id: str
+    idea_version: int
+    parent_digest: str | None = None
+    artifact_id: str
+    capability_ref: str | None = None
+    capability_digest: str | None = None
+    spec_digest: str | None = None
+    frozen_at: datetime
+
+
+class ScienceOutcome(_Record):
+    """One system-computed outcome, bound to its chain (`sql/0047`). Immutable."""
+
+    outcome_id: str
+    project_id: str
+    idea_id: str
+    idea_version: int
+    role: ExperimentRole
+    state: PrimaryOutcome
+    reason: str
+    contract_id: str | None = None
+    experiment_id: str | None = None
+    contract_digest: str | None = None
+    design_digest: str | None = None
+    plan_digest: str | None = None
+    capability_ref: str | None = None
+    capability_digest: str | None = None
+    receipt_id: str | None = None
+    result_sha256: str | None = None
+    estimate: float | None = None
+    record_artifact_id: str
+    created_at: datetime
+
+
+class ScienceChain(_Record):
+    """One evidence row's science chain as a readiness gate reads it.
+
+    Built by :func:`research_os.portfolio.sciencechain.science_chains`, which
+    re-verifies everything behind the row *now*: the frozen contract, design
+    and plan re-hash and name one another, the plan is the experiment's and
+    binds a declared capability, the receipt is the runner's for that
+    execution of that plan, the recorded outcome names all of it, and the
+    experiment still names this reading. The gate decides from these fields.
+    """
+
+    evidence_id: str
+    experiment_id: str | None = None
+    role: ExperimentRole
+    outcome: PrimaryOutcome | None = None
+    capability_ref: str | None = None
+    chain_intact: bool
+    #: Replication only: whether its outcome is the same state as the
+    #: primary's, under the capability's frozen comparison rule.
+    agrees_with_primary: bool | None = None
+    problems: tuple[str, ...] = ()
+
+    @property
+    def admissible(self) -> bool:
+        return (
+            self.chain_intact
+            and self.capability_ref is not None
+            and self.outcome in DECISIVE_OUTCOMES
         )
 
 
@@ -1048,6 +1179,10 @@ class IdeaExperiment(_Record):
     #: parent, code identity, inputs, environment, the intended independence
     #: variables and the execution. See ``empirical.freeze_replication_manifest``.
     execution_manifest_artifact_id: str | None = None
+    #: The frozen execution plan (`sql/0047`) this execution realises: the
+    #: capability binding, the code commit, the inputs and the specification.
+    #: ``None`` for an execution no capability manifest governs.
+    plan_digest: str | None = None
 
     @property
     def open(self) -> bool:
@@ -1343,6 +1478,9 @@ ENUM_CONSTRAINTS: dict[str, frozenset[str]] = {
     "literature_retrievals_purpose_ck": frozenset(s.value for s in RetrievalPurpose),
     "literature_retrievals_status_ck": frozenset(s.value for s in RetrievalStatus),
     "ideas_park_reason_ck": frozenset(s.value for s in ParkReason),
+    "science_objects_kind_ck": frozenset(s.value for s in ScienceObjectKind),
+    "science_outcomes_role_ck": frozenset(s.value for s in ExperimentRole),
+    "science_outcomes_state_ck": frozenset(s.value for s in PrimaryOutcome),
 }
 
 

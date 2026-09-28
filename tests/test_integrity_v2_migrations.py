@@ -232,7 +232,8 @@ def test_legacy_state_fails_closed_after_upgrading_to_the_head(
         _legacy_rows(db, schema=schema)
         applied = migrate(db)
         assert applied == tuple(m.version for m in discover() if m.version > schema)
-        assert applied[-4:] == ("0043", "0044", "0045", "0046")
+        start = applied.index("0043")
+        assert applied[start : start + 4] == ("0043", "0044", "0045", "0046")
         store = PortfolioStore(db)
 
         # ---- replication evidence (0046): kept, legacy, never admissible.
