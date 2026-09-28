@@ -1,6 +1,6 @@
 """The Research OS v1 qualification contract, evaluated by code, read-only.
 
-``qualification_v1.yaml`` beside this module is the contract: 25 mandatory
+``qualification_v1.yaml`` beside this module is the contract: 26 mandatory
 gates and the advisory dimensions, each decided by a check this module
 implements (``automated``), by a named evidence file (``evidence``), or both.
 Nothing here writes to the runtime database, calls a model or reads a
@@ -104,8 +104,8 @@ def load_spec(path: Path = SPEC_PATH) -> dict[str, Any]:
                 gate.get("evidence") or {}
             ).get("file"):
                 raise QualificationError(f"{gate['id']} needs an evidence file")
-    if len(data.get("mandatory") or ()) < 25:
-        raise QualificationError("v1 has 25 mandatory gates")
+    if len(data.get("mandatory") or ()) < 26:
+        raise QualificationError("v1 has 26 mandatory gates")
     return data
 
 
@@ -236,12 +236,20 @@ def _retrieval(ctx: _Ctx) -> tuple[bool, str]:
     return _at_least(n, "completed literature retrieval(s)")
 
 
+def _bought(ctx: _Ctx, idea_id: str | None = None) -> int:
+    """Stages the allocator bought with a recorded utility, in the project or one idea."""
+
+    clause = " and a.idea_id = %(idea)s" if idea_id is not None else ""
+    return ctx.count(
+        "select count(*) as n from idea_actions a join ideas i on i.idea_id = a.idea_id "
+        "where i.project_id = %(p)s and a.utility is not null" + clause,
+        idea=idea_id,
+    )
+
+
 def _curation(ctx: _Ctx) -> tuple[bool, str]:
     bank = ctx.one("select bank_commit from portfolio_state where project_id = %(p)s")
-    bought = ctx.count(
-        "select count(*) as n from idea_actions a join ideas i on i.idea_id = a.idea_id "
-        "where i.project_id = %(p)s and a.utility is not null"
-    )
+    bought = _bought(ctx)
     commit = (bank or {}).get("bank_commit") if bank else None
     return bool(commit) and bought >= 1, (
         f"bank commit {commit or '(none)'}; {bought} stage(s) bought with a utility"
@@ -564,12 +572,109 @@ def _second_provider(ctx: _Ctx) -> tuple[bool, str]:
     return len(providers) >= 2, f"providers: {providers}"
 
 
-def _human_ready(ctx: _Ctx) -> tuple[bool, str]:
-    n = ctx.count(
-        "select count(*) as n from ideas where project_id = %(p)s "
-        "and quality_tier = 'HUMAN_READY'"
+def _read_on_intact_chain(chain: Any, role: Any) -> bool:
+    from research_os.portfolio.models import READ_OUTCOMES
+
+    return (
+        chain.role is role
+        and chain.chain_intact
+        and chain.capability_ref is not None
+        and chain.outcome in READ_OUTCOMES
     )
-    return _at_least(n, "idea(s) at HUMAN_READY")
+
+
+def _human_ready_lineage(ctx: _Ctx) -> tuple[bool, str]:
+    """One autonomously originated idea at HUMAN_READY now, on its whole chain.
+
+    Not a count of the tier: ``quality_tier`` is a high-water mark a revision
+    keeps, while ``status`` is the current claim, which a revision resets. So
+    the idea must be HUMAN_READY *now*, by a succeeded meta-review of its
+    current version whose gate-permitted disposition was HUMAN_READY, and
+    that same lineage must carry every link of the mandatory empirical chain,
+    re-verified now through the chain records the readiness gate reads. The
+    primary may be SUPPORTED, REFUTED or INCONCLUSIVE -- whether a reading is
+    decisive enough is the gate's to decide -- and the replication need not
+    agree: MEASURED agreement is reported in the detail, never required here.
+    """
+
+    from research_os.portfolio.models import Disposition, ExperimentRole
+
+    candidates = ctx.rows(
+        "with recursive lineage(idea_id) as ("
+        " select idea_id from ideas where project_id = %(p)s and depth = 0"
+        "   and origin = any(%(origins)s)"
+        " union"
+        " select e.child_idea_id from idea_edges e"
+        "   join lineage l on l.idea_id = e.parent_idea_id)"
+        " select i.idea_id, i.current_version from ideas i"
+        " join lineage l on l.idea_id = i.idea_id"
+        " where i.project_id = %(p)s and i.status = 'HUMAN_READY'"
+        " order by i.idea_id",
+        origins=list(AUTONOMOUS_ROOT_ORIGINS),
+    )
+    if not candidates:
+        return False, "no autonomously originated idea is HUMAN_READY now"
+    chains_by, provenance_by = _chains_by_version(ctx), _replication_provenance(ctx)
+    boards = _board_ideas(ctx)
+    shortfalls: list[str] = []
+    for row in candidates:
+        idea_id, version = str(row["idea_id"]), int(row["current_version"])
+        key = (idea_id, version)
+        chains = chains_by.get(key, ())
+        primary = [
+            c for c in chains if _read_on_intact_chain(c, ExperimentRole.PRIMARY)
+        ]
+        trusted = {r.evidence_id for r in provenance_by.get(key, ()) if r.admissible}
+        replica = [
+            c
+            for c in chains
+            if _read_on_intact_chain(c, ExperimentRole.REPLICATION)
+            and c.evidence_id in trusted
+        ]
+        falsified = ctx.count(
+            "select count(*) as n from idea_actions where idea_id = %(idea)s "
+            "and stage = %(stage)s and status = 'SUCCEEDED'",
+            idea=idea_id,
+            stage=str(Stage.FALSIFY),
+        )
+        retrieved = ctx.count(
+            "select count(*) as n from literature_retrievals where project_id = %(p)s "
+            "and idea_id = %(idea)s and status = 'COMPLETED'",
+            idea=idea_id,
+        )
+        ready = ctx.count(
+            "select count(*) as n from idea_actions a where a.idea_id = %(idea)s "
+            "and a.idea_version = %(version)s and a.stage = %(stage)s "
+            "and a.status = 'SUCCEEDED' and a.disposition = %(ready)s "
+            "and exists (select 1 from idea_reviews r where r.idea_id = a.idea_id "
+            "and r.idea_version = a.idea_version and r.reviewer_role = %(meta)s)",
+            idea=idea_id,
+            version=version,
+            stage=str(Stage.META_REVIEW),
+            ready=str(Disposition.HUMAN_READY),
+            meta=str(ReviewerRole.META),
+        )
+        links = {
+            "falsification": falsified,
+            "executed literature retrieval": retrieved,
+            "an allocator purchase with a recorded utility": _bought(ctx, idea_id),
+            "a primary reading on an intact capability-bound chain": primary,
+            "a replication reading on an intact chain with admissible provenance": (
+                replica
+            ),
+            "a complete current review board": idea_id in boards,
+            "a HUMAN_READY meta-review disposition on the current version": ready,
+        }
+        missing = [what for what, held in links.items() if not held]
+        if not missing:
+            return True, (
+                f"{idea_id} v{version} HUMAN_READY: primary {primary[0].outcome}, "
+                f"replication {replica[0].outcome} "
+                f"(agrees={replica[0].agrees_with_primary}), complete board, "
+                f"meta-review disposition HUMAN_READY"
+            )
+        shortfalls.append(f"{idea_id} v{version} lacks {'; '.join(missing)}")
+    return False, "HUMAN_READY but incomplete: " + " | ".join(shortfalls)
 
 
 CHECKS: dict[str, Check] = {
@@ -597,8 +702,8 @@ CHECKS: dict[str, Check] = {
     "repository_isolation": _isolation,
     "containment": _containment,
     "complete_provenance_chain": _complete_chain,
+    "human_ready_lineage": _human_ready_lineage,
     "second_provider": _second_provider,
-    "human_ready": _human_ready,
 }
 
 

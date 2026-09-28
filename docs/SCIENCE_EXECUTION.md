@@ -306,10 +306,17 @@ naming the same chain, its document re-hashing.
 
 ## 7. The v1 qualification contract
 
-`research_os/portfolio/qualification_v1.yaml` -- 25 mandatory gates and the
-advisory generalisation dimensions (second provider, HUMAN_READY reached,
-second empirical domain, mathematical track), each `automated`, `evidence` or
-`both`. Its sha256 is pinned in `tests/test_qualification_spec.py`; the
+`research_os/portfolio/qualification_v1.yaml` -- 26 mandatory gates and the
+advisory generalisation dimensions (second provider, second empirical domain,
+mathematical track), each `automated`, `evidence` or `both`. HUMAN_READY is
+mandatory (Q26): at least one idea descending from an autonomously originated
+root must be HUMAN_READY now, by a gate-permitted meta-review disposition on
+its current version, and that same lineage must carry the whole empirical
+chain (falsification, executed retrieval, an allocator purchase, a primary and
+a replication reading on intact chains with admissible replication
+provenance, a complete board). The primary need not be SUPPORTED, and
+replication agreement is reported, not required. Its sha256 is pinned in
+`tests/test_qualification_spec.py`; the
 zero-state snapshot of a live qualification records it, and evaluation refuses
 a changed spec. `researchctl portfolio qualification PROJECT --evidence DIR`
 evaluates it read-only (`--snapshot-zero-state` before the run,

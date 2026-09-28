@@ -33,9 +33,11 @@ statement: >-
   a receipt, a validated result and a system-computed outcome; was replicated
   by a separate trusted execution with an assessment; was reviewed by a
   complete board and a meta-review whose readiness the deterministic gate
-  decided; produced a recursive follow-up; and did all of it inside budget
-  authority, repository isolation and containment, on a provenance chain that
-  re-verifies end to end.
+  decided; reached HUMAN_READY through that gate on that same current chain;
+  produced a recursive follow-up; and did all of it inside budget authority,
+  repository isolation and containment, on a provenance chain that re-verifies
+  end to end. The primary hypothesis need not be SUPPORTED, and the
+  replication need not agree with the primary.
 verdicts:
   pass: V1_QUALIFIED
   fail: NOT_QUALIFIED
@@ -237,16 +239,32 @@ mandatory:
       provenance, a complete board and a succeeded meta review.
     check: automated
 
+  - id: Q26
+    name: human_ready_lineage
+    title: HUMAN_READY on an autonomously originated empirical lineage
+    requirement: >-
+      At least one idea descending from an autonomously originated root is
+      HUMAN_READY now -- by a succeeded META_REVIEW of its current version
+      whose gate-permitted disposition was HUMAN_READY -- and that same
+      lineage carries the whole mandatory empirical chain: a succeeded
+      FALSIFY stage, a completed literature retrieval, a stage the allocator
+      bought with a recorded utility, and on its current version a PRIMARY
+      reading (SUPPORTED, REFUTED or INCONCLUSIVE, system-computed) on an
+      intact capability-bound science chain -- frozen contract, design and
+      plan, the runner's re-verifying receipt, a validated result -- a
+      REPLICATION reading on its own intact science chain whose replication
+      provenance is admissible (non-legacy, VERIFIED, ATTESTED, re-verified
+      now), and a complete current review board. The primary need not be
+      SUPPORTED, and replication agreement (MEASURED) is reported, not
+      required: a contradictory replication stays visible in the record and
+      does not by itself fail this gate.
+    check: automated
+
 advisory:
   - id: A01
     name: second_provider
     title: Second model provider
     requirement: At least two provider families answered model calls.
-    check: automated
-  - id: A02
-    name: human_ready
-    title: HUMAN_READY reached
-    requirement: At least one idea reached HUMAN_READY through the gate.
     check: automated
   - id: A03
     name: second_empirical_domain

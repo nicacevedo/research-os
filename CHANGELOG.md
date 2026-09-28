@@ -33,8 +33,10 @@ All notable changes to Research OS. Dates are release dates.
 - **Prompts**: `analysis_designer@2` (declared observables only, population),
   `experiment_designer@8` and `replication_designer@8` (capability-backed
   command, repetitions). Unread contracts frozen by earlier prompts are stale.
-- **Qualification contract**: `portfolio/qualification_v1.yaml` (25 mandatory
-  gates, advisory dimensions, frozen by pinned digest) and
+- **Qualification contract**: `portfolio/qualification_v1.yaml` (26 mandatory
+  gates -- HUMAN_READY on an autonomously originated lineage among them, with
+  no requirement that the primary be SUPPORTED or the replication agree --
+  advisory dimensions, frozen by pinned digest) and
   `researchctl portfolio qualification`; `researchctl experiment capabilities`
   checks a committed manifest against the host's commands.
 - Tests: `test_capability.py`, `test_science_v1_e2e.py`,

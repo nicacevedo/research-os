@@ -4,14 +4,16 @@
 ``research_os.portfolio.qualification`` evaluates it read-only. These tests
 hold the freeze (the file's digest is pinned here, so no mandatory criterion
 changes without this test changing), the shape (the 25 mandatory gates the
-closure brief names, in order, and the advisory generalisation dimensions),
-the freeze rule at evaluation time, and that the automated gates really are
-decided from records -- by evaluating a real synthetic traversal.
+closure brief names, in order, then HUMAN_READY on an autonomously originated
+lineage, and the advisory generalisation dimensions), the freeze rule at
+evaluation time, and that the automated gates really are decided from records
+-- by evaluating a real synthetic traversal.
 """
 
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -51,9 +53,10 @@ __all__ = [
 
 #: The frozen specification's sha256. Changing a mandatory criterion changes
 #: this, visibly; a live qualification records it at its start.
-FROZEN_SPEC_SHA256 = "14627a4d86891dd9af6e5be12247dc5215812f7b654ac2cbded336681d8a0f3b"
+FROZEN_SPEC_SHA256 = "f0d2dba00e00f3319d34d67f599cd41cc3bbd8697a628a19bf8d50535535f9be"
 
-#: The closure brief's 25 mandatory v1 gates, in its order.
+#: The closure brief's 25 mandatory v1 gates, in its order, then Q26: a
+#: lineage the system originated reaches HUMAN_READY on that same chain.
 MANDATORY = (
     "zero_state_environment",
     "unseeded_origination",
@@ -80,7 +83,11 @@ MANDATORY = (
     "repository_isolation",
     "containment",
     "complete_provenance_chain",
+    "human_ready_lineage",
 )
+
+#: What stays advisory: generalisation beyond one provider, domain and track.
+ADVISORY = ("second_provider", "second_empirical_domain", "mathematical_track")
 
 
 def test_the_specification_is_frozen_at_its_pinned_digest() -> None:
@@ -95,13 +102,11 @@ def test_it_names_every_mandatory_gate_and_keeps_generalisation_advisory() -> No
     spec = qualification.load_spec()
     assert tuple(gate["name"] for gate in spec["mandatory"]) == MANDATORY
     assert [gate["id"] for gate in spec["mandatory"]] == [
-        f"Q{n:02d}" for n in range(1, 26)
+        f"Q{n:02d}" for n in range(1, 27)
     ]
-    advisory = {gate["name"] for gate in spec["advisory"]}
-    assert {"second_provider", "second_empirical_domain", "mathematical_track"} <= (
-        advisory
-    )
-    assert not advisory & set(MANDATORY)
+    advisory = tuple(gate["name"] for gate in spec["advisory"])
+    assert advisory == ADVISORY
+    assert not set(advisory) & set(MANDATORY)
     assert spec["frozen"] is True
 
 
@@ -176,22 +181,19 @@ def test_an_empty_project_is_zero_state_and_qualifies_nothing(
     assert status["repository_isolation"] is False, "its evidence file is missing"
 
 
-def test_a_real_traversal_is_decided_gate_by_gate_from_its_records(
+def _traverse(
     portfolio: PortfolioStore,
     runtime_db: Database,
     pg_dsn: str,
-    checkpoint_tables: str,
     runtime_project: str,
     project_repo: Path,
     tmp_path: Path,
-) -> None:
-    """The same end-to-end route as the empirical control, then the contract.
+) -> tuple[str, Callable[[], qualification.Report]]:
+    """The same end-to-end route as the empirical control, from a zero state.
 
     A zero-state snapshot first; an explicit budget a person set; the real
-    stage machine through measurement, replication, board and meta-review;
-    then the evaluator. What this synthetic run does not do -- buy stages
-    through the allocator and publish a bank, open a follow-up child, supply a
-    containment audit -- fails, by name, and nothing else does.
+    stage machine through measurement, replication, board and meta-review.
+    Returns the idea and an evaluation of the contract against its records.
     """
 
     from research_os.portfolio.track import advance_idea
@@ -240,25 +242,162 @@ def test_a_real_traversal_is_decided_gate_by_gate_from_its_records(
     (evidence / "50-isolation.txt").write_text(
         qualification.isolation_report(zero_state=zero, repo_path=project_repo)
     )
-    report = qualification.evaluate(
-        runtime_db,
-        project_id=runtime_project,
-        artifacts=FilesystemArtifactStore(
-            config.artifacts_root, store=RuntimeStore(runtime_db)
-        ),
-        evidence_dir=evidence,
-        repo_path=project_repo,
-        expect_spec_digest=FROZEN_SPEC_SHA256,
+
+    def evaluate() -> qualification.Report:
+        return qualification.evaluate(
+            runtime_db,
+            project_id=runtime_project,
+            artifacts=FilesystemArtifactStore(
+                config.artifacts_root, store=RuntimeStore(runtime_db)
+            ),
+            evidence_dir=evidence,
+            repo_path=project_repo,
+            expect_spec_digest=FROZEN_SPEC_SHA256,
+        )
+
+    return idea.idea_id, evaluate
+
+
+def _gates(report: qualification.Report) -> dict[str, Any]:
+    return {gate.name: gate for gate in report.gates}
+
+
+def test_a_real_traversal_is_decided_gate_by_gate_from_its_records(
+    portfolio: PortfolioStore,
+    runtime_db: Database,
+    pg_dsn: str,
+    checkpoint_tables: str,
+    runtime_project: str,
+    project_repo: Path,
+    tmp_path: Path,
+) -> None:
+    """The real stage machine, then the contract, gate by gate.
+
+    What this synthetic run does not do -- buy stages through the allocator
+    and publish a bank, open a follow-up child, supply a containment audit --
+    fails, by name, and nothing else does. The idea does reach HUMAN_READY,
+    and the lineage gate names the one link it lacks: the allocator's purchase.
+    """
+
+    _idea, evaluate = _traverse(
+        portfolio, runtime_db, pg_dsn, runtime_project, project_repo, tmp_path
     )
-    status: dict[str, Any] = {gate.name: gate for gate in report.gates}
+    report = evaluate()
+    status = _gates(report)
     failed = sorted(name for name in MANDATORY if not status[name].passed)
     detail = {name: status[name].detail for name in failed}
-    assert failed == ["containment", "curation_prioritization", "recursive_child"], (
-        detail
-    )
+    assert failed == [
+        "containment",
+        "curation_prioritization",
+        "human_ready_lineage",
+        "recursive_child",
+    ], detail
     assert report.verdict == "NOT_QUALIFIED"
     assert "03-containment-audit.txt is missing" in status["containment"].detail
     assert status["complete_provenance_chain"].passed, status[
         "complete_provenance_chain"
     ].detail
-    assert status["human_ready"].passed
+    lineage = status["human_ready_lineage"].detail
+    assert lineage.startswith("HUMAN_READY but incomplete"), lineage
+    assert lineage.endswith("lacks an allocator purchase with a recorded utility"), (
+        lineage
+    )
+
+
+def test_human_ready_is_mandatory_and_decided_on_the_lineage_chain(
+    portfolio: PortfolioStore,
+    runtime_db: Database,
+    pg_dsn: str,
+    checkpoint_tables: str,
+    runtime_project: str,
+    project_repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Q26: HUMAN_READY now, on the chain of a lineage the system originated.
+
+    The outcome need not be SUPPORTED and the replication need not agree -- a
+    contradiction is reported in the detail -- but every link must re-verify,
+    and a tier the idea reached once and no longer holds does not count.
+    """
+
+    from research_os.portfolio import sciencechain
+    from research_os.portfolio.models import (
+        ExperimentRole,
+        IdeaStatus,
+        PrimaryOutcome,
+        QualityTier,
+    )
+
+    idea_id, evaluate = _traverse(
+        portfolio, runtime_db, pg_dsn, runtime_project, project_repo, tmp_path
+    )
+    assert portfolio.require_idea(idea_id).status is IdeaStatus.HUMAN_READY
+    # The record Q07 and Q26 read for a stage the allocator bought, which this
+    # direct traversal did not go through.
+    with runtime_db.tx() as conn:
+        conn.execute(
+            "update idea_actions set utility = 1 where idea_id = %s", (idea_id,)
+        )
+    gate = _gates(evaluate())["human_ready_lineage"]
+    assert gate.passed, gate.detail
+    assert gate.mandatory
+
+    real = sciencechain.science_chains
+
+    def read_as(primary: PrimaryOutcome, replication: PrimaryOutcome, **change: Any):
+        def chains(*args: Any, **kwargs: Any) -> tuple[Any, ...]:
+            return tuple(
+                chain.model_copy(
+                    update={"outcome": primary}
+                    if chain.role is ExperimentRole.PRIMARY
+                    else {
+                        "outcome": replication,
+                        "agrees_with_primary": primary == replication,
+                        **change,
+                    }
+                )
+                for chain in real(*args, **kwargs)
+            )
+
+        return chains
+
+    for primary, replication in (
+        (PrimaryOutcome.REFUTED, PrimaryOutcome.SUPPORTED),
+        (PrimaryOutcome.INCONCLUSIVE, PrimaryOutcome.REFUTED),
+    ):
+        monkeypatch.setattr(
+            sciencechain, "science_chains", read_as(primary, replication)
+        )
+        gate = _gates(evaluate())["human_ready_lineage"]
+        assert gate.passed, gate.detail
+        assert f"primary {primary}" in gate.detail
+        assert "agrees=False" in gate.detail, "the contradiction stays visible"
+
+    monkeypatch.setattr(
+        sciencechain,
+        "science_chains",
+        read_as(PrimaryOutcome.SUPPORTED, PrimaryOutcome.SUPPORTED, chain_intact=False),
+    )
+    gate = _gates(evaluate())["human_ready_lineage"]
+    assert not gate.passed
+    assert "replication reading on an intact chain" in gate.detail
+    monkeypatch.setattr(sciencechain, "science_chains", real)
+
+    # A revision after HUMAN_READY: the tier stays as history, the claim does not.
+    portfolio.append_version(
+        idea_id=idea_id,
+        fields=idea_fields(
+            research_question=EMPIRICAL_QUESTION,
+            falsifier=EMPIRICAL_FALSIFIER,
+            why_it_matters="revised after the fact",
+        ),
+    )
+    idea = portfolio.require_idea(idea_id)
+    assert idea.quality_tier is QualityTier.HUMAN_READY
+    assert idea.status is not IdeaStatus.HUMAN_READY
+    report = evaluate()
+    gate = _gates(report)["human_ready_lineage"]
+    assert not gate.passed
+    assert gate.detail == "no autonomously originated idea is HUMAN_READY now"
+    assert report.verdict == "NOT_QUALIFIED"
