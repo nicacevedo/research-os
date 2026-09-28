@@ -21,6 +21,13 @@ Read these, in this order, before significant work:
    INV-10) the autonomous layers must hold, where each is enforced and how it
    is tested. Read it before touching budgets, stage ownership, reviews,
    literature retrieval, replication or the bank renderer.
+9. `docs/SCIENCE_EXECUTION.md` — empirical science execution (v1): typed
+   capabilities, the frozen contract/design/plan chain, capability resolution,
+   result validation, system-computed outcomes, replication and the gates that
+   read the chain (SCI-01 to SCI-05). Read it before touching
+   `research_os.capability`, `portfolio.sciencechain`, the empirical route or
+   the v1 qualification contract (`portfolio/qualification_v1.yaml`, frozen:
+   its digest is pinned in `tests/test_qualification_spec.py`).
 
 `docs/CAPSULE.md` is authoritative on anything scientific. Where any other
 document disagrees with it, it wins.

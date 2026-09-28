@@ -1683,6 +1683,17 @@ is in the closure report.
 
 ---
 
+### 19.11 Typed capabilities and the frozen science chain (v1)
+
+`docs/SCIENCE_EXECUTION.md` is the live specification. In one paragraph: when
+the science repository declares typed capabilities, the contract of §19.10 is
+joined by three content-addressed frozen objects -- scientific contract,
+experimental design, execution plan -- with a mechanical capability binding
+between design and plan; the execution runs the plan's pinned commit; its
+result is validated against the declared schema before the frozen rule reads
+it; the outcome is one of seven system-computed states; and the gates of §9
+read that chain for empirical ideas.
+
 ## 20. The research frontier: recorded events become new science
 
 §AB.7 of the report measured why recursive discovery never happened on real

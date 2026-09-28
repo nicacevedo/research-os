@@ -314,6 +314,15 @@ independent -> `INSUFFICIENT` with the reason); `experiment.spec.CommandSpec`
 (the attestation must name `seeds`, `implementation` or a declared
 parameter).
 
+**Attestation source for a plan-bound execution** (`docs/SCIENCE_EXECUTION.md`
+§5). When an execution is bound to a declared capability through a frozen
+plan, the researcher's attestation frozen into the manifest is that
+capability's declared perturbations -- each carrying the researcher's sentence
+on how the computation uses it, committed with the code it describes and
+pinned by the capability digest in the plan (`attestation_source` in the
+manifest). The meaning is unchanged: attested, never proved. An execution no
+plan governs still takes it from the command's `perturbation_attestation`.
+
 **Case C, exactly.** A program that is delivered seed 14, ignores it and
 reports seed 14: with no attestation it is `INSUFFICIENT` (configuration
 independent, perturbation unattested); with the researcher's attestation it
@@ -352,7 +361,11 @@ counted, and blocks even `PROMISING`); `gates._replication_met` (an executed
 replication counts only with an admissible `ReplicationProvenance` --
 not legacy, configuration independent, attested, and a chain
 `provenance.replication_provenance` re-verified as it stands);
-`runner._evaluate` (hands the gate those chains); `gates._promising_unmet`,
+`runner._evaluate` (hands the gate those chains); `gates._science_chain_met`
+over `sciencechain.science_chains` (an empirical measurement or replication
+counts only on its re-verified science chain -- frozen contract, design and
+capability-bound plan, receipt, validated result, decisive system-computed
+outcome; `docs/SCIENCE_EXECUTION.md` §6); `gates._promising_unmet`,
 `_validated_unmet`, `_human_ready_unmet`, `evaluate`, `permit`.
 
 **PASS requires.** A board missing a reviewer not complete; a re-run

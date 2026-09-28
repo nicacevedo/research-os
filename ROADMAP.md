@@ -302,6 +302,22 @@ nothing reached `VALIDATED`. The verdict stays
 `AUTONOMOUS_DISCOVERY_BETA`; `docs/AUTONOMOUS_DISCOVERY_REPORT.md` §Y is
 the record and §Z is the assessment.
 
+## v1 closure -- empirical science execution, on a branch
+
+`architecture/autonomous-research-os-v1-closure`, on top of the independently
+reviewed integrity substrate (`566d1ae`). `docs/SCIENCE_EXECUTION.md` is the
+specification. Implemented and tested: typed scientific capabilities declared
+by the science repository and resolved mechanically (EXECUTABLE or
+CAPABILITY_LIMITED); the frozen scientific contract, experimental design and
+execution plan, ordered and immutable in the database; plan-pinned trusted
+execution; result validation against the declared schema; seven
+system-computed outcome states; replication bound to the capability's
+attestation; gates that read the chain; and the frozen, machine-readable v1
+qualification contract (`portfolio/qualification_v1.yaml`). The first
+capability, `cg.cells@1`, is in the column-generation repository on
+`research-os-v1/capabilities`. **Not qualified:** the live v1 qualification
+has not been run. Not merged, not tagged.
+
 ## Two external prerequisites, and the policy on each
 
 Neither is a defect. Both are things this workstation cannot establish, and

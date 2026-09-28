@@ -4,6 +4,43 @@ All notable changes to Research OS. Dates are release dates.
 
 ## [Unreleased] — rc/thesis-pilot
 
+### v1 closure: empirical science execution (2026-09-27)
+
+`docs/SCIENCE_EXECUTION.md` is the specification; `sql/0047` the migration.
+
+- **Typed scientific capabilities** (`research_os/capability.py`): a science
+  repository declares, in a committed `research-capabilities.yaml`, what each
+  host-authorised command produces -- result artifact and schema, typed
+  observables with units and determinism, inputs, attested perturbations,
+  resources. `resolve` answers EXECUTABLE with an exact binding or
+  CAPABILITY_LIMITED with the exact unmet requirements. A model cannot declare
+  that an observable exists.
+- **Three frozen objects** (`portfolio/sciencechain.py`): scientific contract,
+  experimental design and execution plan, content-addressed, frozen in that
+  order with the capability binding between design and plan; the database
+  refuses anything out of order, any change, and receipts or outcomes naming
+  another plan or execution.
+- **Plan-pinned trusted execution**: the workspace is cut from the plan's
+  commit; inputs are re-hashed; the receipt names the plan.
+- **Validation, then outcome**: results are validated against the declared
+  schema before any reading; SUPPORTED / REFUTED / INCONCLUSIVE /
+  EXECUTION_FAILED / CAPABILITY_LIMITED / INVALID_EVIDENCE / BUDGET_LIMITED are
+  computed by code and recorded immutably, bound to the chain.
+- **Replication** binds to the capability's attestation (VERIFIED, ATTESTED,
+  MEASURED kept apart); an unattested variation is refused before it runs.
+- **Gates**: empirical VALIDATED and HUMAN_READY require admissible science
+  chains; measured disagreement is disclosed, not a bar.
+- **Prompts**: `analysis_designer@2` (declared observables only, population),
+  `experiment_designer@8` and `replication_designer@8` (capability-backed
+  command, repetitions). Unread contracts frozen by earlier prompts are stale.
+- **Qualification contract**: `portfolio/qualification_v1.yaml` (25 mandatory
+  gates, advisory dimensions, frozen by pinned digest) and
+  `researchctl portfolio qualification`; `researchctl experiment capabilities`
+  checks a committed manifest against the host's commands.
+- Tests: `test_capability.py`, `test_science_v1_e2e.py`,
+  `test_qualification_spec.py`, `test_science_invariants.py`; mutants in
+  `tests/science_mutations.py`.
+
 ### Provider-failure lifecycle closure (2026-09-20)
 
 The pilot of 2026-09-19 was the first time this runtime ran unattended across a

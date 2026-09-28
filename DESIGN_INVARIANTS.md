@@ -352,3 +352,24 @@ the budget scope constraint and adds no table.
 ```text
 a budget that bounds the next call  !=  a budget that bounds the call after the overrun
 ```
+
+## Change control record: the v1 science chain
+
+Per the change-control section above, a dedicated record. **No invariant
+changed and nothing was added to the permitted-technology list.** One
+migration (`0047`) adds two tables and two columns; `docs/SCIENCE_EXECUTION.md`
+is the specification.
+
+| # | invariant | what changed |
+|---|---|---|
+| 1 | local before LLM | strengthened. Whether an analysis can be executed is decided by `capability.resolve`, ordinary code over typed declarations, before any design is asked for; whether a result is acceptable by schema validation; what it means by the frozen rule. No model decides any of the three |
+| 6 | Git-tracked files are truth | unchanged. A capability manifest is read from the science repository's committed tree and pinned by commit and digest; nothing writes it |
+| 8 | no agent approves its own work | strengthened. The primary outcome is one of seven states computed by code and bound to the frozen chain; no model is asked whether a preregistered threshold was crossed |
+| 10 | claims traceable to evidence | strengthened. Empirical VALIDATED and HUMAN_READY read the science chain behind a row -- contract, design, capability-bound plan, receipt, validated result, outcome -- re-verified at readiness |
+| 11 | experiments traceable | strengthened. An execution runs the plan's pinned commit and inputs; the receipt names the plan; a changed upstream object is a new identity whose evidence does not transfer |
+
+The property worth stating as new rather than preserved:
+
+```text
+a model that can name an observable  !=  an observable that exists
+```

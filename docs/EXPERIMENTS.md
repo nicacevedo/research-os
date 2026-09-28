@@ -257,6 +257,28 @@ therefore attest the inputs their computation genuinely depends on. A primary
 measured before execution receipts existed cannot be replicated
 independently; its replication is refused before it runs.
 
+## Typed capabilities: what a command measures (v1)
+
+`experiments.yaml` decides what may run. What a run *produces* is declared by
+the science repository itself, in a committed `research-capabilities.yaml`:
+for each capability, the host command that runs it, the result artifact and
+its schema, typed observables (with units, and which values vary between
+identical executions), immutable inputs, determinism, the perturbations the
+researcher attests a replication may vary, and the time one execution needs.
+`docs/SCIENCE_EXECUTION.md` is the specification.
+
+When a repository declares one, the portfolio's empirical route resolves every
+frozen analysis against it by ordinary code -- `EXECUTABLE` with an exact
+binding, or `CAPABILITY_LIMITED` with the exact unmet requirement -- freezes a
+scientific contract, an experimental design and an execution plan bound to
+the capability and pinned to the commit it was read at, validates each result
+against the declared schema before reading it, and records a system-computed
+outcome. For a plan-bound replication the attestation frozen into its
+manifest is the capability's (§ above, INV-07 unchanged in meaning).
+
+`researchctl portfolio qualification PROJECT` evaluates the v1 qualification
+contract against a project, read-only.
+
 ## Isolation
 
 An experiment runs in a worktree, and the worktree is scanned for outbound
