@@ -1,0 +1,136 @@
+# Machine-readable form of docs/SCIENCE_EXECUTION.md §8.
+#
+# Every enforcement point is `module:qualname` and must resolve; every test is
+# `path::function` and must exist; every mutant must be defined in
+# tests/science_mutations.py and still apply. Held by
+# tests/test_science_invariants.py. Traceability, not proof: whether the tests
+# bite is the mutation harness's job.
+schema: research-os-science-invariants-v1
+spec: docs/SCIENCE_EXECUTION.md
+
+invariants:
+  - id: SCI-01
+    title: Capability honesty
+    threat: >-
+      a model declares that an observable exists, or an execution runs with no
+      declared, host-authorised capability producing what its contract reads
+    enforced_by:
+      - research_os.capability:parse_manifest
+      - research_os.capability:check_against_command
+      - research_os.capability:resolve
+      - research_os.portfolio.sciencechain:requirements_from_analysis
+      - research_os.portfolio.empirical:_analysis_resolution
+      - research_os.portfolio.empirical:_capability_limited
+      - research_os.portfolio.empirical:_freeze_science_chain
+    tests:
+      - tests/test_capability.py::test_an_unmet_requirement_is_capability_limited_and_named
+      - tests/test_capability.py::test_a_chosen_command_perturbation_and_host_limit_are_all_checked
+      - tests/test_capability.py::test_the_manifest_is_read_from_a_commit_and_pinned_to_it
+      - tests/test_science_v1_e2e.py::test_an_observable_no_capability_declares_is_capability_limited
+      - tests/test_science_v1_e2e.py::test_a_numeric_reading_of_a_string_field_is_capability_limited
+      - tests/test_science_v1_e2e.py::test_a_contract_no_host_can_execute_is_capability_limited
+      - tests/test_science_v1_e2e.py::test_a_replication_varying_what_the_capability_does_not_attest_gets_no_plan
+    mutants: [SCI-01-1, SCI-01-2, SCI-01-3, SCI-01-4, SCI-01-5, SCI-01-6, SCI-01-7]
+    pass_requires: >-
+      an undeclared observable, field or numeric reading refused before any
+      design is asked for, with the exact unmet requirement; an unauthorised
+      command, a time need beyond the host and an unattested replication
+      variation each refused before anything runs
+
+  - id: SCI-02
+    title: The frozen chain -- order, ancestry, immutability, pinned execution
+    threat: >-
+      a design or plan exists before what it realises, a frozen object changes
+      in place, an execution runs code or inputs its plan did not bind, or
+      downstream evidence survives an upstream change
+    enforced_by:
+      - research_os.portfolio.sciencechain:freeze
+      - research_os.portfolio.sciencechain:load
+      - research_os.portfolio.sciencechain:verify_plan
+      - research_os.portfolio.store:PortfolioStore.freeze_science_object
+      - research_os.portfolio.empirical:_verified_chain
+      - research_os.portfolio.empirical:_verify_input_artifacts
+      - research_os.portfolio.empirical:ensure_workspace
+      - research_os.portfolio.empirical:submit
+    tests:
+      - tests/test_science_v1_e2e.py::test_an_executable_contract_is_frozen_bound_run_and_read_in_order
+      - tests/test_science_v1_e2e.py::test_nothing_is_frozen_before_what_it_realises
+      - tests/test_science_v1_e2e.py::test_frozen_objects_and_an_experiments_plan_never_change
+      - tests/test_science_v1_e2e.py::test_a_changed_frozen_design_stops_the_execution
+      - tests/test_science_v1_e2e.py::test_the_execution_runs_the_commit_its_plan_froze
+      - tests/test_science_v1_e2e.py::test_a_receipt_must_name_its_experiments_plan
+      - tests/test_science_v1_e2e.py::test_a_chain_whose_contract_the_analysis_does_not_derive_is_refused
+      - tests/test_science_v1_e2e.py::test_a_revised_idea_gets_a_new_contract_and_keeps_no_evidence
+      - tests/test_science_v1_e2e.py::test_an_analysis_without_a_population_keeps_the_digest_it_had
+    mutants: [SCI-02-1, SCI-02-2, SCI-02-3, SCI-02-4, SCI-02-5, SCI-02-6, SCI-02-7, SCI-02-8, SCI-02-9, SCI-02-10]
+    pass_requires: >-
+      the database refusing an out-of-order, wrong-kind or later-frozen parent,
+      any change to a frozen object or an experiment's plan, and a receipt or
+      outcome naming another plan or execution; a tampered design stopping the
+      run; a moved HEAD not moving what runs; a revision deriving a new chain
+
+  - id: SCI-03
+    title: Validation before acceptance
+    threat: >-
+      a malformed, off-schema, missing or substituted result read under the
+      preregistered rule as if it were the declared result
+    enforced_by:
+      - research_os.portfolio.sciencechain:validate_result
+      - research_os.portfolio.sciencechain:reading_outcome
+      - research_os.portfolio.empirical:interpret
+    tests:
+      - tests/test_science_v1_e2e.py::test_a_result_off_its_declaration_is_invalid_evidence
+      - tests/test_science_v1_e2e.py::test_a_result_replaced_after_the_execution_is_not_read
+      - tests/test_science_v1_e2e.py::test_validation_reads_only_the_bytes_the_runner_hashed
+      - tests/test_science_v1_e2e.py::test_an_execution_with_no_trusted_receipt_is_invalid_evidence
+    mutants: [SCI-03-1, SCI-03-2, SCI-03-3, SCI-03-4]
+    pass_requires: >-
+      malformed JSON, a schema violation and a missing artifact each
+      INVALID_EVIDENCE with the rule never applied; bytes other than the
+      runner-hashed ones refused
+
+  - id: SCI-04
+    title: System-computed outcomes
+    threat: >-
+      a numerical preregistered threshold judged by a model, an operational
+      failure read as a finding, or an outcome not bound to the execution it
+      is about
+    enforced_by:
+      - research_os.portfolio.sciencechain:record_outcome
+      - research_os.portfolio.store:PortfolioStore.record_outcome
+      - research_os.portfolio.empirical:_record_failure_outcome
+    tests:
+      - tests/test_science_v1_e2e.py::test_the_primary_outcome_is_computed_from_the_frozen_rule
+      - tests/test_science_v1_e2e.py::test_an_execution_that_crashes_is_execution_failed_and_never_evidence
+      - tests/test_science_v1_e2e.py::test_an_execution_a_budget_cannot_cover_is_budget_limited
+      - tests/test_science_v1_e2e.py::test_the_database_refuses_an_outcome_that_reads_another_execution
+    mutants: [SCI-04-1, SCI-04-2, SCI-04-3, SCI-04-4]
+    pass_requires: >-
+      SUPPORTED, REFUTED and INCONCLUSIVE computed from the frozen rule with no
+      model call after the designs; EXECUTION_FAILED, BUDGET_LIMITED,
+      CAPABILITY_LIMITED and INVALID_EVIDENCE recorded for what they are
+
+  - id: SCI-05
+    title: The gates read the chain
+    threat: >-
+      empirical VALIDATED or HUMAN_READY reached on a row with no science
+      chain, a broken one, one bound to no capability, or one without a
+      decisive outcome
+    enforced_by:
+      - research_os.portfolio.sciencechain:science_chains
+      - research_os.portfolio.gates:_science_chain_met
+      - research_os.portfolio.gates:_replication_met
+      - research_os.portfolio.models:ScienceChain
+    tests:
+      - tests/test_portfolio_gates.py::test_an_empirical_measurement_without_a_science_chain_does_not_validate
+      - tests/test_portfolio_gates.py::test_a_replication_needs_its_own_science_chain_for_human_ready
+      - tests/test_portfolio_gates.py::test_a_measured_disagreement_is_disclosed_and_is_not_a_bar
+      - tests/test_science_v1_e2e.py::test_legacy_evidence_from_an_unbound_execution_cannot_validate
+      - tests/test_science_v1_e2e.py::test_a_reading_with_no_recorded_outcome_is_not_an_intact_chain
+      - tests/test_science_v1_e2e.py::test_a_replication_that_contradicts_its_primary_is_measured_and_disclosed
+      - tests/test_portfolio_empirical.py::test_a_real_empirical_idea_traverses_experiment_evidence_and_review
+    mutants: [SCI-05-1, SCI-05-2, SCI-05-3, SCI-05-4, SCI-05-5]
+    pass_requires: >-
+      an executed row with an absent, broken, capability-less or non-decisive
+      chain not validating; a replication without its own chain not verifying;
+      the full route reaching HUMAN_READY only on intact chains
