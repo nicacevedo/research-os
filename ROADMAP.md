@@ -315,8 +315,29 @@ system-computed outcome states; replication bound to the capability's
 attestation; gates that read the chain; and the frozen, machine-readable v1
 qualification contract (`portfolio/qualification_v1.yaml`). The first
 capability, `cg.cells@1`, is in the column-generation repository on
-`research-os-v1/capabilities`. **Not qualified:** the live v1 qualification
-has not been run. Not merged, not tagged.
+`research-os-v1/capabilities`.
+
+The first final live qualification (`538c54f`) ended
+`FINAL_QUALIFICATION_INCOMPLETE`, `NOT_QUALIFIED` at 10 of 26 gates, having
+spent 29.75 of 30 USD. Its evidence is preserved unchanged outside the
+repository. Two causes were architectural: shallow exploration took the
+scarce advancement work, and the directions that did advance needed either
+a sample larger than one execution holds or records no capability produces.
+The final implementation sprint addresses both, and nothing else:
+
+- **two allocation lanes** -- exploration and advancement, with a
+  human-set share of the budget (`advancement_reserve_fraction`, default
+  0.5) held for advancement while advancement is eligible and lent back when
+  it is not;
+- **multi-execution campaigns** -- one frozen design compiled to N distinct
+  units, each with its own receipt and validated result, combined by the
+  capability's declared rule and read once (`sql/0048`); `cg.cells@1`
+  declares campaign support;
+- **a feasibility signal** -- derived from the committed catalogue and the
+  idea's structured evidence needs, used only to order advancement.
+
+The qualification contract is unchanged (its digest is still pinned). **Not
+qualified:** the rerun has not been made. Not merged, not tagged.
 
 ## Two external prerequisites, and the policy on each
 

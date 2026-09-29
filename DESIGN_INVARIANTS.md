@@ -373,3 +373,25 @@ The property worth stating as new rather than preserved:
 ```text
 a model that can name an observable  !=  an observable that exists
 ```
+
+## Change control record: advancement lanes, campaigns and feasibility
+
+Per the change-control section above, a dedicated record. **No invariant
+changed and nothing was added to the permitted-technology list.** One
+migration (`0048`) adds four tables and three columns; `docs/SCIENCE_EXECUTION.md`
+§3a and §7a and `docs/AUTONOMOUS_DISCOVERY_ARCHITECTURE.md` (the two lanes)
+are the specification.
+
+| # | invariant | what changed |
+|---|---|---|
+| 1 | local before LLM | strengthened. Which lane a unit of work is in, how much of the budget advancement holds, whether units of a campaign are distinct executions, and whether a declared capability reports what an idea says it needs are all decided by ordinary code. A model proposes units and states needs; it decides none of the four |
+| 8 | no agent approves its own work | unchanged in kind, extended to campaigns. A campaign's outcome is computed by the frozen rule from the deterministic combination of every validated unit result; the database refuses a reading that names fewer units than the plan froze |
+| 11 | experiments traceable | strengthened. Every unit of a campaign has its own trusted receipt, bound to that unit's frozen specification by the database, and its own validated, content-addressed result; the gate re-verifies each before it reads the combination |
+| 12 | paid use has budgets | strengthened. The advancement reserve is a fraction of the binding human-set ceiling (the smaller of the project's and the system's), set only in `portfolio.yaml` and at most 0.9; the system cannot change it. A campaign reserves execution authority for every unit before any runs, and one beyond the human-set unit or time bound is BUDGET_LIMITED before it starts |
+| 14 | finite stop conditions | unchanged. A campaign has a frozen number of units, bounded by the capability and by the human; a partial campaign is not read |
+
+The property worth stating as new rather than preserved:
+
+```text
+N executions of the same thing  !=  N independent observations
+```
