@@ -83,6 +83,10 @@ from research_os.runtime.failures import FailureClass
 CONTRACT_SCHEMA = "research-os-science-contract-v1"
 DESIGN_SCHEMA = "research-os-experiment-design-v1"
 PLAN_SCHEMA = "research-os-execution-plan-v1"
+#: A campaign plan: one frozen design compiled to several execution units of
+#: one capability (`research_os.portfolio.campaign`). Still a PLAN -- it
+#: realises one design and binds one capability -- with its units frozen in it.
+CAMPAIGN_SCHEMA = "research-os-execution-campaign-v1"
 OUTCOME_SCHEMA = "research-os-science-outcome-v1"
 COMPUTED_BY = "research_os.portfolio.sciencechain"
 
@@ -95,6 +99,12 @@ SCHEMA: Mapping[ScienceObjectKind, str] = {
     ScienceObjectKind.CONTRACT: CONTRACT_SCHEMA,
     ScienceObjectKind.DESIGN: DESIGN_SCHEMA,
     ScienceObjectKind.PLAN: PLAN_SCHEMA,
+}
+#: Every schema a frozen object of each kind may carry.
+SCHEMAS: Mapping[ScienceObjectKind, frozenset[str]] = {
+    ScienceObjectKind.CONTRACT: frozenset({CONTRACT_SCHEMA}),
+    ScienceObjectKind.DESIGN: frozenset({DESIGN_SCHEMA}),
+    ScienceObjectKind.PLAN: frozenset({PLAN_SCHEMA, CAMPAIGN_SCHEMA}),
 }
 
 #: The largest result artifact this layer will parse to validate it.
@@ -269,8 +279,14 @@ def design_payload(
     composed: Mapping[str, str],
     seeds: Sequence[int],
     parent_design_digest: str | None = None,
+    campaign: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
-    """The experimental design: HOW the contract is tested. Names the contract."""
+    """The experimental design: HOW the contract is tested. Names the contract.
+
+    ``campaign`` is a campaign design's units -- each unit's parameters (a
+    composed document by its digest) and seeds -- frozen here, in the design,
+    before any plan binds them to a capability.
+    """
 
     from research_os.portfolio import scicontract
 
@@ -342,6 +358,19 @@ def design_payload(
         },
         "falsification_criterion": design.falsification_criterion,
         "measurement": {"command": design.command, "parameters": parameters},
+        **(
+            {
+                "campaign": {
+                    "units": [dict(item) for item in campaign],
+                    "rationale": (
+                        design.campaign.rationale if design.campaign is not None else ""
+                    ),
+                    "stopping_rule": analysis.stopping_rule,
+                }
+            }
+            if campaign
+            else {}
+        ),
     }
 
 
@@ -407,6 +436,113 @@ def plan_payload(
     }
 
 
+def campaign_payload(
+    *,
+    design_digest: str,
+    contract_digest: str,
+    project_id: str,
+    version: IdeaVersion,
+    role: ExperimentRole,
+    binding: Binding,
+    command_identity: Mapping[str, Any],
+    units: Sequence[Mapping[str, Any]],
+    spec_digest: str,
+    variation_digest: str,
+    aggregation: Sequence[Mapping[str, Any]],
+    resources: Mapping[str, Any],
+    input_artifacts: Sequence[tuple[str, str]],
+) -> dict[str, Any]:
+    """The frozen execution campaign: the design mapped onto several executions.
+
+    Everything a single plan binds, once -- the contract and design, the
+    capability and its declaration, the code commit, the host command, the
+    immutable input artifacts -- and then each unit's own frozen execution:
+    argv, parameters, composed inputs, expected outputs, result artifact,
+    configuration (env, environment, seeds, cwd), implementation bounds and
+    its specification and variation digests. Plus the declared aggregation
+    rule for every observable the analysis reads, the rule for a missing unit
+    (the campaign is not read), and the bounded total resources. Changing any
+    of it is a new plan with a new digest, and evidence bound to the old one
+    does not transfer.
+    """
+
+    from research_os.portfolio import campaign as campaigns
+    from research_os.portfolio import provenance
+
+    capability = binding.capability
+    return {
+        "schema": CAMPAIGN_SCHEMA,
+        "project_id": project_id,
+        "idea_id": version.idea_id,
+        "idea_version": version.version,
+        "role": str(role),
+        "design_digest": design_digest,
+        "contract_digest": contract_digest,
+        "capability": {
+            **binding.record(),
+            "declaration": capability.model_dump(mode="json", by_alias=True),
+            "result_schema": capability.result.json_schema,
+        },
+        "code": {"commit": binding.commit},
+        "command": {
+            "name": capability.command,
+            "declaration": dict(command_identity),
+            "command_digest": provenance.digest(dict(command_identity)),
+        },
+        "inputs": {"artifacts": [list(item) for item in input_artifacts]},
+        "units": [dict(item) for item in units],
+        "aggregation": {
+            "observables": [dict(item) for item in aggregation],
+            "missing_units": campaigns.MISSING_UNITS,
+            "stopping_rule": campaigns.CAMPAIGN_STOPPING_RULE,
+        },
+        "resources": dict(resources),
+        "spec_digest": spec_digest,
+        "variation_digest": variation_digest,
+    }
+
+
+def unit_record(
+    *,
+    index: int,
+    label: str,
+    spec: Any,
+    spec_digest: str,
+    variation_digest: str,
+    parameters: Mapping[str, Any],
+    result_artifact: str | None,
+    input_artifacts: Sequence[tuple[str, str]],
+    varies: Sequence[str],
+) -> dict[str, Any]:
+    """One campaign unit's frozen execution, as the campaign plan holds it."""
+
+    return {
+        "index": index,
+        "label": label,
+        "argv": list(spec.argv),
+        "parameters": dict(parameters),
+        "inputs": {
+            "composed": [list(item) for item in spec.inputs],
+            "artifacts": [list(item) for item in input_artifacts],
+        },
+        "expected_outputs": sorted(spec.outputs),
+        "result_artifact": result_artifact,
+        "configuration": {
+            "env": dict(sorted(dict(spec.env).items())),
+            "environment": dict(sorted(dict(spec.environment).items())),
+            "seeds": list(spec.seeds),
+            "cwd": spec.cwd,
+        },
+        "implementation": {
+            "timeout_seconds": int(spec.timeout_seconds),
+            "resources": dict(sorted(dict(spec.resources).items())),
+        },
+        "spec_digest": spec_digest,
+        "variation_digest": variation_digest,
+        "varies_from_first_unit": list(varies),
+    }
+
+
 # --------------------------------------------------------------- freezing --
 def freeze(
     context: Any,
@@ -416,6 +552,7 @@ def freeze(
     parent: str | None = None,
     capability: tuple[str, str] | None = None,
     spec_digest: str | None = None,
+    units: Sequence[tuple[int, str, str]] = (),
 ) -> ScienceObject:
     """Store one object's canonical bytes and freeze its row. Idempotent.
 
@@ -452,6 +589,7 @@ def freeze(
         capability_ref=capability[0] if capability is not None else None,
         capability_digest=capability[1] if capability is not None else None,
         spec_digest=spec_digest,
+        units=units,
     )
 
 
@@ -479,6 +617,31 @@ class VerifiedChain:
     def result_path(self) -> str | None:
         found = (self.plan.payload.get("capability") or {}).get("result_path")
         return str(found) if found else None
+
+    @property
+    def is_campaign(self) -> bool:
+        return self.plan.payload.get("schema") == CAMPAIGN_SCHEMA
+
+    @property
+    def units(self) -> tuple[Mapping[str, Any], ...]:
+        """A campaign's frozen units, in order; none for a single plan."""
+
+        return tuple(self.plan.payload.get("units") or ()) if self.is_campaign else ()
+
+    def unit(self, index: int) -> Mapping[str, Any]:
+        for item in self.units:
+            if int(item.get("index", -1)) == index:
+                return item
+        raise ChainError(f"the campaign {self.plan.digest[:24]} froze no unit {index}")
+
+    def unit_result_path(self, index: int) -> str | None:
+        found = self.unit(index).get("result_artifact") or self.result_path
+        return str(found) if found else None
+
+    @property
+    def aggregation(self) -> tuple[Mapping[str, Any], ...]:
+        block = dict(self.plan.payload.get("aggregation") or {})
+        return tuple(block.get("observables") or ())
 
     @property
     def code_commit(self) -> str:
@@ -517,7 +680,7 @@ def load(
     if canonical(payload) != _stored_bytes(artifacts, row.artifact_id):
         raise ChainError(f"{digest[:24]} is not stored in canonical form")
     if (
-        payload.get("schema") != SCHEMA[kind]
+        payload.get("schema") not in SCHEMAS[kind]
         or payload.get("idea_id") != row.idea_id
         or payload.get("idea_version") != row.idea_version
         or payload.get("project_id") != row.project_id
@@ -598,6 +761,10 @@ def verify_plan(
         )
     if capability.command != experiment.command:
         problems.append("the bound capability is run by another command")
+    if plan.payload.get("schema") == CAMPAIGN_SCHEMA:
+        problems.extend(_campaign_problems(store, plan, experiment))
+    elif store.campaign_units(plan.digest):
+        problems.append("a single execution plan has campaign units recorded")
     if version is not None and analysis is not None:
         rebuilt = object_digest(
             ScienceObjectKind.CONTRACT,
@@ -623,6 +790,63 @@ def verify_plan(
     return VerifiedChain(
         contract=contract, design=design, plan=plan, capability=capability
     )
+
+
+def _campaign_problems(
+    store: Any, plan: Frozen, experiment: IdeaExperiment
+) -> list[str]:
+    """What does not hold about a campaign plan's units, against every record of them.
+
+    The units are frozen twice -- in the plan's bytes and, row by row, in
+    ``science_campaign_units`` -- and the campaign's specification digest is
+    a function of theirs. All three must say the same thing.
+    """
+
+    from research_os.portfolio import campaign as campaigns
+
+    problems: list[str] = []
+    units = list(plan.payload.get("units") or ())
+    if len(units) < 2:
+        problems.append("the campaign plan freezes fewer than two units")
+        return problems
+    indexes = [item.get("index") for item in units]
+    if indexes != list(range(len(units))):
+        problems.append("the campaign's units are not numbered 0..n-1 in order")
+    digests = [str(item.get("spec_digest") or "") for item in units]
+    if len(set(digests)) != len(digests):
+        problems.append("two campaign units share one specification")
+    rebuilt = campaigns.campaign_spec_digest(digests)
+    if rebuilt != plan.payload.get("spec_digest") or rebuilt != experiment.spec_digest:
+        problems.append(
+            "the campaign's specification digest is not the one its units derive"
+        )
+    variation = campaigns.campaign_variation_digest(
+        [str(item.get("variation_digest") or "") for item in units]
+    )
+    if variation != plan.payload.get("variation_digest"):
+        problems.append("the campaign's variation digest is not its units'")
+    recorded = [
+        (item.unit_index, item.spec_digest, item.variation_digest)
+        for item in store.campaign_units(plan.digest)
+    ]
+    frozen = [
+        (
+            int(item.get("index", -1)),
+            str(item.get("spec_digest") or ""),
+            str(item.get("variation_digest") or ""),
+        )
+        for item in units
+    ]
+    if recorded != frozen:
+        problems.append(
+            "the campaign's units in the database are not the units its plan froze"
+        )
+    resources = dict(plan.payload.get("resources") or {})
+    if int(resources.get("units") or 0) != len(units):
+        problems.append("the campaign's resources are not bounded over its units")
+    if not dict(plan.payload.get("aggregation") or {}).get("observables"):
+        problems.append("the campaign freezes no aggregation rule")
+    return problems
 
 
 # ------------------------------------------------------ result validation --
@@ -667,6 +891,7 @@ def validate_result(
     *,
     workspace: Path,
     recorded_outputs: Sequence[tuple[str, str, int]],
+    result_path: str | None = None,
 ) -> ResultCheck:
     """Validate the result artifact against the capability's declaration.
 
@@ -679,10 +904,8 @@ def validate_result(
     """
 
     from research_os.automation.filescope import open_contained
-    from research_os.errors import ExperimentSpecError
-    from research_os.experiment.generated import validate_document
 
-    path = chain.result_path
+    path = result_path or chain.result_path
     if not path:
         return ResultCheck(
             False, "result_unlocated", "the plan locates no result artifact"
@@ -708,6 +931,31 @@ def validate_result(
         )
     with handle:
         data = handle.read(MAX_RESULT_BYTES + 1)
+    return validate_result_bytes(chain, path=path, data=data, recorded_sha=sha)
+
+
+def validate_result_bytes(
+    chain: VerifiedChain, *, path: str, data: bytes, recorded_sha: str
+) -> ResultCheck:
+    """The declaration's checks over a result's bytes, wherever they are read from.
+
+    The workspace right after the run, or -- for a campaign unit read again
+    when the campaign is combined and at readiness -- the content-addressed
+    store. Either way the bytes must be the ones the runner hashed at exit.
+    """
+
+    from research_os.errors import ExperimentSpecError
+    from research_os.experiment.generated import validate_document
+
+    sha = recorded_sha
+    if len(data) > MAX_RESULT_BYTES:
+        return ResultCheck(
+            False,
+            "result_too_large",
+            f"{path} is {len(data)} bytes",
+            path=path,
+            sha256=sha,
+        )
     if hashlib.sha256(data).hexdigest() != sha:
         return ResultCheck(
             False,
@@ -830,8 +1078,15 @@ def record_outcome(
     receipt: ExecutionReceipt | None = None,
     result: ResultCheck | None = None,
     estimate: float | None = None,
+    units: Sequence[tuple[int, str, str | None]] = (),
 ) -> ScienceOutcome:
-    """Store the outcome document and its immutable row. Ordinary code only."""
+    """Store the outcome document and its immutable row. Ordinary code only.
+
+    ``units`` -- ``(index, receipt id, validated result sha256)`` -- are every
+    execution a campaign's outcome was computed from; ``receipt`` is then the
+    campaign's last unit, the receipt the reading is anchored on, and
+    ``result`` the combined result's check.
+    """
 
     digests = (
         chain.digests()
@@ -856,6 +1111,19 @@ def record_outcome(
         "result": result.record() if result is not None else None,
         "estimate": estimate,
         "detail": dict(detail),
+        **(
+            {
+                "campaign": {
+                    "unit_count": len(units),
+                    "units": [
+                        {"index": index, "receipt_id": receipt_id, "result_sha256": sha}
+                        for index, receipt_id, sha in units
+                    ],
+                }
+            }
+            if units
+            else {}
+        ),
     }
     ref = context.artifacts.put_bytes(
         canonical(document),
@@ -879,6 +1147,8 @@ def record_outcome(
         result_sha256=(result.sha256 if result is not None and result.ok else None),
         estimate=estimate,
         record_artifact_id=str(ref.artifact_id),
+        unit_count=len(units) if units else None,
+        units=tuple(units),
         **digests,
     )
 
@@ -980,6 +1250,14 @@ def _reading_chain(
                     provenance.verified_json(artifacts, outcome.record_artifact_id)
                 except provenance.ProvenanceError as exc:
                     problems.append(f"the outcome record: {exc}")
+                if chain.is_campaign:
+                    problems.extend(
+                        campaign_reading_problems(
+                            store, artifacts, chain, anchor=receipt, outcome=outcome
+                        )
+                    )
+                elif store.outcome_units(outcome.outcome_id):
+                    problems.append("a single execution's outcome names campaign units")
         except ChainError as exc:
             problems.append(str(exc))
     return (
@@ -994,6 +1272,117 @@ def _reading_chain(
         ),
         outcome,
     )
+
+
+def campaign_reading_problems(
+    store: Any,
+    artifacts: Any,
+    chain: VerifiedChain,
+    *,
+    anchor: ExecutionReceipt,
+    outcome: ScienceOutcome,
+) -> list[str]:
+    """Everything a campaign's reading rests on, re-verified now.
+
+    Every unit the plan froze is named by the outcome, once, from one
+    attempt; each unit's receipt is the runner's, re-hashed, of that unit of
+    that plan at the plan's commit; each unit's result is stored by content,
+    re-hashes, is the output that receipt recorded and still satisfies the
+    declared schema; and the combined result, rebuilt from those bytes by the
+    frozen aggregation, hashes to what the outcome names. Nothing here trusts
+    that a row exists: each claim is recomputed from what is stored.
+    """
+
+    from research_os.portfolio import campaign as campaigns
+    from research_os.portfolio import provenance
+
+    problems: list[str] = []
+    named = store.outcome_units(outcome.outcome_id)
+    frozen = chain.units
+    if outcome.unit_count != len(frozen) or len(named) != len(frozen):
+        problems.append(
+            f"the reading names {len(named)} of the campaign's {len(frozen)} units"
+        )
+        return problems
+    if anchor.receipt_id not in {item.receipt_id for item in named}:
+        problems.append("the reading's receipt is not one of its units")
+    documents: list[tuple[int, Mapping[str, Any]]] = []
+    for unit in named:
+        receipt = store.get_receipt(unit.receipt_id)
+        if receipt is None:
+            problems.append(f"unit {unit.unit_index} has no receipt")
+            continue
+        try:
+            document = provenance.verified_receipt(artifacts, receipt)
+        except provenance.ProvenanceError as exc:
+            problems.append(f"unit {unit.unit_index}: {exc}")
+            continue
+        try:
+            frozen_unit = chain.unit(unit.unit_index)
+        except ChainError as exc:
+            problems.append(str(exc))
+            continue
+        if (
+            receipt.experiment_id != anchor.experiment_id
+            or receipt.plan_digest != chain.plan.digest
+            or receipt.unit_index != unit.unit_index
+            or receipt.unit_attempt != anchor.unit_attempt
+            or receipt.spec_digest != frozen_unit.get("spec_digest")
+        ):
+            problems.append(
+                f"unit {unit.unit_index}'s receipt is not that unit of this "
+                f"campaign's attempt"
+            )
+        science = dict(document.get("science") or {})
+        if (
+            science.get("plan_digest") != chain.plan.digest
+            or science.get("design_digest") != chain.design.digest
+            or science.get("contract_digest") != chain.contract.digest
+        ):
+            problems.append(
+                f"unit {unit.unit_index}'s receipt does not name this chain"
+            )
+        if (document.get("code") or {}).get("base_commit") != chain.code_commit:
+            problems.append(
+                f"unit {unit.unit_index} ran a commit other than the plan's"
+            )
+        stored = store.unit_result(unit.receipt_id)
+        if stored is None or stored.result_sha256 != unit.result_sha256:
+            problems.append(f"unit {unit.unit_index}'s validated result is not stored")
+            continue
+        path = chain.unit_result_path(unit.unit_index) or ""
+        recorded = {
+            str(item[0]): str(item[1]) for item in document.get("outputs") or ()
+        }
+        if recorded.get(path) != stored.result_sha256:
+            problems.append(
+                f"unit {unit.unit_index}'s stored result is not the output its "
+                f"receipt recorded"
+            )
+            continue
+        try:
+            data = bytes(artifacts.get_bytes(stored.result_artifact_id))
+        except ResearchOSError as exc:
+            problems.append(f"unit {unit.unit_index}'s result bytes: {exc}")
+            continue
+        check = validate_result_bytes(
+            chain, path=path, data=data, recorded_sha=stored.result_sha256
+        )
+        if not check.ok:
+            problems.append(f"unit {unit.unit_index}'s result: {check.detail}")
+            continue
+        documents.append((unit.unit_index, json.loads(data.decode("utf-8"))))
+    if problems:
+        return problems
+    combined = campaigns.combine(chain.aggregation, documents)
+    if not combined.ok:
+        problems.append(f"the campaign's units do not combine: {combined.detail}")
+    elif combined.sha256 != outcome.result_sha256:
+        problems.append(
+            "the combined result rebuilt from the stored units is not the one the "
+            "outcome names"
+        )
+    return problems
 
 
 def science_chains(
@@ -1059,6 +1448,7 @@ def science_chains(
 
 
 __all__ = [
+    "CAMPAIGN_SCHEMA",
     "CONTRACT_SCHEMA",
     "DESIGN_SCHEMA",
     "FAILURE_OUTCOME",
@@ -1066,6 +1456,8 @@ __all__ = [
     "ChainError",
     "ResultCheck",
     "VerifiedChain",
+    "campaign_payload",
+    "campaign_reading_problems",
     "contract_payload",
     "design_payload",
     "freeze",
@@ -1076,6 +1468,8 @@ __all__ = [
     "record_outcome",
     "requirements_from_analysis",
     "science_chains",
+    "unit_record",
     "validate_result",
+    "validate_result_bytes",
     "verify_plan",
 ]

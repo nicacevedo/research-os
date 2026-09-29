@@ -147,6 +147,7 @@ def design_payload(
     *,
     spec: ExecutionSpec,
     composed: Mapping[str, str],
+    campaign: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
     """The scientific design, as it is hashed.
 
@@ -182,6 +183,42 @@ def design_payload(
         # so a design that froze `seeds` and not `env` froze a list the
         # program never reads: an independent mutation review ran a job with
         # a different seed under an unchanged, verifying contract.
+        "env": dict(sorted(dict(spec.env).items())),
+        "environment": dict(sorted(dict(spec.environment).items())),
+        # A campaign's every unit, each as the fields above are for a single
+        # execution -- the measurement, unit by unit. Present only for a
+        # campaign, so no single design's digest moves.
+        **(
+            {"campaign": {"units": [dict(item) for item in campaign]}}
+            if campaign
+            else {}
+        ),
+    }
+
+
+def campaign_unit_design(
+    *,
+    index: int,
+    label: str,
+    design: DesignSpecification,
+    spec: ExecutionSpec,
+    composed: Mapping[str, str],
+) -> dict[str, Any]:
+    """One campaign unit as the frozen design hashes it: what it measures."""
+
+    parameters: dict[str, Any] = {}
+    for name, value in sorted(dict(design.command_parameters).items()):
+        parameters[name] = (
+            {"composed_sha256": composed[name]} if name in composed else value
+        )
+    return {
+        "index": index,
+        "label": label,
+        "command_parameters": parameters,
+        "seeds": list(spec.seeds),
+        "argv": list(spec.argv),
+        "outputs": sorted(spec.outputs),
+        "inputs": [list(item) for item in spec.inputs],
         "env": dict(sorted(dict(spec.env).items())),
         "environment": dict(sorted(dict(spec.environment).items())),
     }
@@ -512,6 +549,17 @@ def requirements_block(spec: AnalysisSpec) -> list[str]:
             f"records ({spec.uncertainty.method}), so the design must produce "
             "enough of them for an interval to mean something"
         )
+    lines.append(
+        "stopping rule: "
+        + (
+            "fixed_campaign -- the measurement is a CAMPAIGN of several executions "
+            "of one declared capability, every unit run once and all of them read "
+            "once, combined by the capability's declared rule; specify its units"
+            if spec.stopping_rule == "fixed_campaign"
+            else "fixed_single_execution -- ONE execution, read once; specify no "
+            "campaign"
+        )
+    )
     lines.append(
         "(the thresholds that decide the conclusion were fixed with this analysis "
         "and are deliberately not shown to you)"

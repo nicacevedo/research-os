@@ -272,6 +272,37 @@ class ExplorerOutput(_Contract):
         return value
 
 
+class EvidenceNeeds(_Contract):
+    """What a measurement that settled an idea would have to report -- a claim, typed.
+
+    Written by ``scientific_discovery`` when it sharpens an empirical idea,
+    against the capability catalogue it is shown, and **never trusted as a
+    declaration of anything**: it is what the idea says it needs, and
+    `research_os.portfolio.feasibility` matches it by ordinary code against
+    the science repository's *committed* declarations to produce planning
+    metadata. It changes no hypothesis and settles nothing.
+    """
+
+    #: ``new_execution`` -- a measurement a declared command could run;
+    #: ``existing_records`` -- data that already exists somewhere (a past
+    #: study's own rows), which no execution produces; ``none`` -- not a
+    #: measurement at all.
+    data: Literal["new_execution", "existing_records", "none"] = "new_execution"
+    #: The record fields or scalar observables the measurement must report,
+    #: named exactly as the catalogue names them.
+    fields: tuple[str, ...] = _shown_list(items=128, count=16, default=())
+    #: How many independent draws -- seeds, instance batches, conditions --
+    #: the answer needs. More than one execution holds is a campaign.
+    independent_draws: int = Field(default=1, ge=1, le=1000)
+
+    @field_validator("fields")
+    @classmethod
+    def _bounded_fields(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(value) > 16:
+            raise ValueError("at most 16 fields")
+        return tuple(_bounded(item, 128, "a field name") for item in value)
+
+
 class DiscoveryOutput(_Contract):
     """What ``scientific_discovery`` returns.
 
@@ -289,6 +320,9 @@ class DiscoveryOutput(_Contract):
     #: The smallest thing that would move this forward. Prose; the allocator
     #: does not parse it, a person reads it.
     minimum_decisive_action: str = _shown(MAX_STATEMENT_CHARS, default="")
+    #: What a measurement settling the refined idea would need, when it is a
+    #: measurement. Planning metadata (`EvidenceNeeds`).
+    evidence_needs: EvidenceNeeds | None = None
 
     @field_validator("obstacle", "minimum_decisive_action")
     @classmethod
@@ -1250,8 +1284,14 @@ class AnalysisSpec(_Contract):
     support: tuple[SupportRequirement, ...] = ()
     #: Fixed, and stated so the frozen record says it: one execution of the
     #: preregistered specification, read once. No interim looks, no "run it
-    #: again until it clears".
-    stopping_rule: Literal["fixed_single_execution"] = "fixed_single_execution"
+    #: again until it clears". ``fixed_campaign`` is the same rule over a
+    #: campaign: every execution unit the frozen design fixes, each run once,
+    #: combined by the capability's declared aggregation and read once -- no
+    #: unit added after a look, none dropped, and a campaign missing any unit
+    #: is not read (`research_os.portfolio.campaign`).
+    stopping_rule: Literal["fixed_single_execution", "fixed_campaign"] = (
+        "fixed_single_execution"
+    )
     #: Fixed, and stated for the same reason: a required observable, field or
     #: reduction that is absent, non-numeric or undefined makes the
     #: conclusion INSUFFICIENT. There is no other value, and in particular no
@@ -1594,6 +1634,80 @@ class CapabilityRequest(_Contract):
         return stripped[: MAX_SUMMARY_CHARS - 14].rstrip() + " [clipped]"
 
 
+#: The most execution units one campaign design may name. A capability, and
+#: the portfolio's ``bounds.max_campaign_units``, may allow fewer.
+MAX_CAMPAIGN_UNITS = 64
+
+
+class CampaignUnit(_Contract):
+    """One execution unit of a campaign: how it differs from the base design.
+
+    ``command_parameters`` override the design's own, key by key, and
+    ``seeds`` replace its seeds; anything a unit does not name is the
+    design's. What makes two units two observations is decided by
+    ordinary code against the capability's declaration
+    (`research_os.portfolio.campaign.compile_campaign`), never by this label.
+    """
+
+    label: str = _shown(64, default="")
+    command_parameters: dict[str, Any] = Field(default_factory=dict)
+    seeds: tuple[int, ...] = ()
+
+    @field_validator("label")
+    @classmethod
+    def _label(cls, value: str) -> str:
+        stripped = value.strip()
+        if len(stripped) > 64:
+            raise ValueError("a unit label is at most 64 characters")
+        return stripped
+
+    @field_validator("seeds")
+    @classmethod
+    def _bounded_seeds(cls, value: tuple[int, ...]) -> tuple[int, ...]:
+        return _checked_seeds(value)
+
+    @field_validator("command_parameters")
+    @classmethod
+    def _bounded_parameters(cls, value: dict[str, Any]) -> dict[str, Any]:
+        return _checked_parameters(value)
+
+
+class CampaignDesign(_Contract):
+    """Several executions of one declared capability, fixed before any runs.
+
+    For a design whose sample -- independent seeds, instance batches,
+    conditions -- is larger than one bounded execution can hold. Each unit
+    is a complete execution of the same command; the campaign is read once,
+    over every unit, under a contract whose stopping rule is
+    ``fixed_campaign``.
+    """
+
+    units: tuple[CampaignUnit, ...]
+    #: How the units together realise the design's sample, in words.
+    rationale: str = _shown(MAX_STATEMENT_CHARS, default="")
+
+    @field_validator("units")
+    @classmethod
+    def _bounded_units(
+        cls, value: tuple[CampaignUnit, ...]
+    ) -> tuple[CampaignUnit, ...]:
+        if len(value) < 2:
+            raise ValueError(
+                "a campaign has at least two units; one execution is an ordinary design"
+            )
+        if len(value) > MAX_CAMPAIGN_UNITS:
+            raise ValueError(f"a campaign has at most {MAX_CAMPAIGN_UNITS} units")
+        return value
+
+    @field_validator("rationale")
+    @classmethod
+    def _rationale(cls, value: str) -> str:
+        stripped = value.strip()
+        if len(stripped) > MAX_STATEMENT_CHARS:
+            raise ValueError(f"at most {MAX_STATEMENT_CHARS} characters")
+        return stripped
+
+
 class DesignSpecification(_Contract):
     """The design half of a scientific contract, authored against a frozen analysis.
 
@@ -1629,6 +1743,9 @@ class DesignSpecification(_Contract):
     #: realise. Recorded in the frozen experimental design; not hashed into
     #: the legacy design digest, which predates it.
     repetitions: int | None = Field(default=None, ge=1, le=1000)
+    #: Several executions of the command, when one cannot hold the sample.
+    #: Absent: one execution, as before.
+    campaign: CampaignDesign | None = None
 
     @field_validator("command")
     @classmethod

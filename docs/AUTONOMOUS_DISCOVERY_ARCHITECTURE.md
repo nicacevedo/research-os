@@ -907,6 +907,58 @@ novelty closure            ideas whose novelty is the only open question
 maintenance/revival        stale tracks, blocked tracks whose block has cleared
 ```
 
+### Exploration and advancement: two lanes, and a reserve between them
+
+The first final qualification (538c54f) spent about 96 % of its 30 USD on
+exploration -- screening, originating and falsifying follow-up ideas -- while
+admitted directions waited, and froze no executable contract. The earlier
+release reserved one idea slot per tick for a depth stage; one slot was not
+enough, because an admitted idea still had to win its sharpening, its re-run
+falsifier and its adjudication against an unbounded stream of fresh children
+scoring near 3.0, and nothing protected spend at all.
+
+Every unit of work now has a lane (`allocation.Lane`, `allocation.lane_of`):
+
+```text
+exploration   explorers, follow-up generation, branches, and the cheap ladder
+              (dedup, novelty screen, falsifier, discovery, adjudication) on an
+              idea that has not earned admission
+advancement   the same ladder on an idea already PROMISING or beyond, the
+              literature audit, the evidence stage (contract, design, binding,
+              plan, execution or campaign), the review board, the meta-review,
+              the replication; and a literature question or a synthesis
+```
+
+While advancement work is **eligible** -- an advancement candidate could be
+bought on its own bounds (novelty floor, idea and lineage ceilings, the whole
+authority), or advancement work is queued or running -- a human-set share
+`bounds.advancement_reserve_fraction` (default and v1 qualification: 0.5; at
+most 0.9) is held for it in both currencies:
+
+- **slots** -- that fraction of the free idea slots, rounded up and counted
+  before anything takes one (the pool-floor explorer included), go first to
+  the best advancement candidates by the ordinary utility (queued advancement
+  work counts toward its share); a reserved slot no advancement candidate can
+  take returns to the ordinary order, and the explorer after it;
+- **spend** -- exploration is never sold into the protected share:
+  `fraction x ceiling` of the binding monetary ceiling (the smaller of the
+  project's and the system's) less what advancement has committed (recorded
+  call costs, holds, one call ceiling per queued advancement item;
+  `PortfolioStore.lane_spend`, the lane recorded on each queue item).
+  Advancement may spend everything.
+
+When nothing advancement-eligible exists exploration uses the whole authority,
+so the reserve is borrowed rather than left idle and returns the moment an
+idea is admitted. Follow-up generation is bounded by the same share -- that,
+and not a count of ideas, is what stops recursion crowding completion out.
+The allocator's ranking inside each lane is the utility. The fraction is a
+person's number: read from `portfolio.yaml` and a project's stored overrides,
+which nothing autonomous writes (`tests/test_portfolio_allocation_lanes.py`
+parses the package to assert it). At zero the plan is exactly the earlier
+release's. The tick reports the fraction, the eligibility and the protected
+amount on every pass. The ledger's own per-call reservation remains the
+boundary; the lanes are allocation policy on top of it.
+
 ### Diversity
 
 Tracked across `lineage_root` and `adjudication_types`, which are

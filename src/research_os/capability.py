@@ -312,6 +312,45 @@ class ParameterNote(_Declared):
     unit: str = Field(default="", max_length=32)
 
 
+class CampaignAggregation(_Declared):
+    """How one observable's values from several executions become one value.
+
+    ``concatenate`` for records -- the campaign's records are every unit's
+    records, in unit order -- and ``sum``, ``min`` or ``max`` for a numeric
+    scalar. ``identity`` names the record fields that identify one
+    observation: two units of one campaign that produce a record with the
+    same identity have produced the same observation twice, and the
+    campaign's result is refused rather than counted twice.
+    """
+
+    observable: str = Field(pattern=NAME_PATTERN)
+    rule: Literal["concatenate", "sum", "min", "max"]
+    identity: tuple[str, ...] = ()
+
+
+class CampaignSupport(_Declared):
+    """That several executions of this capability may form one measurement, and how.
+
+    The researcher's statement, like the rest of the declaration. It says
+    which attested perturbations may differ between the units of one
+    campaign -- a unit that differs from another in nothing the computation
+    is attested to use would be the same observation again, and Research OS
+    refuses such a campaign rather than let it pad a sample -- how each
+    observable combines across units, and how many units one campaign may
+    have. A capability without it is run one execution per measurement.
+    """
+
+    max_units: int = Field(ge=2, le=64)
+    unit_varies: tuple[str, ...] = Field(min_length=1)
+    aggregation: tuple[CampaignAggregation, ...] = Field(min_length=1)
+
+    def rule_for(self, observable: str) -> CampaignAggregation | None:
+        for item in self.aggregation:
+            if item.observable == observable:
+                return item
+        return None
+
+
 class Capability(_Declared):
     id: str = Field(pattern=CAPABILITY_ID_PATTERN, max_length=64)
     version: int = Field(ge=1, le=1_000_000)
@@ -326,6 +365,9 @@ class Capability(_Declared):
     determinism_notes: str = ""
     replication: Replication = Replication()
     resources: Resources
+    #: Whether, and how, several executions form one measurement
+    #: (`research_os.portfolio.campaign`). Absent: one execution each.
+    campaign: CampaignSupport | None = None
 
     @model_validator(mode="after")
     def _coherent(self) -> Self:
@@ -345,6 +387,8 @@ class Capability(_Declared):
         if len(set(paths)) != len(paths):
             raise ValueError("an input artifact is listed twice")
         _observables_fit_schema(self)
+        if self.campaign is not None:
+            _campaign_coherent(self, self.campaign)
         return self
 
     @property
@@ -453,6 +497,65 @@ def _observables_fit_schema(capability: Capability) -> None:
                 )
 
 
+def _campaign_coherent(capability: Capability, campaign: CampaignSupport) -> None:
+    """A campaign declaration that could be honoured, checked once when read.
+
+    What units may differ in must be perturbations the same declaration
+    attests the computation uses, and never ``implementation``: every unit
+    of a campaign runs one command. Every aggregation names a declared
+    observable, once; records concatenate and numeric scalars sum, take a
+    minimum or a maximum; an identity names declared record fields.
+    """
+
+    attested = {item.token for item in capability.replication.perturbations}
+    for token in campaign.unit_varies:
+        if token == "implementation":
+            raise ValueError(
+                "the units of one campaign run one command; they cannot differ in "
+                "implementation"
+            )
+        if token not in attested:
+            raise ValueError(
+                f"campaign units may differ in {token!r}, which this capability "
+                f"does not attest its computation uses (attested: "
+                f"{sorted(attested) or 'nothing'}); units differing in it would "
+                f"not be different observations"
+            )
+    if len(set(campaign.unit_varies)) != len(campaign.unit_varies):
+        raise ValueError("campaign.unit_varies names a perturbation twice")
+    seen: set[str] = set()
+    for item in campaign.aggregation:
+        if item.observable in seen:
+            raise ValueError(f"observable {item.observable!r} is aggregated twice")
+        seen.add(item.observable)
+        observable = capability.observable(item.observable)
+        if observable is None:
+            raise ValueError(
+                f"campaign aggregation names {item.observable!r}, which is not a "
+                f"declared observable"
+            )
+        if observable.kind == "records":
+            if item.rule != "concatenate":
+                raise ValueError(
+                    f"records observable {item.observable!r} combines by "
+                    f"concatenation, not {item.rule!r}"
+                )
+            for name in item.identity:
+                if observable.field(name) is None:
+                    raise ValueError(
+                        f"the identity of {item.observable!r} names field "
+                        f"{name!r}, which it does not declare"
+                    )
+            continue
+        if item.identity:
+            raise ValueError(f"scalar {item.observable!r} has no record identity")
+        if item.rule == "concatenate" or observable.type not in NUMERIC_TYPES:
+            raise ValueError(
+                f"scalar {item.observable!r} combines by sum, min or max, and only "
+                f"when it is a number"
+            )
+
+
 def _schema_admits(node: Mapping[str, Any], declared: FieldType) -> bool:
     found = node.get("type")
     if found is None:
@@ -552,6 +655,11 @@ def capability_digest(capability: Capability) -> str:
     """One capability's declaration, by content. Wording included: it is short."""
 
     payload = capability.model_dump(mode="json", by_alias=True)
+    # Absent is omitted rather than hashed as `null`, so no declaration
+    # written before campaigns existed changes its digest -- and no plan that
+    # pinned one stops verifying.
+    if payload.get("campaign") is None:
+        payload.pop("campaign", None)
     return (
         f"{CAPABILITY_DIGEST_VERSION}:{hashlib.sha256(canonical(payload)).hexdigest()}"
     )
@@ -762,6 +870,21 @@ def _result_path(capability: Capability, parameters: Mapping[str, str]) -> str |
         return capability.result.artifact
     value = parameters.get(capability.result.artifact_parameter)
     return str(value) if value else None
+
+
+def result_path_for(
+    capability: Capability, parameters: Mapping[str, Any]
+) -> str | None:
+    """Where one execution's result artifact is, given its parameter values."""
+
+    return _result_path(
+        capability,
+        {
+            str(name): str(value)
+            for name, value in dict(parameters).items()
+            if not isinstance(value, dict | list)
+        },
+    )
 
 
 def _match(
@@ -1078,6 +1201,39 @@ def catalogue_lines(
         for item in attested:
             lines.append(f"        {item.token}: {item.description}")
         lines.append(f"    one execution needs up to {cap.resources.timeout_seconds}s")
+        if cap.campaign is None:
+            lines.append(
+                "    campaign: not declared -- one execution per measurement; its "
+                "results cannot be combined with another's"
+            )
+            continue
+        lines.append(
+            f"    campaign: up to {cap.campaign.max_units} executions may form one "
+            f"measurement; the units must differ in "
+            + " or ".join(cap.campaign.unit_varies)
+            + " (anything else would repeat an observation, and is refused)"
+        )
+        for rule in cap.campaign.aggregation:
+            identity = (
+                f"; one observation is identified by {', '.join(rule.identity)}, and "
+                f"a repeated one refuses the result"
+                if rule.identity
+                else ""
+            )
+            lines.append(
+                f"        {rule.observable}: combined by {rule.rule} across units"
+                + identity
+            )
+        missing = [
+            item.name
+            for item in cap.observables
+            if cap.campaign.rule_for(item.name) is None
+        ]
+        if missing:
+            lines.append(
+                "        not combinable across units (a campaign analysis cannot "
+                "read them): " + ", ".join(missing)
+            )
     return lines
 
 
@@ -1095,6 +1251,8 @@ __all__ = [
     "MANIFEST_PATH",
     "MANIFEST_SCHEMA",
     "Binding",
+    "CampaignAggregation",
+    "CampaignSupport",
     "Capability",
     "CapabilityError",
     "CapabilityManifest",
@@ -1113,4 +1271,5 @@ __all__ = [
     "parse_manifest",
     "perturbation_tokens",
     "resolve",
+    "result_path_for",
 ]

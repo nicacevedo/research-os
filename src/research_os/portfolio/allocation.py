@@ -19,14 +19,17 @@ diversity constraint rather than an ordering by it. See docs/adr/0004.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
+from enum import StrEnum
 
 from research_os.portfolio import digests as pdigests
 from research_os.portfolio.config import PortfolioConfig
 from research_os.portfolio.models import (
+    Feasibility,
     IdeaOrigin,
     IdeaStatus,
     PortfolioIdea,
@@ -78,6 +81,101 @@ DEPTH_STAGES: frozenset[Stage] = frozenset(
         Stage.REPLICATE,
     }
 )
+
+
+class Lane(StrEnum):
+    """Which of the portfolio's two purposes a unit of work serves.
+
+    **Exploration** widens the portfolio: an explorer, a follow-up question
+    turned into new ideas, a branch, and the cheap ladder -- dedup, the
+    novelty screen, the falsifier, discovery, adjudication -- on an idea that
+    has not yet earned admission. **Advancement** carries an admitted idea
+    towards completion: the same ladder re-run on a revision of an idea
+    already PROMISING or beyond, the literature audit, the evidence stage
+    (contract, design, capability binding, plan, execution), the review
+    board, the meta-review and the replication; and the two pieces of
+    project work that serve ideas already in flight, a literature question
+    and a synthesis of reviewed evidence.
+
+    The first final qualification spent about 96 % of its authority on
+    exploration while three admitted directions waited, so the split is
+    explicit and the reserve below protects advancement from being starved
+    by an unbounded stream of attractive shallow work.
+    """
+
+    EXPLORATION = "exploration"
+    ADVANCEMENT = "advancement"
+
+
+#: The stages an idea runs to *earn* admission. On a candidate they are
+#: exploration; on an idea already PROMISING or beyond -- a revision re-running
+#: the ladder, a sharpening, an adjudication -- they are how it advances.
+ADMISSION_STAGES: frozenset[Stage] = frozenset(
+    {
+        Stage.DEDUP,
+        Stage.NOVELTY_SCREEN,
+        Stage.FALSIFY,
+        Stage.DISCOVER,
+        Stage.ADJUDICATE,
+    }
+)
+
+#: The statuses of an idea that has earned admission.
+ADMITTED: frozenset[IdeaStatus] = frozenset(
+    {
+        IdeaStatus.PROMISING,
+        IdeaStatus.INVESTIGATING,
+        IdeaStatus.REVIEW,
+        IdeaStatus.VALIDATED,
+    }
+)
+
+
+def lane_of(
+    kind: str, stage: Stage | str | None = None, status: IdeaStatus | None = None
+) -> Lane:
+    """The lane one unit of work belongs to. Ordinary code over its kind and stage.
+
+    ``status`` is the idea's status when the work is bought. Unknown -- a
+    queue row from before lanes were recorded -- reads the cheap ladder as
+    exploration, which is the side that only makes the reserve stricter.
+    """
+
+    if kind in {LITERATURE_REQUEST, SYNTHESIZE}:
+        return Lane.ADVANCEMENT
+    if kind != ADVANCE_IDEA or not stage:
+        return Lane.EXPLORATION
+    try:
+        which = Stage(str(stage))
+    except ValueError:
+        return Lane.EXPLORATION
+    if which in DEPTH_STAGES:
+        return Lane.ADVANCEMENT
+    if which in ADMISSION_STAGES and status in ADMITTED:
+        return Lane.ADVANCEMENT
+    return Lane.EXPLORATION
+
+
+@dataclass(frozen=True, slots=True)
+class AdvancementPosition:
+    """What the tick knows about the advancement lane, for one plan.
+
+    ``protected_usd`` is the share of the human-set authority still held for
+    advancement: ``fraction x ceiling`` less what advancement work has
+    already committed (recorded spend, what its calls in flight hold, and one
+    call ceiling per advancement item bought and not started). ``None`` when
+    no finite monetary ceiling applies, which is what an absent budget row
+    means everywhere in the ledger -- there is then no scarce authority to
+    protect, and only the slot reservation applies.
+
+    ``in_flight`` counts advancement work queued or running. While any is,
+    advancement is eligible even if no advancement candidate can be bought
+    this tick, so exploration cannot spend the reserve while a deep stage
+    runs and leave the idea nothing to continue with.
+    """
+
+    protected_usd: Decimal | None = None
+    in_flight: int = 0
 
 
 def call_ceiling(
@@ -204,6 +302,9 @@ class Allocation:
     #: tick that bought it -- and never again by a later plan; recorded so
     #: that it is asserted rather than inferred.
     charged: Decimal = Decimal(0)
+    #: The lane this work serves, recorded on the queue item so what each lane
+    #: has committed can be read back (`PortfolioStore.lane_spend`).
+    lane: Lane = Lane.EXPLORATION
 
     @property
     def dedup_key(self) -> str:
@@ -307,6 +408,15 @@ class Candidate:
     #: are not being worked -- but not charged again: its call ceiling is
     #: already in ``spent``, ``lineage_spent`` and the sale authority.
     bought: bool = False
+    #: Whether the declared capabilities can answer this idea's empirical
+    #: question (`research_os.portfolio.feasibility`). Planning metadata, never
+    #: evidence: it orders advancement work between otherwise equal ideas and
+    #: changes nothing about what an idea is.
+    feasibility: Feasibility = Feasibility.UNKNOWN
+
+    @property
+    def lane(self) -> Lane:
+        return lane_of(ADVANCE_IDEA, self.stage, self.idea.status)
 
 
 def diversity_key(
@@ -368,6 +478,17 @@ def utility(
     if active:
         crowding = max(candidate.diversity.overlap(other) for other in active)
         score -= weights.diversity_penalty * crowding
+
+    # Completion resources are scarce, and an idea the declared capabilities
+    # cannot answer would spend them on a refusal. Subtracted only in the
+    # advancement lane, so a capability-limited idea still explores, is kept
+    # in the bank, and is bought for advancement when nothing executable of
+    # comparable value is waiting. Nothing about the idea itself changes.
+    if (
+        candidate.feasibility is Feasibility.CAPABILITY_LIMITED
+        and candidate.lane is Lane.ADVANCEMENT
+    ):
+        score -= weights.capability_limited_penalty
 
     return Decimal(str(round(score, 6)))
 
@@ -431,6 +552,7 @@ def plan(
     synthesis_basis: tuple[str, int] | None = None,
     syntheses_in_flight: int = 0,
     authority: SaleAuthority | None = None,
+    advancement: AdvancementPosition | None = None,
 ) -> tuple[Allocation, ...]:
     """The ordered, bounded list of work this tick buys.
 
@@ -444,27 +566,78 @@ def plan(
     buys is judged against a budget that already paid for the first. A tick
     used to test every candidate against the same pre-tick sums, and a
     lineage one cent under its ceiling was sold a stage per free slot.
+
+    **Exploration and advancement are two lanes** (:class:`Lane`), and while
+    advancement work is eligible ``bounds.advancement_reserve_fraction`` of
+    the portfolio is held for it in both currencies it can be starved of:
+
+    - *slots* -- that fraction of the idea slots (rounded up) goes first to
+      the best admissible advancement candidate, by the ordinary utility; a
+      reserved slot no advancement candidate can take returns to the
+      ordinary order;
+    - *spend* -- exploration may not be sold into the protected share of the
+      human-set authority (``advancement.protected_usd``). Advancement may
+      use all of it, and what advancement buys uses the reserve up.
+
+    Advancement is *eligible* when an advancement candidate could be bought
+    this tick on its own bounds, or advancement work is already queued or
+    running. When none is, exploration uses the whole authority as before:
+    the reserve is borrowed, never idle, and it is back the moment an idea
+    is admitted. With the fraction at zero the plan is exactly the earlier
+    release's: one slot reserved for a depth stage and no spend reserve.
     """
 
     allocations: list[Allocation] = []
     remaining = max(0, free_slots)
     authority = authority or SaleAuthority()
+    fraction = Decimal(str(config.bounds.advancement_reserve_fraction))
     sold_cost = Decimal(0)
     sold_calls = 0
 
-    def affordable(kind: str, stage: Stage | None = None) -> bool:
-        return authority.covers(
-            call_ceiling(kind, stage, config),
-            sold_cost=sold_cost,
-            sold_calls=sold_calls,
+    eligible = advancement_eligible(
+        candidates=candidates,
+        config=config,
+        authority=authority,
+        advancement=advancement,
+    )
+    #: What exploration may not be sold into, as the plan grows. `None` is no
+    #: spend reserve: advancement is not eligible, the fraction is zero, or no
+    #: finite ceiling applies.
+    protected: Decimal | None = (
+        advancement.protected_usd
+        if eligible
+        and advancement is not None
+        and advancement.protected_usd is not None
+        and authority.cost_usd is not None
+        else None
+    )
+
+    def affordable(
+        kind: str, stage: Stage | None = None, lane: Lane = Lane.EXPLORATION
+    ) -> bool:
+        ceiling = call_ceiling(kind, stage, config)
+        if not authority.covers(ceiling, sold_cost=sold_cost, sold_calls=sold_calls):
+            return False
+        # The spend reserve: exploration is never sold into what is held for
+        # advancement. Advancement itself may use everything.
+        return not (
+            lane is Lane.EXPLORATION
+            and protected is not None
+            and ceiling > 0
+            and authority.cost_usd is not None
+            and authority.cost_usd - sold_cost - ceiling < protected
         )
 
-    def charge(kind: str, stage: Stage | None = None) -> Decimal:
-        nonlocal sold_cost, sold_calls
+    def charge(
+        kind: str, stage: Stage | None = None, lane: Lane = Lane.EXPLORATION
+    ) -> Decimal:
+        nonlocal sold_cost, sold_calls, protected
         ceiling = call_ceiling(kind, stage, config)
         if ceiling > 0:
             sold_cost += ceiling
             sold_calls += 1
+            if lane is Lane.ADVANCEMENT and protected is not None:
+                protected = max(Decimal(0), protected - ceiling)
         return ceiling
 
     # Project-level work first, and outside the idea slots. A follow-up, a
@@ -478,7 +651,10 @@ def plan(
     # A recorded question is the cheapest unit of genuinely new science the
     # portfolio can buy -- one call, about one event that already happened.
     # `open_requests` is ``(request_id, generation, basis)``, oldest first,
-    # already filtered to the requests that may run now.
+    # already filtered to the requests that may run now. A follow-up widens
+    # the portfolio, so it is exploration and the reserve bounds it: that,
+    # and not a count of ideas, is what stops recursion crowding completion
+    # out while there is something admitted to complete.
     if open_requests and follow_ups_in_flight == 0 and affordable(FOLLOW_UP):
         request_id, generation, basis = open_requests[0]
         allocations.append(
@@ -487,19 +663,25 @@ def plan(
                 reason=f"an open {basis} request owes the frontier new ideas",
                 payload={"request_id": request_id, "generation": generation},
                 charged=charge(FOLLOW_UP),
+                lane=Lane.EXPLORATION,
             )
         )
     # A synthesis, when the reviewed evidence changed. Its referee's findings
     # are what return the writing to the frontier, so it is bought as readily
     # as a question is -- one at a time, once per basis and generation.
-    if synthesis_basis and syntheses_in_flight == 0 and affordable(SYNTHESIZE):
+    if (
+        synthesis_basis
+        and syntheses_in_flight == 0
+        and affordable(SYNTHESIZE, lane=Lane.ADVANCEMENT)
+    ):
         basis_digest, generation = synthesis_basis
         allocations.append(
             Allocation(
                 kind=SYNTHESIZE,
                 reason="the reviewed evidence changed since the last synthesis",
                 payload={"basis": basis_digest, "generation": generation},
-                charged=charge(SYNTHESIZE),
+                charged=charge(SYNTHESIZE, lane=Lane.ADVANCEMENT),
+                lane=Lane.ADVANCEMENT,
             )
         )
     # And a question put to the literature, the same way and for the same
@@ -507,7 +689,7 @@ def plan(
     if (
         literature_requests
         and literature_in_flight == 0
-        and affordable(LITERATURE_REQUEST)
+        and affordable(LITERATURE_REQUEST, lane=Lane.ADVANCEMENT)
     ):
         request_id, generation, basis = literature_requests[0]
         allocations.append(
@@ -515,13 +697,27 @@ def plan(
                 kind=LITERATURE_REQUEST,
                 reason=f"an open {basis} question for the literature",
                 payload={"request_id": request_id, "generation": generation},
-                charged=charge(LITERATURE_REQUEST),
+                charged=charge(LITERATURE_REQUEST, lane=Lane.ADVANCEMENT),
+                lane=Lane.ADVANCEMENT,
             )
         )
 
+    # The advancement share of the idea slots, counted before anything takes
+    # one: ``ceil(fraction x free slots)``, while an advancement candidate is
+    # waiting. The pool-floor explorer below may not take it -- with one free
+    # slot it would, on every tick the pool was short, and the reserve would
+    # hold nothing. A share no advancement candidate can take this tick goes
+    # back to the ordinary order, and the explorer after it.
+    share = (
+        math.ceil(fraction * remaining)
+        if fraction > 0
+        and remaining
+        and any(item.lane is Lane.ADVANCEMENT for item in candidates)
+        else 0
+    )
     if (
         may_explore
-        and remaining
+        and remaining > share
         and candidate_pool < config.bounds.candidate_pool_floor
         and explorers_in_flight == 0
         and affordable(EXPLORE)
@@ -542,6 +738,7 @@ def plan(
                 explorer=explorer,
                 payload={"bucket": tick_bucket},
                 charged=charge(EXPLORE),
+                lane=Lane.EXPLORATION,
             )
         )
         remaining -= 1
@@ -559,34 +756,53 @@ def plan(
     #: What this plan has already charged to each lineage's ceiling.
     sold_lineage: dict[str, Decimal] = {}
     pool = list(candidates)
-    # **One slot is reserved for depth.** The utility is a breadth-first
+    # **Slots reserved for completion.** The utility is a breadth-first
     # number by construction -- it subtracts a stage's cost and divides its
     # decisiveness by the idea's open objections, and an idea that has
     # survived the falsifier twice carries ten of them -- so a steady supply
     # of fresh children, every one of which scores near 3.0, outranked a
     # PROMISING, empirically adjudicated idea waiting on its literature audit
     # (2.12) on every tick of the first clean qualification, and no track
-    # ever reached a contract. So the first idea slot of a tick goes to the
-    # best deep track that every bound below admits, when there is one; if
-    # none is admissible the slot returns to the ordinary order. One slot and
-    # no more: breadth is still how the portfolio finds what to deepen.
+    # ever reached a contract. The earlier release reserved one slot for a
+    # depth stage; the first *final* qualification then showed one slot was
+    # not enough -- an admitted idea still had to win its sharpening, its
+    # re-run falsifier and its adjudication against breadth, and 96 % of the
+    # spend went to breadth. So with a reserve fraction the first
+    # ``ceil(fraction x slots)`` go to the best admissible *advancement*
+    # candidate; at fraction zero, one slot to the best depth stage, as
+    # before. A reserved slot no candidate can take returns to the ordinary
+    # order: breadth is still how the portfolio finds what to deepen.
     #
-    # An item already queued does not take it: its need is served, and the
-    # slot is for a track that is not.
-    reserve_depth = any(item.stage in DEPTH_STAGES and not item.bought for item in pool)
+    # At fraction zero an item already queued does not take the depth slot:
+    # its need is served, and the slot is for a track that is not. With a
+    # reserve the advancement *share* of the slots includes advancement work
+    # already queued -- a queued item is re-announced and occupies a slot
+    # like any other -- so a second pass over the same state reserves the
+    # same items in the same order, and queued breadth never takes a share
+    # it does not have.
+    if fraction > 0:
+
+        def reservable(item: Candidate) -> bool:
+            return item.lane is Lane.ADVANCEMENT
+
+        reserved_left = min(share, remaining)
+        tag = "a slot reserved for advancement"
+    else:
+
+        def reservable(item: Candidate) -> bool:
+            return item.stage in DEPTH_STAGES and not item.bought
+
+        reserved_left = 1 if any(reservable(item) for item in pool) else 0
+        tag = "the slot reserved for depth"
     while remaining > 0 and pool:
         scored = [(utility(item, config=config, active=active), item) for item in pool]
         # Ties broken by idea id, so the plan is a function of state and not of
         # dictionary order.
         scored.sort(key=lambda pair: (-pair[0], pair[1].idea.idea_id))
-        reserved = reserve_depth
-        reserve_depth = False
+        reserved = reserved_left > 0
         if reserved:
-            scored = [
-                pair
-                for pair in scored
-                if pair[1].stage in DEPTH_STAGES and not pair[1].bought
-            ]
+            reserved_left -= 1
+            scored = [pair for pair in scored if reservable(pair[1])]
         chosen: Candidate | None = None
         for score, item in scored:
             if taken_lineage.get(item.idea.lineage_root, 0) >= (
@@ -601,18 +817,14 @@ def plan(
             # It was documented as "applied by the allocator" and read by
             # nothing -- an independent test audit found the identifier
             # appeared only in its own config line.
-            novelty = item.dimensions.novelty
-            if (
-                novelty is not None
-                and novelty < config.thresholds.novelty_floor
-                and _screened(item)
-            ):
+            if _below_floor(item, config):
                 continue
             # The next stage's call ceiling must fit under the idea's and
             # the lineage's ceilings *after* what is committed and what this
             # plan already sold -- not merely "not yet at the ceiling", which
             # sold a 2.50 stage to a lineage with a cent left.
             charged = Decimal(0)
+            lane = item.lane
             if not item.bought:
                 exposure = call_ceiling(ADVANCE_IDEA, item.stage, config)
                 if item.spent + exposure > config.bounds.idea_spend_ceiling_usd:
@@ -623,30 +835,29 @@ def plan(
                     > config.bounds.lineage_spend_ceiling_usd
                 ):
                     continue
-                if not affordable(ADVANCE_IDEA, item.stage):
+                if not affordable(ADVANCE_IDEA, item.stage, lane):
                     continue
-                charged = charge(ADVANCE_IDEA, item.stage)
+                charged = charge(ADVANCE_IDEA, item.stage, lane)
                 sold_lineage[root] = sold_lineage.get(root, Decimal(0)) + exposure
             chosen = item
             allocations.append(
                 Allocation(
                     kind=ADVANCE_IDEA,
-                    reason=(
-                        f"{item.reason} [the slot reserved for depth]"
-                        if reserved
-                        else item.reason
-                    ),
+                    reason=(f"{item.reason} [{tag}]" if reserved else item.reason),
                     utility=score,
                     idea_id=item.idea.idea_id,
                     stage=item.stage,
                     idea_version=item.idea.current_version,
                     generation=item.generation,
                     charged=charged,
+                    lane=lane,
                 )
             )
             break
         if chosen is None and reserved:
-            # No deep track is admissible this tick; the slot is ordinary.
+            # No reservable track is admissible this tick; the slots are
+            # ordinary.
+            reserved_left = 0
             continue
         if chosen is None:
             break
@@ -686,9 +897,63 @@ def plan(
                     explorer=explorer,
                     payload={"bucket": tick_bucket},
                     charged=charge(EXPLORE),
+                    lane=Lane.EXPLORATION,
                 )
             )
     return tuple(allocations)
+
+
+def advancement_eligible(
+    *,
+    candidates: Sequence[Candidate],
+    config: PortfolioConfig,
+    authority: SaleAuthority | None,
+    advancement: AdvancementPosition | None,
+) -> bool:
+    """Whether the advancement reserve is in force for this state.
+
+    True when the reserve fraction is positive and either advancement work
+    is already queued or running, or some advancement candidate could be
+    bought on its own bounds. *Its own bounds*: lineage room is not asked --
+    it is taken by running tracks that end, and an idea waiting for it is
+    waiting, not blocked -- and everything that does not free itself is: the
+    novelty floor, the idea's and its lineage's ceilings, and whether the
+    whole authority could pay for the next call at all. Read by the plan and
+    by the tick's report, so the two cannot disagree.
+    """
+
+    fraction = Decimal(str(config.bounds.advancement_reserve_fraction))
+    if fraction <= 0:
+        return False
+    if advancement is not None and advancement.in_flight > 0:
+        return True
+    whole = authority or SaleAuthority()
+    for item in candidates:
+        if item.lane is not Lane.ADVANCEMENT:
+            continue
+        if item.bought:
+            return True
+        if _below_floor(item, config):
+            continue
+        exposure = call_ceiling(ADVANCE_IDEA, item.stage, config)
+        if item.spent + exposure > config.bounds.idea_spend_ceiling_usd:
+            continue
+        if item.lineage_spent + exposure > config.bounds.lineage_spend_ceiling_usd:
+            continue
+        if whole.covers(exposure, sold_cost=Decimal(0), sold_calls=0):
+            return True
+    return False
+
+
+def _below_floor(candidate: Candidate, config: PortfolioConfig) -> bool:
+    """Whether an idea's *assessed* novelty is below the floor the plan skips."""
+
+    novelty = candidate.dimensions.novelty
+    return (
+        novelty is not None
+        and novelty < config.thresholds.novelty_floor
+        and _screened(candidate)
+    )
 
 
 def _screened(candidate: Candidate) -> bool:

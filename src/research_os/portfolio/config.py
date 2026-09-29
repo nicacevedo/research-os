@@ -118,6 +118,29 @@ class Bounds(BaseModel):
     #: question is kept, and recursion stops. Depth grows only through
     #: recorded events, so this bounds a chain of events rather than a loop.
     max_lineage_depth: int = Field(default=6, ge=1, le=50)
+    #: The share of the portfolio held for *advancement* while an admitted
+    #: idea has advancement work to do (`allocation.Lane`): that fraction of
+    #: the idea slots, rounded up, goes first to advancement, and exploration
+    #: is never sold into that fraction of the human-set monetary ceiling
+    #: less what advancement has already committed. When no advancement work
+    #: is eligible exploration uses everything. Zero is the earlier release:
+    #: one slot for a depth stage and no spend reserve.
+    #:
+    #: A person's number. It is read from this file and from a project's
+    #: stored overrides, and nothing autonomous writes either
+    #: (`tests/test_portfolio_allocation_lanes.py` asserts it); an idea, a
+    #: model or a tick cannot raise, lower or remove it.
+    advancement_reserve_fraction: Decimal = Field(
+        default=Decimal("0.5"), ge=0, le=Decimal("0.9")
+    )
+    #: The most execution units one campaign may compile to
+    #: (`research_os.portfolio.campaign`). A capability may declare fewer.
+    max_campaign_units: int = Field(default=6, ge=1, le=64)
+    #: The most one campaign may run in total, in seconds: the sum of its
+    #: units' ceilings, each already no longer than ``max_experiment_seconds``.
+    #: A campaign whose declared upper bound exceeds it is refused before
+    #: anything runs.
+    max_campaign_seconds: int = Field(default=7_200, ge=1, le=24 * 3600)
 
 
 class Thresholds(BaseModel):
@@ -212,6 +235,11 @@ class Weights(BaseModel):
     staleness: float = 0.3
     #: Added for an idea whose only open question is cheap to close.
     decisiveness: float = 0.7
+    #: Subtracted from *advancement* work on an idea the declared
+    #: capabilities cannot answer (`Feasibility.CAPABILITY_LIMITED`), so
+    #: completion resources go first to an equally strong direction this
+    #: laboratory can test. The idea keeps exploring and stays in the bank.
+    capability_limited_penalty: float = 1.0
 
 
 #: What one invocation of each stage may cost. A per-request ceiling, passed

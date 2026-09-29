@@ -63,6 +63,8 @@ from research_os.portfolio.models import (
     TIER_ORDER,
     ActionStatus,
     AdjudicationType,
+    CampaignPlanUnit,
+    CampaignUnitResult,
     ContractKind,
     ContractState,
     Disposition,
@@ -88,6 +90,7 @@ from research_os.portfolio.models import (
     LiteratureRetrieval,
     ObjectionTarget,
     OperationalState,
+    OutcomeUnit,
     ParkReason,
     PortfolioDigestRecord,
     PortfolioIdea,
@@ -177,7 +180,7 @@ RECEIPT_COLUMNS = (
     "run_id, work_id, command, command_digest, spec_digest, base_commit, "
     "delivered_digest, inputs_digest, outputs_digest, exit_code, "
     "manifest_artifact_id, manifest_digest, parent_receipt_id, "
-    "receipt_artifact_id, created_at, plan_digest"
+    "receipt_artifact_id, created_at, plan_digest, unit_index, unit_attempt"
 )
 SCIENCE_OBJECT_COLUMNS = (
     "object_digest, kind, project_id, idea_id, idea_version, parent_digest, "
@@ -187,7 +190,11 @@ OUTCOME_COLUMNS = (
     "outcome_id, project_id, idea_id, idea_version, role, state, reason, "
     "contract_id, experiment_id, contract_digest, design_digest, plan_digest, "
     "capability_ref, capability_digest, receipt_id, result_sha256, estimate, "
-    "record_artifact_id, created_at"
+    "record_artifact_id, created_at, unit_count"
+)
+UNIT_RESULT_COLUMNS = (
+    "receipt_id, experiment_id, unit_index, unit_attempt, result_sha256, "
+    "result_artifact_id, created_at"
 )
 ASSESSMENT_COLUMNS = (
     "assessment_id, evidence_id, experiment_id, idea_id, idea_version, legacy, "
@@ -1803,7 +1810,7 @@ class PortfolioStore:
                      spec_digest, base_commit, delivered_digest, inputs_digest,
                      outputs_digest, exit_code, manifest_artifact_id,
                      manifest_digest, parent_receipt_id, receipt_artifact_id,
-                     plan_digest)
+                     plan_digest, unit_index, unit_attempt)
                 values (%(receipt_id)s, %(job_id)s, %(experiment_id)s,
                         %(idea_id)s, %(idea_version)s, %(role)s, %(action_id)s,
                         %(run_id)s, %(work_id)s, %(command)s, %(command_digest)s,
@@ -1811,11 +1818,13 @@ class PortfolioStore:
                         %(inputs_digest)s, %(outputs_digest)s, %(exit_code)s,
                         %(manifest_artifact_id)s, %(manifest_digest)s,
                         %(parent_receipt_id)s, %(receipt_artifact_id)s,
-                        %(plan_digest)s)
+                        %(plan_digest)s, %(unit_index)s, %(unit_attempt)s)
                 returning {RECEIPT_COLUMNS}
                 """,
                 {
                     "plan_digest": None,
+                    "unit_index": None,
+                    "unit_attempt": None,
                     **fields,
                     "role": str(fields["role"]),
                 },
@@ -1838,6 +1847,113 @@ class PortfolioStore:
                 (receipt_id,),
             ).fetchone()
         return ExecutionReceipt.model_validate(row) if row else None
+
+    def unit_receipts(
+        self, experiment_id: str, *, attempt: int | None = None
+    ) -> tuple[ExecutionReceipt, ...]:
+        """A campaign experiment's unit receipts, of one attempt or all, by unit."""
+
+        clauses = ["experiment_id = %s", "unit_index is not null"]
+        args: list[Any] = [experiment_id]
+        if attempt is not None:
+            clauses.append("unit_attempt = %s")
+            args.append(attempt)
+        with self._tx() as conn:
+            rows = conn.execute(
+                f"select {RECEIPT_COLUMNS} from execution_receipts where "
+                + " and ".join(clauses)
+                + " order by unit_attempt, unit_index",
+                tuple(args),
+            ).fetchall()
+        return tuple(ExecutionReceipt.model_validate(row) for row in rows)
+
+    def record_unit_result(
+        self,
+        *,
+        receipt_id: str,
+        experiment_id: str,
+        unit_index: int,
+        unit_attempt: int,
+        result_sha256: str,
+        result_artifact_id: str,
+    ) -> CampaignUnitResult:
+        """Record one campaign unit's validated result (`sql/0048`). Once."""
+
+        with self._tx() as conn:
+            conn.execute(
+                """
+                insert into campaign_unit_results
+                    (receipt_id, experiment_id, unit_index, unit_attempt,
+                     result_sha256, result_artifact_id)
+                values (%s, %s, %s, %s, %s, %s)
+                on conflict (receipt_id) do nothing
+                """,
+                (
+                    receipt_id,
+                    experiment_id,
+                    unit_index,
+                    unit_attempt,
+                    result_sha256,
+                    result_artifact_id,
+                ),
+            )
+            row = conn.execute(
+                f"select {UNIT_RESULT_COLUMNS} from campaign_unit_results "
+                "where receipt_id = %s",
+                (receipt_id,),
+            ).fetchone()
+        return CampaignUnitResult.model_validate(row)
+
+    def unit_result(self, receipt_id: str) -> CampaignUnitResult | None:
+        with self._tx() as conn:
+            row = conn.execute(
+                f"select {UNIT_RESULT_COLUMNS} from campaign_unit_results "
+                "where receipt_id = %s",
+                (receipt_id,),
+            ).fetchone()
+        return CampaignUnitResult.model_validate(row) if row else None
+
+    def campaign_units(self, plan_digest: str | None) -> tuple[CampaignPlanUnit, ...]:
+        """The units a campaign plan froze (`sql/0048`); none for any other plan."""
+
+        if not plan_digest:
+            return ()
+        with self._tx() as conn:
+            rows = conn.execute(
+                "select plan_digest, unit_index, spec_digest, variation_digest "
+                "from science_campaign_units where plan_digest = %s "
+                "order by unit_index",
+                (plan_digest,),
+            ).fetchall()
+        return tuple(CampaignPlanUnit.model_validate(row) for row in rows)
+
+    def outcome_units(self, outcome_id: str | None) -> tuple[OutcomeUnit, ...]:
+        if not outcome_id:
+            return ()
+        with self._tx() as conn:
+            rows = conn.execute(
+                "select outcome_id, unit_index, receipt_id, result_sha256 "
+                "from science_outcome_units where outcome_id = %s "
+                "order by unit_index",
+                (outcome_id,),
+            ).fetchall()
+        return tuple(OutcomeUnit.model_validate(row) for row in rows)
+
+    def outcome_for_unit_receipt(self, receipt_id: str | None) -> ScienceOutcome | None:
+        """The campaign reading that read this unit's execution, if one did."""
+
+        if not receipt_id:
+            return None
+        with self._tx() as conn:
+            row = conn.execute(
+                f"select {', '.join('o.' + item.strip() for item in OUTCOME_COLUMNS.split(','))} "
+                "from science_outcome_units u "
+                "join science_outcomes o on o.outcome_id = u.outcome_id "
+                "where u.receipt_id = %s and o.state in "
+                "('SUPPORTED','REFUTED','INCONCLUSIVE','INVALID_EVIDENCE')",
+                (receipt_id,),
+            ).fetchone()
+        return ScienceOutcome.model_validate(row) if row else None
 
     def replication_assessments(
         self, *, idea_id: str, idea_version: int
@@ -1864,8 +1980,13 @@ class PortfolioStore:
         capability_ref: str | None = None,
         capability_digest: str | None = None,
         spec_digest: str | None = None,
+        units: Sequence[tuple[int, str, str]] = (),
     ) -> ScienceObject:
         """Freeze one contract, design or plan (`sql/0047`). Idempotent by content.
+
+        ``units`` -- ``(index, spec digest, variation digest)`` -- are a
+        campaign plan's execution units (`sql/0048`), frozen in the same
+        transaction as the plan they belong to.
 
         The digest is the primary key, so freezing identical content twice is
         the same object -- a replication and its primary share one frozen
@@ -1897,6 +2018,16 @@ class PortfolioStore:
                     spec_digest,
                 ),
             )
+            for index, unit_spec, unit_variation in units:
+                conn.execute(
+                    """
+                    insert into science_campaign_units
+                        (plan_digest, unit_index, spec_digest, variation_digest)
+                    values (%s, %s, %s, %s)
+                    on conflict (plan_digest, unit_index) do nothing
+                    """,
+                    (object_digest, int(index), unit_spec, unit_variation),
+                )
             row = conn.execute(
                 f"select {SCIENCE_OBJECT_COLUMNS} from science_objects "
                 "where object_digest = %s",
@@ -1955,8 +2086,10 @@ class PortfolioStore:
             "receipt_id": None,
             "result_sha256": None,
             "estimate": None,
+            "unit_count": None,
             **fields,
         }
+        units = tuple(values.pop("units", None) or ())
         values["role"] = str(values["role"])
         values["state"] = str(values["state"])
         values.setdefault("outcome_id", new_science_outcome_id())
@@ -1968,18 +2101,31 @@ class PortfolioStore:
                      reason, contract_id, experiment_id, contract_digest,
                      design_digest, plan_digest, capability_ref,
                      capability_digest, receipt_id, result_sha256, estimate,
-                     record_artifact_id)
+                     record_artifact_id, unit_count)
                 values (%(outcome_id)s, %(project_id)s, %(idea_id)s,
                         %(idea_version)s, %(role)s, %(state)s, %(reason)s,
                         %(contract_id)s, %(experiment_id)s, %(contract_digest)s,
                         %(design_digest)s, %(plan_digest)s, %(capability_ref)s,
                         %(capability_digest)s, %(receipt_id)s, %(result_sha256)s,
-                        %(estimate)s, %(record_artifact_id)s)
+                        %(estimate)s, %(record_artifact_id)s, %(unit_count)s)
                 on conflict do nothing
                 returning {OUTCOME_COLUMNS}
                 """,
                 values,
             ).fetchone()
+            if row is not None:
+                # A campaign's outcome names every unit it was computed from,
+                # in the same transaction; the database checks at commit that
+                # a reading names every unit of its plan (`sql/0048`).
+                for index, receipt_id, result_sha in units:
+                    conn.execute(
+                        """
+                        insert into science_outcome_units
+                            (outcome_id, unit_index, receipt_id, result_sha256)
+                        values (%s, %s, %s, %s)
+                        """,
+                        (row["outcome_id"], int(index), receipt_id, result_sha),
+                    )
             if row is None and values["receipt_id"]:
                 row = conn.execute(
                     f"select {OUTCOME_COLUMNS} from science_outcomes "
@@ -4029,6 +4175,160 @@ class PortfolioStore:
         return tuple(
             (str(row["kind"]), str(row["idea_id"]), str(row["stage"])) for row in rows
         )
+
+    def lane_spend(
+        self, *, project_id: str, kinds: Sequence[str]
+    ) -> tuple[tuple[str, str, str, Decimal, Decimal], ...]:
+        """This project's portfolio model spend, grouped by what bought it.
+
+        ``(kind, stage, lane, settled, held)`` per group: ``settled`` the
+        recorded cost of the calls its work items made, ``held`` what their
+        calls in flight hold against the *project* ceiling right now. The
+        lane is the one the allocator recorded on the item when it bought it
+        (``''`` for an item from before lanes were recorded); the caller
+        classifies. Read by the tick for the advancement reserve, which is
+        allocation policy: the ledger's own reservation remains the boundary.
+        """
+
+        with self._tx() as conn:
+            settled = conn.execute(
+                """
+                select w.kind,
+                       coalesce(w.payload->>'stage', '') as stage,
+                       coalesce(w.payload->>'lane', '') as lane,
+                       coalesce(sum(m.cost_usd), 0) as total
+                  from model_calls m
+                  join work_items w on w.work_id = m.work_id
+                 where w.project_id = %(project_id)s
+                   and w.kind = any(%(kinds)s)
+                 group by 1, 2, 3
+                """,
+                {"project_id": project_id, "kinds": list(kinds)},
+            ).fetchall()
+            held = conn.execute(
+                """
+                select w.kind,
+                       coalesce(w.payload->>'stage', '') as stage,
+                       coalesce(w.payload->>'lane', '') as lane,
+                       coalesce(sum(r.amount), 0) as total
+                  from budget_reservations r
+                  join budgets b on b.budget_id = r.budget_id
+                  join work_items w on w.work_id = r.work_id
+                 where b.scope = 'project' and b.scope_id = %(project_id)s
+                   and b.dimension = 'model_cost_usd'
+                   and r.status = 'HELD'
+                   and w.kind = any(%(kinds)s)
+                 group by 1, 2, 3
+                """,
+                {"project_id": project_id, "kinds": list(kinds)},
+            ).fetchall()
+        groups: dict[tuple[str, str, str], list[Decimal]] = {}
+        for rows, index in ((settled, 0), (held, 1)):
+            for row in rows:
+                key = (str(row["kind"]), str(row["stage"]), str(row["lane"]))
+                groups.setdefault(key, [Decimal(0), Decimal(0)])[index] += Decimal(
+                    str(row["total"])
+                )
+        return tuple(
+            (kind, stage, lane, values[0], values[1])
+            for (kind, stage, lane), values in sorted(groups.items())
+        )
+
+    def lane_work(
+        self, *, project_id: str, kinds: Sequence[str]
+    ) -> tuple[tuple[str, str, str, str], ...]:
+        """Portfolio work queued or running: ``(kind, stage, lane, status)``.
+
+        The same lane the allocator recorded, for the two numbers the reserve
+        needs about work not yet settled: what bought-and-unstarted items
+        will reserve, and whether advancement work is in flight at all.
+        """
+
+        with self._tx() as conn:
+            rows = conn.execute(
+                """
+                select kind,
+                       coalesce(payload->>'stage', '') as stage,
+                       coalesce(payload->>'lane', '') as lane,
+                       status
+                  from work_items
+                 where project_id = %(project_id)s
+                   and kind = any(%(kinds)s)
+                   and status in ('PENDING', 'WAITING', 'LEASED')
+                """,
+                {"project_id": project_id, "kinds": list(kinds)},
+            ).fetchall()
+        return tuple(
+            (str(row["kind"]), str(row["stage"]), str(row["lane"]), str(row["status"]))
+            for row in rows
+        )
+
+    def record_evidence_needs(
+        self,
+        *,
+        idea_id: str,
+        idea_version: int,
+        needs: Mapping[str, Any],
+        origin_call_id: str | None = None,
+    ) -> None:
+        """Record what one idea version says a settling measurement needs.
+
+        Planning metadata (`research_os.portfolio.feasibility`): a model's
+        typed claim, matched against the committed capability declarations by
+        code. Never part of the idea's content; first write wins.
+        """
+
+        with self._tx() as conn:
+            conn.execute(
+                """
+                insert into idea_evidence_needs
+                    (idea_id, idea_version, needs, origin_call_id)
+                values (%s, %s, %s, %s)
+                on conflict (idea_id, idea_version) do nothing
+                """,
+                (idea_id, idea_version, jsonb(dict(needs)), origin_call_id),
+            )
+
+    def evidence_needs(
+        self, *, project_id: str
+    ) -> dict[tuple[str, int], dict[str, Any]]:
+        """Every recorded evidence requirement of this project's ideas, by version."""
+
+        with self._tx() as conn:
+            rows = conn.execute(
+                """
+                select n.idea_id, n.idea_version, n.needs
+                  from idea_evidence_needs n
+                  join ideas i on i.idea_id = n.idea_id
+                 where i.project_id = %s
+                """,
+                (project_id,),
+            ).fetchall()
+        return {
+            (str(row["idea_id"]), int(row["idea_version"])): dict(row["needs"] or {})
+            for row in rows
+        }
+
+    def capability_blocked_versions(
+        self, *, project_id: str, command_set_digest: str | None = None
+    ) -> set[tuple[str, int]]:
+        """Idea versions whose own contract capability resolution refused.
+
+        With ``command_set_digest``, only those refused under that set of
+        declared commands and capabilities: a contract blocked before the
+        set changed is a question worth asking again, not an answer.
+        """
+
+        with self._tx() as conn:
+            rows = conn.execute(
+                """
+                select distinct idea_id, idea_version from scientific_contracts
+                 where project_id = %s and state = 'BLOCKED_CAPABILITY'
+                   and (%s::text is null or command_set_digest = %s::text)
+                """,
+                (project_id, command_set_digest, command_set_digest),
+            ).fetchall()
+        return {(str(row["idea_id"]), int(row["idea_version"])) for row in rows}
 
     # ----------------------------------------------------- portfolio state --
     def upsert_state(

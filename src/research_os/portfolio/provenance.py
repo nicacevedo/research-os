@@ -141,8 +141,15 @@ def write_receipt(
     manifest: tuple[str, str] | None = None,
     parent: Mapping[str, Any] | None = None,
     science: Mapping[str, Any] | None = None,
+    unit: Mapping[str, Any] | None = None,
 ) -> ExecutionReceipt:
     """Record, from the runner's own observation, what one execution was.
+
+    ``unit`` is one execution unit of a campaign (`sql/0048`): its index, the
+    attempt, the unit count and the unit's own specification and variation
+    digests. Each unit is its own execution with its own receipt; the
+    receipt names the unit, and the database checks its specification is the
+    one the campaign froze for it.
 
     Called by :func:`research_os.portfolio.empirical.submit` the moment the
     executor returns, before anything else can touch the workspace. Every
@@ -180,10 +187,32 @@ def write_receipt(
         },
         "code": {"base_commit": base_commit},
         "specification": {
-            "spec_digest": experiment.spec_digest,
-            "variation_digest": experiment.variation_digest,
+            "spec_digest": (
+                str(unit["spec_digest"]) if unit is not None else experiment.spec_digest
+            ),
+            "variation_digest": (
+                str(unit["variation_digest"])
+                if unit is not None
+                else experiment.variation_digest
+            ),
             "contract_id": experiment.contract_id,
+            **(
+                {"campaign_spec_digest": experiment.spec_digest}
+                if unit is not None
+                else {}
+            ),
         },
+        **(
+            {
+                "unit": {
+                    "index": int(unit["index"]),
+                    "attempt": int(unit["attempt"]),
+                    "count": int(unit["count"]),
+                }
+            }
+            if unit is not None
+            else {}
+        ),
         "delivered": delivered,
         "delivered_digest": digest(delivered),
         "inputs": inputs,
@@ -217,7 +246,7 @@ def write_receipt(
         work_id=document["work_id"],
         command=experiment.command,
         command_digest=document["capability"]["command_digest"],
-        spec_digest=experiment.spec_digest,
+        spec_digest=document["specification"]["spec_digest"],
         base_commit=base_commit,
         delivered_digest=document["delivered_digest"],
         inputs_digest=document["inputs_digest"],
@@ -228,6 +257,8 @@ def write_receipt(
         parent_receipt_id=(parent or {}).get("receipt_id"),
         receipt_artifact_id=str(ref.artifact_id),
         plan_digest=(science or {}).get("plan_digest"),
+        unit_index=int(unit["index"]) if unit is not None else None,
+        unit_attempt=int(unit["attempt"]) if unit is not None else None,
     )
 
 
@@ -293,7 +324,21 @@ def verified_receipt(artifacts: Any, row: ExecutionReceipt) -> dict[str, Any]:
             row.parent_receipt_id,
         ),
         ("plan", (document.get("science") or {}).get("plan_digest"), row.plan_digest),
+        ("unit", (document.get("unit") or {}).get("index"), row.unit_index),
+        ("unit attempt", (document.get("unit") or {}).get("attempt"), row.unit_attempt),
     )
+    if row.unit_index is not None:
+        # A campaign unit's specification is its unit's, not the experiment's,
+        # so the database binds it to the campaign's frozen units and this
+        # binds the document to the row (`sql/0048`).
+        checks = (
+            *checks,
+            (
+                "specification",
+                (document.get("specification") or {}).get("spec_digest"),
+                row.spec_digest,
+            ),
+        )
     for what, found, wanted in checks:
         if found != wanted:
             raise ProvenanceError(
@@ -348,11 +393,23 @@ class ReplicationFinding:
 
 
 def _chain(
-    store: Any, artifacts: Any, experiment: IdeaExperiment, receipt: ExecutionReceipt
+    store: Any,
+    artifacts: Any,
+    experiment: IdeaExperiment,
+    receipt: ExecutionReceipt,
+    *,
+    anchor: bool = True,
 ) -> tuple[
     dict[str, Any], dict[str, Any], dict[str, Any], ExecutionReceipt, IdeaExperiment
 ]:
-    """The replication's receipt, manifest, parent receipt and parent -- all bound."""
+    """The replication's receipt, manifest, parent receipt and parent -- all bound.
+
+    For a campaign each unit is bound this way on its own: its manifest,
+    frozen before *that unit* ran, names its job and the primary's execution
+    of the same unit. ``anchor`` is the unit the reading is anchored on (the
+    campaign's last), whose manifest the experiment row points at; every
+    other unit's manifest is named by its own receipt.
+    """
 
     mine = verified_receipt(artifacts, receipt)
     if receipt.role is not ExperimentRole.REPLICATION:
@@ -362,7 +419,10 @@ def _chain(
             f"receipt {receipt.receipt_id} is of {receipt.experiment_id}, not of "
             f"{experiment.experiment_id}"
         )
-    if experiment.execution_manifest_artifact_id != receipt.manifest_artifact_id:
+    if (
+        anchor
+        and experiment.execution_manifest_artifact_id != receipt.manifest_artifact_id
+    ):
         raise ProvenanceError(
             "the experiment's manifest pointer is not the manifest its execution "
             "was bound to"
@@ -376,6 +436,7 @@ def _chain(
         or manifest.get("experiment_id") != experiment.experiment_id
         or execution.get("job_id") != receipt.job_id
         or execution.get("spec_digest") != receipt.spec_digest
+        or execution.get("unit_index") != receipt.unit_index
     ):
         raise ProvenanceError(
             "the frozen manifest does not name this execution of this replication"
@@ -402,11 +463,33 @@ def _chain(
         parent_receipt.role is not ExperimentRole.PRIMARY
         or parent_receipt.experiment_id != primary.experiment_id
         or parent_link.get("experiment_id") != primary.experiment_id
-        or primary.job_id != parent_receipt.job_id
     ):
         raise ProvenanceError(
             "the parent receipt is not the primary's execution of this idea version"
         )
+    if receipt.unit_index is None:
+        if primary.job_id != parent_receipt.job_id:
+            raise ProvenanceError(
+                "the parent receipt is not the primary's execution of this idea version"
+            )
+    else:
+        # A replication unit's parent is the primary campaign's execution of
+        # the same unit, as the primary's reading names it -- not merely some
+        # primary receipt with the same index.
+        read = store.receipt_for_job(primary.job_id) if primary.job_id else None
+        reading = store.outcome_for_receipt(read.receipt_id) if read else None
+        units = {
+            item.unit_index: item.receipt_id
+            for item in store.outcome_units(reading.outcome_id if reading else None)
+        }
+        if (
+            parent_receipt.unit_index != receipt.unit_index
+            or units.get(receipt.unit_index) != parent_receipt.receipt_id
+        ):
+            raise ProvenanceError(
+                f"unit {receipt.unit_index}'s parent is not the primary's reading "
+                f"of the same unit"
+            )
     if (
         primary.state is not ExperimentState.INTERPRETED
         or primary.evidence_id != parent_link.get("evidence_id")
@@ -424,11 +507,86 @@ def _chain(
 def assess_replication(
     store: Any, artifacts: Any, experiment: IdeaExperiment, receipt: ExecutionReceipt
 ) -> ReplicationFinding:
-    """Establish what a replication's trusted chain shows, and only that."""
+    """Establish what a replication's trusted chain shows, and only that.
 
+    A campaign replication is established unit by unit: every unit of the
+    anchor's attempt against the primary's execution of the same unit, and
+    it counts as independent only if every pair does.
+    """
+
+    if receipt.unit_index is not None:
+        return _assess_campaign(store, artifacts, experiment, receipt)
+    return _assess_pair(store, artifacts, experiment, receipt)
+
+
+def _assess_campaign(
+    store: Any, artifacts: Any, experiment: IdeaExperiment, anchor: ExecutionReceipt
+) -> ReplicationFinding:
+    units = store.unit_receipts(experiment.experiment_id, attempt=anchor.unit_attempt)
+    if not units or anchor.receipt_id not in {item.receipt_id for item in units}:
+        return ReplicationFinding(
+            configuration_independent=False,
+            perturbation_attested=False,
+            basis="the campaign's unit receipts are not the anchor's attempt",
+        )
+    findings = [
+        _assess_pair(
+            store,
+            artifacts,
+            experiment,
+            unit,
+            anchor=unit.receipt_id == anchor.receipt_id,
+        )
+        for unit in units
+    ]
+    anchored = next(
+        item
+        for item, unit in zip(findings, units, strict=True)
+        if unit.receipt_id == anchor.receipt_id
+    )
+    independent = all(item.configuration_independent for item in findings)
+    attested = all(item.perturbation_attested for item in findings)
+    varied = tuple(dict.fromkeys(name for item in findings for name in item.varied))
+    failing = [
+        f"unit {unit.unit_index}: {item.basis}"
+        for item, unit in zip(findings, units, strict=True)
+        if not (item.configuration_independent and item.perturbation_attested)
+    ]
+    basis = (
+        f"every one of {len(units)} campaign units: " + anchored.basis
+        if not failing
+        else "not every campaign unit is an independent replication of its "
+        "primary unit -- " + "; ".join(failing)
+    )
+    return ReplicationFinding(
+        configuration_independent=independent,
+        perturbation_attested=independent and attested,
+        basis=basis,
+        varied=varied,
+        attested=tuple(
+            dict.fromkeys(name for item in findings for name in item.attested)
+        ),
+        unattested=tuple(
+            dict.fromkeys(name for item in findings for name in item.unattested)
+        ),
+        not_delivered=tuple(
+            dict.fromkeys(name for item in findings for name in item.not_delivered)
+        ),
+        chain=dict(anchored.chain),
+    )
+
+
+def _assess_pair(
+    store: Any,
+    artifacts: Any,
+    experiment: IdeaExperiment,
+    receipt: ExecutionReceipt,
+    *,
+    anchor: bool = True,
+) -> ReplicationFinding:
     try:
         mine, manifest, theirs, parent_receipt, primary = _chain(
-            store, artifacts, experiment, receipt
+            store, artifacts, experiment, receipt, anchor=anchor
         )
     except ProvenanceError as exc:
         return ReplicationFinding(
@@ -610,6 +768,16 @@ def replication_provenance(
                     )
                 if receipt.receipt_id == assessment.parent_receipt_id:
                     problems.append("the replication is its own parent")
+                if receipt.unit_index is not None:
+                    for unit in store.unit_receipts(
+                        replication.experiment_id, attempt=receipt.unit_attempt
+                    ):
+                        if unit.receipt_id == receipt.receipt_id:
+                            continue
+                        try:
+                            _chain(store, artifacts, replication, unit, anchor=False)
+                        except ProvenanceError as exc:
+                            problems.append(f"unit {unit.unit_index}: {exc}")
                 try:
                     _mine, _manifest, _theirs, parent_receipt, primary = _chain(
                         store, artifacts, replication, receipt

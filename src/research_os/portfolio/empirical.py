@@ -1844,6 +1844,46 @@ def capability_manifest(
         return None, str(exc)
 
 
+def campaign_bound_lines(
+    loaded: capabilities.LoadedManifest | None,
+    commands: Mapping[str, Any],
+    bounds: Any,
+) -> list[str]:
+    """What the human-set campaign bounds permit of each campaign capability, here.
+
+    The catalogue states what a capability declares; this states what this
+    portfolio allows of it -- the most units whose time ceilings fit
+    ``bounds.max_campaign_seconds``, each unit's ceiling being its command's,
+    capped at ``bounds.max_experiment_seconds`` -- so the designer is not
+    paid to propose a campaign :func:`campaigns.compile_campaign` must refuse.
+    """
+
+    if loaded is None:
+        return []
+    lines: list[str] = []
+    per_run = int(bounds.max_experiment_seconds)
+    for capability in sorted(loaded.manifest.capabilities, key=lambda item: item.id):
+        declared = commands.get(capability.command)
+        if capability.campaign is None or declared is None:
+            continue
+        unit_seconds = min(
+            int(getattr(declared, "timeout_seconds", 0) or per_run), per_run
+        )
+        allowed = min(
+            int(capability.campaign.max_units),
+            int(bounds.max_campaign_units),
+            int(bounds.max_campaign_seconds) // max(1, unit_seconds),
+        )
+        lines.append(
+            f"campaigns of {capability.ref} on this host: at most {allowed} unit(s). "
+            f"Each unit may run up to {unit_seconds}s, and this portfolio permits "
+            f"{int(bounds.max_campaign_units)} units and "
+            f"{int(bounds.max_campaign_seconds)}s per campaign (a person's "
+            f"numbers); a larger campaign is refused before it runs"
+        )
+    return lines
+
+
 def _manifest_identity(
     loaded: capabilities.LoadedManifest | None, error: str | None
 ) -> str | None:
@@ -2372,11 +2412,18 @@ def design(
             ),
             *([""] if governed else []),
             *capabilities.catalogue_lines(loaded, commands),
+            *(
+                campaign_bound_lines(loaded, commands, context.config.bounds)
+                if governed
+                else []
+            ),
         ],
     }
     if replication:
         assert previous is not None
-        blocks["first_experiment"] = _first_experiment_block(previous)
+        blocks["first_experiment"] = _first_experiment_block(
+            previous, list(_campaign_block(context, previous).get("units") or ())
+        )
 
     from research_os.portfolio.runner import _ask, _cost
 
@@ -2468,6 +2515,60 @@ def design(
                 f"{contract.contract_id}]"
             ),
             failure_class=FailureClass.CAPABILITY_DENIED,
+            cost_usd=cost,
+            model_calls=calls,
+        )
+
+    if proposed.campaign is not None:
+        return _design_campaign(
+            context,
+            version,
+            role=role,
+            previous=previous,
+            contract=contract,
+            verified=verified,
+            analysis=analysis,
+            proposed=proposed,
+            template=template,
+            response=response,
+            cost=cost,
+            calls=calls,
+            loaded=loaded,
+            commands=commands,
+            governed=governed,
+        )
+    if (
+        replication
+        and previous is not None
+        and is_campaign_experiment(context, previous)
+    ):
+        units = len(_campaign_block(context, previous).get("units") or ())
+        return ExperimentStep(
+            ok=False,
+            detail=(
+                f"the primary was a campaign of {units} executions; a replication "
+                f"of it is a campaign of {units}, each unit replicating the "
+                f"primary's unit of the same index"
+            ),
+            failure_class=FailureClass.MODEL_OUTPUT_INVALID,
+            cost_usd=cost,
+            model_calls=calls,
+        )
+    from research_os.portfolio.campaign import CAMPAIGN_STOPPING_RULE
+
+    if analysis.stopping_rule == CAMPAIGN_STOPPING_RULE:
+        # The frozen analysis decided its sample needs several executions; one
+        # execution is not the measurement it froze, and reading it would read
+        # a subset of the sample the rule was fixed for.
+        return ExperimentStep(
+            ok=False,
+            detail=(
+                "the frozen analysis's stopping rule is fixed_campaign: its sample "
+                "needs several executions of one capability, so the design "
+                "specifies a campaign of its units; a single execution is not the "
+                "measurement it froze"
+            ),
+            failure_class=FailureClass.MODEL_OUTPUT_INVALID,
             cost_usd=cost,
             model_calls=calls,
         )
@@ -2926,7 +3027,9 @@ def _idea_block(version: IdeaVersion) -> list[str]:
     ]
 
 
-def _first_experiment_block(previous: IdeaExperiment) -> list[str]:
+def _first_experiment_block(
+    previous: IdeaExperiment, units: Sequence[Mapping[str, Any]] = ()
+) -> list[str]:
     """What the replication designer is told about the run it must differ from.
 
     What it ran, and deliberately **not** what it concluded. A replicator that
@@ -2936,6 +3039,29 @@ def _first_experiment_block(previous: IdeaExperiment) -> list[str]:
     """
 
     rule = previous.decision_rule or {}
+    if previous.contract_id and units:
+        return [
+            f"command: {previous.command}",
+            (
+                f"the primary is a CAMPAIGN of {len(units)} executions of that "
+                f"command (specification digest {previous.spec_digest}); your "
+                f"replication must be a campaign of exactly {len(units)} units, "
+                f"unit i replicating the primary's unit i and differing from it in "
+                f"something the capability attests (seeds, or an attested "
+                f"parameter)"
+            ),
+            *(
+                f"primary unit {index}: variation digest {item.get('variation_digest')}"
+                f", seeds {list((item.get('spec') or {}).get('seeds') or ())}"
+                for index, item in enumerate(units)
+            ),
+            (
+                f"analysis: the frozen analysis of contract {previous.contract_id} "
+                f"({rule.get('analysis_digest', '(unrecorded)')}) reads both "
+                f"campaigns -- yours must produce the observables it names"
+            ),
+            "(the first experiment's outcome is deliberately not shown)",
+        ]
     if previous.contract_id:
         return [
             f"command: {previous.command}",
@@ -3617,7 +3743,19 @@ def _preregistered(
         record = json.loads(
             context.artifacts.get_text(experiment.preregistration_artifact_id)
         )
+        if record.get("campaign"):
+            # Fails closed: a campaign has one specification per unit, and a
+            # path that asks for "the" specification is not one that may run
+            # or read it (`_preregistered_campaign` is).
+            raise EmpiricalError(
+                f"{experiment.experiment_id} is a campaign of several executions, "
+                f"each with its own preregistered specification; it is run and "
+                f"read unit by unit",
+                failure_class=FailureClass.MISSING_SCIENTIFIC_AUTHORITY,
+            )
         spec = spec_from_record(record["spec"])
+    except EmpiricalError:
+        raise
     except (
         ResearchOSError,
         KeyError,
@@ -3667,6 +3805,7 @@ def _verified_contract(
     *,
     record: Mapping[str, Any] | None = None,
     spec: ExecutionSpec | None = None,
+    specs: Sequence[ExecutionSpec] | None = None,
 ) -> scicontract.VerifiedContract:
     """The frozen contract an experiment executes, re-verified, or a refusal.
 
@@ -3685,12 +3824,18 @@ def _verified_contract(
        names and nothing else.
     """
 
-    if record is None or spec is None:
-        spec, _rule = _preregistered(context, experiment)
+    if record is None:
         record = json.loads(
             context.artifacts.get_text(experiment.preregistration_artifact_id or "")
         )
-    assert record is not None and spec is not None
+    if record.get("campaign"):
+        # A campaign: every unit's specification, each re-hashed, realises
+        # the unit its frozen design fixed.
+        if specs is None:
+            specs = _campaign_specs(experiment, record)
+    elif spec is None:
+        spec, _rule = _preregistered(context, experiment)
+    assert record is not None and (spec is not None or specs is not None)
     contract = context.portfolio.get_contract(experiment.contract_id or "")
     if contract is None:
         raise EmpiricalError(
@@ -3754,7 +3899,11 @@ def _verified_contract(
             f"layer may not read a result under it.",
             failure_class=FailureClass.MISSING_SCIENTIFIC_AUTHORITY,
         )
-    _assert_realises(verified, spec)
+    if specs is not None:
+        _assert_realises_campaign(verified, specs)
+    else:
+        assert spec is not None
+        _assert_realises(verified, spec)
     return verified
 
 
@@ -5264,6 +5413,1843 @@ def previous_for(context: Any, role: ExperimentRole) -> IdeaExperiment | None:
     )
 
 
+# ------------------------------------------------------------- campaigns --
+#
+# One frozen design, several trusted executions of the one capability it
+# binds, read once over all of them (`research_os.portfolio.campaign`,
+# `docs/SCIENCE_EXECUTION.md` §3a). The single-execution route above is
+# untouched: a design with no campaign never reaches anything below.
+
+
+def is_campaign_experiment(context: Any, experiment: IdeaExperiment) -> bool:
+    """Whether this experiment realises a campaign plan (`sql/0048`)."""
+
+    return bool(context.portfolio.campaign_units(experiment.plan_digest))
+
+
+def _campaign_block(context: Any, experiment: IdeaExperiment | None) -> dict[str, Any]:
+    """An experiment's preregistered campaign block, or ``{}`` if it has none."""
+
+    if experiment is None:
+        return {}
+    document = _document(context, experiment.preregistration_artifact_id) or {}
+    block = document.get("campaign")
+    return dict(block) if isinstance(block, Mapping) else {}
+
+
+def _campaign_specs(
+    experiment: IdeaExperiment, record: Mapping[str, Any]
+) -> tuple[ExecutionSpec, ...]:
+    """Every unit's preregistered specification, each re-hashed, and the campaign's.
+
+    The same rule the single route applies to its one specification, unit by
+    unit: what runs is what was written down, or nothing runs.
+    """
+
+    from research_os.portfolio import campaign as campaigns
+
+    units = list((record.get("campaign") or {}).get("units") or ())
+    if len(units) < 2:
+        raise EmpiricalError(
+            f"{experiment.experiment_id} preregisters no campaign of two or more units",
+            failure_class=FailureClass.MISSING_SCIENTIFIC_AUTHORITY,
+        )
+    specs: list[ExecutionSpec] = []
+    for index, unit in enumerate(units):
+        try:
+            spec = spec_from_record(unit["spec"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise EmpiricalError(
+                f"unit {index} of {experiment.experiment_id}'s preregistration is "
+                f"unreadable: {exc}",
+                failure_class=FailureClass.ARTIFACT_MISSING,
+            ) from None
+        if (
+            int(unit.get("index", -1)) != index
+            or spec_digest(spec) != unit.get("spec_digest")
+            or variation_digest(spec) != unit.get("variation_digest")
+        ):
+            raise EmpiricalError(
+                f"unit {index} of {experiment.experiment_id}'s preregistered campaign "
+                f"does not hash to the specification it records",
+                failure_class=FailureClass.MISSING_SCIENTIFIC_AUTHORITY,
+            )
+        specs.append(spec)
+    if (
+        campaigns.campaign_spec_digest([spec_digest(item) for item in specs])
+        != experiment.spec_digest
+        or campaigns.campaign_variation_digest(
+            [variation_digest(item) for item in specs]
+        )
+        != experiment.variation_digest
+    ):
+        raise EmpiricalError(
+            f"the preregistered units of {experiment.experiment_id} are not the "
+            f"campaign its record names; running a different campaign under a "
+            f"preregistration is not something this layer may decide",
+            failure_class=FailureClass.MISSING_SCIENTIFIC_AUTHORITY,
+        )
+    return tuple(specs)
+
+
+def _preregistered_campaign(
+    context: Any, experiment: IdeaExperiment
+) -> tuple[ExecutionSpec, ...]:
+    """A campaign's unit specifications as written down, and its contract re-verified."""
+
+    if not experiment.preregistration_artifact_id:
+        raise EmpiricalError(
+            f"{experiment.experiment_id} has no stored preregistration",
+            failure_class=FailureClass.MISSING_SCIENTIFIC_AUTHORITY,
+        )
+    try:
+        record = json.loads(
+            context.artifacts.get_text(experiment.preregistration_artifact_id)
+        )
+    except (ResearchOSError, TypeError, ValueError, UnicodeDecodeError) as exc:
+        raise EmpiricalError(
+            f"the preregistration for {experiment.experiment_id} is unreadable: {exc}",
+            failure_class=FailureClass.ARTIFACT_MISSING,
+        ) from None
+    specs = _campaign_specs(experiment, record)
+    if experiment.contract_id:
+        _verified_contract(context, experiment, record=record, specs=specs)
+    return specs
+
+
+def _assert_realises_campaign(
+    verified: scicontract.VerifiedContract, specs: Sequence[ExecutionSpec]
+) -> None:
+    """Every unit about to run realises the unit its frozen design fixed."""
+
+    units = list((dict(verified.design or {}).get("campaign") or {}).get("units") or ())
+    if len(units) != len(specs):
+        raise EmpiricalError(
+            f"the campaign about to run under {verified.contract.contract_id} has "
+            f"{len(specs)} units and its frozen design {len(units)}",
+            failure_class=FailureClass.MISSING_SCIENTIFIC_AUTHORITY,
+        )
+    moved = [
+        f"unit {index} {name}"
+        for index, (unit, spec) in enumerate(zip(units, specs, strict=True))
+        for name, value in (
+            ("argv", list(spec.argv)),
+            ("outputs", sorted(spec.outputs)),
+            ("inputs", [list(item) for item in spec.inputs]),
+            ("seeds", list(spec.seeds)),
+            ("env", dict(spec.env)),
+            ("environment", dict(spec.environment)),
+        )
+        if unit.get(name) != value
+    ]
+    if moved:
+        raise EmpiricalError(
+            f"the campaign about to run under {verified.contract.contract_id} differs "
+            f"from its frozen design in {', '.join(moved)}; a different campaign is a "
+            f"different experiment and needs a contract of its own",
+            failure_class=FailureClass.MISSING_SCIENTIFIC_AUTHORITY,
+        )
+
+
+def _unit_record(
+    context: Any, experiment: IdeaExperiment | None, index: int
+) -> dict[str, Any] | None:
+    """One preregistered unit as `independence_variables` compares it."""
+
+    block = _campaign_block(context, experiment)
+    units = list(block.get("units") or ())
+    if experiment is None or index >= len(units):
+        return None
+    unit = dict(units[index])
+    return {
+        "spec": unit.get("spec") or {},
+        "command": experiment.command,
+        "command_parameters": dict(unit.get("command_parameters") or {}),
+        "generated_inputs": list(unit.get("generated_inputs") or ()),
+    }
+
+
+def _design_campaign(
+    context: Any,
+    version: IdeaVersion,
+    *,
+    role: ExperimentRole,
+    previous: IdeaExperiment | None,
+    contract: ScientificContract,
+    verified: scicontract.VerifiedContract,
+    analysis: AnalysisSpec,
+    proposed: DesignSpecification,
+    template: Any,
+    response: Any,
+    cost: str,
+    calls: int,
+    loaded: capabilities.LoadedManifest | None,
+    commands: Mapping[str, Any],
+    governed: bool,
+) -> ExperimentStep:
+    """Freeze a campaign design: its units, each a complete execution of one command.
+
+    The same order as a single execution -- contract, design, capability
+    binding, plan, preregistration, experiment -- with the design holding
+    every unit and the plan every unit's frozen execution, compiled and
+    checked by :func:`research_os.portfolio.campaign.compile_campaign` before
+    it is frozen. Nothing runs here.
+    """
+
+    from research_os.portfolio import campaign as campaigns
+
+    def failed(detail: str, failure: FailureClass) -> ExperimentStep:
+        return ExperimentStep(
+            ok=False,
+            detail=detail,
+            failure_class=failure,
+            cost_usd=cost,
+            model_calls=calls,
+        )
+
+    if not governed or loaded is None:
+        return failed(
+            "a campaign is several executions of one declared capability, and this "
+            "project's repository declares no capability manifest; a design here is "
+            "one execution",
+            FailureClass.MODEL_OUTPUT_INVALID,
+        )
+    replication = role is ExperimentRole.REPLICATION
+    experiment_id = _reserve_id()
+    workspace = workspace_for(experiment_id)
+    assert proposed.campaign is not None
+    labels = [item.label for item in proposed.campaign.units]
+    units: list[campaigns.UnitInput] = []
+    for index, unit_design in enumerate(campaigns.unit_designs(proposed)):
+        try:
+            spec, _rule, frozen_inputs = build_spec(
+                unit_design,
+                commands=commands,
+                workspace=workspace,
+                max_seconds=context.config.bounds.max_experiment_seconds,
+                required_outputs=analysis.sources(),
+            )
+        except EmpiricalError as exc:
+            return failed(f"campaign unit {index}: {exc}", exc.failure_class)
+        units.append(
+            campaigns.UnitInput(
+                index=index,
+                label=labels[index],
+                design=unit_design,
+                spec=spec,
+                frozen_inputs=tuple(frozen_inputs),
+                spec_digest=spec_digest(spec),
+                variation_digest=variation_digest(spec),
+                parameters=dict(spec_parameters(spec, unit_design)),
+            )
+        )
+    if replication:
+        primary_units = list(_campaign_block(context, previous).get("units") or ())
+        problems = campaigns.pair_with_primary(units, primary_units)
+        if not problems:
+            # What each primary unit measured, where it ran and its resources
+            # removed. No replication unit may be any of them.
+            measured: dict[str, int] = {}
+            for position, theirs in enumerate(primary_units):
+                try:
+                    primary_spec = spec_from_record(dict(theirs).get("spec") or {})
+                except (KeyError, TypeError, ValueError):
+                    problems.append(
+                        capabilities.Unmet(
+                            "replication campaign",
+                            f"the primary's unit {position} is unreadable",
+                        )
+                    )
+                    continue
+                measured.setdefault(scientific_variation(primary_spec), position)
+            for unit in units if not problems else ():
+                position = measured.get(scientific_variation(unit.spec))
+                if position is not None:
+                    problems.append(
+                        capabilities.Unmet(
+                            "replication campaign",
+                            f"unit {unit.index} differs from the primary's unit "
+                            f"{position} only in its resources or time limit",
+                        )
+                    )
+        if problems:
+            return failed(
+                "; ".join(item.rendered() for item in problems),
+                FailureClass.MODEL_OUTPUT_INVALID,
+            )
+
+    frozen = _freeze_campaign_chain(
+        context,
+        version=version,
+        role=role,
+        contract=contract,
+        analysis=analysis,
+        proposed=proposed,
+        units=units,
+        loaded=loaded,
+        commands=commands,
+        previous=previous,
+    )
+    if isinstance(frozen, ExperimentStep):
+        return replace(frozen, cost_usd=cost, model_calls=calls)
+    plan, compiled = frozen
+
+    first = units[0]
+    composed_first = {item.parameter: item.sha256 for item in first.frozen_inputs}
+    unit_designs = [
+        scicontract.campaign_unit_design(
+            index=unit.index,
+            label=unit.label,
+            design=unit.design,
+            spec=unit.spec,
+            composed={item.parameter: item.sha256 for item in unit.frozen_inputs},
+        )
+        for unit in units
+    ]
+    design_record = scicontract.design_payload(
+        proposed, spec=first.spec, composed=composed_first, campaign=unit_designs
+    )
+    design_hash = scicontract.design_digest(design_record)
+    provenance_record = {
+        **dict(verified.document.get("provenance") or {}),
+        "design_role": str(template.role),
+        "design_prompt": template.identity,
+        "design_call_id": response.call_id,
+        "design_provider": response.provider,
+        "design_model": response.model,
+    }
+    for unit in units:
+        for item in unit.frozen_inputs:
+            stored = context.artifacts.put_bytes(
+                item.canonical,
+                media_type="application/json",
+                role=f"idea_experiment_input:{item.sha256}",
+                producer=f"{response.provider}:{template.identity}",
+            )
+            context.artifacts.link(
+                stored,
+                role=f"idea_experiment_input:{item.sha256}",
+                run_id=context.run_id,
+            )
+    design_ref = context.artifacts.put_text(
+        json.dumps(
+            {
+                "schema": scicontract.DESIGN_SCHEMA,
+                "contract_id": contract.contract_id,
+                "design": design_record,
+                "design_digest": design_hash,
+                "provenance": provenance_record,
+            },
+            indent=2,
+            sort_keys=True,
+            ensure_ascii=False,
+            allow_nan=False,
+        ),
+        media_type="application/json",
+        role=f"idea_design:{design_hash}",
+        producer=f"{response.provider}:{template.identity}",
+    )
+    context.artifacts.link(
+        design_ref, role=f"idea_design:{design_hash}", run_id=context.run_id
+    )
+    parent_digest = (
+        context.portfolio.require_contract(contract.parent_contract_id).contract_digest
+        if contract.parent_contract_id
+        else None
+    )
+    contract_hash = scicontract.contract_digest(
+        idea_id=contract.idea_id,
+        idea_version=contract.idea_version,
+        hypothesis_digest=contract.hypothesis_digest,
+        role=str(contract.role),
+        kind=contract.kind,
+        analysis_digest=contract.analysis_digest,
+        design_digest=design_hash,
+        parent_contract_digest=parent_digest,
+    )
+    rule_summary = row_rule(analysis, contract.contract_id)
+    digest = compiled.spec_digest
+    variation = compiled.variation_digest
+    prereg = _preregistration_record(
+        experiment_id=experiment_id,
+        context=context,
+        version=version,
+        role=role,
+        design=first.design,
+        spec=first.spec,
+        spec_hash=digest,
+        variation=variation,
+        frozen_inputs=[item for unit in units for item in unit.frozen_inputs],
+        contract=contract,
+        contract_hash=contract_hash,
+        design_hash=design_hash,
+        analysis=analysis,
+        rule_summary=rule_summary,
+        science=_plan_identity(plan),
+    )
+    prereg["campaign"] = {
+        "spec_digest": digest,
+        "variation_digest": variation,
+        "units": [
+            {
+                "index": unit.index,
+                "label": unit.label,
+                "spec": _spec_record(unit.spec),
+                "spec_digest": unit.spec_digest,
+                "variation_digest": unit.variation_digest,
+                "command_parameters": dict(unit.parameters),
+                "generated_inputs": [item.record() for item in unit.frozen_inputs],
+                "implementation": scicontract.implementation_fields(unit.spec),
+            }
+            for unit in units
+        ],
+        "aggregation": [dict(item) for item in compiled.aggregation],
+        "resources": dict(compiled.resources),
+    }
+    prereg_ref = context.artifacts.put_text(
+        json.dumps(
+            prereg, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False
+        ),
+        media_type="application/json",
+        role=f"idea_preregistration:{digest}",
+        producer=f"{response.provider}:{template.identity}",
+    )
+    context.artifacts.link(
+        prereg_ref, role=f"idea_preregistration:{digest}", run_id=context.run_id
+    )
+    document = scicontract.contract_document(
+        contract=contract,
+        version=version,
+        spec=analysis,
+        design=design_record,
+        execution={
+            "experiment_id": experiment_id,
+            "command": proposed.command,
+            "spec_digest": digest,
+            "variation_digest": variation,
+            "workspace_path": str(workspace),
+            "preregistration_artifact_id": prereg_ref.artifact_id,
+            "implementation": [
+                scicontract.implementation_fields(unit.spec) for unit in units
+            ],
+            "campaign_units": len(units),
+            "plan_digest": plan.object_digest,
+        },
+        provenance=provenance_record,
+        parent_contract_digest=parent_digest,
+    )
+    contract_ref = context.artifacts.put_text(
+        json.dumps(
+            document, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False
+        ),
+        media_type="application/json",
+        role=f"idea_contract:{contract_hash}",
+        producer="portfolio.scicontract",
+    )
+    context.artifacts.link(
+        contract_ref, role=f"idea_contract:{contract_hash}", run_id=context.run_id
+    )
+    contract = context.portfolio.freeze_contract(
+        contract.contract_id,
+        design_digest=design_hash,
+        design_artifact_id=design_ref.artifact_id,
+        contract_digest=contract_hash,
+        contract_artifact_id=contract_ref.artifact_id,
+        design_prompt=template.identity,
+        design_call_id=response.call_id,
+    )
+    try:
+        experiment = context.portfolio.create_experiment(
+            idea_id=context.idea_id,
+            idea_version=version.version,
+            project_id=context.project_id,
+            role=role,
+            command=proposed.command,
+            spec_digest=digest,
+            variation_digest=variation,
+            workspace_path=str(workspace),
+            decision_rule=rule_summary,
+            no_rule_reason=(
+                None if rule_summary is not None else analysis.unanalysable_reason
+            ),
+            preregistration_artifact_id=prereg_ref.artifact_id,
+            origin_call_id=response.call_id,
+            experiment_id=experiment_id,
+            prompt_version=template.identity,
+            contract_id=contract.contract_id,
+            plan_digest=plan.object_digest,
+        )
+    except DuplicateExperimentError as exc:
+        return failed(str(exc), FailureClass.POLICY_REFUSED)
+    return ExperimentStep(
+        ok=True,
+        detail=(
+            f"froze contract {contract.contract_id} ({contract_hash[:24]}) and "
+            f"preregistered {role} campaign {experiment.experiment_id} of "
+            f"{len(units)} executions of {proposed.command} ({digest[:12]}); "
+            + analysis.rendered_decision()
+        ),
+        experiment=experiment,
+        cost_usd=cost,
+        model_calls=calls,
+    )
+
+
+def _freeze_campaign_chain(
+    context: Any,
+    *,
+    version: IdeaVersion,
+    role: ExperimentRole,
+    contract: ScientificContract,
+    analysis: AnalysisSpec,
+    proposed: DesignSpecification,
+    units: Sequence[Any],
+    loaded: capabilities.LoadedManifest,
+    commands: Mapping[str, Any],
+    previous: IdeaExperiment | None,
+) -> tuple[ScienceObject, Any] | ExperimentStep:
+    """Contract, design, binding, then the campaign plan -- or a refusal, before any runs."""
+
+    from research_os.portfolio import campaign as campaigns
+    from research_os.portfolio import provenance
+
+    contract_object = sciencechain.freeze(
+        context,
+        ScienceObjectKind.CONTRACT,
+        sciencechain.contract_payload(
+            project_id=context.project_id, version=version, analysis=analysis
+        ),
+    )
+    parent_design: str | None = None
+    perturbations: list[str] = []
+    if role is ExperimentRole.REPLICATION:
+        parent_plan = context.portfolio.get_science_object(
+            previous.plan_digest if previous is not None else None
+        )
+        if previous is None or parent_plan is None:
+            return _plan_refused(
+                context,
+                contract,
+                capabilities.Resolution(
+                    capabilities.CapabilityStatus.CAPABILITY_LIMITED,
+                    unmet=(
+                        capabilities.Unmet(
+                            "primary plan",
+                            "the primary was not measured under a frozen execution "
+                            "plan, so a replication of it cannot be bound to one",
+                        ),
+                    ),
+                ),
+                retry=False,
+            )
+        parent_design = parent_plan.parent_digest
+        for unit in units:
+            theirs = _unit_record(context, previous, unit.index) or {}
+            mine = {
+                "spec": _spec_record(unit.spec),
+                "command": proposed.command,
+                "command_parameters": dict(unit.parameters),
+            }
+            perturbations.extend(
+                _perturbation_tokens(independence_variables(theirs, mine))
+            )
+    unit_designs = [
+        {
+            "index": unit.index,
+            "label": unit.label,
+            "parameters": {
+                name: (
+                    {"composed_sha256": composed}
+                    if (
+                        composed := {
+                            item.parameter: item.sha256 for item in unit.frozen_inputs
+                        }.get(name)
+                    )
+                    else value
+                )
+                for name, value in sorted(dict(unit.design.command_parameters).items())
+            },
+            "seeds": list(unit.spec.seeds),
+        }
+        for unit in units
+    ]
+    design_object = sciencechain.freeze(
+        context,
+        ScienceObjectKind.DESIGN,
+        sciencechain.design_payload(
+            contract_digest=contract_object.object_digest,
+            project_id=context.project_id,
+            version=version,
+            role=role,
+            analysis=analysis,
+            design=proposed,
+            composed={item.parameter: item.sha256 for item in units[0].frozen_inputs},
+            seeds=units[0].spec.seeds,
+            parent_design_digest=parent_design,
+            campaign=unit_designs,
+        ),
+        parent=contract_object.object_digest,
+    )
+    resolution = capabilities.resolve(
+        capabilities.Requirements(
+            observables=sciencechain.requirements_from_analysis(analysis),
+            command=proposed.command,
+            parameters={
+                str(name): str(value)
+                for name, value in dict(units[0].design.command_parameters).items()
+                if not isinstance(value, dict | list)
+            },
+            perturbations=tuple(dict.fromkeys(perturbations)),
+            max_seconds=int(context.config.bounds.max_experiment_seconds),
+        ),
+        loaded=loaded,
+        commands=commands,
+    )
+    if not resolution.executable:
+        chosen = loaded.manifest.by_command(proposed.command)
+        hopeless = role is ExperimentRole.REPLICATION and (
+            chosen is None or not chosen.replication.perturbations
+        )
+        return _plan_refused(context, contract, resolution, retry=not hopeless)
+    binding = resolution.binding
+    assert binding is not None
+    inputs, missing = capabilities.input_digests(
+        Path(context.repo_path), commit=binding.commit, capability=binding.capability
+    )
+    if missing:
+        return _plan_refused(
+            context,
+            contract,
+            capabilities.Resolution(
+                capabilities.CapabilityStatus.CAPABILITY_LIMITED, unmet=tuple(missing)
+            ),
+            retry=False,
+        )
+    compiled = campaigns.compile_campaign(
+        units,
+        analysis=analysis,
+        capability=binding.capability,
+        observables=binding.observables,
+        max_units=int(context.config.bounds.max_campaign_units),
+        max_seconds=int(context.config.bounds.max_campaign_seconds),
+    )
+    if isinstance(compiled, campaigns.Refused):
+        state = (
+            PrimaryOutcome.BUDGET_LIMITED
+            if compiled.state == "BUDGET_LIMITED"
+            else PrimaryOutcome.CAPABILITY_LIMITED
+        )
+        sciencechain.record_outcome(
+            context,
+            state=state,
+            reason="campaign_not_compiled",
+            role=contract.role,
+            idea_id=contract.idea_id,
+            idea_version=contract.idea_version,
+            contract_id=contract.contract_id,
+            detail=compiled.record(),
+        )
+        return ExperimentStep(
+            ok=False,
+            detail=f"{compiled.summary()} [contract {contract.contract_id}]",
+            failure_class=(
+                FailureClass.MODEL_OUTPUT_INVALID
+                if compiled.retry
+                else FailureClass.CAPABILITY_DENIED
+            ),
+        )
+    records = [
+        sciencechain.unit_record(
+            index=unit.index,
+            label=unit.label,
+            spec=unit.spec,
+            spec_digest=unit.spec_digest,
+            variation_digest=unit.variation_digest,
+            parameters=unit.parameters,
+            result_artifact=capabilities.result_path_for(
+                binding.capability, unit.design.command_parameters
+            ),
+            input_artifacts=inputs,
+            varies=compiled.assignments[unit.index - 1] if unit.index else (),
+        )
+        for unit in units
+    ]
+    declared = commands[proposed.command]
+    plan = sciencechain.freeze(
+        context,
+        ScienceObjectKind.PLAN,
+        sciencechain.campaign_payload(
+            design_digest=design_object.object_digest,
+            contract_digest=contract_object.object_digest,
+            project_id=context.project_id,
+            version=version,
+            role=role,
+            binding=binding,
+            command_identity=provenance.command_identity(declared),
+            units=records,
+            spec_digest=compiled.spec_digest,
+            variation_digest=compiled.variation_digest,
+            aggregation=compiled.aggregation,
+            resources=compiled.resources,
+            input_artifacts=inputs,
+        ),
+        parent=design_object.object_digest,
+        capability=(binding.capability.ref, binding.digest),
+        spec_digest=compiled.spec_digest,
+        units=[(unit.index, unit.spec_digest, unit.variation_digest) for unit in units],
+    )
+    return plan, compiled
+
+
+def run_campaign(context: Any, experiment: IdeaExperiment) -> ExperimentStep:
+    """Run every unit of a campaign not yet run in this attempt, in order, then stop.
+
+    Before any unit starts, the whole campaign's execution authority is
+    reserved -- one work item per unit left -- so a campaign the ledger
+    cannot cover never starts. Each unit is then an ordinary trusted
+    execution of the plan's commit (:func:`_run_unit`) with its own receipt.
+    A unit that fails ends the attempt as an operational failure and nothing
+    is read; the next attempt runs every unit again, from fresh checkouts. A
+    unit whose result is not valid evidence stops the campaign early, and it
+    is read as that.
+    """
+
+    try:
+        specs = _preregistered_campaign(context, experiment)
+        chain = _verified_chain(context, experiment)
+    except (EmpiricalError, sciencechain.ChainError) as exc:
+        return _operational(context, experiment, str(exc), exc.failure_class)
+    if not chain.is_campaign or [
+        str(item.get("spec_digest")) for item in chain.units
+    ] != [spec_digest(item) for item in specs]:
+        return _operational(
+            context,
+            experiment,
+            "the campaign's preregistered units are not the units its frozen plan "
+            "binds",
+            FailureClass.MISSING_SCIENTIFIC_AUTHORITY,
+        )
+    executor = context.executors.get(LOCAL)
+    if executor is None:
+        return ExperimentStep(
+            ok=False,
+            detail=(
+                "no local executor is available on this machine, so the campaign "
+                "this idea needs cannot be run here"
+            ),
+            failure_class=FailureClass.SCHEDULER_UNAVAILABLE,
+            experiment=experiment,
+        )
+    repository = Path(context.repo_path)
+    attempt = int(experiment.attempts)
+    count = len(specs)
+    ran = {
+        item.unit_index: item
+        for item in context.portfolio.unit_receipts(
+            experiment.experiment_id, attempt=attempt
+        )
+    }
+    for index, receipt in sorted(ran.items()):
+        job = context.runtime.get_external_job(receipt.job_id)
+        if (
+            job is None
+            or job.status is not ExternalJobStatus.COMPLETED
+            or (job.exit_code or 0) != 0
+        ):
+            return _operational(
+                context,
+                experiment,
+                f"unit {index} of the campaign did not run correctly in this "
+                f"attempt; no part of a campaign is read when a unit failed",
+                FailureClass.EXECUTOR_FAILED,
+                job_id=receipt.job_id,
+            )
+    # A unit whose receipt was written and whose result was not stored -- the
+    # process stopped between the two -- is not done. Its bytes are still in
+    # the workspace only if it was the last unit to run (the next unit's
+    # checkout replaces the workspace), and they are stored now exactly as
+    # they would have been; otherwise the attempt did not complete.
+    unstored = [
+        index
+        for index, receipt in sorted(ran.items())
+        if context.portfolio.unit_result(receipt.receipt_id) is None
+    ]
+    stopped: str | None = None
+    if unstored:
+        last = max(ran)
+        receipt = ran[unstored[0]]
+        if unstored == [last]:
+            stopped = _store_unit_result(
+                context,
+                experiment,
+                chain=chain,
+                index=last,
+                attempt=attempt,
+                job_id=receipt.job_id,
+            )
+        if context.portfolio.unit_result(receipt.receipt_id) is None:
+            return _operational(
+                context,
+                experiment,
+                f"unit {unstored[0]} of the campaign ran and its result was not "
+                f"stored before the process stopped, and its bytes are no longer "
+                f"where the runner hashed them; no part of a campaign is read when "
+                f"a unit is missing, and the next attempt runs every unit again",
+                FailureClass.EXECUTOR_FAILED,
+                job_id=receipt.job_id,
+            )
+        release_workspace(experiment, repository=repository)
+    remaining = [] if stopped else [index for index in range(count) if index not in ran]
+    grants: tuple[Any, ...] = ()
+    if remaining:
+        try:
+            grants = context.budgets.reserve_all(
+                dimension=Dimension.WORK_ITEMS,
+                amount=len(remaining),
+                run_id=context.run_id,
+                project_id=context.project_id,
+            )
+        except BudgetExhaustedError as exc:
+            _record_failure_outcome(
+                context,
+                experiment,
+                FailureClass.BUDGET_EXHAUSTED,
+                detail=str(exc),
+                job_id=None,
+            )
+            return ExperimentStep(
+                ok=False,
+                detail=(
+                    f"the campaign needs {len(remaining)} more execution(s) and the "
+                    f"execution budget cannot authorise them all, so none starts: {exc}"
+                ),
+                failure_class=FailureClass.BUDGET_EXHAUSTED,
+                experiment=experiment,
+            )
+    if experiment.state is ExperimentState.OPERATIONALLY_FAILED:
+        release_workspace(experiment, repository=repository)
+    current = experiment
+    executed = 0
+    for index in remaining:
+        step, stop = _run_unit(
+            context,
+            current,
+            chain=chain,
+            spec=specs[index],
+            index=index,
+            attempt=attempt,
+            count=count,
+            executor=executor,
+            repository=repository,
+        )
+        if step.experiment is not None:
+            current = step.experiment
+        if step.ran:
+            executed += 1
+        if not step.ok:
+            _close_grants(context, grants, executed)
+            return ExperimentStep(
+                ok=False,
+                detail=step.detail,
+                experiment=step.experiment,
+                failure_class=step.failure_class,
+                conclusion=EmpiricalConclusion.OPERATIONALLY_BLOCKED,
+            )
+        if stop is not None:
+            stopped = stop
+            break
+    _close_grants(context, grants, executed)
+    receipts = context.portfolio.unit_receipts(
+        experiment.experiment_id, attempt=attempt
+    )
+    if not receipts:
+        return _operational(
+            context,
+            current,
+            "the campaign's attempt holds no unit receipt, so nothing ran that "
+            "could be read; the next attempt runs every unit again",
+            FailureClass.EXECUTOR_FAILED,
+        )
+    anchor = max(receipts, key=lambda item: int(item.unit_index or 0))
+    updated = context.portfolio.update_experiment(
+        experiment.experiment_id,
+        state=ExperimentState.COMPLETED,
+        job_id=anchor.job_id,
+        detail=(
+            f"campaign stopped after unit {anchor.unit_index}: {stopped}"
+            if stopped
+            else f"campaign of {count} execution(s) ran; every unit completed"
+        ),
+        count_attempt=False,
+    )
+    return ExperimentStep(
+        ok=True,
+        detail=updated.detail or "the campaign ran",
+        experiment=updated,
+    )
+
+
+def _close_grants(context: Any, grants: Sequence[Any], executed: int) -> None:
+    """Charge the executions that ran; hand back what no unit used."""
+
+    if not grants:
+        return
+    if executed:
+        context.budgets.settle_all(tuple(grants), actual=executed)
+    else:
+        context.budgets.release_all(tuple(grants))
+
+
+@dataclass(frozen=True, slots=True)
+class UnitStep:
+    ok: bool
+    detail: str
+    experiment: IdeaExperiment | None = None
+    failure_class: FailureClass | None = None
+    #: Whether an execution happened (and so consumed a work item).
+    ran: bool = False
+
+
+def _run_unit(
+    context: Any,
+    experiment: IdeaExperiment,
+    *,
+    chain: sciencechain.VerifiedChain,
+    spec: ExecutionSpec,
+    index: int,
+    attempt: int,
+    count: int,
+    executor: Any,
+    repository: Path,
+) -> tuple[UnitStep, str | None]:
+    """One unit: exactly what :func:`submit` does for one execution, under the unit's key.
+
+    Its own idempotency key (the experiment, the unit's specification, the
+    attempt and the index), its own fresh checkout of the plan's commit, its
+    own verified inputs, its own job, its own receipt naming the unit, its
+    own canonical-fingerprint check -- and then its result, as the runner
+    hashed it, stored by content before the workspace goes. Returns the step
+    and, when the unit's result is not valid evidence, why the campaign
+    stops here.
+    """
+
+    from research_os.portfolio import provenance
+    from research_os.runtime.actions.coding import (
+        _describe_drift,
+        canonical_fingerprint,
+        escaped,
+    )
+
+    unit_digest = spec_digest(spec)
+    unit_variation = variation_digest(spec)
+    key = idempotency_key(
+        "portfolio.campaign.unit",
+        experiment.experiment_id,
+        unit_digest,
+        attempt,
+        index,
+    )
+    job_id = new_external_job_id()
+    owned = owned_refs(experiment)
+
+    def reconcile(invocation: Any) -> dict[str, Any] | None:
+        # Only a job this invocation could have created: the unit's
+        # specification digest is the same in every attempt, so a job
+        # submitted before this attempt's invocation began, or one whose
+        # receipt names another attempt or unit, is an earlier execution --
+        # and reusing it would read the wrong attempt's result as this one's.
+        with context.portfolio.db.tx() as conn:
+            row = conn.execute(
+                "select j.job_id, j.status, j.exit_code, j.run_dir "
+                "from external_jobs j "
+                "where j.spec_digest = %s and j.project_id = %s "
+                "and j.submitted_at >= %s "
+                "and not exists (select 1 from execution_receipts r "
+                "where r.job_id = j.job_id and (r.experiment_id <> %s "
+                "or r.unit_index is distinct from %s "
+                "or r.unit_attempt is distinct from %s)) "
+                "order by j.submitted_at desc limit 1",
+                (
+                    unit_digest,
+                    context.project_id,
+                    invocation.started_at,
+                    experiment.experiment_id,
+                    index,
+                    attempt,
+                ),
+            ).fetchone()
+        if row is None or str(row["status"]) == str(ExternalJobStatus.SUBMITTING):
+            return None
+        return {
+            "job_id": str(row["job_id"]),
+            "status": str(row["status"]),
+            "exit_code": row["exit_code"],
+            "recovered": True,
+            "contained": "recovered: containment as recorded on the first attempt",
+        }
+
+    def perform() -> dict[str, Any]:
+        if Path(experiment.workspace_path).exists():
+            release_workspace(experiment, repository=repository)
+            if Path(experiment.workspace_path).exists():
+                raise EmpiricalError(
+                    f"the workspace {experiment.workspace_path} holds what an "
+                    f"earlier execution left and could not be removed, so a clean "
+                    f"unit cannot be run",
+                    failure_class=FailureClass.EXECUTOR_FAILED,
+                )
+        workspace = ensure_workspace(
+            experiment, repository=repository, base_commit=chain.code_commit
+        )
+        _materialise_inputs(context, spec, workspace=workspace)
+        _verify_input_artifacts(chain, workspace)
+        manifest: tuple[str, str] | None = None
+        parent: dict[str, Any] | None = None
+        if experiment.role is ExperimentRole.REPLICATION:
+            manifest_id, parent = freeze_unit_manifest(
+                context,
+                experiment,
+                index=index,
+                attempt=attempt,
+                spec=spec,
+                workspace=workspace,
+                job_id=job_id,
+                chain=chain,
+            )
+            manifest = (manifest_id, manifest_id)
+        base_commit = _workspace_commit(workspace)
+        if base_commit != chain.code_commit:
+            raise EmpiricalError(
+                f"the workspace is at {base_commit[:12]} and the campaign plan "
+                f"froze {chain.code_commit[:12]}; nothing runs code its plan did "
+                f"not bind",
+                failure_class=FailureClass.MISSING_SCIENTIFIC_AUTHORITY,
+            )
+        run_dir = prepare_run_dir(spec, job_id=job_id)
+        before = canonical_fingerprint(repository, owned_ref_prefixes=owned)
+        context.runtime.create_external_job(
+            job_id=job_id,
+            project_id=context.project_id,
+            run_id=context.run_id,
+            work_id=context.work_id,
+            executor=LOCAL,
+            spec_digest=unit_digest,
+            run_dir=str(run_dir),
+        )
+        started = time.monotonic()
+        handle = executor.submit(spec, run_dir=run_dir)
+        wall_clock_seconds = round(time.monotonic() - started, 3)
+        status = (
+            ExternalJobStatus.COMPLETED
+            if handle.finished and handle.exit_code == 0
+            else ExternalJobStatus.FAILED
+            if handle.finished
+            else ExternalJobStatus.SUBMITTED
+        )
+        context.runtime.update_external_job(
+            job_id,
+            status=status,
+            scheduler_job_id=handle.scheduler_job_id,
+            exit_code=handle.exit_code,
+            detail=handle.detail,
+            contained=handle.contained,
+            containment=str(handle.containment),
+            wall_clock_seconds=wall_clock_seconds,
+        )
+        provenance.write_receipt(
+            context,
+            experiment,
+            spec=spec,
+            job_id=job_id,
+            declared=declared_commands(context.project_id).get(experiment.command),
+            base_commit=base_commit,
+            outcome={
+                "executor": LOCAL,
+                "finished": bool(handle.finished),
+                "exit_code": handle.exit_code,
+                "contained": bool(handle.contained),
+                "containment": str(handle.containment),
+                "wall_clock_seconds": wall_clock_seconds,
+            },
+            outputs=_collect(workspace, spec.outputs),
+            manifest=manifest,
+            parent=parent,
+            science={
+                **chain.digests(),
+                "code_commit": chain.code_commit,
+                "result_artifact": chain.unit_result_path(index),
+            },
+            unit={
+                "index": index,
+                "attempt": attempt,
+                "count": count,
+                "spec_digest": unit_digest,
+                "variation_digest": unit_variation,
+            },
+        )
+        after = canonical_fingerprint(repository, owned_ref_prefixes=owned)
+        if escaped(before, after):
+            drift = _describe_drift(before, after)
+            LOG.error(
+                "campaign unit %s/%s changed the canonical checkout: %s",
+                experiment.experiment_id,
+                index,
+                drift,
+            )
+            return {
+                "job_id": job_id,
+                "status": str(status),
+                "exit_code": handle.exit_code,
+                "escaped": drift,
+            }
+        return {
+            "job_id": job_id,
+            "status": str(status),
+            "exit_code": handle.exit_code,
+            "finished": handle.finished,
+            "run_dir": str(run_dir),
+            "wall_clock_seconds": wall_clock_seconds,
+        }
+
+    def failed(
+        detail: str, failure: FailureClass, *, ran: bool, job: str | None = None
+    ) -> tuple[UnitStep, None]:
+        step = _operational(context, experiment, detail, failure, job_id=job)
+        return (
+            UnitStep(
+                ok=False,
+                detail=step.detail,
+                experiment=step.experiment,
+                failure_class=failure,
+                ran=ran,
+            ),
+            None,
+        )
+
+    try:
+        outcome = context.ledger.run(
+            key=key,
+            kind="portfolio.campaign.unit",
+            run_id=context.run_id,
+            work_id=context.work_id,
+            request={
+                "experiment_id": experiment.experiment_id,
+                "unit_index": index,
+                "spec_digest": unit_digest,
+            },
+            perform=perform,
+            reconcile=reconcile,
+        )
+    except ContainmentUnavailableError as exc:
+        return failed(str(exc), FailureClass.CAPABILITY_DENIED, ran=False)
+    except (ExecutorError, IdempotencyError) as exc:
+        return failed(str(exc), FailureClass.EXECUTOR_FAILED, ran=False)
+    except EmpiricalError as exc:
+        return failed(str(exc), exc.failure_class, ran=False)
+    except ResearchOSError as exc:
+        return failed(
+            f"could not submit: {exc}", FailureClass.EXECUTOR_FAILED, ran=False
+        )
+
+    result = dict(outcome.result)
+    job_id = str(result.get("job_id") or job_id)
+    if result.get("recovered"):
+        # A job found after a crash is this unit's execution only with this
+        # unit's receipt; one without it stopped before the runner recorded
+        # what it ran, and nothing unrecorded is read.
+        found = context.portfolio.receipt_for_job(job_id)
+        if found is None or (found.unit_index, found.unit_attempt) != (index, attempt):
+            return failed(
+                (
+                    f"campaign unit {index}'s execution was found after the "
+                    f"process stopped, without its trusted receipt; the next "
+                    f"attempt runs every unit again"
+                ),
+                FailureClass.EXECUTOR_FAILED,
+                ran=True,
+                job=job_id,
+            )
+    if result.get("escaped"):
+        return failed(
+            (
+                f"campaign unit {index} changed the canonical checkout, which it must "
+                f"never do: {result['escaped']}"
+            ),
+            FailureClass.POLICY_REFUSED,
+            ran=True,
+            job=job_id,
+        )
+    status = ExternalJobStatus(str(result["status"]))
+    updated = context.portfolio.update_experiment(
+        experiment.experiment_id,
+        state=ExperimentState.RUNNING,
+        job_id=job_id,
+        detail=(
+            f"campaign unit {index + 1}/{count}: {status}, exit "
+            f"{result.get('exit_code')}"
+        ),
+        count_attempt=False,
+    )
+    if status is not ExternalJobStatus.COMPLETED or (result.get("exit_code") or 0) != 0:
+        job = context.runtime.get_external_job(job_id)
+        if job is not None:
+            _store_logs(context, updated, run_dir=Path(job.run_dir))
+        partial: tuple[tuple[str, str, int], ...] = ()
+        if Path(updated.workspace_path).is_dir():
+            partial = _collect(Path(updated.workspace_path), spec.outputs)
+        step = _operational(
+            context,
+            updated,
+            (
+                f"campaign unit {index} did not run correctly ({status}, exit "
+                f"{result.get('exit_code')}). No part of a campaign is read when any "
+                f"unit failed; the next attempt runs every unit again."
+            ),
+            FailureClass.EXECUTOR_FAILED,
+            job_id=job_id,
+            keep=partial,
+        )
+        return (
+            UnitStep(
+                ok=False,
+                detail=step.detail,
+                experiment=step.experiment,
+                failure_class=FailureClass.EXECUTOR_FAILED,
+                ran=True,
+            ),
+            None,
+        )
+    stop = _store_unit_result(
+        context, updated, chain=chain, index=index, attempt=attempt, job_id=job_id
+    )
+    release_workspace(updated, repository=repository)
+    return (
+        UnitStep(
+            ok=True,
+            detail=f"campaign unit {index} ran",
+            experiment=updated,
+            ran=True,
+        ),
+        stop,
+    )
+
+
+def _store_unit_result(
+    context: Any,
+    experiment: IdeaExperiment,
+    *,
+    chain: sciencechain.VerifiedChain,
+    index: int,
+    attempt: int,
+    job_id: str,
+) -> str | None:
+    """Store a unit's result by content, as the runner hashed it. Why it stops, if it does.
+
+    Read from the workspace once, through the containment rule, and only if
+    its bytes are the bytes the receipt recorded at exit; a result
+    byte-identical to the copy committed in the checkout was not written by
+    this run. The bytes are stored and recorded whether or not they are
+    valid evidence -- the reading cites them either way -- and the validity
+    the declaration demands is checked now, so a campaign whose unit wrote
+    invalid evidence stops rather than running the rest.
+    """
+
+    from research_os.portfolio import provenance
+
+    receipt = context.portfolio.receipt_for_job(job_id)
+    if receipt is None:
+        return f"unit {index} has no trusted receipt"
+    try:
+        document = provenance.verified_receipt(context.artifacts, receipt)
+    except provenance.ProvenanceError as exc:
+        return f"unit {index}'s receipt does not verify: {exc}"
+    path = chain.unit_result_path(index) or ""
+    recorded = {str(item[0]): str(item[1]) for item in document.get("outputs") or ()}
+    workspace = Path(experiment.workspace_path)
+    if path not in recorded:
+        return f"unit {index} did not produce its declared result {path}"
+    data = read_contained(workspace, path, max_bytes=sciencechain.MAX_RESULT_BYTES + 1)
+    if data is None or hashlib.sha256(data).hexdigest() != recorded[path]:
+        return f"unit {index}'s {path} is not the bytes the runner hashed at exit"
+    if _was_already_in_the_checkout(workspace, path) is not None:
+        return (
+            f"unit {index}'s {path} is byte-identical to the copy committed in the "
+            f"checkout, so it was not written by this run"
+        )
+    stored = context.artifacts.put_bytes(
+        data,
+        media_type="application/json",
+        role=f"campaign_unit_result:{receipt.receipt_id}",
+        producer="portfolio.empirical.campaign",
+    )
+    context.artifacts.link(
+        stored,
+        role=f"campaign_unit_result:{receipt.receipt_id}",
+        run_id=context.run_id,
+    )
+    context.portfolio.record_unit_result(
+        receipt_id=receipt.receipt_id,
+        experiment_id=experiment.experiment_id,
+        unit_index=index,
+        unit_attempt=attempt,
+        result_sha256=recorded[path],
+        result_artifact_id=str(stored.artifact_id),
+    )
+    check = sciencechain.validate_result_bytes(
+        chain, path=path, data=data, recorded_sha=recorded[path]
+    )
+    return None if check.ok else f"unit {index}'s result: {check.detail}"
+
+
+def freeze_unit_manifest(
+    context: Any,
+    experiment: IdeaExperiment,
+    *,
+    index: int,
+    attempt: int,
+    spec: ExecutionSpec,
+    workspace: Path,
+    job_id: str,
+    chain: sciencechain.VerifiedChain,
+) -> tuple[str, dict[str, Any]]:
+    """Freeze what one replication unit is, before it runs (INV-06, INV-07).
+
+    :func:`freeze_replication_manifest`, for unit ``index`` of a campaign:
+    its parent is the primary campaign's execution of the same unit, as the
+    primary's reading names it, and what it was meant to vary is computed
+    from the two units' preregistrations. The experiment's manifest pointer
+    moves to each unit's manifest before that unit runs -- the database
+    allows it while the campaign has no result -- and ends on the last,
+    which the reading is anchored on; every unit's receipt names its own.
+    """
+
+    from research_os.portfolio import provenance
+
+    primary = context.portfolio.get_experiment(
+        idea_id=experiment.idea_id,
+        idea_version=experiment.idea_version,
+        role=ExperimentRole.PRIMARY,
+    )
+    anchor = (
+        context.portfolio.receipt_for_job(primary.job_id)
+        if primary is not None and primary.job_id
+        else None
+    )
+    reading = (
+        context.portfolio.outcome_for_receipt(anchor.receipt_id) if anchor else None
+    )
+    parents = {
+        item.unit_index: item.receipt_id
+        for item in context.portfolio.outcome_units(
+            reading.outcome_id if reading else None
+        )
+    }
+    parent_receipt = (
+        context.portfolio.get_receipt(parents[index]) if index in parents else None
+    )
+    if (
+        primary is None
+        or primary.state is not ExperimentState.INTERPRETED
+        or not primary.evidence_id
+        or parent_receipt is None
+    ):
+        raise EmpiricalError(
+            f"the primary campaign has no read execution of unit {index} with a "
+            f"trusted receipt, so this replication unit cannot be shown to be a "
+            f"separate execution of a different configuration",
+            failure_class=FailureClass.CAPABILITY_DENIED,
+        )
+    theirs = _unit_record(context, primary, index)
+    mine = _unit_record(context, experiment, index) or {}
+    parent_analysis = _document(context, primary.analysis_artifact_id)
+    declared = declared_commands(context.project_id).get(experiment.command)
+    identity = provenance.command_identity(declared) if declared is not None else {}
+    parent = {
+        "experiment_id": primary.experiment_id,
+        "receipt_id": parent_receipt.receipt_id,
+        "job_id": parent_receipt.job_id,
+        "evidence_id": primary.evidence_id,
+        "spec_digest": parent_receipt.spec_digest,
+        "variation_digest": primary.variation_digest,
+        "contract_id": primary.contract_id,
+        "preregistration_artifact_id": primary.preregistration_artifact_id,
+        "analysis_artifact_id": primary.analysis_artifact_id,
+        "base_commit": (parent_analysis or {}).get("base_commit"),
+        "unit_index": index,
+    }
+    manifest = {
+        "schema": provenance.MANIFEST_SCHEMA,
+        "experiment_id": experiment.experiment_id,
+        "idea_id": experiment.idea_id,
+        "idea_version": experiment.idea_version,
+        "parent": parent,
+        "code": {
+            "base_commit": _workspace_commit(workspace),
+            "command": experiment.command,
+            "argv": list(spec.argv),
+        },
+        "capability": _manifest_capability(experiment, identity, chain),
+        "inputs": [list(item) for item in spec.inputs],
+        "generated_inputs": [
+            {"parameter": item.get("parameter"), "path": item.get("path")}
+            for item in mine.get("generated_inputs") or ()
+        ],
+        "environment": dict(spec.environment),
+        "delivered": provenance.delivered_configuration(spec),
+        "execution": {
+            "spec_digest": spec_digest(spec),
+            "variation_digest": variation_digest(spec),
+            "campaign_spec_digest": experiment.spec_digest,
+            "contract_id": experiment.contract_id,
+            "job_id": job_id,
+            "seeds": list(spec.seeds),
+            "unit_index": index,
+            "unit_attempt": attempt,
+        },
+        "independence_variables": (
+            independence_variables(theirs, mine) if theirs is not None else {}
+        ),
+        "science": chain.digests(),
+    }
+    ref = context.artifacts.put_text(
+        json.dumps(manifest, indent=2, sort_keys=True, ensure_ascii=False),
+        media_type="application/json",
+        role=f"idea_replication_manifest:{experiment.experiment_id}:{index}",
+        producer="portfolio.empirical.replication_manifest@2",
+    )
+    context.portfolio.set_execution_manifest(
+        experiment.experiment_id, artifact_id=ref.artifact_id
+    )
+    return str(ref.artifact_id), parent
+
+
+def interpret_campaign(context: Any, experiment: IdeaExperiment) -> ExperimentStep:
+    """Validate every unit's result, combine them by the frozen rule, read once.
+
+    No model is asked. Every unit of the attempt must have run, have a
+    verified receipt of that unit of the plan, and have a stored result that
+    is the output its receipt recorded and satisfies the declared schema;
+    the results are combined by the capability's declared aggregation
+    (:func:`research_os.portfolio.campaign.combine`) -- refusing an
+    observation two units both produced -- and the frozen analysis is
+    applied once to the combined result. The outcome is recorded before the
+    reading, anchored on the campaign's last unit and naming every unit's
+    receipt and result, so the gate can re-verify all of it
+    (:func:`research_os.portfolio.sciencechain.campaign_reading_problems`).
+    Anything short of a full, valid campaign is ``INVALID_EVIDENCE``: a
+    partial campaign is never read as the primary analysis.
+    """
+
+    from research_os.portfolio import analysis as engine
+    from research_os.portfolio import campaign as campaigns
+    from research_os.portfolio import provenance
+
+    try:
+        specs = _preregistered_campaign(context, experiment)
+        verified = _verified_contract(context, experiment)
+        chain = _verified_chain(context, experiment)
+    except (EmpiricalError, sciencechain.ChainError) as exc:
+        return _operational(context, experiment, str(exc), exc.failure_class)
+    attempt = int(experiment.attempts)
+    receipts = sorted(
+        context.portfolio.unit_receipts(experiment.experiment_id, attempt=attempt),
+        key=lambda item: int(item.unit_index or 0),
+    )
+    anchor = context.portfolio.receipt_for_job(experiment.job_id or "")
+    if anchor is None or anchor.receipt_id not in {
+        item.receipt_id for item in receipts
+    }:
+        return _operational(
+            context,
+            experiment,
+            f"{experiment.experiment_id} names no unit execution of this attempt "
+            f"with a trusted receipt, so there is nothing to read",
+            FailureClass.ARTIFACT_MISSING,
+        )
+    failure: sciencechain.ResultCheck | None = None
+    documents: list[tuple[int, Mapping[str, Any]]] = []
+    named: list[tuple[int, str, str | None]] = []
+    units_record: list[dict[str, Any]] = []
+    for receipt in receipts:
+        index = int(receipt.unit_index or 0)
+        job = context.runtime.get_external_job(receipt.job_id)
+        try:
+            document = provenance.verified_receipt(context.artifacts, receipt)
+        except provenance.ProvenanceError as exc:
+            return _operational(
+                context,
+                experiment,
+                f"the receipt of campaign unit {index} does not verify: {exc}",
+                FailureClass.ARTIFACT_MISSING,
+            )
+        if job is None or job.status is not ExternalJobStatus.COMPLETED:
+            return _operational(
+                context,
+                experiment,
+                f"campaign unit {index} has no completed execution",
+                FailureClass.EXECUTOR_FAILED,
+            )
+        path = chain.unit_result_path(index) or ""
+        recorded = {
+            str(item[0]): str(item[1]) for item in document.get("outputs") or ()
+        }
+        stored = context.portfolio.unit_result(receipt.receipt_id)
+        units_record.append(
+            {
+                "index": index,
+                "job_id": receipt.job_id,
+                "receipt_id": receipt.receipt_id,
+                "spec_digest": receipt.spec_digest,
+                "result_path": path,
+                "result_sha256": stored.result_sha256 if stored else None,
+                "result_artifact_id": stored.result_artifact_id if stored else None,
+                "containment": _containment(job),
+                "argv": list(specs[index].argv),
+                "seeds": list(specs[index].seeds),
+            }
+        )
+        if stored is None or recorded.get(path) != stored.result_sha256:
+            named.append((index, receipt.receipt_id, None))
+            failure = failure or sciencechain.ResultCheck(
+                False,
+                "result_missing",
+                f"unit {index}'s declared result {path} was not produced as the "
+                f"runner hashed it",
+                path=path,
+            )
+            continue
+        data = bytes(context.artifacts.get_bytes(stored.result_artifact_id))
+        check = sciencechain.validate_result_bytes(
+            chain, path=path, data=data, recorded_sha=stored.result_sha256
+        )
+        named.append((index, receipt.receipt_id, stored.result_sha256))
+        if not check.ok:
+            failure = failure or replace(check, detail=f"unit {index}: {check.detail}")
+            continue
+        documents.append((index, json.loads(data.decode("utf-8"))))
+    if failure is None and len(receipts) != len(specs):
+        failure = sciencechain.ResultCheck(
+            False,
+            "campaign_incomplete",
+            f"{len(receipts)} of the campaign's {len(specs)} units ran; a campaign "
+            f"is read over every unit or not at all",
+        )
+    combined: campaigns.Combined | None = None
+    if failure is None:
+        combined = campaigns.combine(chain.aggregation, documents)
+        if not combined.ok:
+            failure = sciencechain.ResultCheck(False, combined.reason, combined.detail)
+    sources = verified.analysis.sources()
+    source = sources[0] if sources else (chain.result_path or "")
+    contract_result: Any = None
+    combined_ref: Any = None
+    if failure is not None:
+        analysis = Analysis(
+            conclusion=EmpiricalConclusion.INSUFFICIENT,
+            summary=f"INVALID_EVIDENCE: {failure.detail}",
+            notes=(f"result validation failed: {failure.reason}",),
+        )
+        result_check = failure
+    else:
+        assert combined is not None and combined.data is not None
+        combined_ref = context.artifacts.put_bytes(
+            combined.data,
+            media_type="application/json",
+            role=f"campaign_result:{experiment.experiment_id}",
+            producer="portfolio.campaign.combine",
+        )
+        context.artifacts.link(
+            combined_ref,
+            role=f"campaign_result:{experiment.experiment_id}",
+            run_id=context.run_id,
+        )
+        parsed = {
+            item: engine.parse_bytes(combined.data, name=item) for item in sources
+        }
+        contract_result = engine.evaluate(verified.analysis, parsed)
+        analysis = Analysis(
+            conclusion=contract_result.conclusion,
+            summary=contract_result.summary,
+            observed=contract_result.statistic,
+            outputs=((source, str(combined.sha256), len(combined.data)),),
+            notes=tuple(contract_result.notes),
+        )
+        result_check = sciencechain.ResultCheck(
+            True,
+            "valid",
+            f"every one of {len(receipts)} unit results satisfies its declaration, "
+            f"and they combine by the frozen rules",
+            path=source,
+            sha256=combined.sha256,
+        )
+    read_conclusion = analysis.conclusion
+    finding: provenance.ReplicationFinding | None = None
+    if (
+        experiment.role is ExperimentRole.REPLICATION
+        and analysis.conclusion in _READ_CONCLUSIONS
+    ):
+        finding = provenance.assess_replication(
+            context.portfolio, context.artifacts, experiment, anchor
+        )
+        established = finding.independent
+        if established:
+            analysis = replace(
+                analysis,
+                notes=(*analysis.notes, f"independent replication: {finding.basis}"),
+            )
+        else:
+            analysis = replace(
+                analysis,
+                conclusion=EmpiricalConclusion.INSUFFICIENT,
+                summary=(
+                    f"the replication does not count as an independent "
+                    f"replication: {finding.basis}. (Read as {read_conclusion}: "
+                    f"{analysis.summary})"
+                ),
+                notes=(
+                    *analysis.notes,
+                    f"not an independent replication: {finding.basis}",
+                ),
+            )
+    state, reason = sciencechain.reading_outcome(read_conclusion, result_check)
+    outcome = sciencechain.record_outcome(
+        context,
+        state=state,
+        reason=reason,
+        role=experiment.role,
+        idea_id=experiment.idea_id,
+        idea_version=experiment.idea_version,
+        contract_id=experiment.contract_id,
+        experiment=experiment,
+        chain=chain,
+        receipt=anchor,
+        result=result_check,
+        estimate=sciencechain.estimate_of(
+            contract_result.record() if contract_result is not None else None
+        ),
+        detail={
+            "conclusion_of_the_rule": str(read_conclusion),
+            "summary": analysis.summary[:2000],
+            "independence": finding.record() if finding is not None else None,
+        },
+        units=named,
+    )
+    anchor_job = context.runtime.get_external_job(anchor.job_id)
+    document = analysis.record(
+        experiment=experiment,
+        spec=specs[int(anchor.unit_index or 0)],
+        job_id=anchor.job_id,
+        exit_code=anchor_job.exit_code if anchor_job is not None else None,
+        contained=_containment(anchor_job) if anchor_job is not None else "unrecorded",
+    )
+    document["schema"] = "portfolio-empirical-analysis-v2"
+    document["contract"] = {
+        "contract_id": verified.contract.contract_id,
+        "contract_digest": verified.contract.contract_digest,
+        "kind": str(verified.contract.kind),
+        "hypothesis_digest": verified.contract.hypothesis_digest,
+        "analysis_digest": verified.contract.analysis_digest,
+        "design_digest": verified.contract.design_digest,
+    }
+    document["analysis_result"] = (
+        contract_result.record() if contract_result is not None else None
+    )
+    document["campaign"] = {
+        "units": units_record,
+        "unit_count": len(specs),
+        "attempt": attempt,
+        "combined_sha256": combined.sha256 if combined is not None else None,
+        "combined_artifact_id": (
+            str(combined_ref.artifact_id) if combined_ref is not None else None
+        ),
+        "aggregation": [dict(item) for item in chain.aggregation],
+    }
+    document["science"] = {
+        **chain.digests(),
+        "code_commit": chain.code_commit,
+        "result": result_check.record(),
+        "outcome_id": outcome.outcome_id,
+        "outcome": str(outcome.state),
+        "outcome_reason": outcome.reason,
+    }
+    document["execution_receipt"] = {
+        "receipt_id": anchor.receipt_id,
+        "artifact_id": anchor.receipt_artifact_id,
+        "written_by": "the Research OS runner",
+        "unit_receipts": [item.receipt_id for item in receipts],
+    }
+    assessment: dict[str, Any] | None = None
+    if experiment.role is ExperimentRole.REPLICATION:
+        agreement = assess_agreement(
+            context, experiment, conclusion=read_conclusion, document=document
+        )
+        document["replication"] = {
+            "execution_manifest_artifact_id": experiment.execution_manifest_artifact_id,
+            "receipt_id": anchor.receipt_id,
+            "parent_receipt_id": anchor.parent_receipt_id,
+            "independence": (
+                finding.record()
+                if finding is not None
+                else {
+                    "configuration_independent": False,
+                    "perturbation_validity": "UNATTESTED",
+                    "counts_as_independent_replication": False,
+                    "basis": "the reading concluded nothing, so independence was "
+                    "not assessed",
+                }
+            ),
+            "agreement": agreement,
+        }
+        link = dict(finding.chain) if finding is not None else {}
+        assessment = {
+            "receipt_id": link.get("receipt_id", anchor.receipt_id),
+            "parent_receipt_id": link.get(
+                "parent_receipt_id", anchor.parent_receipt_id
+            ),
+            "parent_experiment_id": link.get("parent_experiment_id"),
+            "parent_evidence_id": link.get("parent_evidence_id"),
+            "parent_analysis_artifact_id": link.get("parent_analysis_artifact_id"),
+            "manifest_artifact_id": link.get(
+                "manifest_artifact_id", anchor.manifest_artifact_id
+            ),
+            "manifest_digest": link.get("manifest_digest", anchor.manifest_digest),
+            "configuration_independent": bool(
+                finding and finding.configuration_independent
+            ),
+            "perturbation_attested": bool(finding and finding.perturbation_attested),
+            "varied": finding.varied if finding else (),
+            "attested": finding.attested if finding else (),
+            "unattested": finding.unattested if finding else (),
+            "agrees": agreement.get("agrees"),
+            "identical_values": agreement.get("identical_scientific_values"),
+            "basis": (
+                finding.basis
+                if finding is not None
+                else "the reading concluded nothing, so independence was not assessed"
+            ),
+        }
+    logs: list[dict[str, str]] = []
+    for receipt in receipts:
+        job = context.runtime.get_external_job(receipt.job_id)
+        if job is not None:
+            logs.extend(_store_logs(context, experiment, run_dir=Path(job.run_dir)))
+    document["stored_logs"] = logs
+    document["resource_usage"] = {
+        "wall_clock_seconds": [
+            (
+                "unknown"
+                if (job := context.runtime.get_external_job(item.job_id)) is None
+                or job.wall_clock_seconds is None
+                else str(job.wall_clock_seconds)
+            )
+            for item in receipts
+        ],
+        "cpu_seconds": "unknown",
+        "max_rss_kb": "unknown",
+        "observed_by": "LocalExecutor (wall clock only), per unit",
+    }
+    document["base_commit"] = chain.code_commit
+    ref = context.artifacts.put_text(
+        json.dumps(
+            document, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False
+        ),
+        media_type="application/json",
+        role=f"idea_experiment_analysis:{experiment.experiment_id}",
+        producer="portfolio.empirical.campaign@1",
+    )
+    context.artifacts.link(
+        ref,
+        role=f"idea_experiment_analysis:{experiment.experiment_id}",
+        run_id=context.run_id,
+    )
+    updated, evidence_id = context.portfolio.record_reading(
+        experiment.experiment_id,
+        evidence={
+            "idea_id": experiment.idea_id,
+            "idea_version": experiment.idea_version,
+            "kind": _evidence_kind(context, experiment),
+            "strength": EVIDENCE_STRENGTH_FOR_CONCLUSION[analysis.conclusion],
+            "summary": _evidence_summary(
+                experiment,
+                analysis,
+                composed=tuple(item for spec in specs for item in spec.inputs),
+                contract=verified,
+                result=contract_result,
+                attempts=experiment.attempts,
+                prior=_prior_readings(context, experiment, verified),
+            )
+            + f" [a campaign of {len(specs)} executions, combined by their frozen rules]",
+            "artifact_id": ref.artifact_id,
+            "job_id": anchor.job_id,
+            "source_call_id": experiment.origin_call_id,
+        },
+        analysis_artifact_id=ref.artifact_id,
+        conclusion=analysis.conclusion,
+        detail=analysis.summary[:2000],
+        assessment=assessment,
+    )
+    release_workspace(updated, repository=Path(context.repo_path))
+    return ExperimentStep(
+        ok=True,
+        detail=f"{analysis.conclusion}: {analysis.summary}",
+        experiment=updated,
+        conclusion=analysis.conclusion,
+        evidence_id=evidence_id,
+    )
+
+
+def _advance_campaign(
+    context: Any,
+    existing: IdeaExperiment,
+    *,
+    design_cost: str,
+    design_calls: int,
+) -> ExperimentStep:
+    """:func:`advance`'s run-then-read, for a campaign."""
+
+    if existing.state in {
+        ExperimentState.PROPOSED,
+        ExperimentState.EXECUTABLE,
+        ExperimentState.OPERATIONALLY_FAILED,
+        ExperimentState.RUNNING,
+    }:
+        step = run_campaign(context, existing)
+        if not step.ok or step.experiment is None:
+            return ExperimentStep(
+                ok=False,
+                detail=step.detail,
+                experiment=step.experiment,
+                failure_class=step.failure_class,
+                cost_usd=design_cost,
+                model_calls=design_calls,
+                conclusion=step.conclusion,
+            )
+        existing = step.experiment
+    if existing.state is not ExperimentState.COMPLETED:
+        return ExperimentStep(
+            ok=False,
+            detail=(
+                f"{existing.experiment_id} is {existing.state}; the campaign is not "
+                f"finished and there is nothing to read yet"
+            ),
+            failure_class=FailureClass.SCHEDULER_UNAVAILABLE,
+            experiment=existing,
+            cost_usd=design_cost,
+            model_calls=design_calls,
+        )
+    step = interpret_campaign(context, existing)
+    return ExperimentStep(
+        ok=step.ok,
+        detail=step.detail,
+        experiment=step.experiment,
+        failure_class=step.failure_class,
+        cost_usd=design_cost,
+        model_calls=design_calls,
+        conclusion=step.conclusion,
+        evidence_id=step.evidence_id,
+    )
+
+
 def advance(
     context: Any,
     version: IdeaVersion,
@@ -5379,6 +7365,11 @@ def advance(
             detail="this experiment measures a version that has been revised",
             failure_class=FailureClass.POLICY_REFUSED,
             experiment=existing,
+        )
+
+    if is_campaign_experiment(context, existing):
+        return _advance_campaign(
+            context, existing, design_cost=design_cost, design_calls=design_calls
         )
 
     if existing.state is ExperimentState.OPERATIONALLY_FAILED and existing.contract_id:

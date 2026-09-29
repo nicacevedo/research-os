@@ -48,6 +48,30 @@ class IdeaStatus(StrEnum):
     SUPERSEDED = "SUPERSEDED"
 
 
+class Feasibility(StrEnum):
+    """Whether the declared capabilities could answer an idea's empirical question.
+
+    **Planning metadata, never evidence.** Derived by ordinary code
+    (:mod:`research_os.portfolio.feasibility`) from the science repository's
+    committed capability catalogue and the idea's structured requirements --
+    the fields its measurement needs, whether it needs records that already
+    exist, how many independent draws -- or, once one is frozen, from the
+    mechanical resolution of its frozen analysis. It never names an
+    observable, never changes a hypothesis, and never rejects anything: it
+    orders scarce advancement work between otherwise equal ideas.
+    """
+
+    #: One execution of a declared capability produces everything it needs.
+    CURRENTLY_EXECUTABLE = "CURRENTLY_EXECUTABLE"
+    #: A declared capability produces what it reads, and it needs more
+    #: independent draws than one execution holds: a campaign of several.
+    LIKELY_EXECUTABLE_WITH_CAMPAIGN = "LIKELY_EXECUTABLE_WITH_CAMPAIGN"
+    #: No declared capability produces something it needs.
+    CAPABILITY_LIMITED = "CAPABILITY_LIMITED"
+    #: Not yet known: no structured requirement, or not empirical.
+    UNKNOWN = "UNKNOWN"
+
+
 #: Statuses from which no further work is allocated without a deliberate act.
 #: ``HUMAN_READY`` is here, and that is the release-critical part: its track has
 #: ended, so it occupies no capacity and blocks nothing.
@@ -887,6 +911,40 @@ class ExecutionReceipt(_Record):
     #: The frozen execution plan this execution realised (`sql/0047`), or
     #: ``None`` for an execution no plan governs.
     plan_digest: str | None = None
+    #: For one execution unit of a campaign (`sql/0048`): which unit, and of
+    #: which attempt. ``None`` for any other execution.
+    unit_index: int | None = None
+    unit_attempt: int | None = None
+
+
+class CampaignPlanUnit(_Record):
+    """One execution unit a campaign plan froze (`sql/0048`)."""
+
+    plan_digest: str
+    unit_index: int
+    spec_digest: str
+    variation_digest: str
+
+
+class CampaignUnitResult(_Record):
+    """One campaign unit's result, validated and stored by content (`sql/0048`)."""
+
+    receipt_id: str
+    experiment_id: str
+    unit_index: int
+    unit_attempt: int
+    result_sha256: str
+    result_artifact_id: str
+    created_at: datetime
+
+
+class OutcomeUnit(_Record):
+    """One unit execution a campaign outcome was computed from (`sql/0048`)."""
+
+    outcome_id: str
+    unit_index: int
+    receipt_id: str
+    result_sha256: str | None = None
 
 
 class ReplicationAssessment(_Record):
@@ -997,6 +1055,8 @@ class ScienceOutcome(_Record):
     estimate: float | None = None
     record_artifact_id: str
     created_at: datetime
+    #: A campaign's outcome: how many units it was computed from.
+    unit_count: int | None = None
 
 
 class ScienceChain(_Record):

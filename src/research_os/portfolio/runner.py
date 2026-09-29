@@ -33,6 +33,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Protocol
 
+from research_os.capability import catalogue_lines as capabilities_lines
 from research_os.portfolio import dedup as pdedup
 from research_os.portfolio import gates, packets, stages
 from research_os.portfolio.config import PortfolioConfig
@@ -830,6 +831,7 @@ def run_discover(context: TrackContext, snapshot: stages.TrackSnapshot) -> Stage
     blocks = {
         "candidate": packet.idea_block() + _objection_lines(packet),
         "established_facts": list(context.established_facts),
+        "declared_capabilities": _capability_catalogue(context),
     }
     try:
         response = _ask(
@@ -897,6 +899,16 @@ def run_discover(context: TrackContext, snapshot: stages.TrackSnapshot) -> Stage
         dimensions=snapshot.version.dimensions.merged(result.refined.dimensions),
         addressed_objections=claimed,
     )
+    if result.evidence_needs is not None:
+        # Planning metadata for the allocator, matched against the committed
+        # declarations by `research_os.portfolio.feasibility`; not part of the
+        # version's content and not evidence of anything.
+        context.portfolio.record_evidence_needs(
+            idea_id=context.idea_id,
+            idea_version=version.version,
+            needs=result.evidence_needs.model_dump(mode="json"),
+            origin_call_id=response.call_id,
+        )
     return StageOutcome.succeeded(
         f"sharpened into version {version.version}",
         disposition=Disposition.REVISE,
@@ -904,6 +916,17 @@ def run_discover(context: TrackContext, snapshot: stages.TrackSnapshot) -> Stage
         model_calls=1,
         data={"version": version.version},
     )
+
+
+def _capability_catalogue(context: TrackContext) -> list[str]:
+    """The committed capability catalogue, as the sharpening stage is shown it."""
+
+    from research_os.portfolio import empirical
+
+    loaded, error = empirical.capability_manifest(context)
+    if error is not None:
+        return [f"the capability manifest is invalid: {error[:500]}"]
+    return capabilities_lines(loaded, empirical.declared_commands(context.project_id))
 
 
 def run_adjudicate(

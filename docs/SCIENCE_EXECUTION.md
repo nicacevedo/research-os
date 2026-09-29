@@ -14,8 +14,10 @@ independent idea -> dedup -> falsification -> literature -> curation
   -> EXPERIMENTAL DESIGN (frozen)          how it is tested
   -> CAPABILITY RESOLUTION                 EXECUTABLE + exact binding | CAPABILITY_LIMITED + exact unmet
   -> EXECUTION PLAN (frozen)               how the design maps onto a declared capability
-  -> trusted execution (receipt names the plan)
-  -> result validated against the capability's declared schema
+       or EXECUTION CAMPAIGN (frozen)     several units of that capability (§3a)
+  -> trusted execution (receipt names the plan)      -- one receipt per unit
+  -> result validated against the capability's declared schema  -- per unit
+  -> (campaign) deterministic aggregation by the capability's declared rule
   -> system-computed PRIMARY OUTCOME
   -> replication: frozen plan + manifest, separate trusted execution, receipt
   -> replication assessment: VERIFIED + ATTESTED, and MEASURED agreement
@@ -24,9 +26,10 @@ independent idea -> dedup -> falsification -> literature -> curation
 
 Code: `research_os/capability.py` (generic, kernel-level),
 `research_os/portfolio/sciencechain.py` (objects, verification, outcomes,
-gate records), `research_os/portfolio/empirical.py` (the route),
+gate records), `research_os/portfolio/campaign.py` (campaign compilation and
+aggregation), `research_os/portfolio/empirical.py` (the route),
 `research_os/portfolio/gates.py` (the gate), `sql/0047_science_chain.sql`
-(the database's own refusals), `research_os/portfolio/qualification.py` and
+and `sql/0048_science_campaigns.sql` (the database's own refusals), `research_os/portfolio/qualification.py` and
 `qualification_v1.yaml` (the v1 qualification contract).
 
 ---
@@ -77,7 +80,20 @@ capabilities:
         - {kind: implementation, description}
       comparison: same_outcome
     resources: {timeout_seconds, cpus, memory_mb}
+    campaign:                  # optional: several executions may form one measurement (§3a)
+      max_units: 6
+      unit_varies: [seeds, plan]              # attested perturbations units may differ in
+      aggregation:
+        - {observable: solves, rule: concatenate, identity: [instance_label, ...]}
+        - {observable: cells, rule: sum}      # numeric scalars: sum | min | max
 ```
+
+A `campaign` block is checked when read: `unit_varies` is a subset of the
+declaration's own attested perturbations and never `implementation` (every
+unit runs one command); every aggregation names a declared observable once;
+records concatenate and their `identity` names declared fields; scalars are
+numbers. Absent, a capability runs one execution per measurement, and the
+block is omitted from the capability digest so no earlier digest moves.
 
 Checked when read (`parse_manifest`): strict UTF-8, no duplicate keys, closed
 objects, unique ids and commands (a command backs at most one capability),
@@ -212,6 +228,120 @@ The receipt already binds the action, run and work identity, the command
 digest, code commit, delivered configuration, inputs and every output digest
 at exit. Nothing a program writes is read into it.
 
+## 3a. Multi-execution campaigns
+
+A design whose valid sample -- independent seeds, more instances or
+conditions than one bounded execution holds -- needs several executions of
+the one capability it binds is a **campaign**. The first final
+qualification (538c54f) was refused on exactly such a design: one execution
+of `cg.cells@1` could have held the sample only by repeating identical
+solves. The abstraction is the minimum, and not a workflow engine:
+
+```text
+scientific contract      stopping_rule: fixed_campaign
+  -> experimental design  its units: each overrides parameters and/or seeds
+  -> frozen campaign      a PLAN (schema research-os-execution-campaign-v1)
+       -> unit 0 .. n-1   each the trusted runner's execution, its own receipt
+       -> unit results    each validated against the declared schema
+  -> aggregation          the capability's declared rule, by code
+  -> primary outcome      bound to the campaign and every unit's receipt
+```
+
+**Frozen.** The campaign plan binds everything a plan binds once -- contract
+and design digests, capability, declaration and digest, code commit, command,
+immutable input artifacts -- and, per unit, its argv, parameters, composed
+inputs, expected outputs, result artifact, configuration (env, environment,
+seeds, cwd), implementation bounds and its own specification and variation
+digests, plus the attested tokens it differs from unit 0 in. Then the
+aggregation rule for every observable the analysis reads, the missing-unit
+rule (`refuse`), the stopping rule and the bounded resources (units, the sum
+of the units' time ceilings, work items). Its digest is its content; the
+campaign's specification digest is a function of its units'
+(`campaign.campaign_spec_digest`); the units are frozen twice more, row by
+row in `science_campaign_units` and in the design (`sql/0048`). Changing one
+unit is a new plan, and evidence bound to the old one does not transfer.
+
+**Compiled before anything runs** (`campaign.compile_campaign`), in order:
+the contract's stopping rule is `fixed_campaign`; the capability declares
+campaign support and allows this many units; every pair of units differs,
+and in something the capability *attests* its computation uses -- units that
+are the same execution are refused, and units that differ only in something
+unattested (a seed a deterministic program ignores) are `CAPABILITY_LIMITED`:
+the capability cannot provide the independent observations the design asks
+for; every observable the analysis reads has a declared rule to combine it;
+and the campaign fits the human-set bounds `bounds.max_campaign_units` and
+`bounds.max_campaign_seconds` (else `BUDGET_LIMITED`). A refusal that a
+different design could avoid is a retry; nothing ran.
+
+**Run once, all of it.** Before unit 0 starts, one work item per unit left is
+reserved against every applicable ledger, so a campaign the execution
+authority cannot cover never starts. Each unit is then an ordinary plan-bound
+execution (`empirical._run_unit`): its own idempotency key, a fresh checkout
+of the plan's commit, its inputs re-hashed, its own job, its own receipt
+naming the plan, the unit and the attempt (`sql/0048` checks the unit's
+specification is the one the campaign froze for it), the canonical
+fingerprint checked around it. Its result is stored by content as the runner
+hashed it (`campaign_unit_results`) before the workspace goes. A unit that
+fails ends the attempt as an operational failure and nothing is read -- the
+next attempt runs every unit again; a unit whose result is not valid
+evidence stops the campaign early.
+
+**Read once.** `empirical.interpret_campaign` re-validates every unit's
+stored result against the declared schema, combines them by the frozen rule
+(`campaign.combine`: records concatenated in unit order, scalars summed or
+their minimum or maximum), refuses an observation whose declared identity two
+units both produced, and applies the frozen analysis once to the combined
+result. The outcome is recorded before the reading, anchored on the
+campaign's last unit, with every unit's receipt and result sha in
+`science_outcome_units`; at commit the database refuses a reading that does
+not name every unit of its plan, all of one attempt. Anything short of a
+full, valid campaign is `INVALID_EVIDENCE`: a partial campaign is never read
+as the primary analysis -- the contract's `on_missing` has one value,
+`INSUFFICIENT`, and no rule allows a subset.
+
+**Replicated unit by unit.** A replication of a campaign is a campaign of as
+many units; unit *i* replicates the primary's unit *i*. Each replication unit
+runs under its own manifest, frozen immediately before it, whose parent is
+the primary's execution of the same unit as the primary's reading names it
+(and the database checks the parent's unit index). No replication unit may
+be *any* primary unit run again (`campaign.pair_with_primary`, and
+`empirical._design_campaign` with resources removed): the primary's seeds
+shifted by one position differ pair by pair and re-measure the primary's own
+observations. Configuration independence and attestation are established per
+pair (`provenance.assess_replication`), and the campaign counts as
+independent only if every pair does; agreement is the frozen `same_outcome`
+rule over the two campaign outcomes.
+
+**Recovered, never guessed.** A unit's idempotency key names its attempt,
+and the reconciler recovers only a job this attempt's invocation could have
+created -- submitted after it began, and not bound by a receipt to another
+attempt or unit: the unit's specification digest is the same in every
+attempt. A job recovered without this unit's receipt is not read; the
+attempt ends as an operational failure. A unit whose receipt was written and
+whose result was not stored before the process stopped is stored on resume
+if it was the last to run (its bytes are still where the runner hashed
+them), and otherwise the attempt did not complete. None of these becomes a
+reading.
+
+**A campaign contract is a campaign.** Under `fixed_campaign` a
+single-execution design is refused (a retry): the frozen rule said the
+sample needs several executions. The designer is shown, per campaign
+capability, how many units the human-set bounds permit on this host
+(`empirical.campaign_bound_lines`: the capability's limit, `max_campaign_units`,
+and how many unit time ceilings fit `max_campaign_seconds`), so it is not
+paid to propose one the compiler must refuse.
+
+**Re-verified at readiness.** For a campaign, the gate's chain
+(`sciencechain.campaign_reading_problems`) re-verifies every unit receipt,
+checks each stored result re-hashes and is the output its receipt recorded,
+re-validates it, and rebuilds the combined result from those bytes, which
+must hash to what the outcome names. The v1 qualification gates read campaign
+evidence with unchanged meaning: every unit is a completed plan-bound
+execution with a verifying receipt (Q12, Q13, Q16, Q17), the outcome's
+result is the combined result that passed validation (Q14), and the chain
+the gates read is the one above (Q15, Q18, Q25, Q26). The specification file
+and its digest are unchanged.
+
 ## 4. Result validation, then the deterministic outcome
 
 Before any reading, `sciencechain.validate_result` requires that the result
@@ -322,6 +452,28 @@ a changed spec. `researchctl portfolio qualification PROJECT --evidence DIR`
 evaluates it read-only (`--snapshot-zero-state` before the run,
 `--isolation-report` after).
 
+## 7a. Feasibility: planning metadata, not evidence
+
+`portfolio/feasibility.py` gives each idea version one of
+`CURRENTLY_EXECUTABLE`, `LIKELY_EXECUTABLE_WITH_CAMPAIGN`, `CAPABILITY_LIMITED`
+or `UNKNOWN`, by ordinary code over the committed manifest and the idea's
+structured requirement (`contracts.EvidenceNeeds`: new execution or existing
+records, the catalogue fields a settling measurement must report, how many
+independent draws), which the sharpening stage states against the catalogue
+it is shown and which is stored beside the idea (`idea_evidence_needs`), not
+in it -- or, once one exists, from its own contract's capability-limited
+state under the current declared commands and manifest (a contract blocked
+before they changed is a question worth asking again, not an answer). Every
+capability that reports every field is considered: many independent draws
+are `LIKELY_EXECUTABLE_WITH_CAMPAIGN` if any of them declares campaigns. A
+model's words cannot make a field exist; nothing here changes a
+hypothesis, freezes anything or rejects anything. The allocator subtracts a
+configurable penalty from *advancement* work on a capability-limited idea
+(`weights.capability_limited_penalty`), so scarce completion resources go
+first to an equally strong direction this laboratory can test, and the
+limited idea stays in the bank and is still advanced when nothing executable
+of comparable value waits.
+
 ## 8. Invariants of this layer
 
 Machine-readable in `docs/science_invariants.yaml`; held by
@@ -343,6 +495,15 @@ still applies).
   chain, one reading per execution.
 - **SCI-05 the gates read the chain** -- empirical VALIDATED and HUMAN_READY
   require admissible science chains.
+
+The campaign guarantees of §3a and the allocation and feasibility policy of
+`docs/AUTONOMOUS_DISCOVERY_ARCHITECTURE.md` are held by
+`tests/test_science_campaigns.py`, `tests/test_campaign_stage_machine_e2e.py`,
+`tests/test_portfolio_allocation_lanes.py` and
+`tests/test_portfolio_feasibility.py`, and each enforcement point by a mutant
+in `tests/campaign_allocation_mutations.py` -- a fourth harness beside the
+integrity, science and qualification ones, checked to still apply by
+`test_every_campaign_and_allocation_mutant_still_applies`.
 
 ## 9. What this does not claim
 

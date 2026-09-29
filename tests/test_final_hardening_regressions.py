@@ -1449,9 +1449,14 @@ def _live_shaped_pool(
 def _plain_plan(
     candidates: list[allocation.Candidate], **kwargs: Any
 ) -> tuple[allocation.Allocation, ...]:
+    # The single depth slot these tests hold is the plan at an advancement
+    # reserve fraction of zero, which is how a person keeps the earlier
+    # release's allocation. The lane reserve that became the default after
+    # the first final qualification is tested in
+    # tests/test_portfolio_allocation_lanes.py.
     return allocation.plan(
         candidates=candidates,
-        config=load_config(),
+        config=load_config().with_overrides({"advancement_reserve_fraction": 0}),
         free_slots=8,
         lineage_in_flight={},
         candidate_pool=100,

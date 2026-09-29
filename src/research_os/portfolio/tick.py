@@ -24,7 +24,7 @@ function to reach.
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -34,6 +34,7 @@ from research_os.portfolio import allocation, frontier
 from research_os.portfolio.config import PortfolioConfig
 from research_os.portfolio.models import (
     BUDGET_PARK_REASONS,
+    Feasibility,
     FrontierRequest,
     IdeaOrigin,
     IdeaStatus,
@@ -90,6 +91,15 @@ class TickReport:
     uncurated: int = 0
     curation_enqueued: bool = False
     digest_enqueued: bool = False
+    #: The advancement reserve as this pass saw it (`allocation.plan`): the
+    #: human-set fraction, whether advancement work was eligible, and the
+    #: authority held for it (``None``: no finite ceiling applies).
+    advancement_fraction: str = "0"
+    advancement_eligible: bool = False
+    advancement_protected_usd: str | None = None
+    #: How many candidates carry each feasibility signal
+    #: (`research_os.portfolio.feasibility`): planning metadata, not science.
+    feasibility: dict[str, int] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
 
     def payload(self) -> dict[str, Any]:
@@ -110,6 +120,12 @@ class TickReport:
             "uncurated": self.uncurated,
             "curation_enqueued": self.curation_enqueued,
             "digest_enqueued": self.digest_enqueued,
+            "advancement": {
+                "fraction": self.advancement_fraction,
+                "eligible": self.advancement_eligible,
+                "protected_usd": self.advancement_protected_usd,
+            },
+            "feasibility": dict(sorted(self.feasibility.items())),
             "allocations": [
                 {
                     "kind": item.kind,
@@ -118,6 +134,7 @@ class TickReport:
                     "explorer": item.explorer,
                     "utility": str(item.utility),
                     "charged_usd": str(item.charged),
+                    "lane": str(item.lane),
                     "reason": item.reason,
                 }
                 for item in self.allocations
@@ -241,6 +258,7 @@ def tick(
         )
     queued = store.queued_work(project_id=project_id, kinds=allocation.MODEL_KINDS)
     authority = _sale_authority(ledgers, queued, config)
+    advancement = _advancement_position(store, project_id, config, ledgers)
 
     in_flight = store.explorations_in_flight(project_id=project_id)
 
@@ -259,8 +277,17 @@ def tick(
     )
 
     candidates, report.settled = _candidates(
-        store, project_id, config, moment, queued=queued
+        store,
+        project_id,
+        config,
+        moment,
+        queued=queued,
+        feasible=_feasibility_reader(store, runtime, project_id),
     )
+    for item in candidates:
+        report.feasibility[str(item.feasibility)] = (
+            report.feasibility.get(str(item.feasibility), 0) + 1
+        )
     # The pause is for a portfolio with nothing left to do, and it was taken
     # before the candidates were even read: six barren explorer runs froze
     # every idea that still had a stage to run, and told the researcher the
@@ -336,8 +363,21 @@ def tick(
             project_id=project_id, kind=allocation.SYNTHESIZE
         ),
         authority=authority,
+        advancement=advancement,
     )
     report.allocations = allocations
+    report.advancement_fraction = str(config.bounds.advancement_reserve_fraction)
+    report.advancement_eligible = allocation.advancement_eligible(
+        candidates=candidates,
+        config=config,
+        authority=authority,
+        advancement=advancement,
+    )
+    report.advancement_protected_usd = (
+        str(advancement.protected_usd)
+        if report.advancement_eligible and advancement.protected_usd is not None
+        else None
+    )
 
     # There was a second branch here -- `PAUSED_NO_FRONTIER` when nothing was
     # allocatable and the pool was empty -- and it could not fire. An empty
@@ -408,6 +448,9 @@ def tick(
                 "explorer": item.explorer,
                 "reason": item.reason,
                 "utility": str(item.utility),
+                # Recorded so what each lane has committed can be read back:
+                # an idea's status moves, and the lane is what it was bought as.
+                "lane": str(item.lane),
                 **(
                     {"request_id": item.payload.get("request_id")}
                     if item.kind
@@ -735,6 +778,120 @@ def _sale_authority(
     )
 
 
+def _recorded_lane(kind: str, stage: str, recorded: str) -> allocation.Lane:
+    """The lane a queue item was bought in, or the one its kind and stage imply."""
+
+    try:
+        return allocation.Lane(recorded)
+    except ValueError:
+        return allocation.lane_of(kind, stage or None)
+
+
+def _advancement_position(
+    store: PortfolioStore,
+    project_id: str,
+    config: PortfolioConfig,
+    ledgers: Mapping[tuple[BudgetScope, Dimension], Any],
+) -> allocation.AdvancementPosition:
+    """What the advancement lane holds and has committed, for the reserve.
+
+    The protected share is the human-set fraction of the binding monetary
+    ceiling -- the smaller of the project's and the system's -- less what
+    advancement work has committed: the recorded cost of its calls, what
+    its calls in flight hold, and one call ceiling per advancement item
+    bought and not started. Nothing here writes a bound or a budget.
+    """
+
+    fraction = Decimal(str(config.bounds.advancement_reserve_fraction))
+    work = store.lane_work(project_id=project_id, kinds=allocation.MODEL_KINDS)
+    advancing = [
+        (kind, stage, status)
+        for kind, stage, recorded, status in work
+        if _recorded_lane(kind, stage, recorded) is allocation.Lane.ADVANCEMENT
+    ]
+    in_flight = len(advancing)
+    # The ceiling that binds: a sale needs the project's authority and the
+    # system's, so the share is of the smaller.
+    limits = [
+        Decimal(record.limit_value)
+        for scope in (BudgetScope.PROJECT, BudgetScope.SYSTEM)
+        if (record := ledgers.get((scope, Dimension.MODEL_COST_USD))) is not None
+    ]
+    if fraction <= 0 or not limits:
+        return allocation.AdvancementPosition(protected_usd=None, in_flight=in_flight)
+    committed = sum(
+        (
+            settled + held
+            for kind, stage, recorded, settled, held in store.lane_spend(
+                project_id=project_id, kinds=allocation.MODEL_KINDS
+            )
+            if _recorded_lane(kind, stage, recorded) is allocation.Lane.ADVANCEMENT
+        ),
+        Decimal(0),
+    )
+    queued = sum(
+        (
+            allocation.call_ceiling(kind, stage or None, config)
+            for kind, stage, status in advancing
+            if status in {"PENDING", "WAITING"}
+        ),
+        Decimal(0),
+    )
+    protected = max(Decimal(0), fraction * min(limits) - committed - queued)
+    return allocation.AdvancementPosition(protected_usd=protected, in_flight=in_flight)
+
+
+def _feasibility_reader(
+    store: PortfolioStore, runtime: RuntimeStore, project_id: str
+) -> Callable[[PortfolioIdea, Any], Feasibility]:
+    """One pass's reader of each idea version's feasibility signal.
+
+    The committed capability manifest at the project repository's HEAD and
+    the host's declared commands are read once per pass; an idea version's
+    signal is then ordinary code over those and what the version says it
+    needs (`research_os.portfolio.feasibility`). A manifest that cannot be
+    read makes every signal UNKNOWN: planning metadata never blocks anything.
+    """
+
+    from pathlib import Path
+
+    from research_os.capability import load_committed
+    from research_os.errors import ResearchOSError
+    from research_os.portfolio import feasibility
+    from research_os.portfolio.scicontract import (
+        capability_set_digest,
+        declared_command_set,
+    )
+
+    loaded = None
+    project = runtime.get_project(project_id)
+    if project is not None and project.repo_path:
+        try:
+            loaded = load_committed(Path(project.repo_path))
+        except (ResearchOSError, OSError):
+            loaded = None
+    commands = declared_command_set(project_id)
+    needs = store.evidence_needs(project_id=project_id)
+    blocked = store.capability_blocked_versions(
+        project_id=project_id,
+        command_set_digest=capability_set_digest(
+            commands, manifest=loaded.sha256 if loaded is not None else None
+        ),
+    )
+
+    def read(idea: PortfolioIdea, version: Any) -> Feasibility:
+        key = (idea.idea_id, int(version.version))
+        return feasibility.assess(
+            needs.get(key),
+            loaded=loaded,
+            commands=commands,
+            adjudication=tuple(version.adjudication_types),
+            blocked_on_capability=key in blocked,
+        ).signal
+
+    return read
+
+
 def _candidates(
     store: PortfolioStore,
     project_id: str,
@@ -742,6 +899,7 @@ def _candidates(
     moment: datetime,
     *,
     queued: Sequence[tuple[str, str, str]] = (),
+    feasible: Callable[[PortfolioIdea, Any], Feasibility] | None = None,
 ) -> tuple[tuple[allocation.Candidate, ...], int]:
     """Every idea the allocator may choose from, with its next stage.
 
@@ -890,6 +1048,11 @@ def _candidates(
                 + queued_lineage.get(idea.lineage_root, Decimal(0)),
                 generation=generation,
                 bought=str(stage) in queued_stage.get(idea.idea_id, set()),
+                feasibility=(
+                    feasible(idea, version)
+                    if feasible is not None
+                    else Feasibility.UNKNOWN
+                ),
             )
         )
     return tuple(found), settled

@@ -503,8 +503,10 @@ MUTANTS: tuple[Mutant, ...] = (
         "INV-06",
         "REPOINTED_MANIFEST",
         "src/research_os/portfolio/provenance.py",
-        "    if experiment.execution_manifest_artifact_id != receipt.manifest_artifact_id:\n",
-        "    if False:\n",
+        # Moved under the campaign `anchor` guard (sql/0048): the check is the
+        # same for a single execution and for the unit a reading is anchored on.
+        "        anchor\n        and experiment.execution_manifest_artifact_id != receipt.manifest_artifact_id\n",
+        "        False\n        and experiment.execution_manifest_artifact_id != receipt.manifest_artifact_id\n",
         (
             f"{R2}::test_rev_a_manifest_cannot_be_repointed_once_its_execution_has_a_result",
         ),
@@ -538,9 +540,13 @@ MUTANTS: tuple[Mutant, ...] = (
         "MUT-R2-6",
         "INV-02",
         "WRONG_PARENT_STALE_RECEIPT",
-        "src/research_os/runtime/sql/0046_trusted_execution_provenance.sql",
-        "    if new.parent_receipt_id is not null and not exists (\n",
-        "    if false and not exists (\n",
+        # 0048 replaced 0046's function with the campaign case added; the
+        # parent check is there now, unchanged.
+        "src/research_os/runtime/sql/0048_science_campaigns.sql",
+        "        if not found then\n            raise exception\n"
+        "                'receipt % names parent",
+        "        if false then\n            raise exception\n"
+        "                'receipt % names parent",
         (
             f"{R2}::test_rev_a_receipt_of_another_run_or_parent_is_refused_by_the_database",
         ),
