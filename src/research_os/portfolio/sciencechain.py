@@ -771,6 +771,9 @@ def verify_plan(
         problems.append("the bound capability is run by another command")
     if plan.payload.get("schema") == CAMPAIGN_SCHEMA:
         problems.extend(_campaign_problems(store, plan, experiment))
+        problems.extend(
+            _campaign_variation_problems(plan, contract=contract, capability=capability)
+        )
     elif store.campaign_units(plan.digest):
         problems.append("a single execution plan has campaign units recorded")
     if version is not None and analysis is not None:
@@ -855,6 +858,53 @@ def _campaign_problems(
     if not dict(plan.payload.get("aggregation") or {}).get("observables"):
         problems.append("the campaign freezes no aggregation rule")
     return problems
+
+
+def _campaign_variation_problems(
+    plan: Frozen, *, contract: Frozen, capability: Capability
+) -> list[str]:
+    """Whether the frozen campaign's units vary only as its frozen analysis allows.
+
+    Re-derived from the plan's own bytes every time the chain is verified --
+    before any unit runs, before the campaign is read, and at readiness --
+    and from nothing the plan says *about* its units: what each pair differs
+    in comes from their frozen argv, composed inputs, seeds and environment
+    against the host command's declared argv the plan binds
+    (``campaign.record_configuration``), and what is allowed from the frozen
+    contract's execution shape and the plan's own capability declaration.
+    So a campaign that was compiled under a weaker rule, or recovered, or
+    retried, is held to the rule all the same.
+    """
+
+    from research_os.portfolio import campaign as campaigns
+
+    command = dict(plan.payload.get("command") or {})
+    template = list(dict(command.get("declaration") or {}).get("argv") or ())
+    stated = dict(contract.payload.get("execution_shape") or {}).get("unit_varies")
+    pairs = campaigns.pair_differences(
+        [
+            (
+                int(item.get("index", -1)),
+                campaigns.record_configuration(
+                    item, command_argv=template, capability=capability
+                ),
+            )
+            for item in plan.payload.get("units") or ()
+        ]
+    )
+    return [
+        item.rendered()
+        for item in campaigns.unit_variation(
+            pairs,
+            allowed=campaigns.allowed_variation(tuple(stated or ()), capability),
+            attested=(
+                capability.campaign.unit_varies
+                if capability.campaign is not None
+                else ()
+            ),
+            ref=capability.ref,
+        )
+    ]
 
 
 # ------------------------------------------------------ result validation --

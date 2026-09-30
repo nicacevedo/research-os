@@ -59,6 +59,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from research_os import capability as capabilities
+from research_os.portfolio.campaign import PairDifference
 from research_os.portfolio.contracts import AnalysisSpec, Observable
 from research_os.portfolio.models import ExecutionShapeVerdict
 
@@ -898,7 +899,7 @@ def changed_fields(before: Mapping[str, Any], after: Mapping[str, Any]) -> list[
 def realisation_problems(
     shape_check: ShapeCheck,
     *,
-    unit_differences: Sequence[Sequence[str]],
+    unit_differences: Sequence[PairDifference],
     unit_count: int,
     analysis: AnalysisSpec,
     envelope: capabilities.ExecutionEnvelope,
@@ -906,12 +907,15 @@ def realisation_problems(
 ) -> list[str]:
     """Why a campaign design does not realise the shape its analysis was frozen with.
 
-    ``unit_differences`` are, for every pair of units, the attested
-    differences between them. A stated number of units is exact; stated unit
-    differences are the only ones; and the campaign the design actually
-    specifies -- this many units, differing in what they differ in -- must be
-    one the envelope says could hold the frozen support. Nothing here relaxes
-    what compiling the campaign checks.
+    ``unit_differences`` are, for every pair of units, *everything* the two
+    differ in (``campaign.pair_differences``) -- not only what the
+    capability attests, since a difference nothing attests is exactly the
+    one that must not pass unseen. A stated number of units is exact; stated
+    unit differences are the only ones, and every pair differing in anything
+    else is reported, however much else it also differs in; and the campaign
+    the design actually specifies -- this many units, differing in what they
+    differ in -- must be one the envelope says could hold the frozen
+    support. Nothing here relaxes what compiling the campaign checks.
     """
 
     if shape_check.verdict is not ExecutionShapeVerdict.VALID_CAMPAIGN:
@@ -925,19 +929,24 @@ def realisation_problems(
             f"and the design has {unit_count}"
         )
     allowed = set(shape_check.shape_varies)
-    used: set[str] = set()
-    for pair in unit_differences:
-        differing = set(pair)
-        used |= differing
-        if differing - allowed:
-            problems.append(
-                f"two units differ in {', '.join(sorted(differing - allowed))}; the "
-                f"frozen analysis lets them differ only in {', '.join(sorted(allowed))}"
-            )
-            break
     cap = (
         envelope.capability(shape_check.capability) if shape_check.capability else None
     )
+    attested = set(cap.unit_varies) if cap is not None else set()
+    used: set[str] = set()
+    for pair in unit_differences:
+        differing = set(pair.tokens)
+        used |= differing
+        if not differing & attested:
+            # The same execution, or one padded by what nothing attests: the
+            # compiler refuses it, as CAPABILITY_LIMITED, whatever this says.
+            continue
+        if differing - allowed:
+            problems.append(
+                f"units {pair.first} and {pair.second} differ in "
+                f"{pair.rendered(differing - allowed)}; the frozen analysis lets "
+                f"them differ only in {', '.join(sorted(allowed))}"
+            )
     if cap is not None and not problems:
         short = _fits(
             demands(analysis, envelope=cap, observables=binding_observables),

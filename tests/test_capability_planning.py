@@ -1182,9 +1182,10 @@ def test_the_design_realises_the_frozen_execution_shape_and_nothing_else(
     )
     other = advance(context)
     assert not other.ok
-    assert "differ in plan; the frozen analysis lets them differ only in seeds" in (
-        other.detail
-    )
+    assert (
+        "units 0 and 1 differ in plan (at plan.xs[0], plan.xs[1], plan.xs[2], "
+        "plan.xs[3], plan.xs[4]); the frozen analysis lets them differ only in seeds"
+    ) in other.detail
 
     router.answers_by_prompt[DESIGNER] = campaign_design([unit(7), unit(8)])
     assert advance(context).ok

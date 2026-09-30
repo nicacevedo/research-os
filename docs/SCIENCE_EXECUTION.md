@@ -377,7 +377,10 @@ frozen execution shape and the smallest campaign the envelope says can hold
 the support; a campaign design must have exactly the stated number of units,
 differ between units only in the stated differences, and be one the
 envelope says could hold the frozen support, or it is refused before it is
-compiled (a retry). Nothing here relaxes what the compiler checks.
+compiled (a retry). What a pair of units differs in is *everything* their
+specifications differ in (§3a), never only what the capability attests, and
+every pair that differs in anything the shape does not allow is reported.
+Nothing here relaxes what the compiler checks.
 
 ## 3. Trusted execution
 
@@ -421,7 +424,7 @@ and design digests, capability, declaration and digest, code commit, command,
 immutable input artifacts -- and, per unit, its argv, parameters, composed
 inputs, expected outputs, result artifact, configuration (env, environment,
 seeds, cwd), implementation bounds and its own specification and variation
-digests, plus the attested tokens it differs from unit 0 in. Then the
+digests, plus every token it differs from unit 0 in. Then the
 aggregation rule for every observable the analysis reads, the missing-unit
 rule (`refuse`), the stopping rule and the bounded resources (units, the sum
 of the units' time ceilings, work items). Its digest is its content; the
@@ -433,14 +436,56 @@ unit is a new plan, and evidence bound to the old one does not transfer.
 **Compiled before anything runs** (`campaign.compile_campaign`), in order:
 the contract's stopping rule is `fixed_campaign`; the capability declares
 campaign support and allows this many units; every pair of units differs,
-and in something the capability *attests* its computation uses -- units that
-are the same execution are refused, and units that differ only in something
-unattested (a seed a deterministic program ignores) are `CAPABILITY_LIMITED`:
-the capability cannot provide the independent observations the design asks
-for; every observable the analysis reads has a declared rule to combine it;
+in something the capability *attests* its computation uses, and in nothing
+the frozen analysis does not allow -- units that are the same execution are
+refused, units that differ only in something unattested (a seed a
+deterministic program ignores) are `CAPABILITY_LIMITED`: the capability
+cannot provide the independent observations the design asks for, and units
+that differ in anything not allowed are refused whatever else they differ
+in; every observable the analysis reads has a declared rule to combine it;
 and the campaign fits the human-set bounds `bounds.max_campaign_units` and
 `bounds.max_campaign_seconds` (else `BUDGET_LIMITED`). A refusal that a
 different design could avoid is a retry; nothing ran.
+
+**Varied only as preregistered.** For every pair of a campaign's units:
+
+```text
+actual differences  <=  allowed differences     one allowed difference never
+actual differences  !=  {}                      excuses another that is not
+```
+
+*Actual* is derived by code from the two frozen specifications
+(`campaign.configuration`), never from a list anyone wrote, and each part of
+a specification the program can read is attributed to the input that put it
+there: the seeds and the `RESEARCH_OS_SEED_<n>` variables delivering them to
+`seeds`; a composed document -- its content, by digest -- to the parameter
+that composed it, so a change anywhere inside it (a slope nested in a plan)
+is a difference in that parameter, and is reported at its path
+(`plan (at plan.slope)`); an argument filled from a placeholder of the host
+command's declared argv to that parameter, and a recorded parameter value to
+its name. Anything no declared input accounts for -- a literal argument,
+another environment variable, the expected outputs -- is a `spec.*`
+difference no analysis can allow. Not science, and not compared: where a
+unit ran (`cwd`), its name and label, its implementation bounds
+(`timeout_seconds`, `resources`), identifiers and digests derived from the
+rest, and the parameter the capability declares as its result's location
+(`result.artifact_parameter`). *Allowed* is the frozen analysis's
+`execution_shape.unit_varies` -- or, when it states none, whatever the
+capability attests -- and never more than the capability attests
+(`campaign.allowed_variation`). **Allowed is not required:** a v1 analysis
+marks no difference as one every pair must have, so units differing in some
+of what is allowed, and in nothing else, realise it; whether that can hold
+the frozen support is §2a's question, and the data's.
+
+The rule is applied three times, each independently of the others: by the
+designer-side check against the frozen shape (§2a), by the compiler, and --
+re-derived from the frozen plan's own bytes against the frozen contract's
+execution shape and the plan's capability declaration -- by
+`sciencechain.verify_plan`, which runs before any unit starts, before the
+campaign is read and at readiness. A campaign plan frozen under a weaker
+rule, recovered after a crash, retried, or a replication's, never runs and
+is never admissible. The frozen analysis and plan are not changed by any of
+this; a campaign that does not conform is refused before it runs.
 
 **Run once, all of it.** Before unit 0 starts, one work item per unit left is
 reserved against every applicable ledger, so a campaign the execution
@@ -479,7 +524,9 @@ shifted by one position differ pair by pair and re-measure the primary's own
 observations. Configuration independence and attestation are established per
 pair (`provenance.assess_replication`), and the campaign counts as
 independent only if every pair does; agreement is the frozen `same_outcome`
-rule over the two campaign outcomes.
+rule over the two campaign outcomes. The replication's own units are held to
+the variation rule above exactly as the primary's are: its analysis is the
+primary's, and so is what its units may differ in.
 
 **Recovered, never guessed.** A unit's idempotency key names its attempt,
 and the reconciler recovers only a job this attempt's invocation could have

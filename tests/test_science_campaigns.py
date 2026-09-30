@@ -665,6 +665,7 @@ def test_a_capability_without_campaign_support_cannot_be_combined(
         observables=(("points", "points"),),
         max_units=6,
         max_seconds=7200,
+        command_argv=("python3", "draw.py", "--plan", "{plan}"),
     )
     assert isinstance(refused, campaigns.Refused)
     assert "declares no campaign support" in refused.summary()

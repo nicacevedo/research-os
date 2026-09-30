@@ -6026,24 +6026,25 @@ def _design_campaign(
         # reinterpreted: a stated number of units is exact, stated unit
         # differences are the only ones, and the campaign this design
         # actually is must be one the envelope says could hold the support.
-        # A retry: another design may realise it.
-        cap = (
-            planning.envelope.capability(frozen_shape.capability)
-            if frozen_shape.capability
-            else None
-        )
-        attested = set(cap.unit_varies) if cap is not None else set()
+        # A retry: another design may realise it. What the units differ in
+        # is everything their specifications differ in -- never only what
+        # the capability attests, which would let a difference nothing
+        # attests (a slope inside a plan, beside a new seed) pass unseen.
         shape_problems = shapes.realisation_problems(
             frozen_shape,
-            unit_differences=[
-                tuple(
-                    item
-                    for item in campaigns._differences(first, second)
-                    if item in attested
-                )
-                for index, second in enumerate(units)
-                for first in units[:index]
-            ],
+            unit_differences=campaigns.pair_differences(
+                [
+                    (
+                        unit.index,
+                        campaigns.unit_configuration(
+                            unit,
+                            command_argv=commands[proposed.command].argv,
+                            capability=loaded.manifest.by_command(proposed.command),
+                        ),
+                    )
+                    for unit in units
+                ]
+            ),
             unit_count=len(units),
             analysis=analysis,
             envelope=planning.envelope,
@@ -6410,6 +6411,7 @@ def _freeze_campaign_chain(
         observables=binding.observables,
         max_units=int(context.config.bounds.max_campaign_units),
         max_seconds=int(context.config.bounds.max_campaign_seconds),
+        command_argv=commands[proposed.command].argv,
     )
     if isinstance(compiled, campaigns.Refused):
         state = (
