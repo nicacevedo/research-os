@@ -424,3 +424,30 @@ The property worth stating as new rather than preserved:
 ```text
 a model that can read the envelope  !=  a model that can enlarge it
 ```
+
+## Change control record: campaign unit variation
+
+Per the change-control section above, a dedicated record. **No invariant
+changed, nothing was added to the permitted-technology list, and there is no
+migration.** `docs/SCIENCE_EXECUTION.md` §3a ("Varied only as
+preregistered") is the specification.
+
+The defect, reproduced by an independent review of 7f39fd1 rather than
+reasoned about: a frozen analysis let campaign units differ in the seed
+only; a design changed the seed *and* the slope inside the composed plan.
+The designer-side check filtered each pair's differences to what the
+capability attests before comparing them with the frozen shape, the
+compiler accepted a pair any of whose differences was attested, and the
+campaign ran, was read `SUPPORTED` and was admissible.
+
+| # | invariant | what changed |
+|---|---|---|
+| 1 | local before LLM | strengthened. What two campaign units differ in is derived by ordinary code from their frozen specifications -- a composed document by its content, an argument by the placeholder that filled it -- and never taken from anything a model or a design wrote about itself |
+| 8 | no agent approves its own work | unchanged in kind. A campaign whose units vary what the frozen analysis did not allow is refused before it runs, by the designer-side check, by the compiler and by the chain verification, each independently |
+| 11 | experiments traceable | strengthened. Every run, every reading and readiness re-derive each pair's differences from the frozen plan's bytes against the frozen contract's execution shape and the plan's capability declaration; a plan frozen under a weaker rule never runs and is never admissible |
+
+The property worth stating as new rather than preserved:
+
+```text
+one allowed difference  !=  permission for the others
+```

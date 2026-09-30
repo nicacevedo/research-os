@@ -366,6 +366,17 @@ capability-planning sprint addresses that, and nothing else
   shown, and a frozen contract is bound to the envelope it was checked
   against.
 
+An independent review of that sprint (`7f39fd1`) reproduced one
+release-blocking defect: a campaign could run with a variation its frozen
+analysis forbade -- a seed change beside a changed slope inside the plan --
+because the designer-side check compared only what the capability attests
+and the compiler accepted a pair any of whose differences was attested. The
+repair is that and nothing else (`docs/SCIENCE_EXECUTION.md` §3a, "Varied
+only as preregistered"): each pair of units must differ, and only in what
+the frozen analysis allows; what they differ in is derived from their frozen
+specifications; and the rule is applied by the designer-side check, the
+compiler and the chain verification before every run, reading and readiness.
+
 **Not qualified:** a third run has not been made. Not merged, not tagged.
 
 ## Two external prerequisites, and the policy on each
