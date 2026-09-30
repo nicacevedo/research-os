@@ -1,0 +1,96 @@
+# The host operator's `cg-cells` command, copied verbatim from the second final
+# v1 qualification's frozen experiments.yaml (sha256 684969b1...), under a
+# placeholder project. Used by tests/test_capability_planning_regression.py
+# with tests/fixtures/cg_cells_research_capabilities.yaml.
+schema_version: 1
+limits:
+  require_explicit_execute: false
+projects:
+  {project}:
+    default_executor: local
+    commands:
+      # Research OS v1 capability cg.cells@1 (research-capabilities.yaml on research-os-v1/capabilities).
+      cg-cells:
+        name: cg-cells
+        description: >-
+          Run one composed benchmark plan -- instances x lambda/lambda_max
+          ratios x solvers x tolerances x repetitions -- and write one typed
+          record per solve. The Research OS capability cg.cells@1, declared in
+          the repository's research-capabilities.yaml, which says what every
+          field of the result is.
+        argv:
+          - "uv"
+          - "run"
+          - "--frozen"
+          - "--extra"
+          - "conic"
+          - "--extra"
+          - "baselines"
+          - "python"
+          - "scripts/ros_cells.py"
+          - "--plan"
+          - "{plan}"
+          - "--out"
+          - "results/ros/cells.json"
+        parameters:
+          - name: plan
+            type: generated
+            required: true
+            max_bytes: 8192
+            description: >-
+              The composed plan (src/cg2026/bench.py::Plan.from_json). At most
+              4 instances x 5 ratios x 2 arms, each cell capped at 30 s, so one
+              execution is bounded below the capability's 1500 s.
+            input_schema:
+              type: object
+              additionalProperties: false
+              required: ["instances", "lambda_ratios", "arms", "repetitions", "timeout_seconds"]
+              properties:
+                instances:
+                  type: array
+                  minItems: 1
+                  maxItems: 4
+                  items:
+                    type: object
+                    additionalProperties: false
+                    required: ["family", "n", "p"]
+                    properties:
+                      family: {type: string, enum: ["sparse", "toeplitz", "block", "correlated", "illcond", "historical"]}
+                      n: {type: integer, minimum: 50, maximum: 1000}
+                      p: {type: integer, minimum: 10, maximum: 300}
+                      k: {type: integer, minimum: 1, maximum: 100}
+                      seed: {type: integer, minimum: 0, maximum: 65535}
+                      snr: {type: number, minimum: 0.1, maximum: 100.0}
+                      rho: {type: number, minimum: 0.0, maximum: 0.99}
+                      block_size: {type: integer, minimum: 2, maximum: 300}
+                      noise_fraction: {type: number, minimum: 0.0, maximum: 1.0}
+                      condition: {type: number, minimum: 1.0, maximum: 1000000.0}
+                lambda_ratios:
+                  type: array
+                  minItems: 1
+                  maxItems: 5
+                  items: {type: number, minimum: 0.001, maximum: 1.0}
+                arms:
+                  type: array
+                  minItems: 1
+                  maxItems: 2
+                  items:
+                    type: object
+                    additionalProperties: false
+                    required: ["solver", "tolerances"]
+                    properties:
+                      solver: {type: string, enum: ["cg_hist", "celer", "skglm", "lars", "sklearn", "conic_reduced", "conic_thesis"]}
+                      tolerances:
+                        type: array
+                        minItems: 1
+                        maxItems: 2
+                        items: {type: number, minimum: 0.000000001, maximum: 0.1}
+                      repetitions: {type: integer, minimum: 1, maximum: 3}
+                repetitions: {type: integer, minimum: 1, maximum: 3}
+                timeout_seconds: {type: integer, minimum: 5, maximum: 30}
+        outputs:
+          - "results/ros/cells.json"
+          - "results/ros/cells.raw.jsonl"
+        timeout_seconds: 1800
+        checks: ["outputs_exist"]
+        perturbation_attestation: ["seeds", "plan"]

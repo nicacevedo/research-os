@@ -26,6 +26,7 @@ import pytest
 
 from research_os.portfolio import campaign as campaigns
 from research_os.portfolio import empirical, sciencechain
+from research_os.portfolio.contracts import AnalysisSpec
 from research_os.portfolio.models import (
     EmpiricalConclusion,
     ExperimentRole,
@@ -623,6 +624,15 @@ def test_a_capability_without_campaign_support_cannot_be_combined(
     science_repo: Path,
     tmp_path: Path,
 ) -> None:
+    """Refused twice over: before the analysis freezes, and by the compiler.
+
+    A ``fixed_campaign`` analysis against a capability that declares no
+    campaign is an execution-shape mismatch before anything is frozen
+    (docs/SCIENCE_EXECUTION.md §2a) -- one execution is all it can have --
+    and nothing is designed. The compiler's own refusal still stands behind
+    it, for a campaign design however it arrives.
+    """
+
     commit_manifest(science_repo, manifest(campaign=None))
     context = context_for(
         portfolio,
@@ -635,9 +645,29 @@ def test_a_capability_without_campaign_support_cannot_be_combined(
     step = advance(context)
     assert not step.ok
     assert "declares no campaign support" in step.detail
-    (outcome,) = outcomes(context)
-    assert outcome.state is PrimaryOutcome.CAPABILITY_LIMITED
+    assert "EXECUTION_SHAPE_MISMATCH" in step.detail
+    assert step.failure_class is FailureClass.MODEL_OUTPUT_INVALID
+    assert (
+        portfolio.live_contract(
+            idea_id=context.idea_id, idea_version=1, role=ExperimentRole.PRIMARY
+        )
+        is None
+    )
     assert jobs(runtime_db) == []
+
+    loaded = empirical.capability_manifest(context)[0]
+    assert loaded is not None
+    (capability,) = loaded.manifest.capabilities
+    refused = campaigns.compile_campaign(
+        [],
+        analysis=AnalysisSpec.model_validate(analysis()),
+        capability=capability,
+        observables=(("points", "points"),),
+        max_units=6,
+        max_seconds=7200,
+    )
+    assert isinstance(refused, campaigns.Refused)
+    assert "declares no campaign support" in refused.summary()
 
 
 def test_a_campaign_is_not_run_under_a_single_execution_contract(
@@ -681,12 +711,55 @@ def test_a_campaign_beyond_the_human_set_bounds_is_budget_limited_before_it_runs
         tmp_path,
         router(runtime_db, primary=campaign_design([unit(7), unit(8), unit(9)])),
     )
-    context.config = context.config.with_overrides({"max_campaign_seconds": 200})
+    # Room for a campaign of two 120 s units, so the analysis's campaign is
+    # one the envelope allows and is frozen (docs/SCIENCE_EXECUTION.md §2a);
+    # the three-unit design is the one beyond the person's bound. Bounds that
+    # permit no campaign at all refuse the analysis itself, before freezing:
+    # test_bounds_that_permit_no_campaign_refuse_a_campaign_analysis_before_freezing.
+    context.config = context.config.with_overrides({"max_campaign_seconds": 240})
     step = advance(context)
     assert not step.ok
     assert "bounds.max_campaign_seconds" in step.detail
     (outcome,) = outcomes(context)
     assert outcome.state is PrimaryOutcome.BUDGET_LIMITED
+    assert jobs(runtime_db) == []
+
+
+def test_bounds_that_permit_no_campaign_refuse_a_campaign_analysis_before_freezing(
+    portfolio: PortfolioStore,
+    runtime_db: Database,
+    runtime_project: str,
+    science_repo: Path,
+    tmp_path: Path,
+) -> None:
+    """A person's bounds that leave room for one 120 s unit leave no campaign.
+
+    The envelope says so before the analysis is frozen: ``fixed_campaign``
+    cannot be realised here, one execution can hold this (undeclared-bound)
+    sample, and so the proposal is an execution-shape mismatch -- refused,
+    never frozen, and never converted.
+    """
+
+    context = context_for(
+        portfolio,
+        runtime_db,
+        runtime_project,
+        science_repo,
+        tmp_path,
+        router(runtime_db, primary=campaign_design([unit(7), unit(8), unit(9)])),
+    )
+    context.config = context.config.with_overrides({"max_campaign_seconds": 200})
+    step = advance(context)
+    assert not step.ok
+    assert "EXECUTION_SHAPE_MISMATCH" in step.detail
+    assert "only 1 unit(s) under the human-set bounds" in step.detail
+    assert (
+        portfolio.live_contract(
+            idea_id=context.idea_id, idea_version=1, role=ExperimentRole.PRIMARY
+        )
+        is None
+    )
+    assert outcomes(context) == []
     assert jobs(runtime_db) == []
 
 

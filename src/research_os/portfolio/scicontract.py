@@ -41,6 +41,7 @@ from typing import Any
 from research_os.errors import ResearchOSError
 from research_os.portfolio.contracts import AnalysisSpec, DesignSpecification
 from research_os.portfolio.models import (
+    FREEZABLE_SHAPE_VERDICTS,
     ContractKind,
     ContractState,
     IdeaVersion,
@@ -93,6 +94,8 @@ def analysis_payload(spec: AnalysisSpec) -> dict[str, Any]:
     # applies to composed inputs.
     if not payload.get("population"):
         payload.pop("population", None)
+    if payload.get("execution_shape") is None:
+        payload.pop("execution_shape", None)
     return payload
 
 
@@ -125,8 +128,20 @@ def analysis_document(
     spec: AnalysisSpec,
     provenance: Mapping[str, Any],
     parent_contract_id: str | None = None,
+    shape_check: Mapping[str, Any] | None = None,
+    revises: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
-    return {
+    """The frozen analysis, as stored.
+
+    ``shape_check`` is the execution-shape check it passed before it was
+    frozen (``research_os.portfolio.shape``), naming the envelope it was
+    checked against; ``revises`` names the proposals refused before it, by
+    draft and digest, and which of their fields this one changed. Both are
+    beside the analysis rather than in its digest: they are how it came to be
+    frozen, not what it says.
+    """
+
+    document = {
         "schema": ANALYSIS_SCHEMA,
         "contract_id": contract_id,
         "project_id": project_id,
@@ -139,6 +154,11 @@ def analysis_document(
         "analysis_digest": analysis_digest(spec),
         "provenance": dict(provenance),
     }
+    if shape_check is not None:
+        document["execution_shape_check"] = dict(shape_check)
+    if revises:
+        document["revises"] = [dict(item) for item in revises]
+    return document
 
 
 # --------------------------------------------------------------- design --
@@ -437,6 +457,24 @@ def verify(
             f"{contract.contract_id}'s stored analysis names a different hypothesis"
         )
     spec = _analysis_from(analysis_doc, contract)
+    if contract.envelope_digest is not None:
+        # The row's envelope binding and the stored check must be one fact,
+        # and the check must be one the analysis passed: a frozen analysis
+        # whose record says it was refused before freezing is not one this
+        # layer may execute or read under.
+        check = analysis_doc.get("execution_shape_check") or {}
+        if check.get("envelope_digest") != contract.envelope_digest:
+            raise ContractIntegrityError(
+                f"{contract.contract_id} is bound to envelope "
+                f"{contract.envelope_digest} and its stored analysis was checked "
+                f"against {check.get('envelope_digest') or '(none)'}"
+            )
+        if check.get("verdict") not in FREEZABLE_SHAPE_VERDICTS:
+            raise ContractIntegrityError(
+                f"{contract.contract_id}'s stored analysis records the execution-shape "
+                f"verdict {check.get('verdict')!r}, which is not one an analysis is "
+                f"frozen under"
+            )
     if contract.state is not ContractState.FROZEN:
         return VerifiedContract(
             contract=contract, analysis=spec, design=None, document=analysis_doc
@@ -485,7 +523,9 @@ def verify(
 
 
 # --------------------------------------------------------------- render --
-def requirements_block(spec: AnalysisSpec) -> list[str]:
+def requirements_block(
+    spec: AnalysisSpec, *, shape_check: Mapping[str, Any] | None = None
+) -> list[str]:
     """What the experiment designer is shown of a frozen analysis.
 
     **Everything it must produce, and nothing it could aim at.** The
@@ -494,7 +534,10 @@ def requirements_block(spec: AnalysisSpec) -> list[str]:
     design that does not produce those cannot be analysed. Not the
     predicates: a designer that knows the threshold can choose a grid that
     lands on the right side of it, which is the co-design this split exists
-    to remove.
+    to remove. And the execution shape the analysis was frozen with, with the
+    smallest campaign the envelope says can hold its support
+    (``shape_check``), so the designer realises the shape rather than
+    reinterpreting it.
     """
 
     if not spec.analysable:
@@ -560,6 +603,30 @@ def requirements_block(spec: AnalysisSpec) -> list[str]:
             "campaign"
         )
     )
+    stated = spec.execution_shape
+    if stated is not None and spec.stopping_rule == "fixed_campaign":
+        parts = []
+        if stated.capability:
+            parts.append(f"of {stated.capability}")
+        if stated.units:
+            parts.append(f"of exactly {stated.units} units")
+        if stated.unit_varies:
+            parts.append("whose units differ only in " + ", ".join(stated.unit_varies))
+        if parts:
+            lines.append(
+                "execution shape, frozen with the analysis: a campaign "
+                + ", ".join(parts)
+                + " -- a design of any other shape is refused before it runs"
+            )
+    check = dict(shape_check or {})
+    campaign = dict(check.get("campaign") or {})
+    if spec.stopping_rule == "fixed_campaign" and campaign.get("min_units"):
+        lines.append(
+            f"by the capability envelope, the support needs a campaign of at least "
+            f"{campaign['min_units']} units of {check.get('capability')} "
+            f"(at most {campaign.get('max_units')} here); a smaller one cannot hold "
+            f"it and is refused before it runs"
+        )
     lines.append(
         "(the thresholds that decide the conclusion were fixed with this analysis "
         "and are deliberately not shown to you)"

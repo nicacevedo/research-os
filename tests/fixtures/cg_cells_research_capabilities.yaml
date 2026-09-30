@@ -1,0 +1,254 @@
+# What this repository can execute and observe, for Research OS.
+#
+# Read by Research OS from a *committed* tree (never a working copy), pinned
+# into every execution plan by commit and digest. The host operator still
+# decides what may run: the command named below must also be declared in the
+# operator's experiments.yaml (see docs/2026/RESEARCH_OS_CAPABILITIES.md for
+# the exact entry). This file says what that command produces.
+#
+# Generic schema: research-os-capabilities-v1 (Research OS,
+# docs/SCIENCE_EXECUTION.md). Nothing in it is specific to this project;
+# everything below is.
+
+schema: research-os-capabilities-v1
+capabilities:
+  - id: cg.cells
+    version: 1
+    title: Sparse-regression solver benchmark cells, one typed record per solve
+    description: >-
+      Runs one composed plan -- instances (family, n, p and the family's
+      parameters) x lambda/lambda_max ratios x solvers x tolerances x
+      repetitions -- through the project's benchmark runner, each cell in a
+      fresh single-threaded process with a hard per-cell timeout, and writes
+      one record per solve with the solve's accuracy, sparsity, support
+      recovery, iteration count, columns generated (cg_hist) and cost. The
+      objective is ||y - X beta||^2 + lambda_1 ||beta||_1 on standardised
+      data (src/cg2026/objective.py).
+    command: cg-cells
+    parameters:
+      - name: plan
+        description: >-
+          The composed plan (src/cg2026/bench.py::Plan.from_json). Instance
+          seeds in it are offset by RESEARCH_OS_SEED_0 before anything runs.
+    result:
+      artifact: results/ros/cells.json
+      format: json
+      schema:
+        type: object
+        required: [schema, plan_digest, seed_offset, summary, records]
+        properties:
+          schema: {type: string, const: cg2026.cells.v1}
+          plan_digest: {type: string, minLength: 64, maxLength: 64}
+          seed_offset: {type: integer}
+          summary:
+            type: object
+            required: [cells, records, ok_records, failed_cells]
+            properties:
+              cells: {type: integer, minimum: 0}
+              records: {type: integer, minimum: 0}
+              ok_records: {type: integer, minimum: 0}
+              failed_cells: {type: integer, minimum: 0}
+          records:
+            type: array
+            items:
+              type: object
+              required:
+                - instance_label
+                - family
+                - n
+                - p
+                - k
+                - seed
+                - snr
+                - rho
+                - condition
+                - noise_fraction
+                - block_size
+                - lambda_ratio
+                - solver
+                - status
+                - ok
+              properties:
+                instance_label: {type: string}
+                family: {type: string}
+                n: {type: integer}
+                p: {type: integer}
+                k: {type: integer}
+                seed: {type: integer}
+                snr: {type: number}
+                rho: {type: number}
+                condition: {type: number}
+                noise_fraction: {type: number}
+                block_size: {type: integer}
+                lambda_ratio: {type: number}
+                solver: {type: string}
+                status: {type: string}
+                ok: {type: boolean}
+                tolerance: {type: number}
+                repetition: {type: integer}
+                wall_seconds: {type: number}
+                cpu_seconds: {type: number}
+                peak_rss_mib: {type: number}
+                cell_wall_seconds: {type: number}
+                objective: {type: number}
+                kkt: {type: number}
+                relative_gap: {type: number}
+                nnz: {type: integer}
+                iterations: {type: integer}
+                support_size: {type: integer}
+                true_support_size: {type: integer}
+                support_recall: {type: number}
+                support_precision: {type: number}
+                columns_generated: {type: integer}
+    observables:
+      - name: solves
+        kind: records
+        path: records
+        description: >-
+          One record per solve; a cell that produced no solve (timeout, crashed
+          worker) is one record with its status and ok false. Fields a solve
+          did not report are absent, never null. support_* exist only for
+          families with a planted truth (sparse, illcond, toeplitz, block);
+          iterations only for solvers that report it; columns_generated only
+          for cg_hist.
+        fields:
+          - {name: instance_label, type: string, description: "the instance's label, seed included"}
+          - {name: family, type: string, description: "sparse | toeplitz | block | correlated | illcond | historical"}
+          - {name: n, type: integer, unit: rows}
+          - {name: p, type: integer, unit: features}
+          - {name: k, type: integer, unit: features, description: planted support size (sparse-truth families)}
+          - {name: seed, type: integer, description: "the effective instance seed, after the offset"}
+          - {name: snr, type: number, unit: "1"}
+          - {name: rho, type: number, unit: "1", description: "correlation (correlated, toeplitz, block)"}
+          - {name: condition, type: number, unit: "1", description: Gram condition number (illcond)}
+          - {name: noise_fraction, type: number, unit: "1", description: noise columns (historical)}
+          - {name: block_size, type: integer, unit: features, description: block width (block)}
+          - {name: lambda_ratio, type: number, unit: "1", description: lambda_1 / lambda_max}
+          - {name: solver, type: string, description: "cg_hist | celer | skglm | lars | sklearn | conic_reduced | conic_thesis"}
+          - {name: status, type: string, description: "the solver's status, or the cell's (timeout, worker_exit_N)"}
+          - {name: ok, type: boolean, description: "status is ok, optimal or optimal_inaccurate"}
+          - {name: tolerance, type: number, unit: "1", description: the solver's own tolerance parameter}
+          - {name: repetition, type: integer}
+          - {name: objective, type: number, unit: "1", description: "||y - X beta||^2 + lambda_1 ||beta||_1"}
+          - {name: relative_gap, type: number, unit: "1", description: relative duality gap attained}
+          - {name: kkt, type: number, unit: "1", description: KKT violation}
+          - {name: nnz, type: integer, unit: features, description: non-zeros at relative tolerance 1e-5}
+          - {name: iterations, type: integer, unit: iterations, description: "CG rounds (cg_hist), n_iter (sklearn)"}
+          - {name: columns_generated, type: integer, unit: columns, description: columns cg_hist generated}
+          - {name: support_size, type: integer, unit: features}
+          - {name: true_support_size, type: integer, unit: features}
+          - {name: support_recall, type: number, unit: "1"}
+          - {name: support_precision, type: number, unit: "1"}
+          - {name: wall_seconds, type: number, unit: s, deterministic: false}
+          - {name: cpu_seconds, type: number, unit: s, deterministic: false}
+          - {name: peak_rss_mib, type: number, unit: MiB, deterministic: false}
+          - {name: cell_wall_seconds, type: number, unit: s, deterministic: false}
+      - name: cells
+        kind: scalar
+        path: summary.cells
+        type: integer
+        unit: cells
+      - name: ok_records
+        kind: scalar
+        path: summary.ok_records
+        type: integer
+        unit: solves
+      - name: failed_cells
+        kind: scalar
+        path: summary.failed_cells
+        type: integer
+        unit: cells
+    determinism: seeded
+    determinism_notes: >-
+      Instances and solver paths are deterministic given the plan and
+      RESEARCH_OS_SEED_0 (threads pinned to one per process). wall_seconds,
+      cpu_seconds, peak_rss_mib and cell_wall_seconds vary between identical
+      executions, and a cell near its timeout may finish or not.
+    replication:
+      perturbations:
+        - kind: seeds
+          description: >-
+            RESEARCH_OS_SEED_0 is added to every instance seed before the data
+            are generated (scripts/ros_cells.py::offset_plan), and the seed is
+            the only input to np.random.default_rng in src/cg2026/data.py::build,
+            so a different design seed draws different instances of the same
+            families, sizes and parameters.
+        - kind: parameter
+          name: plan
+          description: >-
+            Every record is computed from the plan: it chooses the instances,
+            the lambda grid, the solvers, their tolerances and the repetitions.
+      comparison: same_outcome
+    resources:
+      timeout_seconds: 1500
+      cpus: 1
+      memory_mb: 4096
+    # What ONE execution holds, at most, in terms of the records an analysis
+    # reads -- so Research OS can check a preregistered analysis against it
+    # before freezing it (docs/SCIENCE_EXECUTION.md there, §2a), instead of the
+    # experiment designer discovering it afterwards. Nothing here is new
+    # capacity: every number follows from the composed-plan bounds the host
+    # declares for cg-cells (docs/2026/RESEARCH_OS_CAPABILITIES.md) -- at most 4
+    # instances, 5 lambda ratios and 2 arms, each arm at most 2 tolerances and
+    # 3 repetitions, so at most 4 x 5 x 2 x 2 x 3 = 240 solves -- and
+    # tests/test_ros_cells.py checks them against that schema and the code.
+    execution:
+      records:
+        - {observable: solves, max: 240}
+      inputs:
+        - name: instances
+          observable: solves
+          max: 4
+          fields: [instance_label, family, n, p, k, seed, snr, rho, condition, noise_fraction, block_size]
+          description: the plan's instances; every solve is of one of them
+          across_units:
+            # Another plan is other instances altogether; another seed offset
+            # draws new instances of the same families and sizes.
+            - varies: plan
+              fields: [instance_label, family, n, p, k, seed, snr, rho, condition, noise_fraction, block_size]
+            - {varies: seeds, fields: [instance_label, seed]}
+        - name: lambda_ratios
+          observable: solves
+          max: 5
+          fields: [lambda_ratio]
+          across_units:
+            - {varies: plan, fields: [lambda_ratio]}
+        - name: arms
+          observable: solves
+          max: 2
+          fields: [solver]
+          across_units:
+            - {varies: plan, fields: [solver]}
+        - name: tolerances
+          observable: solves
+          max: 4
+          fields: [tolerance]
+          description: at most 2 per arm
+          across_units:
+            - {varies: plan, fields: [tolerance]}
+        - name: repetitions
+          observable: solves
+          max: 3
+          fields: [repetition]
+          description: repetitions count from 0 in every execution, so no unit adds a new value
+          across_units: []
+    # Several executions of this capability may form one measurement -- a
+    # Research OS campaign (docs/SCIENCE_EXECUTION.md there, §3a) -- when a
+    # design needs more independent draws or instances than one bounded plan
+    # holds (at most 4 instances per plan). Units must differ in the seed
+    # offset or the plan: a unit with the same plan and offset as another
+    # draws the same instances and repeats the same solves, which is not a new
+    # observation. Records are concatenated; one observation is one instance
+    # (its label carries the effective seed) under one lambda ratio, solver
+    # and tolerance, and a repeat of it across units is refused rather than
+    # counted twice. The scalars add up.
+    campaign:
+      max_units: 6
+      unit_varies: [seeds, plan]
+      aggregation:
+        - observable: solves
+          rule: concatenate
+          identity: [instance_label, lambda_ratio, solver, tolerance]
+        - {observable: cells, rule: sum}
+        - {observable: ok_records, rule: sum}
+        - {observable: failed_cells, rule: sum}

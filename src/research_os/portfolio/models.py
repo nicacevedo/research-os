@@ -504,6 +504,46 @@ class ScienceObjectKind(StrEnum):
     PLAN = "PLAN"
 
 
+class ExecutionShapeVerdict(StrEnum):
+    """Whether a proposed analysis can be executed as it says, decided before it is frozen.
+
+    By ordinary code, from the analysis and the committed capability envelope
+    (``research_os.portfolio.shape``). Two verdicts freeze it, two refuse it,
+    and one says the check had nothing to check.
+    """
+
+    VALID_SINGLE_EXECUTION = "VALID_SINGLE_EXECUTION"
+    """One execution can hold every support requirement it states."""
+    VALID_CAMPAIGN = "VALID_CAMPAIGN"
+    """A campaign this envelope allows can hold them, in the shape it states."""
+    EXECUTION_SHAPE_MISMATCH = "EXECUTION_SHAPE_MISMATCH"
+    """Its declared execution shape cannot hold its own requirements, or claims
+    what the envelope does not provide -- and another shape the envelope
+    allows could hold them. Refused before freezing, and the author is shown
+    why; it is never converted for it."""
+    CAPABILITY_LIMITED = "CAPABILITY_LIMITED"
+    """Neither one execution nor any campaign this envelope allows can hold
+    what it requires. Refused before freezing."""
+    UNRESOLVED = "UNRESOLVED"
+    """Nothing to check: the analysis is not analysable, or what it reads
+    resolves to no declared capability -- which capability resolution then
+    says, exactly as it did before this check existed."""
+
+
+#: The verdicts an analysis may be frozen under.
+FREEZABLE_SHAPE_VERDICTS: frozenset[str] = frozenset(
+    {
+        str(ExecutionShapeVerdict.VALID_SINGLE_EXECUTION),
+        str(ExecutionShapeVerdict.VALID_CAMPAIGN),
+        str(ExecutionShapeVerdict.UNRESOLVED),
+    }
+)
+#: The verdicts that refuse one -- the only ones a draft records.
+REFUSING_SHAPE_VERDICTS: frozenset[str] = (
+    frozenset(str(item) for item in ExecutionShapeVerdict) - FREEZABLE_SHAPE_VERDICTS
+)
+
+
 class PrimaryOutcome(StrEnum):
     """The system-computed outcome of one determination. No model decides one.
 
@@ -1296,10 +1336,39 @@ class ScientificContract(_Record):
     created_at: datetime
     updated_at: datetime
     frozen_at: datetime | None = None
+    #: The capability envelope the analysis was checked against before it was
+    #: frozen (`sql/0049`). ``None`` for a contract frozen before the check
+    #: existed, or on a project that declares no capability manifest.
+    envelope_digest: str | None = None
 
     @property
     def frozen(self) -> bool:
         return self.state is ContractState.FROZEN
+
+
+class AnalysisDraft(_Record):
+    """A proposed analysis refused before it was frozen. See ``sql/0049``.
+
+    Not a contract and never one: the database refuses a contract whose
+    analysis is a draft refused under the same envelope. Kept, immutably, so
+    the author's revision is shown exactly why, so the bounded revision is
+    counted from rows, and so the record says what was proposed and refused.
+    """
+
+    draft_id: str
+    project_id: str
+    idea_id: str
+    idea_version: int
+    role: ExperimentRole
+    verdict: ExecutionShapeVerdict
+    analysis_digest: str
+    artifact_id: str
+    envelope_digest: str
+    code_commit: str
+    check_record: dict[str, Any]
+    analysis_prompt: str = ""
+    analysis_call_id: str | None = None
+    created_at: datetime
 
 
 class FrontierRequest(_Record):
@@ -1541,6 +1610,8 @@ ENUM_CONSTRAINTS: dict[str, frozenset[str]] = {
     "science_objects_kind_ck": frozenset(s.value for s in ScienceObjectKind),
     "science_outcomes_role_ck": frozenset(s.value for s in ExperimentRole),
     "science_outcomes_state_ck": frozenset(s.value for s in PrimaryOutcome),
+    "analysis_drafts_role_ck": frozenset(s.value for s in ExperimentRole),
+    "analysis_drafts_verdict_ck": REFUSING_SHAPE_VERDICTS,
 }
 
 

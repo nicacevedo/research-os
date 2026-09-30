@@ -263,6 +263,14 @@ def contract_payload(
             else None
         ),
         "stopping_rule": analysis.stopping_rule,
+        # How the stopping rule is realised, when the analysis stated it
+        # (docs/SCIENCE_EXECUTION.md §2a). Present only then, so no contract
+        # frozen before it existed changes its digest.
+        **(
+            {"execution_shape": analysis.execution_shape.model_dump(mode="json")}
+            if analysis.execution_shape is not None
+            else {}
+        ),
         "on_missing": analysis.on_missing,
         "analysis_digest": scicontract.analysis_digest(analysis),
     }

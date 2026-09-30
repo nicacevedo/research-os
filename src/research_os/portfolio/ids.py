@@ -36,6 +36,7 @@ SYNTHESIS_ID_RE = re.compile(r"^PSYN-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$")
 RETRIEVAL_ID_RE = re.compile(r"^PRET-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$")
 EXECUTION_RECEIPT_ID_RE = re.compile(r"^XRCT-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$")
 REPLICATION_ASSESSMENT_ID_RE = re.compile(r"^RASM-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$")
+DRAFT_ID_RE = re.compile(r"^PDRAFT-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$")
 
 #: Every id pattern this package mints, so a test can assert none of them can
 #: match a capsule id and none can match another runtime id.
@@ -56,6 +57,7 @@ ID_PATTERNS: dict[str, re.Pattern[str]] = {
     "literature_retrieval": RETRIEVAL_ID_RE,
     "execution_receipt": EXECUTION_RECEIPT_ID_RE,
     "replication_assessment": REPLICATION_ASSESSMENT_ID_RE,
+    "analysis_draft": DRAFT_ID_RE,
 }
 
 
@@ -110,6 +112,12 @@ def new_contract_id(*, moment: datetime | None = None) -> str:
     """
 
     return new_id("PCON", moment=moment)
+
+
+def new_draft_id(*, moment: datetime | None = None) -> str:
+    """A refused analysis proposal: ``PDRAFT``. Never a contract, never a capsule object."""
+
+    return new_id("PDRAFT", moment=moment)
 
 
 def new_request_id(*, moment: datetime | None = None) -> str:

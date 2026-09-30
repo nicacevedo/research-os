@@ -1254,6 +1254,74 @@ class SupportRequirement(_Contract):
         return checked
 
 
+class ExecutionShape(_Contract):
+    """How the analysis author proposes its sample be realised -- a claim, checked by code.
+
+    Stated against the capability envelope the author is shown
+    (``research_os.capability.ExecutionEnvelope``), and never trusted:
+    ``research_os.portfolio.shape`` compares every number and every unit
+    difference here with the *committed* envelope before the analysis is
+    frozen, and nothing here is an input to what the envelope says. A claim
+    that one execution holds more than the declaration says it does, a
+    campaign larger than the human-set bounds permit, or units differing in
+    something the capability does not attest, is refused before anything is
+    frozen -- it is how a model would try to enlarge the laboratory, and the
+    answer to that is a refusal, not a larger laboratory.
+
+    Frozen with the analysis when present, so the experiment designer
+    realises the shape the author planned rather than reinterpreting it: a
+    stated number of units is the number of units, and stated unit
+    differences are the only differences.
+    """
+
+    #: The capability the author plans on, as ``id@version``.
+    capability: str = Field(
+        default="", pattern=r"^([a-z][a-z0-9]*([.-][a-z0-9]+)*@[1-9][0-9]{0,6})?$"
+    )
+    #: How many executions: 1 under ``fixed_single_execution``; under
+    #: ``fixed_campaign`` the campaign's exact number of units, or omitted to
+    #: leave it to the design within the envelope.
+    units: int | None = Field(default=None, ge=1, le=64)
+    #: What may differ between units, in the envelope's vocabulary (``seeds``
+    #: or a parameter name). Omitted: whatever the capability allows.
+    unit_varies: tuple[str, ...] = _shown_list(items=32, count=16, default=())
+    #: The per-execution capacity the author relies on: an input bound's name,
+    #: a field, or ``records`` -> how many one execution holds. Checked against
+    #: the envelope and refused when it claims more; never used as capacity.
+    per_execution: dict[str, int] = Field(default_factory=dict)
+    rationale: str = _shown(MAX_STATEMENT_CHARS, default="")
+
+    @field_validator("unit_varies")
+    @classmethod
+    def _tokens(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(value) > 16 or len(set(value)) != len(value):
+            raise ValueError("unit_varies names at most 16 distinct differences")
+        for item in value:
+            if not re.fullmatch(r"^(seeds|[a-z][a-z0-9_]{0,31})$", item):
+                raise ValueError(f"{item!r} is not a unit difference")
+        return value
+
+    @field_validator("per_execution")
+    @classmethod
+    def _capacity(cls, value: dict[str, int]) -> dict[str, int]:
+        if len(value) > MAX_CONDITIONS * 2:
+            raise ValueError(f"at most {MAX_CONDITIONS * 2} per-execution capacities")
+        checked: dict[str, int] = {}
+        for name, count in value.items():
+            if not 1 <= int(count) <= 100_000_000:
+                raise ValueError("a per-execution capacity is between 1 and 100000000")
+            checked[_field_name(name, "a per-execution capacity")] = int(count)
+        return checked
+
+    @field_validator("rationale")
+    @classmethod
+    def _rationale(cls, value: str) -> str:
+        stripped = value.strip()
+        if len(stripped) > MAX_STATEMENT_CHARS:
+            raise ValueError(f"at most {MAX_STATEMENT_CHARS} characters")
+        return stripped
+
+
 class AnalysisSpec(_Contract):
     """The analysis half of a scientific contract. See the section comment.
 
@@ -1292,6 +1360,10 @@ class AnalysisSpec(_Contract):
     stopping_rule: Literal["fixed_single_execution", "fixed_campaign"] = (
         "fixed_single_execution"
     )
+    #: How the stopping rule is to be realised against the capability
+    #: envelope (:class:`ExecutionShape`). Omitted from the analysis digest
+    #: when absent, so every analysis frozen before it existed keeps its digest.
+    execution_shape: ExecutionShape | None = None
     #: Fixed, and stated for the same reason: a required observable, field or
     #: reduction that is absent, non-numeric or undefined makes the
     #: conclusion INSUFFICIENT. There is no other value, and in particular no
@@ -1350,7 +1422,13 @@ class AnalysisSpec(_Contract):
                     "why; the reason is what a person reads to add the missing "
                     "observable"
                 )
-            if self.observables or self.reductions or self.success or self.failure:
+            if (
+                self.observables
+                or self.reductions
+                or self.success
+                or self.failure
+                or self.execution_shape is not None
+            ):
                 raise ContractError(
                     "an unanalysable answer carries a reason and nothing else; a "
                     "half-specified analysis is how a rule gets finished after "
@@ -1430,6 +1508,20 @@ class AnalysisSpec(_Contract):
                     f"{rule.observable!r} is a scalar; only a records observable "
                     f"can be required to hold records or distinct values"
                 )
+        shape = self.execution_shape
+        if shape is None:
+            return
+        if self.stopping_rule == "fixed_single_execution":
+            if (shape.units or 1) != 1 or shape.unit_varies:
+                raise ContractError(
+                    "fixed_single_execution is one execution: its execution_shape has "
+                    "one unit and nothing that differs between units"
+                )
+        elif shape.units is not None and shape.units < 2:
+            raise ContractError(
+                "fixed_campaign is two or more executions of one capability; a "
+                "campaign of one unit is a single execution"
+            )
 
     def _check_thresholds_are_not_restated(self) -> None:
         """Refuse free text that repeats a threshold the designer must not see.

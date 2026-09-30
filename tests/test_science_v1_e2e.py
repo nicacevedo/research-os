@@ -1314,6 +1314,9 @@ def test_an_analysis_without_a_population_keeps_the_digest_it_had() -> None:
     spec = AnalysisSpec.model_validate(legacy)
     payload = spec.model_dump(mode="json")
     payload.pop("population")
+    # Nor did the execution shape, added after it (docs/SCIENCE_EXECUTION.md
+    # §2a): absent, it is omitted from the digest the same way.
+    payload.pop("execution_shape")
     expected = (
         "panalysis-v1:"
         + hashlib.sha256(scicontract.canonical_bytes(payload)).hexdigest()

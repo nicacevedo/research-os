@@ -687,7 +687,11 @@ def _observe_capability(store: PortfolioStore, report: TickReport, state: Any) -
     command set it was judged against; when that differs from today's, its
     idea is released and the stage-failure watermark moves, so the refusal
     that blocked it is not counted against the retry. The idea resumes from
-    its frozen analysis: nothing scientific is re-decided.
+    its frozen analysis: nothing scientific is re-decided -- unless the
+    change moved the capability envelope that analysis was checked against
+    before freezing, in which case the evidence stage supersedes the unread
+    contract and the analysis is authored and checked again
+    (``docs/SCIENCE_EXECUTION.md`` §2a).
 
     The first observation only records the digest. Nothing had changed.
     """

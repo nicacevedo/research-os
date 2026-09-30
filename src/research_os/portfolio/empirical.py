@@ -62,6 +62,7 @@ from research_os.automation.filescope import (
 from research_os.errors import ExperimentSpecError, ResearchOSError
 from research_os.experiment.generated import GeneratedInput
 from research_os.portfolio import scicontract, sciencechain
+from research_os.portfolio import shape as shapes
 from research_os.portfolio.contracts import (
     AnalysisSpec,
     ContractError,
@@ -75,10 +76,12 @@ from research_os.portfolio.contracts import (
 from research_os.portfolio.models import (
     EVIDENCE_STRENGTH_FOR_CONCLUSION,
     AdjudicationType,
+    AnalysisDraft,
     ContractKind,
     ContractState,
     EmpiricalConclusion,
     EvidenceKind,
+    ExecutionShapeVerdict,
     ExperimentRole,
     ExperimentState,
     IdeaExperiment,
@@ -1486,13 +1489,27 @@ def _freeze_analysis(
     analysis_prompt: str,
     analysis_call_id: str | None,
     parent_contract_id: str | None = None,
+    checked: shapes.ShapeCheck | None = None,
+    revises: Sequence[Mapping[str, Any]] = (),
 ) -> ScientificContract:
     """Store one analysis immutably and open its contract. Raises on a race.
 
     ``parent_contract_id`` is set for a replication, and only there: the
     primary contract whose frozen analysis it inherits, as a column the
     database validates and never lets change.
+
+    ``checked`` is the execution-shape check the analysis passed, under a
+    capability envelope; its envelope becomes the contract's binding, a
+    column the database never lets change, and a check that refused the
+    analysis is not something this function will freeze under.
     """
+
+    if checked is not None and checked.refused:
+        raise EmpiricalError(
+            f"an analysis the execution-shape check refused ({checked.verdict}) is "
+            f"never frozen",
+            failure_class=FailureClass.MISSING_SCIENTIFIC_AUTHORITY,
+        )
 
     from research_os.portfolio.ids import new_contract_id
 
@@ -1506,6 +1523,8 @@ def _freeze_analysis(
         spec=spec,
         provenance=provenance,
         parent_contract_id=parent_contract_id,
+        shape_check=checked.record() if checked is not None else None,
+        revises=revises,
     )
     ref = context.artifacts.put_text(
         json.dumps(
@@ -1531,7 +1550,217 @@ def _freeze_analysis(
         analysis_prompt=analysis_prompt,
         analysis_call_id=analysis_call_id,
         parent_contract_id=parent_contract_id,
+        envelope_digest=(
+            checked.envelope_digest
+            if checked is not None and checked.envelope_digest
+            else None
+        ),
     )
+
+
+def _envelope_binding_holds(
+    context: Any, contract: ScientificContract, planning: shapes.Planning | None
+) -> bool:
+    """Whether a live contract's analysis was checked against the envelope in force.
+
+    The envelope is derived from the committed declaration, the host's
+    commands and the human-set bounds at the pinned commit, and its digest
+    covers all of them: a contract checked against another envelope -- an
+    earlier commit, another declaration, another bound -- was checked
+    against a laboratory that is not this one. Before a design exists such a
+    contract is not designed under the envelope it was not checked against:
+    unread, it is retired and the analysis is authored and checked again.
+    Once designed, the plan pins its own commit and declaration, and once
+    read nothing is re-decided. A contract frozen before the check existed
+    names no envelope and is left to the rules it was frozen under.
+    """
+
+    if planning is None or contract.envelope_digest is None:
+        return True
+    if contract.state in {ContractState.FROZEN, ContractState.SUPERSEDED}:
+        return True
+    if _contract_was_read(context, contract):
+        return True
+    return contract.envelope_digest == planning.envelope.digest
+
+
+def _draft_document(
+    *,
+    context: Any,
+    version: IdeaVersion,
+    role: ExperimentRole,
+    spec: AnalysisSpec,
+    checked: shapes.ShapeCheck,
+    provenance: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "schema": "portfolio-analysis-draft-v1",
+        "project_id": context.project_id,
+        "role": str(role),
+        "hypothesis_digest": version.content_digest,
+        "analysis": scicontract.analysis_payload(spec),
+        "analysis_digest": scicontract.analysis_digest(spec),
+        "execution_shape_check": checked.record(),
+        "frozen": False,
+        "provenance": dict(provenance),
+    }
+
+
+def _refuse_proposal(
+    context: Any,
+    version: IdeaVersion,
+    *,
+    role: ExperimentRole,
+    spec: AnalysisSpec,
+    checked: shapes.ShapeCheck,
+    earlier: Sequence[AnalysisDraft],
+    provenance: Mapping[str, Any],
+    analysis_prompt: str,
+    analysis_call_id: str | None,
+    cost_usd: str,
+) -> ExperimentStep:
+    """Record a proposal the check refused, freeze nothing, and say what happens next.
+
+    ``CAPABILITY_LIMITED`` is a refusal: nothing this envelope allows can
+    hold what the analysis requires, and asking again under it would buy
+    the same sentence. ``EXECUTION_SHAPE_MISMATCH`` is a retry, once: the
+    queue's ordinary retry of a malformed answer re-asks the author with the
+    refusal in front of it. A second mismatch under the same envelope is a
+    policy answer, and no third analysis is bought.
+    """
+
+    document = _draft_document(
+        context=context,
+        version=version,
+        role=role,
+        spec=spec,
+        checked=checked,
+        provenance=provenance,
+    )
+    ref = context.artifacts.put_text(
+        json.dumps(
+            document, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False
+        ),
+        media_type="application/json",
+        role=f"idea_analysis_draft:{document['analysis_digest']}",
+        producer=analysis_prompt or "portfolio.empirical",
+    )
+    context.artifacts.link(
+        ref,
+        role=f"idea_analysis_draft:{document['analysis_digest']}",
+        run_id=context.run_id,
+    )
+    assert checked.envelope_digest is not None and checked.commit is not None
+    draft = context.portfolio.record_analysis_draft(
+        project_id=context.project_id,
+        idea_id=version.idea_id,
+        idea_version=version.version,
+        role=role,
+        verdict=checked.verdict,
+        analysis_digest=document["analysis_digest"],
+        artifact_id=ref.artifact_id,
+        envelope_digest=checked.envelope_digest,
+        code_commit=checked.commit,
+        check_record=checked.record(),
+        analysis_prompt=analysis_prompt,
+        analysis_call_id=analysis_call_id,
+    )
+    detail = (
+        f"the proposed analysis was refused before freezing, {checked.summary()} "
+        f"[draft {draft.draft_id}; nothing was frozen]"
+    )
+    if checked.verdict is ExecutionShapeVerdict.CAPABILITY_LIMITED:
+        failure = FailureClass.CAPABILITY_DENIED
+    elif len(earlier) + 1 < shapes.MAX_REFUSED_DRAFTS:
+        failure = FailureClass.MODEL_OUTPUT_INVALID
+        detail += (
+            "; the analysis author is shown why, and may revise how it is executed"
+        )
+    else:
+        failure = FailureClass.POLICY_REFUSED
+        detail += (
+            f"; this is refused proposal {len(earlier) + 1} of "
+            f"{shapes.MAX_REFUSED_DRAFTS} under this envelope, so no further "
+            f"analysis is asked for until the envelope changes -- a person decides"
+        )
+    return ExperimentStep(
+        ok=False,
+        detail=detail,
+        failure_class=failure,
+        cost_usd=cost_usd,
+        model_calls=1,
+    )
+
+
+def _earlier_refusal(
+    earlier: Sequence[AnalysisDraft], planning: shapes.Planning
+) -> ExperimentStep | None:
+    """A refusal the drafts already give under this envelope, at no cost -- or none."""
+
+    limited = [
+        item
+        for item in earlier
+        if item.verdict is ExecutionShapeVerdict.CAPABILITY_LIMITED
+    ]
+    if limited:
+        return ExperimentStep(
+            ok=False,
+            detail=(
+                f"still CAPABILITY_LIMITED: {limited[-1].draft_id} was refused before "
+                f"freezing under envelope {planning.envelope.digest}, and nothing "
+                f"about the envelope has changed since"
+            ),
+            failure_class=FailureClass.CAPABILITY_DENIED,
+        )
+    if len(earlier) >= shapes.MAX_REFUSED_DRAFTS:
+        return ExperimentStep(
+            ok=False,
+            detail=(
+                f"{len(earlier)} proposed analyses of this version were refused before "
+                f"freezing under envelope {planning.envelope.digest} (the last "
+                f"{earlier[-1].draft_id}); no further analysis is asked for until the "
+                f"envelope changes"
+            ),
+            failure_class=FailureClass.POLICY_REFUSED,
+        )
+    return None
+
+
+def _revision_record(
+    context: Any, earlier: Sequence[AnalysisDraft], spec: AnalysisSpec
+) -> list[dict[str, Any]]:
+    """What a frozen analysis revises: each refused proposal, and what changed from it."""
+
+    after = scicontract.analysis_payload(spec)
+    records: list[dict[str, Any]] = []
+    for item in earlier:
+        try:
+            before = dict(
+                json.loads(context.artifacts.get_text(item.artifact_id)).get("analysis")
+                or {}
+            )
+        except (OSError, ValueError, ResearchOSError):
+            before = {}
+        records.append(
+            {
+                "draft_id": item.draft_id,
+                "analysis_digest": item.analysis_digest,
+                "verdict": str(item.verdict),
+                "envelope_digest": item.envelope_digest,
+                "changed": shapes.changed_fields(before, after),
+            }
+        )
+    return records
+
+
+def _refused_block(context: Any, draft: AnalysisDraft) -> list[str]:
+    try:
+        proposal = json.loads(context.artifacts.get_text(draft.artifact_id)).get(
+            "analysis"
+        )
+    except (OSError, ValueError, ResearchOSError):
+        proposal = None
+    return shapes.refused_lines(draft_record=draft.check_record, proposal=proposal)
 
 
 def ensure_analysis(
@@ -1542,6 +1771,7 @@ def ensure_analysis(
     previous: IdeaExperiment | None = None,
     commands: Mapping[str, Any] | None = None,
     capability_catalogue: Sequence[str] = (),
+    planning: shapes.Planning | None = None,
 ) -> ExperimentStep | HeldContract:
     """The live contract for this idea version and role, its analysis frozen.
 
@@ -1556,6 +1786,17 @@ def ensure_analysis(
     verified against the primary's contract, so "the replication measures
     what the primary measured" is a property of the digest rather than a
     comparison of two model-written paths.
+
+    **Under a capability manifest the analysis is checked before it is
+    frozen** (``planning``; ``docs/SCIENCE_EXECUTION.md`` §2a). The author is
+    shown the capability envelope -- what one execution and one campaign can
+    hold here -- before it chooses a stopping rule, and its proposal is
+    checked against that envelope by ordinary code. Only a proposal the check
+    accepts is frozen, bound to the envelope it was checked against. A
+    refused one is kept as a draft, never as a contract: an execution-shape
+    mismatch is re-asked once, through the queue's own retry, with the
+    refusal shown; ``CAPABILITY_LIMITED`` is not re-asked under the same
+    envelope at all. Nothing is converted for the author.
 
     Returns the contract, or a failed :class:`ExperimentStep` saying why none
     could be frozen.
@@ -1607,11 +1848,38 @@ def ensure_analysis(
             ),
         )
         contract = None
+    if contract is not None and not _envelope_binding_holds(
+        context, contract, planning
+    ):
+        assert planning is not None and contract.envelope_digest is not None
+        _retire_contract(
+            context,
+            contract,
+            detail=(
+                f"its analysis was checked against capability envelope "
+                f"{contract.envelope_digest}, and the envelope now in force is "
+                f"{planning.envelope.digest} (commit {planning.envelope.commit[:12]}); "
+                f"nothing was designed or measured under it, and it is checked again"
+            ),
+        )
+        contract = None
     if contract is not None:
         return HeldContract(contract)
 
     if role is ExperimentRole.REPLICATION:
-        return _inherit_analysis(context, version, previous=previous)
+        return _inherit_analysis(context, version, previous=previous, planning=planning)
+
+    earlier: tuple[AnalysisDraft, ...] = ()
+    if planning is not None:
+        earlier = store.analysis_drafts(
+            idea_id=version.idea_id,
+            idea_version=version.version,
+            role=role,
+            envelope_digest=planning.envelope.digest,
+        )
+        refused = _earlier_refusal(earlier, planning)
+        if refused is not None:
+            return refused
 
     template = _analysis_designer()
     # Under a capability manifest the typed catalogue is the whole of what the
@@ -1637,12 +1905,18 @@ def ensure_analysis(
     )
     from research_os.portfolio.runner import _ask, _cost
 
+    blocks: dict[str, Sequence[str]] = {
+        "idea": _idea_block(version),
+        "observable_catalogue": catalogue,
+    }
+    if planning is not None:
+        # Before the author chooses anything: what one execution and one
+        # campaign can hold here, derived from committed sources only.
+        blocks["capability_envelope"] = planning.envelope.lines()
+        if earlier:
+            blocks["refused_analysis"] = _refused_block(context, earlier[-1])
     try:
-        response = _ask(
-            context,
-            template,
-            blocks={"idea": _idea_block(version), "observable_catalogue": catalogue},
-        )
+        response = _ask(context, template, blocks=blocks)
     except ProviderCallFailedError as exc:
         return ExperimentStep(
             ok=False,
@@ -1678,21 +1952,38 @@ def ensure_analysis(
             cost_usd=cost,
             model_calls=1,
         )
+    provenance = {
+        "analysis_role": str(template.role),
+        "analysis_prompt": template.identity,
+        "analysis_call_id": response.call_id,
+        "provider": response.provider,
+        "model": response.model,
+    }
+    checked = planning.check(spec) if planning is not None else None
+    if checked is not None and checked.refused:
+        return _refuse_proposal(
+            context,
+            version,
+            role=role,
+            spec=spec,
+            checked=checked,
+            earlier=earlier,
+            provenance=provenance,
+            analysis_prompt=template.identity,
+            analysis_call_id=response.call_id,
+            cost_usd=cost,
+        )
     try:
         contract = _freeze_analysis(
             context,
             version,
             role=role,
             spec=spec,
-            provenance={
-                "analysis_role": str(template.role),
-                "analysis_prompt": template.identity,
-                "analysis_call_id": response.call_id,
-                "provider": response.provider,
-                "model": response.model,
-            },
+            provenance=provenance,
             analysis_prompt=template.identity,
             analysis_call_id=response.call_id,
+            checked=checked,
+            revises=_revision_record(context, earlier, spec) if earlier else (),
         )
     except DuplicateContractError:
         # Another pass froze one first, and that one is the commitment.
@@ -1715,7 +2006,11 @@ class HeldContract:
 
 
 def _inherit_analysis(
-    context: Any, version: IdeaVersion, *, previous: IdeaExperiment | None
+    context: Any,
+    version: IdeaVersion,
+    *,
+    previous: IdeaExperiment | None,
+    planning: shapes.Planning | None = None,
 ) -> ExperimentStep | HeldContract:
     if previous is None:  # pragma: no cover - advance() refuses first
         return ExperimentStep(
@@ -1746,6 +2041,21 @@ def _inherit_analysis(
         )
         spec = analysis_from_legacy_rule(legacy, reason=previous.no_rule_reason)
         source = previous.experiment_id
+    # The same check the primary's analysis passed, against the envelope in
+    # force now. An inherited analysis is not revisable -- it is the
+    # primary's -- so an envelope that can no longer execute it is a refusal
+    # with nothing frozen, not a second author.
+    checked = planning.check(spec) if planning is not None else None
+    if checked is not None and checked.refused:
+        return ExperimentStep(
+            ok=False,
+            detail=(
+                f"the primary's frozen analysis cannot be executed as a replication "
+                f"within the capability envelope now in force: {checked.summary()} "
+                f"[nothing was frozen]"
+            ),
+            failure_class=FailureClass.CAPABILITY_DENIED,
+        )
     try:
         contract = _freeze_analysis(
             context,
@@ -1756,6 +2066,7 @@ def _inherit_analysis(
             analysis_prompt=f"inherited:{source}",
             analysis_call_id=None,
             parent_contract_id=parent_contract_id,
+            checked=checked,
         )
     except DuplicateContractError:
         existing = context.portfolio.live_contract(
@@ -1861,19 +2172,15 @@ def campaign_bound_lines(
     if loaded is None:
         return []
     lines: list[str] = []
-    per_run = int(bounds.max_experiment_seconds)
+    human = shapes.human_bounds(bounds)
     for capability in sorted(loaded.manifest.capabilities, key=lambda item: item.id):
         declared = commands.get(capability.command)
         if capability.campaign is None or declared is None:
             continue
-        unit_seconds = min(
-            int(getattr(declared, "timeout_seconds", 0) or per_run), per_run
-        )
-        allowed = min(
-            int(capability.campaign.max_units),
-            int(bounds.max_campaign_units),
-            int(bounds.max_campaign_seconds) // max(1, unit_seconds),
-        )
+        # The envelope's arithmetic, so the designer and the analysis author
+        # are shown one number.
+        unit_seconds = capabilities.execution_seconds(capability, commands, human)
+        allowed = capabilities.campaign_units(capability, commands, human)
         lines.append(
             f"campaigns of {capability.ref} on this host: at most {allowed} unit(s). "
             f"Each unit may run up to {unit_seconds}s, and this portfolio permits "
@@ -1882,6 +2189,22 @@ def campaign_bound_lines(
             f"numbers); a larger campaign is refused before it runs"
         )
     return lines
+
+
+def _binding_observables(
+    planning: shapes.Planning, analysis: AnalysisSpec
+) -> tuple[tuple[str, str], ...]:
+    """The analysis-to-capability observable map resolution gives, here."""
+
+    resolution = capabilities.resolve(
+        capabilities.Requirements(
+            observables=sciencechain.requirements_from_analysis(analysis),
+            max_seconds=int(planning.envelope.bounds.max_execution_seconds),
+        ),
+        loaded=planning.loaded,
+        commands=planning.commands,
+    )
+    return resolution.binding.observables if resolution.binding is not None else ()
 
 
 def _manifest_identity(
@@ -2299,6 +2622,10 @@ def design(
     # route, whose evidence no v1 gate accepts.
     loaded, manifest_error = capability_manifest(context)
     governed = loaded is not None or manifest_error is not None
+    # What one execution and one campaign can hold here, from the committed
+    # declaration, the host's commands and the human-set bounds: what the
+    # analysis is planned against, and checked against, before it is frozen.
+    planning = shapes.planning_for(loaded, commands, context.config.bounds)
     replication = role is ExperimentRole.REPLICATION
     if replication and previous is None:  # pragma: no cover - the caller always has one
         raise EmpiricalError(
@@ -2312,6 +2639,7 @@ def design(
         previous=previous,
         commands=commands,
         capability_catalogue=capabilities.catalogue_lines(loaded, commands),
+        planning=planning,
     )
     if isinstance(held, ExperimentStep):
         return held
@@ -2396,12 +2724,24 @@ def design(
             model_calls=analysis_calls,
         )
 
+    # The check the frozen analysis passed, recomputed -- it is a function of
+    # the analysis and the envelope, and the contract is bound to this one --
+    # so the designer is shown the shape to realise and the campaign it
+    # proposes is held to it.
+    frozen_shape = (
+        planning.check(analysis)
+        if planning is not None and contract.envelope_digest is not None
+        else None
+    )
     template = designer_for(role)
     blocks: dict[str, Sequence[str]] = {
         # The idea with its bar redacted: the falsifier usually states the
         # threshold the analysis froze from it.
         "idea": scicontract.withhold_thresholds(_idea_block(version), analysis),
-        "analysis_requirements": scicontract.requirements_block(analysis),
+        "analysis_requirements": scicontract.requirements_block(
+            analysis,
+            shape_check=frozen_shape.record() if frozen_shape is not None else None,
+        ),
         "declared_commands": [
             # Under a manifest, only the commands that back a declared
             # capability: any other gets no plan, so offering it would only
@@ -2536,6 +2876,8 @@ def design(
             loaded=loaded,
             commands=commands,
             governed=governed,
+            frozen_shape=frozen_shape,
+            planning=planning,
         )
     if (
         replication
@@ -5586,6 +5928,8 @@ def _design_campaign(
     loaded: capabilities.LoadedManifest | None,
     commands: Mapping[str, Any],
     governed: bool,
+    frozen_shape: shapes.ShapeCheck | None = None,
+    planning: shapes.Planning | None = None,
 ) -> ExperimentStep:
     """Freeze a campaign design: its units, each a complete execution of one command.
 
@@ -5675,6 +6019,40 @@ def _design_campaign(
         if problems:
             return failed(
                 "; ".join(item.rendered() for item in problems),
+                FailureClass.MODEL_OUTPUT_INVALID,
+            )
+    if frozen_shape is not None and planning is not None:
+        # The shape the analysis was frozen with, realised rather than
+        # reinterpreted: a stated number of units is exact, stated unit
+        # differences are the only ones, and the campaign this design
+        # actually is must be one the envelope says could hold the support.
+        # A retry: another design may realise it.
+        cap = (
+            planning.envelope.capability(frozen_shape.capability)
+            if frozen_shape.capability
+            else None
+        )
+        attested = set(cap.unit_varies) if cap is not None else set()
+        shape_problems = shapes.realisation_problems(
+            frozen_shape,
+            unit_differences=[
+                tuple(
+                    item
+                    for item in campaigns._differences(first, second)
+                    if item in attested
+                )
+                for index, second in enumerate(units)
+                for first in units[:index]
+            ],
+            unit_count=len(units),
+            analysis=analysis,
+            envelope=planning.envelope,
+            binding_observables=_binding_observables(planning, analysis),
+        )
+        if shape_problems:
+            return failed(
+                "the design does not realise the frozen execution shape: "
+                + "; ".join(shape_problems),
                 FailureClass.MODEL_OUTPUT_INVALID,
             )
 

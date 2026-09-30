@@ -351,6 +351,69 @@ class CampaignSupport(_Declared):
         return None
 
 
+class RecordsBound(_Declared):
+    """At most ``max`` records of one ``records`` observable come from one execution."""
+
+    observable: str = Field(pattern=NAME_PATTERN)
+    max: int = Field(ge=1, le=100_000_000)
+
+
+class Renewal(_Declared):
+    """Which of an input's fields a campaign unit differing in ``varies`` gives new values.
+
+    A unit of a campaign that differs from another in a composed plan may
+    draw different instances altogether; one that differs only in its seed
+    draws the same sizes and families with new random draws. What each
+    difference renews is a fact about the program, so it is the researcher's
+    to state, in the attestation vocabulary ``campaign.unit_varies`` uses.
+    """
+
+    varies: str = Field(pattern=r"^(seeds|[a-z][a-z0-9_]{0,31})$")
+    fields: tuple[str, ...] = Field(min_length=1)
+
+
+class InputBound(_Declared):
+    """One bounded input of one execution, and the record fields it determines.
+
+    ``max`` of it per execution -- instances in a plan, noise draws, grid
+    points -- and every record of ``observable`` comes from one of them, with
+    ``fields`` fixed by which one. So one execution's records hold at most
+    ``max`` distinct combinations of those fields, and records selected by
+    *different* values of one of them come from *different* ones: two
+    analyses of disjoint families of instances share the bound, they do not
+    each get it.
+
+    ``across_units`` says what a campaign can add. ``None`` is not stated,
+    and the envelope then takes every unit difference to renew every field
+    -- its upper bound, never a refusal. Empty is stated: no difference
+    between units gives new values of these fields, so a campaign holds no
+    more distinct values of them than one execution does.
+    """
+
+    name: str = Field(pattern=NAME_PATTERN)
+    observable: str = Field(pattern=NAME_PATTERN)
+    max: int = Field(ge=1, le=1_000_000)
+    fields: tuple[str, ...] = Field(min_length=1)
+    across_units: tuple[Renewal, ...] | None = None
+    description: str = ""
+
+
+class ExecutionBounds(_Declared):
+    """What one execution of this capability can hold, at most: the researcher's statement.
+
+    The part of a declaration a *preregistration* is planned against. The
+    host command's own schema is what enforces a bound when a design is
+    composed; this states it in terms of the records an analysis reads, so
+    that whether one execution can hold the sample an analysis requires is
+    decided by ordinary code before the analysis is frozen, rather than
+    discovered by the experiment designer after it (the second final
+    qualification, 66d5704, was refused exactly there, twice).
+    """
+
+    records: tuple[RecordsBound, ...] = ()
+    inputs: tuple[InputBound, ...] = ()
+
+
 class Capability(_Declared):
     id: str = Field(pattern=CAPABILITY_ID_PATTERN, max_length=64)
     version: int = Field(ge=1, le=1_000_000)
@@ -368,6 +431,10 @@ class Capability(_Declared):
     #: Whether, and how, several executions form one measurement
     #: (`research_os.portfolio.campaign`). Absent: one execution each.
     campaign: CampaignSupport | None = None
+    #: What one execution can hold, at most (`execution_envelope`). Absent:
+    #: nothing is declared, and no analysis is refused for its sample size
+    #: before it is frozen -- the pre-envelope behaviour, unchanged.
+    execution: ExecutionBounds | None = None
 
     @model_validator(mode="after")
     def _coherent(self) -> Self:
@@ -389,6 +456,8 @@ class Capability(_Declared):
         _observables_fit_schema(self)
         if self.campaign is not None:
             _campaign_coherent(self, self.campaign)
+        if self.execution is not None:
+            _execution_coherent(self, self.execution)
         return self
 
     @property
@@ -556,6 +625,86 @@ def _campaign_coherent(capability: Capability, campaign: CampaignSupport) -> Non
             )
 
 
+def _execution_coherent(capability: Capability, bounds: ExecutionBounds) -> None:
+    """Execution bounds that describe this declaration's own records, checked once.
+
+    Every bound names a declared ``records`` observable and only fields it
+    declares; a field is bounded by one input at most, so which bound a
+    requirement on it meets is never a choice; and what a campaign unit
+    renews is a difference ``campaign.unit_varies`` allows, and a field of
+    that input. A declaration with no campaign states no renewal.
+    """
+
+    if not bounds.records and not bounds.inputs:
+        raise ValueError("an execution block states at least one bound")
+    if len(bounds.records) > MAX_OBSERVABLES or len(bounds.inputs) > MAX_FIELDS:
+        raise ValueError(
+            f"at most {MAX_OBSERVABLES} records bounds and {MAX_FIELDS} input bounds"
+        )
+
+    def records_observable(name: str, what: str) -> CapabilityObservable:
+        observable = capability.observable(name)
+        if observable is None or observable.kind != "records":
+            raise ValueError(
+                f"{what} names {name!r}, which is not a records observable"
+            )
+        return observable
+
+    seen: set[str] = set()
+    for item in bounds.records:
+        records_observable(item.observable, "a records bound")
+        if item.observable in seen:
+            raise ValueError(f"the records of {item.observable!r} are bounded twice")
+        seen.add(item.observable)
+    names: set[str] = set()
+    bounded: dict[tuple[str, str], str] = {}
+    allowed = set(capability.campaign.unit_varies) if capability.campaign else set()
+    for item in bounds.inputs:
+        _text(item.description, "an input bound's description")
+        if item.name in names:
+            raise ValueError(f"input bound {item.name!r} is declared twice")
+        names.add(item.name)
+        observable = records_observable(item.observable, f"input bound {item.name!r}")
+        if len(set(item.fields)) != len(item.fields):
+            raise ValueError(f"input bound {item.name!r} names a field twice")
+        for name in item.fields:
+            if observable.field(name) is None:
+                raise ValueError(
+                    f"input bound {item.name!r} names field {name!r}, which "
+                    f"{item.observable!r} does not declare"
+                )
+            key = (item.observable, name)
+            if key in bounded:
+                raise ValueError(
+                    f"field {name!r} of {item.observable!r} is bounded by both "
+                    f"{bounded[key]!r} and {item.name!r}"
+                )
+            bounded[key] = item.name
+        if item.across_units is None:
+            continue
+        if item.across_units and capability.campaign is None:
+            raise ValueError(
+                f"input bound {item.name!r} says what campaign units renew, and "
+                f"this capability declares no campaign"
+            )
+        tokens = [renewal.varies for renewal in item.across_units]
+        if len(set(tokens)) != len(tokens):
+            raise ValueError(f"input bound {item.name!r} names a unit difference twice")
+        for renewal in item.across_units:
+            if renewal.varies not in allowed:
+                raise ValueError(
+                    f"input bound {item.name!r}: campaign units may not differ in "
+                    f"{renewal.varies!r} (campaign.unit_varies: {sorted(allowed)})"
+                )
+            if len(set(renewal.fields)) != len(renewal.fields) or not set(
+                renewal.fields
+            ) <= set(item.fields):
+                raise ValueError(
+                    f"input bound {item.name!r}: what a {renewal.varies!r} unit "
+                    f"difference renews must be distinct fields of that input"
+                )
+
+
 def _schema_admits(node: Mapping[str, Any], declared: FieldType) -> bool:
     found = node.get("type")
     if found is None:
@@ -656,10 +805,11 @@ def capability_digest(capability: Capability) -> str:
 
     payload = capability.model_dump(mode="json", by_alias=True)
     # Absent is omitted rather than hashed as `null`, so no declaration
-    # written before campaigns existed changes its digest -- and no plan that
-    # pinned one stops verifying.
-    if payload.get("campaign") is None:
-        payload.pop("campaign", None)
+    # written before campaigns (or execution bounds) existed changes its
+    # digest -- and no plan that pinned one stops verifying.
+    for optional in ("campaign", "execution"):
+        if payload.get(optional) is None:
+            payload.pop(optional, None)
     return (
         f"{CAPABILITY_DIGEST_VERSION}:{hashlib.sha256(canonical(payload)).hexdigest()}"
     )
@@ -1125,6 +1275,380 @@ def input_digests(
     return sorted(found), unmet
 
 
+# ------------------------------------------------------------- envelope --
+ENVELOPE_SCHEMA = "research-os-execution-envelope-v1"
+ENVELOPE_DIGEST_VERSION = "renv-v1"
+
+
+@dataclass(frozen=True, slots=True)
+class HumanBounds:
+    """The numbers a person set that bound what may run here.
+
+    Research OS core knows them only as numbers: where they are configured
+    (``portfolio.yaml``) is the caller's business, and nothing autonomous
+    writes any of them.
+    """
+
+    #: The longest one execution may run, whatever its command declares.
+    max_execution_seconds: int
+    #: The most units one campaign may have.
+    max_campaign_units: int
+    #: The most one campaign may run in total: the sum of its units' ceilings.
+    max_campaign_seconds: int
+
+    def record(self) -> dict[str, int]:
+        return {
+            "max_execution_seconds": int(self.max_execution_seconds),
+            "max_campaign_units": int(self.max_campaign_units),
+            "max_campaign_seconds": int(self.max_campaign_seconds),
+        }
+
+
+def execution_seconds(
+    capability: Capability, commands: Mapping[str, Any], bounds: HumanBounds
+) -> int:
+    """How long one execution of ``capability`` may run on this host.
+
+    Its command's ceiling, capped by the person's: the same number the runner
+    enforces and a campaign's units are summed at.
+    """
+
+    per_run = int(bounds.max_execution_seconds)
+    declared = commands.get(capability.command)
+    return min(int(getattr(declared, "timeout_seconds", 0) or per_run), per_run)
+
+
+def campaign_units(
+    capability: Capability, commands: Mapping[str, Any], bounds: HumanBounds
+) -> int:
+    """The most units one campaign of ``capability`` may have here; 0 for none.
+
+    The smallest of what the capability declares, what the person permits,
+    and how many unit ceilings fit the person's campaign time -- the bound a
+    compiled campaign is refused beyond.
+    """
+
+    if capability.campaign is None or commands.get(capability.command) is None:
+        return 0
+    seconds = execution_seconds(capability, commands, bounds)
+    return max(
+        0,
+        min(
+            int(capability.campaign.max_units),
+            int(bounds.max_campaign_units),
+            int(bounds.max_campaign_seconds) // max(1, seconds),
+        ),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class CapabilityEnvelope:
+    """What one declared capability can hold here, in one execution and in one campaign."""
+
+    capability: Capability
+    #: Whether the host's declared command can run it (``check_against_command``).
+    unusable: tuple[str, ...]
+    #: The ceiling on one execution, here.
+    seconds: int
+    #: The most units one campaign may have, here; below 2, no campaign.
+    units: int
+
+    @property
+    def ref(self) -> str:
+        return self.capability.ref
+
+    @property
+    def usable(self) -> bool:
+        return not self.unusable
+
+    @property
+    def campaigns(self) -> bool:
+        return self.capability.campaign is not None and self.units >= 2
+
+    @property
+    def unit_varies(self) -> tuple[str, ...]:
+        campaign = self.capability.campaign
+        return tuple(campaign.unit_varies) if campaign is not None else ()
+
+    def records_max(self, observable: str) -> int | None:
+        declared = self.capability.execution
+        for item in declared.records if declared is not None else ():
+            if item.observable == observable:
+                return int(item.max)
+        return None
+
+    def inputs_of(self, observable: str) -> tuple[InputBound, ...]:
+        declared = self.capability.execution
+        return tuple(
+            item
+            for item in (declared.inputs if declared is not None else ())
+            if item.observable == observable
+        )
+
+    def input_named(self, name: str) -> InputBound | None:
+        declared = self.capability.execution
+        for item in declared.inputs if declared is not None else ():
+            if item.name == name:
+                return item
+        return None
+
+    def renewed_by(self, bound: InputBound, field_name: str) -> tuple[str, ...]:
+        """The unit differences that give ``bound`` new values of ``field_name``.
+
+        Not stated is every difference a campaign allows (the upper bound);
+        stated is exactly what the researcher said.
+        """
+
+        if not self.campaigns:
+            return ()
+        if bound.across_units is None:
+            return self.unit_varies
+        return tuple(
+            item.varies for item in bound.across_units if field_name in item.fields
+        )
+
+    def combinable(self, observable: str) -> bool:
+        campaign = self.capability.campaign
+        return campaign is not None and campaign.rule_for(observable) is not None
+
+    def record(self) -> dict[str, Any]:
+        cap = self.capability
+        declared = cap.execution
+        campaign = cap.campaign
+        return {
+            "ref": cap.ref,
+            "digest": capability_digest(cap),
+            "command": cap.command,
+            "usable": self.usable,
+            "unusable": list(self.unusable),
+            "observables": {item.name: item.kind for item in cap.observables},
+            "perturbations": [item.token for item in cap.replication.perturbations],
+            "execution": {
+                "declared": declared is not None,
+                "seconds": self.seconds,
+                "needs_seconds": cap.resources.timeout_seconds,
+                "records": {
+                    item.observable: int(item.max)
+                    for item in (declared.records if declared else ())
+                },
+                "inputs": [
+                    item.model_dump(mode="json")
+                    for item in (declared.inputs if declared else ())
+                ],
+            },
+            "campaign": (
+                None
+                if campaign is None
+                else {
+                    "declared_max_units": int(campaign.max_units),
+                    "max_units": self.units,
+                    "unit_seconds": self.seconds,
+                    "unit_varies": list(campaign.unit_varies),
+                    "aggregation": [
+                        item.model_dump(mode="json") for item in campaign.aggregation
+                    ],
+                }
+            ),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionEnvelope:
+    """What this laboratory can execute, in one execution and one campaign -- derived.
+
+    From three things and nothing else: the capability declaration committed
+    at the pinned commit, the host's declared commands (their time ceilings,
+    and whether they back the declaration at all) and the human-set bounds.
+    A model may be shown it; nothing a model writes is an input to it, so
+    nothing a model writes can enlarge it. Its digest binds an analysis that
+    was checked against it to exactly this envelope at exactly this commit.
+    """
+
+    commit: str
+    manifest_sha256: str
+    bounds: HumanBounds
+    capabilities: tuple[CapabilityEnvelope, ...]
+
+    def record(self) -> dict[str, Any]:
+        return {
+            "schema": ENVELOPE_SCHEMA,
+            "commit": self.commit,
+            "manifest_path": MANIFEST_PATH,
+            "manifest_sha256": self.manifest_sha256,
+            "bounds": self.bounds.record(),
+            "capabilities": [item.record() for item in self.capabilities],
+        }
+
+    @property
+    def digest(self) -> str:
+        return (
+            f"{ENVELOPE_DIGEST_VERSION}:"
+            f"{hashlib.sha256(canonical(self.record())).hexdigest()}"
+        )
+
+    def capability(self, ref: str) -> CapabilityEnvelope | None:
+        for item in self.capabilities:
+            if item.ref == ref:
+                return item
+        return None
+
+    def lines(self) -> list[str]:
+        return envelope_lines(self)
+
+
+def execution_envelope(
+    loaded: LoadedManifest | None,
+    commands: Mapping[str, Any],
+    bounds: HumanBounds,
+) -> ExecutionEnvelope | None:
+    """The envelope of the manifest committed at ``loaded.commit``; ``None`` without one."""
+
+    if loaded is None:
+        return None
+    return ExecutionEnvelope(
+        commit=loaded.commit,
+        manifest_sha256=loaded.sha256,
+        bounds=bounds,
+        capabilities=tuple(
+            CapabilityEnvelope(
+                capability=cap,
+                unusable=tuple(
+                    item.rendered() for item in check_against_command(cap, commands)
+                ),
+                seconds=execution_seconds(cap, commands, bounds),
+                units=campaign_units(cap, commands, bounds),
+            )
+            for cap in sorted(loaded.manifest.capabilities, key=lambda item: item.id)
+        ),
+    )
+
+
+def envelope_lines(envelope: ExecutionEnvelope) -> list[str]:
+    """The envelope as an analysis author is shown it. Every number is the record's."""
+
+    lines = [
+        (
+            f"CAPABILITY ENVELOPE {envelope.digest} -- what ONE execution, and ONE "
+            f"campaign, of each declared capability can hold on this host. Derived "
+            f"by Research OS from {MANIFEST_PATH} at commit {envelope.commit[:12]}, "
+            f"the host's declared commands and the human-set bounds; you may read "
+            f"it and nothing you write can enlarge it. Your stopping rule, "
+            f"execution_shape and support requirements are checked against it by "
+            f"ordinary code BEFORE your analysis is frozen."
+        ),
+    ]
+    for item in envelope.capabilities:
+        cap = item.capability
+        lines.append("")
+        lines.append(
+            f"capability {cap.ref} (command {cap.command})"
+            + (
+                ""
+                if item.usable
+                else " -- NOT usable here: " + "; ".join(item.unusable)
+            )
+        )
+        lines.append(
+            f"  ONE EXECUTION may run up to {item.seconds}s and holds at most:"
+        )
+        declared = cap.execution
+        if declared is None:
+            lines.append(
+                "    (no execution bounds are declared: nothing is refused before "
+                "freezing for its sample size, and the experiment designer may still "
+                "find one execution too small)"
+            )
+        else:
+            for bound in declared.records:
+                lines.append(
+                    f"    {bound.max} records of observable {bound.observable}"
+                )
+            for bound in declared.inputs:
+                joint = (
+                    f" -- jointly: records that differ in any of these come from "
+                    f"different {bound.name}, and records selected by different "
+                    f"values of one of them come from different {bound.name}"
+                    if len(bound.fields) > 1
+                    else ""
+                )
+                lines.append(
+                    f"    {bound.max} {bound.name} of observable {bound.observable}, "
+                    f"so at most {bound.max} distinct values of "
+                    f"{', '.join(bound.fields)}{joint}"
+                    + (f" ({bound.description})" if bound.description else "")
+                )
+            lines.append(
+                "    (fields not named here are not bounded by the declaration)"
+            )
+        if not item.campaigns:
+            why = (
+                "the capability declares no campaign"
+                if cap.campaign is None
+                else f"the human-set bounds permit {item.units} unit(s) here"
+            )
+            lines.append(
+                f"  A CAMPAIGN is not available ({why}): the sample must fit one "
+                f"execution, under stopping_rule fixed_single_execution"
+            )
+            continue
+        assert cap.campaign is not None
+        lines.append(
+            f"  A CAMPAIGN (stopping_rule fixed_campaign) may have 2 to {item.units} "
+            f"units here (the capability declares {cap.campaign.max_units}; this "
+            f"portfolio permits {envelope.bounds.max_campaign_units} units and "
+            f"{envelope.bounds.max_campaign_seconds}s per campaign, each unit up to "
+            f"{item.seconds}s). Its units must differ in "
+            + " or ".join(cap.campaign.unit_varies)
+            + "; a campaign of N units holds at most N times what one execution "
+            "holds of what those differences renew, and no more than one execution "
+            "of anything they do not:"
+        )
+        for bound in declared.inputs if declared is not None else ():
+            for token in item.unit_varies:
+                renewed = [
+                    name
+                    for name in bound.fields
+                    if token in item.renewed_by(bound, name)
+                ]
+                if renewed:
+                    lines.append(
+                        f"    a unit differing in {token} renews {bound.name}: "
+                        f"{', '.join(renewed)}"
+                    )
+            fixed = [name for name in bound.fields if not item.renewed_by(bound, name)]
+            if fixed:
+                lines.append(
+                    f"    nothing renews {', '.join(fixed)} ({bound.name}): a campaign "
+                    f"holds at most {bound.max} distinct values of it"
+                )
+        combined = [
+            f"{rule.observable} ({rule.rule})" for rule in cap.campaign.aggregation
+        ]
+        lines.append("    combinable across units: " + ", ".join(combined))
+        missing = [obs.name for obs in cap.observables if not item.combinable(obs.name)]
+        if missing:
+            lines.append(
+                "    NOT combinable (a campaign analysis cannot read them): "
+                + ", ".join(missing)
+            )
+        for bound in declared.inputs if declared is not None else ():
+            renewing = {
+                name: len(item.renewed_by(bound, name)) for name in bound.fields
+            }
+            most = max(renewing.values(), default=0)
+            if most:
+                example = [name for name, count in renewing.items() if count == most][
+                    -1
+                ]
+                lines.append(
+                    f"    e.g. distinct {example}: at most {bound.max} in one "
+                    f"execution, at most {bound.max * item.units} in a campaign of "
+                    f"{item.units}; more is CAPABILITY_LIMITED here"
+                )
+                break
+    return lines
+
+
 # ------------------------------------------------------------ rendering --
 def catalogue_lines(
     loaded: LoadedManifest | None, commands: Mapping[str, Any] | None = None
@@ -1201,6 +1725,15 @@ def catalogue_lines(
         for item in attested:
             lines.append(f"        {item.token}: {item.description}")
         lines.append(f"    one execution needs up to {cap.resources.timeout_seconds}s")
+        if cap.execution is not None:
+            held = [
+                f"{item.max} records of {item.observable}"
+                for item in cap.execution.records
+            ] + [
+                f"{item.max} {item.name} (distinct {', '.join(item.fields)})"
+                for item in cap.execution.inputs
+            ]
+            lines.append("    one execution holds at most: " + "; ".join(held))
         if cap.campaign is None:
             lines.append(
                 "    campaign: not declared -- one execution per measurement; its "
@@ -1248,24 +1781,36 @@ def iter_fields(capability: Capability) -> Iterable[tuple[str, ObservableField]]
 
 
 __all__ = [
+    "ENVELOPE_SCHEMA",
     "MANIFEST_PATH",
     "MANIFEST_SCHEMA",
     "Binding",
     "CampaignAggregation",
     "CampaignSupport",
     "Capability",
+    "CapabilityEnvelope",
     "CapabilityError",
     "CapabilityManifest",
     "CapabilityStatus",
+    "ExecutionBounds",
+    "ExecutionEnvelope",
+    "HumanBounds",
+    "InputBound",
     "LoadedManifest",
     "ObservableNeed",
+    "RecordsBound",
+    "Renewal",
     "Requirements",
     "Resolution",
     "Unmet",
+    "campaign_units",
     "capability_digest",
     "catalogue_lines",
     "check_against_command",
     "committed_bytes",
+    "envelope_lines",
+    "execution_envelope",
+    "execution_seconds",
     "input_digests",
     "load_committed",
     "parse_manifest",

@@ -540,12 +540,17 @@ def test_the_analysis_is_frozen_first_and_the_designer_never_sees_its_thresholds
     assert "0.4375" not in designer.prompt and "0.0625" not in designer.prompt
     assert "deliberately not shown" in designer.prompt
     assert "size:difficulty" in designer.prompt, "it is shown what it must produce"
-    # The analysis designer's input boundary is its template: the idea and
-    # the catalogue of what can be observed. There is no block a design, a
-    # grid or a result could arrive through.
+    # The analysis designer's input boundary is its template: the idea, the
+    # catalogue of what can be observed, the capability envelope derived from
+    # the committed declaration and the human-set bounds, and its own
+    # proposal if one was refused before freezing (docs/SCIENCE_EXECUTION.md
+    # §2a). There is no block a design, a grid or a result could arrive
+    # through.
     assert [name for name, _fence in TEMPLATES["analysis_designer"].blocks] == [
         "idea",
         "observable_catalogue",
+        "capability_envelope",
+        "refused_analysis",
     ]
     assert router.requests_for_prompt(TEMPLATES["analysis_designer"].identity)
 

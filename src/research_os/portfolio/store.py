@@ -38,6 +38,7 @@ from research_os.portfolio import digests as pdigests
 from research_os.portfolio.contracts import MAX_SUMMARY_CHARS
 from research_os.portfolio.ids import (
     new_contract_id,
+    new_draft_id,
     new_idea_action_id,
     new_idea_evidence_id,
     new_idea_experiment_id,
@@ -63,6 +64,7 @@ from research_os.portfolio.models import (
     TIER_ORDER,
     ActionStatus,
     AdjudicationType,
+    AnalysisDraft,
     CampaignPlanUnit,
     CampaignUnitResult,
     ContractKind,
@@ -73,6 +75,7 @@ from research_os.portfolio.models import (
     EvidenceKind,
     EvidenceStrength,
     ExecutionReceipt,
+    ExecutionShapeVerdict,
     ExperimentRole,
     ExperimentState,
     FrontierRequest,
@@ -209,7 +212,12 @@ CONTRACT_COLUMNS = (
     "analysis_prompt, analysis_call_id, design_digest, design_artifact_id, "
     "design_prompt, design_call_id, contract_digest, contract_artifact_id, "
     "parent_contract_id, capability_request, command_set_digest, detail, "
-    "created_at, updated_at, frozen_at"
+    "created_at, updated_at, frozen_at, envelope_digest"
+)
+DRAFT_COLUMNS = (
+    "draft_id, project_id, idea_id, idea_version, role, verdict, analysis_digest, "
+    "artifact_id, envelope_digest, code_commit, check_record, analysis_prompt, "
+    "analysis_call_id, created_at"
 )
 ACTION_COLUMNS = (
     "action_id, idea_id, idea_version, stage, basis_digest, status, work_id, "
@@ -2756,6 +2764,7 @@ class PortfolioStore:
         parent_contract_id: str | None = None,
         contract_id: str | None = None,
         design: Mapping[str, Any] | None = None,
+        envelope_digest: str | None = None,
     ) -> ScientificContract:
         """Freeze an analysis: the first half of a scientific contract.
 
@@ -2764,6 +2773,12 @@ class PortfolioStore:
         a new rule and so inherits the parent's design. It is a mapping of the
         design columns and is refused for a preregistered contract, whose
         design must be authored *after* its analysis is frozen.
+
+        ``envelope_digest`` is the capability envelope the analysis was
+        checked against before freezing (``portfolio.shape``). The database
+        never lets it change, and refuses the insert outright when the
+        analysis is one it recorded as refused under that envelope
+        (``sql/0049``).
         """
 
         if design is not None and kind is ContractKind.PREREGISTERED:
@@ -2788,7 +2803,7 @@ class PortfolioStore:
                          analysis_artifact_id, analysis_prompt, analysis_call_id,
                          parent_contract_id, design_digest, design_artifact_id,
                          design_prompt, design_call_id, contract_digest,
-                         contract_artifact_id, frozen_at)
+                         contract_artifact_id, frozen_at, envelope_digest)
                     values (%(contract_id)s, %(project_id)s, %(idea_id)s,
                             %(version)s, %(role)s, %(kind)s, %(state)s,
                             %(hypothesis)s, %(analysable)s, %(analysis)s,
@@ -2797,7 +2812,8 @@ class PortfolioStore:
                             %(design_artifact)s, %(design_prompt)s,
                             %(design_call)s, %(contract_digest)s,
                             %(contract_artifact)s,
-                            case when %(frozen)s then now() else null end)
+                            case when %(frozen)s then now() else null end,
+                            %(envelope)s)
                     returning {CONTRACT_COLUMNS}
                     """,
                     {
@@ -2822,6 +2838,7 @@ class PortfolioStore:
                         "contract_digest": columns.get("contract_digest"),
                         "contract_artifact": columns.get("contract_artifact_id"),
                         "frozen": design is not None,
+                        "envelope": envelope_digest,
                     },
                 ).fetchone()
         except RuntimeDatabaseError:
@@ -2836,6 +2853,92 @@ class PortfolioStore:
                     ) from None
             raise
         return ScientificContract.model_validate(row)
+
+    # -------------------------------------------------- analysis drafts --
+    def record_analysis_draft(
+        self,
+        *,
+        project_id: str,
+        idea_id: str,
+        idea_version: int,
+        role: ExperimentRole,
+        verdict: ExecutionShapeVerdict,
+        analysis_digest: str,
+        artifact_id: str,
+        envelope_digest: str,
+        code_commit: str,
+        check_record: Mapping[str, Any],
+        analysis_prompt: str = "",
+        analysis_call_id: str | None = None,
+    ) -> AnalysisDraft:
+        """Record a proposed analysis the execution-shape check refused. Immutable.
+
+        Only the two refusing verdicts are drafts, and only while no contract
+        is live for the version and role: the database refuses anything else
+        (``sql/0049``), as it refuses any later change to a draft.
+        """
+
+        with self._tx() as conn:
+            row = conn.execute(
+                f"""
+                insert into analysis_drafts
+                    (draft_id, project_id, idea_id, idea_version, role, verdict,
+                     analysis_digest, artifact_id, envelope_digest, code_commit,
+                     check_record, analysis_prompt, analysis_call_id)
+                values (%(draft_id)s, %(project_id)s, %(idea_id)s, %(version)s,
+                        %(role)s, %(verdict)s, %(analysis)s, %(artifact)s,
+                        %(envelope)s, %(commit)s, %(check)s, %(prompt)s, %(call)s)
+                returning {DRAFT_COLUMNS}
+                """,
+                {
+                    "draft_id": new_draft_id(),
+                    "project_id": project_id,
+                    "idea_id": idea_id,
+                    "version": idea_version,
+                    "role": str(role),
+                    "verdict": str(verdict),
+                    "analysis": analysis_digest,
+                    "artifact": artifact_id,
+                    "envelope": envelope_digest,
+                    "commit": code_commit,
+                    "check": jsonb(dict(check_record)),
+                    "prompt": analysis_prompt,
+                    "call": analysis_call_id,
+                },
+            ).fetchone()
+        return AnalysisDraft.model_validate(row)
+
+    def analysis_drafts(
+        self,
+        *,
+        idea_id: str,
+        idea_version: int,
+        role: ExperimentRole,
+        envelope_digest: str | None = None,
+    ) -> tuple[AnalysisDraft, ...]:
+        """The refused proposals for one version and role, oldest first.
+
+        ``envelope_digest`` restricts them to the envelope they were refused
+        under: a refusal is an answer about one envelope, and a changed
+        envelope is a question worth asking again.
+        """
+
+        with self._tx() as conn:
+            rows = conn.execute(
+                f"select {DRAFT_COLUMNS} from analysis_drafts "
+                "where idea_id = %(idea_id)s and idea_version = %(version)s "
+                "  and role = %(role)s "
+                "  and (%(envelope)s::text is null "
+                "       or envelope_digest = %(envelope)s::text) "
+                "order by created_at, draft_id",
+                {
+                    "idea_id": idea_id,
+                    "version": idea_version,
+                    "role": str(role),
+                    "envelope": envelope_digest,
+                },
+            ).fetchall()
+        return tuple(AnalysisDraft.model_validate(row) for row in rows)
 
     def freeze_contract(
         self,
