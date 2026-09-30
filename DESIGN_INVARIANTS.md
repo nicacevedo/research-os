@@ -395,3 +395,32 @@ The property worth stating as new rather than preserved:
 ```text
 N executions of the same thing  !=  N independent observations
 ```
+
+## Change control record: capability-aware analysis planning
+
+Per the change-control section above, a dedicated record. **No invariant
+changed and nothing was added to the permitted-technology list.** One
+migration (`0049`) adds one table and one column; `docs/SCIENCE_EXECUTION.md`
+§1a and §2a are the specification.
+
+The defect, measured by the second final qualification (66d5704) rather than
+reasoned about: two independently generated lineages reached the evidence
+stage, and both analysis authors froze `fixed_single_execution` for a sample
+one execution of the only capability could not hold. The experiment
+designer, who alone was shown the per-execution bound, refused both --
+correctly, and after the analysis could no longer change. A campaign within
+the human-set bounds could have held either.
+
+| # | invariant | what changed |
+|---|---|---|
+| 1 | local before LLM | strengthened. Whether an analysis's stopping rule can hold its own support requirements, in one execution or an allowed campaign, is decided by ordinary code over the committed declaration and the human-set bounds before the analysis is frozen. A model proposes an execution shape; it decides nothing about what the laboratory holds, and a capacity it claims is checked, never used |
+| 6 | Git-tracked files are truth | unchanged. The execution bounds are part of the capability declaration read from the science repository's committed tree; the envelope is derived from it at the pinned commit and nothing writes it |
+| 8 | no agent approves its own work | unchanged. The pre-freeze verdict is computed; a refused proposal is never converted, rewritten or frozen for its author, and the database refuses to freeze an analysis it recorded as refused under the same envelope |
+| 11 | experiments traceable | strengthened. A frozen analysis names the envelope it was checked against, in its row (immutable) and in its bytes (re-verified); an unread contract whose envelope is no longer the one in force is superseded rather than designed under another laboratory |
+| 14 | finite stop conditions | unchanged in kind, extended. The revision of a refused proposal is the queue's existing retry, bounded at two refused proposals per version, role and envelope, after which no analysis is bought under that envelope; a CAPABILITY_LIMITED answer is not bought twice |
+
+The property worth stating as new rather than preserved:
+
+```text
+a model that can read the envelope  !=  a model that can enlarge it
+```

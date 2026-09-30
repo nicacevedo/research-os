@@ -336,8 +336,37 @@ The final implementation sprint addresses both, and nothing else:
 - **a feasibility signal** -- derived from the committed catalogue and the
   idea's structured evidence needs, used only to order advancement.
 
-The qualification contract is unchanged (its digest is still pinned). **Not
-qualified:** the rerun has not been made. Not merged, not tagged.
+The qualification contract is unchanged (its digest is still pinned).
+
+The rerun (`66d5704`, CG `5eb3923`) ended `FINAL_QUALIFICATION_INCOMPLETE`,
+`NOT_QUALIFIED` at 10 of 26 gates, on its frozen 900-tick limit with 7.05 of
+30 USD unspent and no integrity, provenance, containment, budget or
+allocator failure. Its evidence is preserved unchanged outside the
+repository. One cause was architectural, and it is narrow: the two lineages
+that reached the evidence stage both froze a `fixed_single_execution`
+analysis whose support one `cg.cells@1` execution cannot hold, and the
+experiment designer -- the only role shown the per-execution bound -- then
+refused both, correctly, after the analysis could no longer change. A
+campaign within the human-set bounds could have held either. The
+capability-planning sprint addresses that, and nothing else
+(`docs/SCIENCE_EXECUTION.md` §1a, §2a; `sql/0049`):
+
+- **a structured capability envelope** -- a capability may declare what one
+  execution holds (`execution`: records, bounded inputs, what each campaign
+  unit difference renews); Research OS derives the envelope from that
+  committed declaration, the host's commands and the human-set bounds at the
+  pinned commit, and digests it; `cg.cells@1` states its existing bounds
+  (four instances per plan, 240 solves) and nothing more;
+- **the envelope before the freeze** -- the analysis author is shown it, and
+  states the execution shape it plans;
+- **a mechanical pre-freeze check** -- VALID_SINGLE_EXECUTION, VALID_CAMPAIGN,
+  EXECUTION_SHAPE_MISMATCH or CAPABILITY_LIMITED; a refused proposal is kept
+  as an immutable draft and never frozen (the database refuses it), a
+  mismatch is re-asked once through the queue's own retry with the refusal
+  shown, and a frozen contract is bound to the envelope it was checked
+  against.
+
+**Not qualified:** a third run has not been made. Not merged, not tagged.
 
 ## Two external prerequisites, and the policy on each
 
