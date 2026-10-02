@@ -1,0 +1,3989 @@
+{
+ "datasets": {
+  "main": {
+   "records": [
+    {
+     "family": "sparse",
+     "instance_label": "sparse-s100-k5",
+     "iterations": 72,
+     "k": 5,
+     "lambda_ratio": 0.1,
+     "ok": false,
+     "p": 100,
+     "seed": 100,
+     "solver": "cg_hist",
+     "tolerance": 1e-06,
+     "wall_seconds": 1.091918
+    },
+    {
+     "family": "sparse",
+     "instance_label": "sparse-s100-k10",
+     "iterations": 50,
+     "k": 10,
+     "lambda_ratio": 0.1,
+     "ok": true,
+     "p": 200,
+     "seed": 100,
+     "solver": "celer",
+     "support_recall": 0.822501,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.841316
+    },
+    {
+     "family": "sparse",
+     "instance_label": "sparse-s100-k20",
+     "iterations": 14,
+     "k": 20,
+     "lambda_ratio": 0.3,
+     "ok": true,
+     "p": 100,
+     "seed": 100,
+     "solver": "skglm",
+     "support_recall": 0.631394,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.870483
+    },
+    {
+     "family": "sparse",
+     "instance_label": "sparse-s100-k5",
+     "iterations": 37,
+     "k": 5,
+     "lambda_ratio": 0.3,
+     "ok": true,
+     "p": 200,
+     "seed": 100,
+     "solver": "lars",
+     "support_recall": 0.538807,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.201894
+    },
+    {
+     "family": "correlated",
+     "instance_label": "correlated-s100-k10",
+     "iterations": 37,
+     "k": 10,
+     "lambda_ratio": 0.5,
+     "ok": true,
+     "p": 100,
+     "seed": 100,
+     "solver": "cg_hist",
+     "support_recall": 0.704289,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.072885
+    },
+    {
+     "family": "correlated",
+     "instance_label": "correlated-s100-k20",
+     "iterations": 60,
+     "k": 20,
+     "lambda_ratio": 0.5,
+     "ok": true,
+     "p": 200,
+     "seed": 100,
+     "solver": "celer",
+     "support_recall": 0.484963,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.686011
+    },
+    {
+     "family": "correlated",
+     "instance_label": "correlated-s100-k5",
+     "iterations": 69,
+     "k": 5,
+     "lambda_ratio": 0.7,
+     "ok": true,
+     "p": 100,
+     "seed": 100,
+     "solver": "skglm",
+     "support_recall": 0.422835,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.255936
+    },
+    {
+     "family": "correlated",
+     "instance_label": "correlated-s100-k10",
+     "iterations": 5,
+     "k": 10,
+     "lambda_ratio": 0.7,
+     "ok": false,
+     "p": 200,
+     "seed": 100,
+     "solver": "lars",
+     "support_recall": 0.309378,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.979226
+    },
+    {
+     "family": "toeplitz",
+     "instance_label": "toeplitz-s100-k20",
+     "iterations": 19,
+     "k": 20,
+     "lambda_ratio": 0.1,
+     "ok": true,
+     "p": 100,
+     "seed": 100,
+     "solver": "cg_hist",
+     "support_recall": 0.729546,
+     "tolerance": 1e-06,
+     "wall_seconds": 0.651007
+    },
+    {
+     "family": "toeplitz",
+     "instance_label": "toeplitz-s100-k5",
+     "iterations": 9,
+     "k": 5,
+     "lambda_ratio": 0.1,
+     "ok": true,
+     "p": 200,
+     "seed": 100,
+     "solver": "celer",
+     "support_recall": 0.94895,
+     "tolerance": 1e-06,
+     "wall_seconds": 3.695949
+    },
+    {
+     "family": "toeplitz",
+     "instance_label": "toeplitz-s100-k10",
+     "iterations": 61,
+     "k": 10,
+     "lambda_ratio": 0.3,
+     "ok": true,
+     "p": 100,
+     "seed": 100,
+     "solver": "skglm",
+     "support_recall": 0.542054,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.478086
+    },
+    {
+     "family": "toeplitz",
+     "instance_label": "toeplitz-s100-k20",
+     "iterations": 64,
+     "k": 20,
+     "lambda_ratio": 0.3,
+     "ok": true,
+     "p": 200,
+     "seed": 100,
+     "solver": "lars",
+     "tolerance": 1e-06,
+     "wall_seconds": 2.038839
+    },
+    {
+     "family": "block",
+     "instance_label": "block-s100-k5",
+     "iterations": 53,
+     "k": 5,
+     "lambda_ratio": 0.5,
+     "ok": true,
+     "p": 100,
+     "seed": 100,
+     "solver": "cg_hist",
+     "support_recall": 0.459421,
+     "tolerance": 1e-06,
+     "wall_seconds": 0.830674
+    },
+    {
+     "family": "block",
+     "instance_label": "block-s100-k10",
+     "iterations": 27,
+     "k": 10,
+     "lambda_ratio": 0.5,
+     "ok": true,
+     "p": 200,
+     "seed": 100,
+     "solver": "celer",
+     "support_recall": 0.559349,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.264656
+    },
+    {
+     "family": "block",
+     "instance_label": "block-s100-k20",
+     "iterations": 32,
+     "k": 20,
+     "lambda_ratio": 0.7,
+     "ok": false,
+     "p": 100,
+     "seed": 100,
+     "solver": "skglm",
+     "support_recall": 0.342718,
+     "tolerance": 1e-06,
+     "wall_seconds": 2.33437
+    },
+    {
+     "family": "block",
+     "instance_label": "block-s100-k5",
+     "iterations": 35,
+     "k": 5,
+     "lambda_ratio": 0.7,
+     "ok": true,
+     "p": 200,
+     "seed": 100,
+     "solver": "lars",
+     "support_recall": 0.352393,
+     "tolerance": 1e-06,
+     "wall_seconds": 0.615015
+    },
+    {
+     "family": "illcond",
+     "instance_label": "illcond-s100-k10",
+     "iterations": 54,
+     "k": 10,
+     "lambda_ratio": 0.1,
+     "ok": true,
+     "p": 100,
+     "seed": 100,
+     "solver": "cg_hist",
+     "support_recall": 0.885689,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.177469
+    },
+    {
+     "family": "illcond",
+     "instance_label": "illcond-s100-k20",
+     "iterations": 72,
+     "k": 20,
+     "lambda_ratio": 0.1,
+     "ok": true,
+     "p": 200,
+     "seed": 100,
+     "solver": "celer",
+     "support_recall": 0.937874,
+     "tolerance": 1e-06,
+     "wall_seconds": 2.327564
+    },
+    {
+     "family": "illcond",
+     "instance_label": "illcond-s100-k5",
+     "iterations": 37,
+     "k": 5,
+     "lambda_ratio": 0.3,
+     "ok": true,
+     "p": 100,
+     "seed": 100,
+     "solver": "skglm",
+     "support_recall": 0.724623,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.640971
+    },
+    {
+     "family": "illcond",
+     "instance_label": "illcond-s100-k10",
+     "iterations": 40,
+     "k": 10,
+     "lambda_ratio": 0.3,
+     "ok": true,
+     "p": 200,
+     "seed": 100,
+     "solver": "lars",
+     "support_recall": 0.821515,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.277765
+    },
+    {
+     "family": "sparse",
+     "instance_label": "sparse-s101-k20",
+     "iterations": 26,
+     "k": 20,
+     "lambda_ratio": 0.5,
+     "ok": true,
+     "p": 100,
+     "seed": 101,
+     "solver": "cg_hist",
+     "support_recall": 0.410934,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.207045
+    },
+    {
+     "family": "sparse",
+     "instance_label": "sparse-s101-k5",
+     "iterations": 63,
+     "k": 5,
+     "lambda_ratio": 0.5,
+     "ok": false,
+     "p": 200,
+     "seed": 101,
+     "solver": "celer",
+     "support_recall": 0.410015,
+     "tolerance": 1e-06,
+     "wall_seconds": 2.238998
+    },
+    {
+     "family": "sparse",
+     "instance_label": "sparse-s101-k10",
+     "iterations": 13,
+     "k": 10,
+     "lambda_ratio": 0.7,
+     "ok": true,
+     "p": 100,
+     "seed": 101,
+     "solver": "skglm",
+     "tolerance": 1e-06,
+     "wall_seconds": 2.370017
+    },
+    {
+     "family": "sparse",
+     "instance_label": "sparse-s101-k20",
+     "iterations": 20,
+     "k": 20,
+     "lambda_ratio": 0.7,
+     "ok": true,
+     "p": 200,
+     "seed": 101,
+     "solver": "lars",
+     "support_recall": 0.576394,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.886887
+    },
+    {
+     "family": "correlated",
+     "instance_label": "correlated-s101-k5",
+     "iterations": 71,
+     "k": 5,
+     "lambda_ratio": 0.1,
+     "ok": true,
+     "p": 100,
+     "seed": 101,
+     "solver": "cg_hist",
+     "support_recall": 0.888801,
+     "tolerance": 1e-06,
+     "wall_seconds": 0.81063
+    },
+    {
+     "family": "correlated",
+     "instance_label": "correlated-s101-k10",
+     "iterations": 10,
+     "k": 10,
+     "lambda_ratio": 0.1,
+     "ok": true,
+     "p": 200,
+     "seed": 101,
+     "solver": "celer",
+     "support_recall": 0.596905,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.372952
+    },
+    {
+     "family": "correlated",
+     "instance_label": "correlated-s101-k20",
+     "iterations": 66,
+     "k": 20,
+     "lambda_ratio": 0.3,
+     "ok": true,
+     "p": 100,
+     "seed": 101,
+     "solver": "skglm",
+     "support_recall": 0.728367,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.506903
+    },
+    {
+     "family": "correlated",
+     "instance_label": "correlated-s101-k5",
+     "iterations": 44,
+     "k": 5,
+     "lambda_ratio": 0.3,
+     "ok": true,
+     "p": 200,
+     "seed": 101,
+     "solver": "lars",
+     "support_recall": 0.536269,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.788518
+    },
+    {
+     "family": "toeplitz",
+     "instance_label": "toeplitz-s101-k10",
+     "iterations": 7,
+     "k": 10,
+     "lambda_ratio": 0.5,
+     "ok": false,
+     "p": 100,
+     "seed": 101,
+     "solver": "cg_hist",
+     "support_recall": 0.453297,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.4545
+    },
+    {
+     "family": "toeplitz",
+     "instance_label": "toeplitz-s101-k20",
+     "iterations": 73,
+     "k": 20,
+     "lambda_ratio": 0.5,
+     "ok": true,
+     "p": 200,
+     "seed": 101,
+     "solver": "celer",
+     "support_recall": 0.545013,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.797895
+    },
+    {
+     "family": "toeplitz",
+     "instance_label": "toeplitz-s101-k5",
+     "iterations": 36,
+     "k": 5,
+     "lambda_ratio": 0.7,
+     "ok": true,
+     "p": 100,
+     "seed": 101,
+     "solver": "skglm",
+     "support_recall": 0.222575,
+     "tolerance": 1e-06,
+     "wall_seconds": 2.086942
+    },
+    {
+     "family": "toeplitz",
+     "instance_label": "toeplitz-s101-k10",
+     "iterations": 64,
+     "k": 10,
+     "lambda_ratio": 0.7,
+     "ok": true,
+     "p": 200,
+     "seed": 101,
+     "solver": "lars",
+     "support_recall": 0.22298,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.986958
+    },
+    {
+     "family": "block",
+     "instance_label": "block-s101-k20",
+     "iterations": 52,
+     "k": 20,
+     "lambda_ratio": 0.1,
+     "ok": true,
+     "p": 100,
+     "seed": 101,
+     "solver": "cg_hist",
+     "support_recall": 0.889527,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.163039
+    },
+    {
+     "family": "block",
+     "instance_label": "block-s101-k5",
+     "iterations": 24,
+     "k": 5,
+     "lambda_ratio": 0.1,
+     "ok": true,
+     "p": 200,
+     "seed": 101,
+     "solver": "celer",
+     "tolerance": 1e-06,
+     "wall_seconds": 1.520708
+    },
+    {
+     "family": "block",
+     "instance_label": "block-s101-k10",
+     "iterations": 6,
+     "k": 10,
+     "lambda_ratio": 0.3,
+     "ok": true,
+     "p": 100,
+     "seed": 101,
+     "solver": "skglm",
+     "support_recall": 0.623466,
+     "tolerance": 1e-06,
+     "wall_seconds": 2.077157
+    },
+    {
+     "family": "block",
+     "instance_label": "block-s101-k20",
+     "iterations": 75,
+     "k": 20,
+     "lambda_ratio": 0.3,
+     "ok": false,
+     "p": 200,
+     "seed": 101,
+     "solver": "lars",
+     "support_recall": 0.664138,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.923975
+    },
+    {
+     "family": "illcond",
+     "instance_label": "illcond-s101-k5",
+     "iterations": 21,
+     "k": 5,
+     "lambda_ratio": 0.5,
+     "ok": true,
+     "p": 100,
+     "seed": 101,
+     "solver": "cg_hist",
+     "support_recall": 0.684163,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.124828
+    },
+    {
+     "family": "illcond",
+     "instance_label": "illcond-s101-k10",
+     "iterations": 17,
+     "k": 10,
+     "lambda_ratio": 0.5,
+     "ok": true,
+     "p": 200,
+     "seed": 101,
+     "solver": "celer",
+     "support_recall": 0.59864,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.007777
+    },
+    {
+     "family": "illcond",
+     "instance_label": "illcond-s101-k20",
+     "iterations": 57,
+     "k": 20,
+     "lambda_ratio": 0.7,
+     "ok": true,
+     "p": 100,
+     "seed": 101,
+     "solver": "skglm",
+     "support_recall": 0.29575,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.614522
+    },
+    {
+     "family": "illcond",
+     "instance_label": "illcond-s101-k5",
+     "iterations": 4,
+     "k": 5,
+     "lambda_ratio": 0.7,
+     "ok": true,
+     "p": 200,
+     "seed": 101,
+     "solver": "lars",
+     "support_recall": 0.475253,
+     "tolerance": 1e-06,
+     "wall_seconds": 2.355431
+    },
+    {
+     "family": "sparse",
+     "instance_label": "sparse-s102-k10",
+     "iterations": 17,
+     "k": 10,
+     "lambda_ratio": 0.1,
+     "ok": true,
+     "p": 100,
+     "seed": 102,
+     "solver": "cg_hist",
+     "support_recall": 0.792058,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.068274
+    },
+    {
+     "family": "sparse",
+     "instance_label": "sparse-s102-k20",
+     "iterations": 38,
+     "k": 20,
+     "lambda_ratio": 0.1,
+     "ok": true,
+     "p": 200,
+     "seed": 102,
+     "solver": "celer",
+     "support_recall": 0.988491,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.435898
+    },
+    {
+     "family": "sparse",
+     "instance_label": "sparse-s102-k5",
+     "iterations": 22,
+     "k": 5,
+     "lambda_ratio": 0.3,
+     "ok": false,
+     "p": 100,
+     "seed": 102,
+     "solver": "skglm",
+     "support_recall": 0.544664,
+     "tolerance": 1e-06,
+     "wall_seconds": 2.130807
+    },
+    {
+     "family": "sparse",
+     "instance_label": "sparse-s102-k10",
+     "iterations": 41,
+     "k": 10,
+     "lambda_ratio": 0.3,
+     "ok": true,
+     "p": 200,
+     "seed": 102,
+     "solver": "lars",
+     "support_recall": 0.744845,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.274152
+    },
+    {
+     "family": "correlated",
+     "instance_label": "correlated-s102-k20",
+     "iterations": 49,
+     "k": 20,
+     "lambda_ratio": 0.5,
+     "ok": true,
+     "p": 100,
+     "seed": 102,
+     "solver": "cg_hist",
+     "tolerance": 1e-06,
+     "wall_seconds": 0.651179
+    },
+    {
+     "family": "correlated",
+     "instance_label": "correlated-s102-k5",
+     "iterations": 55,
+     "k": 5,
+     "lambda_ratio": 0.5,
+     "ok": true,
+     "p": 200,
+     "seed": 102,
+     "solver": "celer",
+     "support_recall": 0.393032,
+     "tolerance": 1e-06,
+     "wall_seconds": 0.978013
+    },
+    {
+     "family": "correlated",
+     "instance_label": "correlated-s102-k10",
+     "iterations": 10,
+     "k": 10,
+     "lambda_ratio": 0.7,
+     "ok": true,
+     "p": 100,
+     "seed": 102,
+     "solver": "skglm",
+     "support_recall": 0.353192,
+     "tolerance": 1e-06,
+     "wall_seconds": 2.174663
+    },
+    {
+     "family": "correlated",
+     "instance_label": "correlated-s102-k20",
+     "iterations": 47,
+     "k": 20,
+     "lambda_ratio": 0.7,
+     "ok": true,
+     "p": 200,
+     "seed": 102,
+     "solver": "lars",
+     "support_recall": 0.226403,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.742481
+    },
+    {
+     "family": "toeplitz",
+     "instance_label": "toeplitz-s102-k5",
+     "iterations": 43,
+     "k": 5,
+     "lambda_ratio": 0.1,
+     "ok": true,
+     "p": 100,
+     "seed": 102,
+     "solver": "cg_hist",
+     "support_recall": 0.850838,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.467828
+    },
+    {
+     "family": "toeplitz",
+     "instance_label": "toeplitz-s102-k10",
+     "iterations": 65,
+     "k": 10,
+     "lambda_ratio": 0.1,
+     "ok": false,
+     "p": 200,
+     "seed": 102,
+     "solver": "celer",
+     "support_recall": 0.818447,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.933025
+    },
+    {
+     "family": "toeplitz",
+     "instance_label": "toeplitz-s102-k20",
+     "iterations": 58,
+     "k": 20,
+     "lambda_ratio": 0.3,
+     "ok": true,
+     "p": 100,
+     "seed": 102,
+     "solver": "skglm",
+     "support_recall": 0.597832,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.419414
+    },
+    {
+     "family": "toeplitz",
+     "instance_label": "toeplitz-s102-k5",
+     "iterations": 36,
+     "k": 5,
+     "lambda_ratio": 0.3,
+     "ok": true,
+     "p": 200,
+     "seed": 102,
+     "solver": "lars",
+     "support_recall": 0.667814,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.135538
+    },
+    {
+     "family": "block",
+     "instance_label": "block-s102-k10",
+     "iterations": 21,
+     "k": 10,
+     "lambda_ratio": 0.5,
+     "ok": true,
+     "p": 100,
+     "seed": 102,
+     "solver": "cg_hist",
+     "support_recall": 0.413643,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.327444
+    },
+    {
+     "family": "block",
+     "instance_label": "block-s102-k20",
+     "iterations": 13,
+     "k": 20,
+     "lambda_ratio": 0.5,
+     "ok": true,
+     "p": 200,
+     "seed": 102,
+     "solver": "celer",
+     "support_recall": 0.505949,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.586475
+    },
+    {
+     "family": "block",
+     "instance_label": "block-s102-k5",
+     "iterations": 15,
+     "k": 5,
+     "lambda_ratio": 0.7,
+     "ok": true,
+     "p": 100,
+     "seed": 102,
+     "solver": "skglm",
+     "support_recall": 0.237518,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.492726
+    },
+    {
+     "family": "block",
+     "instance_label": "block-s102-k10",
+     "iterations": 43,
+     "k": 10,
+     "lambda_ratio": 0.7,
+     "ok": true,
+     "p": 200,
+     "seed": 102,
+     "solver": "lars",
+     "tolerance": 1e-06,
+     "wall_seconds": 1.814118
+    },
+    {
+     "family": "illcond",
+     "instance_label": "illcond-s102-k20",
+     "iterations": 31,
+     "k": 20,
+     "lambda_ratio": 0.1,
+     "ok": false,
+     "p": 100,
+     "seed": 102,
+     "solver": "cg_hist",
+     "support_recall": 0.938188,
+     "tolerance": 1e-06,
+     "wall_seconds": 0.637395
+    },
+    {
+     "family": "illcond",
+     "instance_label": "illcond-s102-k5",
+     "iterations": 57,
+     "k": 5,
+     "lambda_ratio": 0.1,
+     "ok": true,
+     "p": 200,
+     "seed": 102,
+     "solver": "celer",
+     "support_recall": 0.892605,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.123953
+    },
+    {
+     "family": "illcond",
+     "instance_label": "illcond-s102-k10",
+     "iterations": 61,
+     "k": 10,
+     "lambda_ratio": 0.3,
+     "ok": true,
+     "p": 100,
+     "seed": 102,
+     "solver": "skglm",
+     "support_recall": 0.646491,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.324326
+    },
+    {
+     "family": "illcond",
+     "instance_label": "illcond-s102-k20",
+     "iterations": 66,
+     "k": 20,
+     "lambda_ratio": 0.3,
+     "ok": true,
+     "p": 200,
+     "seed": 102,
+     "solver": "lars",
+     "support_recall": 0.821338,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.519916
+    },
+    {
+     "family": "sparse",
+     "instance_label": "sparse-s103-k5",
+     "iterations": 42,
+     "k": 5,
+     "lambda_ratio": 0.5,
+     "ok": true,
+     "p": 100,
+     "seed": 103,
+     "solver": "cg_hist",
+     "support_recall": 0.440165,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.153585
+    },
+    {
+     "family": "sparse",
+     "instance_label": "sparse-s103-k10",
+     "iterations": 79,
+     "k": 10,
+     "lambda_ratio": 0.5,
+     "ok": true,
+     "p": 200,
+     "seed": 103,
+     "solver": "celer",
+     "support_recall": 0.461596,
+     "tolerance": 1e-06,
+     "wall_seconds": 0.960453
+    },
+    {
+     "family": "sparse",
+     "instance_label": "sparse-s103-k20",
+     "iterations": 48,
+     "k": 20,
+     "lambda_ratio": 0.7,
+     "ok": true,
+     "p": 100,
+     "seed": 103,
+     "solver": "skglm",
+     "support_recall": 0.292864,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.677027
+    },
+    {
+     "family": "sparse",
+     "instance_label": "sparse-s103-k5",
+     "iterations": 51,
+     "k": 5,
+     "lambda_ratio": 0.7,
+     "ok": false,
+     "p": 200,
+     "seed": 103,
+     "solver": "lars",
+     "support_recall": 0.20668,
+     "tolerance": 1e-06,
+     "wall_seconds": 2.519082
+    },
+    {
+     "family": "correlated",
+     "instance_label": "correlated-s103-k10",
+     "iterations": 57,
+     "k": 10,
+     "lambda_ratio": 0.1,
+     "ok": true,
+     "p": 100,
+     "seed": 103,
+     "solver": "cg_hist",
+     "support_recall": 0.796451,
+     "tolerance": 1e-06,
+     "wall_seconds": 0.888765
+    },
+    {
+     "family": "correlated",
+     "instance_label": "correlated-s103-k20",
+     "iterations": 50,
+     "k": 20,
+     "lambda_ratio": 0.1,
+     "ok": true,
+     "p": 200,
+     "seed": 103,
+     "solver": "celer",
+     "support_recall": 0.905658,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.208438
+    },
+    {
+     "family": "correlated",
+     "instance_label": "correlated-s103-k5",
+     "iterations": 4,
+     "k": 5,
+     "lambda_ratio": 0.3,
+     "ok": true,
+     "p": 100,
+     "seed": 103,
+     "solver": "skglm",
+     "tolerance": 1e-06,
+     "wall_seconds": 1.641309
+    },
+    {
+     "family": "correlated",
+     "instance_label": "correlated-s103-k10",
+     "iterations": 49,
+     "k": 10,
+     "lambda_ratio": 0.3,
+     "ok": true,
+     "p": 200,
+     "seed": 103,
+     "solver": "lars",
+     "support_recall": 0.712739,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.678151
+    },
+    {
+     "family": "toeplitz",
+     "instance_label": "toeplitz-s103-k20",
+     "iterations": 78,
+     "k": 20,
+     "lambda_ratio": 0.5,
+     "ok": true,
+     "p": 100,
+     "seed": 103,
+     "solver": "cg_hist",
+     "support_recall": 0.444552,
+     "tolerance": 1e-06,
+     "wall_seconds": 0.550483
+    },
+    {
+     "family": "toeplitz",
+     "instance_label": "toeplitz-s103-k5",
+     "iterations": 3,
+     "k": 5,
+     "lambda_ratio": 0.5,
+     "ok": true,
+     "p": 200,
+     "seed": 103,
+     "solver": "celer",
+     "support_recall": 0.395836,
+     "tolerance": 1e-06,
+     "wall_seconds": 2.085184
+    },
+    {
+     "family": "toeplitz",
+     "instance_label": "toeplitz-s103-k10",
+     "iterations": 47,
+     "k": 10,
+     "lambda_ratio": 0.7,
+     "ok": false,
+     "p": 100,
+     "seed": 103,
+     "solver": "skglm",
+     "support_recall": 0.281302,
+     "tolerance": 1e-06,
+     "wall_seconds": 2.169476
+    },
+    {
+     "family": "toeplitz",
+     "instance_label": "toeplitz-s103-k20",
+     "iterations": 69,
+     "k": 20,
+     "lambda_ratio": 0.7,
+     "ok": true,
+     "p": 200,
+     "seed": 103,
+     "solver": "lars",
+     "support_recall": 0.453679,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.710402
+    },
+    {
+     "family": "block",
+     "instance_label": "block-s103-k5",
+     "iterations": 53,
+     "k": 5,
+     "lambda_ratio": 0.1,
+     "ok": true,
+     "p": 100,
+     "seed": 103,
+     "solver": "cg_hist",
+     "support_recall": 0.717859,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.410306
+    },
+    {
+     "family": "block",
+     "instance_label": "block-s103-k10",
+     "iterations": 3,
+     "k": 10,
+     "lambda_ratio": 0.1,
+     "ok": true,
+     "p": 200,
+     "seed": 103,
+     "solver": "celer",
+     "support_recall": 0.897232,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.977497
+    },
+    {
+     "family": "block",
+     "instance_label": "block-s103-k20",
+     "iterations": 78,
+     "k": 20,
+     "lambda_ratio": 0.3,
+     "ok": true,
+     "p": 100,
+     "seed": 103,
+     "solver": "skglm",
+     "support_recall": 0.732512,
+     "tolerance": 1e-06,
+     "wall_seconds": 2.684528
+    },
+    {
+     "family": "block",
+     "instance_label": "block-s103-k5",
+     "iterations": 45,
+     "k": 5,
+     "lambda_ratio": 0.3,
+     "ok": true,
+     "p": 200,
+     "seed": 103,
+     "solver": "lars",
+     "support_recall": 0.757208,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.141849
+    },
+    {
+     "family": "illcond",
+     "instance_label": "illcond-s103-k10",
+     "iterations": 64,
+     "k": 10,
+     "lambda_ratio": 0.5,
+     "ok": true,
+     "p": 100,
+     "seed": 103,
+     "solver": "cg_hist",
+     "support_recall": 0.628344,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.081693
+    },
+    {
+     "family": "illcond",
+     "instance_label": "illcond-s103-k20",
+     "iterations": 74,
+     "k": 20,
+     "lambda_ratio": 0.5,
+     "ok": false,
+     "p": 200,
+     "seed": 103,
+     "solver": "celer",
+     "tolerance": 1e-06,
+     "wall_seconds": 0.683982
+    },
+    {
+     "family": "illcond",
+     "instance_label": "illcond-s103-k5",
+     "iterations": 63,
+     "k": 5,
+     "lambda_ratio": 0.7,
+     "ok": true,
+     "p": 100,
+     "seed": 103,
+     "solver": "skglm",
+     "support_recall": 0.315523,
+     "tolerance": 1e-06,
+     "wall_seconds": 2.097121
+    },
+    {
+     "family": "illcond",
+     "instance_label": "illcond-s103-k10",
+     "iterations": 9,
+     "k": 10,
+     "lambda_ratio": 0.7,
+     "ok": true,
+     "p": 200,
+     "seed": 103,
+     "solver": "lars",
+     "support_recall": 0.347522,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.754246
+    },
+    {
+     "family": "sparse",
+     "instance_label": "sparse-s104-k20",
+     "iterations": 30,
+     "k": 20,
+     "lambda_ratio": 0.1,
+     "ok": true,
+     "p": 100,
+     "seed": 104,
+     "solver": "cg_hist",
+     "support_recall": 0.820184,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.083873
+    },
+    {
+     "family": "sparse",
+     "instance_label": "sparse-s104-k5",
+     "iterations": 62,
+     "k": 5,
+     "lambda_ratio": 0.1,
+     "ok": true,
+     "p": 200,
+     "seed": 104,
+     "solver": "celer",
+     "support_recall": 0.902638,
+     "tolerance": 1e-06,
+     "wall_seconds": 2.194838
+    },
+    {
+     "family": "sparse",
+     "instance_label": "sparse-s104-k10",
+     "iterations": 79,
+     "k": 10,
+     "lambda_ratio": 0.3,
+     "ok": true,
+     "p": 100,
+     "seed": 104,
+     "solver": "skglm",
+     "support_recall": 0.712058,
+     "tolerance": 1e-06,
+     "wall_seconds": 2.191323
+    },
+    {
+     "family": "sparse",
+     "instance_label": "sparse-s104-k20",
+     "iterations": 36,
+     "k": 20,
+     "lambda_ratio": 0.3,
+     "ok": true,
+     "p": 200,
+     "seed": 104,
+     "solver": "lars",
+     "support_recall": 0.606062,
+     "tolerance": 1e-06,
+     "wall_seconds": 2.628507
+    },
+    {
+     "family": "correlated",
+     "instance_label": "correlated-s104-k5",
+     "iterations": 6,
+     "k": 5,
+     "lambda_ratio": 0.5,
+     "ok": false,
+     "p": 100,
+     "seed": 104,
+     "solver": "cg_hist",
+     "support_recall": 0.547912,
+     "tolerance": 1e-06,
+     "wall_seconds": 0.639558
+    },
+    {
+     "family": "correlated",
+     "instance_label": "correlated-s104-k10",
+     "iterations": 72,
+     "k": 10,
+     "lambda_ratio": 0.5,
+     "ok": true,
+     "p": 200,
+     "seed": 104,
+     "solver": "celer",
+     "support_recall": 0.439244,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.713867
+    },
+    {
+     "family": "correlated",
+     "instance_label": "correlated-s104-k20",
+     "iterations": 6,
+     "k": 20,
+     "lambda_ratio": 0.7,
+     "ok": true,
+     "p": 100,
+     "seed": 104,
+     "solver": "skglm",
+     "support_recall": 0.224001,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.95688
+    },
+    {
+     "family": "correlated",
+     "instance_label": "correlated-s104-k5",
+     "iterations": 28,
+     "k": 5,
+     "lambda_ratio": 0.7,
+     "ok": true,
+     "p": 200,
+     "seed": 104,
+     "solver": "lars",
+     "support_recall": 0.412081,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.47636
+    },
+    {
+     "family": "toeplitz",
+     "instance_label": "toeplitz-s104-k10",
+     "iterations": 67,
+     "k": 10,
+     "lambda_ratio": 0.1,
+     "ok": true,
+     "p": 100,
+     "seed": 104,
+     "solver": "cg_hist",
+     "tolerance": 1e-06,
+     "wall_seconds": 1.078592
+    },
+    {
+     "family": "toeplitz",
+     "instance_label": "toeplitz-s104-k20",
+     "iterations": 64,
+     "k": 20,
+     "lambda_ratio": 0.1,
+     "ok": true,
+     "p": 200,
+     "seed": 104,
+     "solver": "celer",
+     "support_recall": 0.936381,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.486945
+    },
+    {
+     "family": "toeplitz",
+     "instance_label": "toeplitz-s104-k5",
+     "iterations": 3,
+     "k": 5,
+     "lambda_ratio": 0.3,
+     "ok": true,
+     "p": 100,
+     "seed": 104,
+     "solver": "skglm",
+     "support_recall": 0.616912,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.068646
+    },
+    {
+     "family": "toeplitz",
+     "instance_label": "toeplitz-s104-k10",
+     "iterations": 59,
+     "k": 10,
+     "lambda_ratio": 0.3,
+     "ok": false,
+     "p": 200,
+     "seed": 104,
+     "solver": "lars",
+     "support_recall": 0.790917,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.803875
+    },
+    {
+     "family": "block",
+     "instance_label": "block-s104-k20",
+     "iterations": 4,
+     "k": 20,
+     "lambda_ratio": 0.5,
+     "ok": true,
+     "p": 100,
+     "seed": 104,
+     "solver": "cg_hist",
+     "support_recall": 0.389382,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.130221
+    },
+    {
+     "family": "block",
+     "instance_label": "block-s104-k5",
+     "iterations": 49,
+     "k": 5,
+     "lambda_ratio": 0.5,
+     "ok": true,
+     "p": 200,
+     "seed": 104,
+     "solver": "celer",
+     "support_recall": 0.534454,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.502018
+    },
+    {
+     "family": "block",
+     "instance_label": "block-s104-k10",
+     "iterations": 75,
+     "k": 10,
+     "lambda_ratio": 0.7,
+     "ok": true,
+     "p": 100,
+     "seed": 104,
+     "solver": "skglm",
+     "support_recall": 0.130494,
+     "tolerance": 1e-06,
+     "wall_seconds": 2.172777
+    },
+    {
+     "family": "block",
+     "instance_label": "block-s104-k20",
+     "iterations": 7,
+     "k": 20,
+     "lambda_ratio": 0.7,
+     "ok": true,
+     "p": 200,
+     "seed": 104,
+     "solver": "lars",
+     "support_recall": 0.158654,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.709288
+    },
+    {
+     "family": "illcond",
+     "instance_label": "illcond-s104-k5",
+     "iterations": 68,
+     "k": 5,
+     "lambda_ratio": 0.1,
+     "ok": true,
+     "p": 100,
+     "seed": 104,
+     "solver": "cg_hist",
+     "support_recall": 1.0,
+     "tolerance": 1e-06,
+     "wall_seconds": 0.946333
+    },
+    {
+     "family": "illcond",
+     "instance_label": "illcond-s104-k10",
+     "iterations": 68,
+     "k": 10,
+     "lambda_ratio": 0.1,
+     "ok": true,
+     "p": 200,
+     "seed": 104,
+     "solver": "celer",
+     "support_recall": 1.0,
+     "tolerance": 1e-06,
+     "wall_seconds": 2.214878
+    },
+    {
+     "family": "illcond",
+     "instance_label": "illcond-s104-k20",
+     "iterations": 6,
+     "k": 20,
+     "lambda_ratio": 0.3,
+     "ok": false,
+     "p": 100,
+     "seed": 104,
+     "solver": "skglm",
+     "support_recall": 0.69661,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.512394
+    },
+    {
+     "family": "illcond",
+     "instance_label": "illcond-s104-k5",
+     "iterations": 57,
+     "k": 5,
+     "lambda_ratio": 0.3,
+     "ok": true,
+     "p": 200,
+     "seed": 104,
+     "solver": "lars",
+     "tolerance": 1e-06,
+     "wall_seconds": 1.416419
+    },
+    {
+     "family": "sparse",
+     "instance_label": "sparse-s105-k10",
+     "iterations": 30,
+     "k": 10,
+     "lambda_ratio": 0.5,
+     "ok": true,
+     "p": 100,
+     "seed": 105,
+     "solver": "cg_hist",
+     "support_recall": 0.524267,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.593286
+    },
+    {
+     "family": "sparse",
+     "instance_label": "sparse-s105-k20",
+     "iterations": 69,
+     "k": 20,
+     "lambda_ratio": 0.5,
+     "ok": true,
+     "p": 200,
+     "seed": 105,
+     "solver": "celer",
+     "support_recall": 0.514161,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.976556
+    },
+    {
+     "family": "sparse",
+     "instance_label": "sparse-s105-k5",
+     "iterations": 19,
+     "k": 5,
+     "lambda_ratio": 0.7,
+     "ok": true,
+     "p": 100,
+     "seed": 105,
+     "solver": "skglm",
+     "support_recall": 0.328584,
+     "tolerance": 1e-06,
+     "wall_seconds": 0.829789
+    },
+    {
+     "family": "sparse",
+     "instance_label": "sparse-s105-k10",
+     "iterations": 49,
+     "k": 10,
+     "lambda_ratio": 0.7,
+     "ok": true,
+     "p": 200,
+     "seed": 105,
+     "solver": "lars",
+     "support_recall": 0.265952,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.920943
+    },
+    {
+     "family": "correlated",
+     "instance_label": "correlated-s105-k20",
+     "iterations": 48,
+     "k": 20,
+     "lambda_ratio": 0.1,
+     "ok": true,
+     "p": 100,
+     "seed": 105,
+     "solver": "cg_hist",
+     "support_recall": 0.784948,
+     "tolerance": 1e-06,
+     "wall_seconds": 0.588138
+    },
+    {
+     "family": "correlated",
+     "instance_label": "correlated-s105-k5",
+     "iterations": 69,
+     "k": 5,
+     "lambda_ratio": 0.1,
+     "ok": false,
+     "p": 200,
+     "seed": 105,
+     "solver": "celer",
+     "support_recall": 0.945728,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.584777
+    },
+    {
+     "family": "correlated",
+     "instance_label": "correlated-s105-k10",
+     "iterations": 41,
+     "k": 10,
+     "lambda_ratio": 0.3,
+     "ok": true,
+     "p": 100,
+     "seed": 105,
+     "solver": "skglm",
+     "support_recall": 0.76113,
+     "tolerance": 1e-06,
+     "wall_seconds": 2.5373
+    },
+    {
+     "family": "correlated",
+     "instance_label": "correlated-s105-k20",
+     "iterations": 38,
+     "k": 20,
+     "lambda_ratio": 0.3,
+     "ok": true,
+     "p": 200,
+     "seed": 105,
+     "solver": "lars",
+     "support_recall": 0.661166,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.597764
+    },
+    {
+     "family": "toeplitz",
+     "instance_label": "toeplitz-s105-k5",
+     "iterations": 26,
+     "k": 5,
+     "lambda_ratio": 0.5,
+     "ok": true,
+     "p": 100,
+     "seed": 105,
+     "solver": "cg_hist",
+     "support_recall": 0.563773,
+     "tolerance": 1e-06,
+     "wall_seconds": 0.783462
+    },
+    {
+     "family": "toeplitz",
+     "instance_label": "toeplitz-s105-k10",
+     "iterations": 16,
+     "k": 10,
+     "lambda_ratio": 0.5,
+     "ok": true,
+     "p": 200,
+     "seed": 105,
+     "solver": "celer",
+     "support_recall": 0.503999,
+     "tolerance": 1e-06,
+     "wall_seconds": 2.553014
+    },
+    {
+     "family": "toeplitz",
+     "instance_label": "toeplitz-s105-k20",
+     "iterations": 23,
+     "k": 20,
+     "lambda_ratio": 0.7,
+     "ok": true,
+     "p": 100,
+     "seed": 105,
+     "solver": "skglm",
+     "tolerance": 1e-06,
+     "wall_seconds": 1.792868
+    },
+    {
+     "family": "toeplitz",
+     "instance_label": "toeplitz-s105-k5",
+     "iterations": 47,
+     "k": 5,
+     "lambda_ratio": 0.7,
+     "ok": true,
+     "p": 200,
+     "seed": 105,
+     "solver": "lars",
+     "support_recall": 0.347803,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.595869
+    },
+    {
+     "family": "block",
+     "instance_label": "block-s105-k10",
+     "iterations": 40,
+     "k": 10,
+     "lambda_ratio": 0.1,
+     "ok": false,
+     "p": 100,
+     "seed": 105,
+     "solver": "cg_hist",
+     "support_recall": 0.886788,
+     "tolerance": 1e-06,
+     "wall_seconds": 0.69769
+    },
+    {
+     "family": "block",
+     "instance_label": "block-s105-k20",
+     "iterations": 7,
+     "k": 20,
+     "lambda_ratio": 0.1,
+     "ok": true,
+     "p": 200,
+     "seed": 105,
+     "solver": "celer",
+     "support_recall": 0.631354,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.284991
+    },
+    {
+     "family": "block",
+     "instance_label": "block-s105-k5",
+     "iterations": 17,
+     "k": 5,
+     "lambda_ratio": 0.3,
+     "ok": true,
+     "p": 100,
+     "seed": 105,
+     "solver": "skglm",
+     "support_recall": 0.69751,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.118947
+    },
+    {
+     "family": "block",
+     "instance_label": "block-s105-k10",
+     "iterations": 9,
+     "k": 10,
+     "lambda_ratio": 0.3,
+     "ok": true,
+     "p": 200,
+     "seed": 105,
+     "solver": "lars",
+     "support_recall": 0.577027,
+     "tolerance": 1e-06,
+     "wall_seconds": 2.083474
+    },
+    {
+     "family": "illcond",
+     "instance_label": "illcond-s105-k20",
+     "iterations": 64,
+     "k": 20,
+     "lambda_ratio": 0.5,
+     "ok": true,
+     "p": 100,
+     "seed": 105,
+     "solver": "cg_hist",
+     "support_recall": 0.594676,
+     "tolerance": 1e-06,
+     "wall_seconds": 0.965388
+    },
+    {
+     "family": "illcond",
+     "instance_label": "illcond-s105-k5",
+     "iterations": 9,
+     "k": 5,
+     "lambda_ratio": 0.5,
+     "ok": true,
+     "p": 200,
+     "seed": 105,
+     "solver": "celer",
+     "support_recall": 0.442706,
+     "tolerance": 1e-06,
+     "wall_seconds": 2.238992
+    },
+    {
+     "family": "illcond",
+     "instance_label": "illcond-s105-k10",
+     "iterations": 22,
+     "k": 10,
+     "lambda_ratio": 0.7,
+     "ok": true,
+     "p": 100,
+     "seed": 105,
+     "solver": "skglm",
+     "support_recall": 0.213136,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.089969
+    },
+    {
+     "family": "illcond",
+     "instance_label": "illcond-s105-k20",
+     "iterations": 28,
+     "k": 20,
+     "lambda_ratio": 0.7,
+     "ok": false,
+     "p": 200,
+     "seed": 105,
+     "solver": "lars",
+     "support_recall": 0.413246,
+     "tolerance": 1e-06,
+     "wall_seconds": 3.744013
+    },
+    {
+     "family": "sparse",
+     "instance_label": "sparse-s106-k5",
+     "iterations": 75,
+     "k": 5,
+     "lambda_ratio": 0.1,
+     "ok": true,
+     "p": 100,
+     "seed": 106,
+     "solver": "cg_hist",
+     "support_recall": 0.807512,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.22426
+    },
+    {
+     "family": "sparse",
+     "instance_label": "sparse-s106-k10",
+     "iterations": 75,
+     "k": 10,
+     "lambda_ratio": 0.1,
+     "ok": true,
+     "p": 200,
+     "seed": 106,
+     "solver": "celer",
+     "tolerance": 1e-06,
+     "wall_seconds": 1.319942
+    },
+    {
+     "family": "sparse",
+     "instance_label": "sparse-s106-k20",
+     "iterations": 67,
+     "k": 20,
+     "lambda_ratio": 0.3,
+     "ok": true,
+     "p": 100,
+     "seed": 106,
+     "solver": "skglm",
+     "support_recall": 0.67034,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.596022
+    },
+    {
+     "family": "sparse",
+     "instance_label": "sparse-s106-k5",
+     "iterations": 9,
+     "k": 5,
+     "lambda_ratio": 0.3,
+     "ok": true,
+     "p": 200,
+     "seed": 106,
+     "solver": "lars",
+     "support_recall": 0.757034,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.391319
+    },
+    {
+     "family": "correlated",
+     "instance_label": "correlated-s106-k10",
+     "iterations": 25,
+     "k": 10,
+     "lambda_ratio": 0.5,
+     "ok": true,
+     "p": 100,
+     "seed": 106,
+     "solver": "cg_hist",
+     "support_recall": 0.468478,
+     "tolerance": 1e-06,
+     "wall_seconds": 0.602787
+    },
+    {
+     "family": "correlated",
+     "instance_label": "correlated-s106-k20",
+     "iterations": 80,
+     "k": 20,
+     "lambda_ratio": 0.5,
+     "ok": true,
+     "p": 200,
+     "seed": 106,
+     "solver": "celer",
+     "support_recall": 0.304429,
+     "tolerance": 1e-06,
+     "wall_seconds": 3.30335
+    },
+    {
+     "family": "correlated",
+     "instance_label": "correlated-s106-k5",
+     "iterations": 43,
+     "k": 5,
+     "lambda_ratio": 0.7,
+     "ok": false,
+     "p": 100,
+     "seed": 106,
+     "solver": "skglm",
+     "support_recall": 0.348424,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.394921
+    },
+    {
+     "family": "correlated",
+     "instance_label": "correlated-s106-k10",
+     "iterations": 11,
+     "k": 10,
+     "lambda_ratio": 0.7,
+     "ok": true,
+     "p": 200,
+     "seed": 106,
+     "solver": "lars",
+     "support_recall": 0.269379,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.868929
+    },
+    {
+     "family": "toeplitz",
+     "instance_label": "toeplitz-s106-k20",
+     "iterations": 34,
+     "k": 20,
+     "lambda_ratio": 0.1,
+     "ok": true,
+     "p": 100,
+     "seed": 106,
+     "solver": "cg_hist",
+     "support_recall": 0.946504,
+     "tolerance": 1e-06,
+     "wall_seconds": 0.552126
+    },
+    {
+     "family": "toeplitz",
+     "instance_label": "toeplitz-s106-k5",
+     "iterations": 74,
+     "k": 5,
+     "lambda_ratio": 0.1,
+     "ok": true,
+     "p": 200,
+     "seed": 106,
+     "solver": "celer",
+     "support_recall": 0.987375,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.382389
+    },
+    {
+     "family": "toeplitz",
+     "instance_label": "toeplitz-s106-k10",
+     "iterations": 70,
+     "k": 10,
+     "lambda_ratio": 0.3,
+     "ok": true,
+     "p": 100,
+     "seed": 106,
+     "solver": "skglm",
+     "support_recall": 0.590053,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.19256
+    },
+    {
+     "family": "toeplitz",
+     "instance_label": "toeplitz-s106-k20",
+     "iterations": 53,
+     "k": 20,
+     "lambda_ratio": 0.3,
+     "ok": true,
+     "p": 200,
+     "seed": 106,
+     "solver": "lars",
+     "support_recall": 0.798412,
+     "tolerance": 1e-06,
+     "wall_seconds": 2.153162
+    },
+    {
+     "family": "block",
+     "instance_label": "block-s106-k5",
+     "iterations": 27,
+     "k": 5,
+     "lambda_ratio": 0.5,
+     "ok": true,
+     "p": 100,
+     "seed": 106,
+     "solver": "cg_hist",
+     "tolerance": 1e-06,
+     "wall_seconds": 1.543131
+    },
+    {
+     "family": "block",
+     "instance_label": "block-s106-k10",
+     "iterations": 50,
+     "k": 10,
+     "lambda_ratio": 0.5,
+     "ok": false,
+     "p": 200,
+     "seed": 106,
+     "solver": "celer",
+     "support_recall": 0.392906,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.091682
+    },
+    {
+     "family": "block",
+     "instance_label": "block-s106-k20",
+     "iterations": 61,
+     "k": 20,
+     "lambda_ratio": 0.7,
+     "ok": true,
+     "p": 100,
+     "seed": 106,
+     "solver": "skglm",
+     "support_recall": 0.27898,
+     "tolerance": 1e-06,
+     "wall_seconds": 2.443601
+    },
+    {
+     "family": "block",
+     "instance_label": "block-s106-k5",
+     "iterations": 14,
+     "k": 5,
+     "lambda_ratio": 0.7,
+     "ok": true,
+     "p": 200,
+     "seed": 106,
+     "solver": "lars",
+     "support_recall": 0.193094,
+     "tolerance": 1e-06,
+     "wall_seconds": 2.148225
+    },
+    {
+     "family": "illcond",
+     "instance_label": "illcond-s106-k10",
+     "iterations": 75,
+     "k": 10,
+     "lambda_ratio": 0.1,
+     "ok": true,
+     "p": 100,
+     "seed": 106,
+     "solver": "cg_hist",
+     "support_recall": 1.0,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.086797
+    },
+    {
+     "family": "illcond",
+     "instance_label": "illcond-s106-k20",
+     "iterations": 56,
+     "k": 20,
+     "lambda_ratio": 0.1,
+     "ok": true,
+     "p": 200,
+     "seed": 106,
+     "solver": "celer",
+     "support_recall": 0.841233,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.596099
+    },
+    {
+     "family": "illcond",
+     "instance_label": "illcond-s106-k5",
+     "iterations": 78,
+     "k": 5,
+     "lambda_ratio": 0.3,
+     "ok": true,
+     "p": 100,
+     "seed": 106,
+     "solver": "skglm",
+     "support_recall": 0.865353,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.195636
+    },
+    {
+     "family": "illcond",
+     "instance_label": "illcond-s106-k10",
+     "iterations": 40,
+     "k": 10,
+     "lambda_ratio": 0.3,
+     "ok": true,
+     "p": 200,
+     "seed": 106,
+     "solver": "lars",
+     "support_recall": 0.479841,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.486937
+    },
+    {
+     "family": "sparse",
+     "instance_label": "sparse-s107-k20",
+     "iterations": 17,
+     "k": 20,
+     "lambda_ratio": 0.5,
+     "ok": false,
+     "p": 100,
+     "seed": 107,
+     "solver": "cg_hist",
+     "support_recall": 0.59343,
+     "tolerance": 1e-06,
+     "wall_seconds": 0.608576
+    },
+    {
+     "family": "sparse",
+     "instance_label": "sparse-s107-k5",
+     "iterations": 52,
+     "k": 5,
+     "lambda_ratio": 0.5,
+     "ok": true,
+     "p": 200,
+     "seed": 107,
+     "solver": "celer",
+     "support_recall": 0.63353,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.855903
+    },
+    {
+     "family": "sparse",
+     "instance_label": "sparse-s107-k10",
+     "iterations": 39,
+     "k": 10,
+     "lambda_ratio": 0.7,
+     "ok": true,
+     "p": 100,
+     "seed": 107,
+     "solver": "skglm",
+     "support_recall": 0.373148,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.128058
+    },
+    {
+     "family": "sparse",
+     "instance_label": "sparse-s107-k20",
+     "iterations": 70,
+     "k": 20,
+     "lambda_ratio": 0.7,
+     "ok": true,
+     "p": 200,
+     "seed": 107,
+     "solver": "lars",
+     "tolerance": 1e-06,
+     "wall_seconds": 1.156894
+    },
+    {
+     "family": "correlated",
+     "instance_label": "correlated-s107-k5",
+     "iterations": 68,
+     "k": 5,
+     "lambda_ratio": 0.1,
+     "ok": true,
+     "p": 100,
+     "seed": 107,
+     "solver": "cg_hist",
+     "support_recall": 0.964263,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.104434
+    },
+    {
+     "family": "correlated",
+     "instance_label": "correlated-s107-k10",
+     "iterations": 67,
+     "k": 10,
+     "lambda_ratio": 0.1,
+     "ok": true,
+     "p": 200,
+     "seed": 107,
+     "solver": "celer",
+     "support_recall": 0.788244,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.678435
+    },
+    {
+     "family": "correlated",
+     "instance_label": "correlated-s107-k20",
+     "iterations": 14,
+     "k": 20,
+     "lambda_ratio": 0.3,
+     "ok": true,
+     "p": 100,
+     "seed": 107,
+     "solver": "skglm",
+     "support_recall": 0.767072,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.710536
+    },
+    {
+     "family": "correlated",
+     "instance_label": "correlated-s107-k5",
+     "iterations": 8,
+     "k": 5,
+     "lambda_ratio": 0.3,
+     "ok": false,
+     "p": 200,
+     "seed": 107,
+     "solver": "lars",
+     "support_recall": 0.72208,
+     "tolerance": 1e-06,
+     "wall_seconds": 2.065725
+    },
+    {
+     "family": "toeplitz",
+     "instance_label": "toeplitz-s107-k10",
+     "iterations": 40,
+     "k": 10,
+     "lambda_ratio": 0.5,
+     "ok": true,
+     "p": 100,
+     "seed": 107,
+     "solver": "cg_hist",
+     "support_recall": 0.584588,
+     "tolerance": 1e-06,
+     "wall_seconds": 0.986711
+    },
+    {
+     "family": "toeplitz",
+     "instance_label": "toeplitz-s107-k20",
+     "iterations": 46,
+     "k": 20,
+     "lambda_ratio": 0.5,
+     "ok": true,
+     "p": 200,
+     "seed": 107,
+     "solver": "celer",
+     "support_recall": 0.65746,
+     "tolerance": 1e-06,
+     "wall_seconds": 3.377842
+    },
+    {
+     "family": "toeplitz",
+     "instance_label": "toeplitz-s107-k5",
+     "iterations": 26,
+     "k": 5,
+     "lambda_ratio": 0.7,
+     "ok": true,
+     "p": 100,
+     "seed": 107,
+     "solver": "skglm",
+     "support_recall": 0.272188,
+     "tolerance": 1e-06,
+     "wall_seconds": 2.257899
+    },
+    {
+     "family": "toeplitz",
+     "instance_label": "toeplitz-s107-k10",
+     "iterations": 80,
+     "k": 10,
+     "lambda_ratio": 0.7,
+     "ok": true,
+     "p": 200,
+     "seed": 107,
+     "solver": "lars",
+     "support_recall": 0.388971,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.585985
+    },
+    {
+     "family": "block",
+     "instance_label": "block-s107-k20",
+     "iterations": 78,
+     "k": 20,
+     "lambda_ratio": 0.1,
+     "ok": true,
+     "p": 100,
+     "seed": 107,
+     "solver": "cg_hist",
+     "support_recall": 0.786522,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.578072
+    },
+    {
+     "family": "block",
+     "instance_label": "block-s107-k5",
+     "iterations": 19,
+     "k": 5,
+     "lambda_ratio": 0.1,
+     "ok": true,
+     "p": 200,
+     "seed": 107,
+     "solver": "celer",
+     "support_recall": 0.891353,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.7857
+    },
+    {
+     "family": "block",
+     "instance_label": "block-s107-k10",
+     "iterations": 57,
+     "k": 10,
+     "lambda_ratio": 0.3,
+     "ok": false,
+     "p": 100,
+     "seed": 107,
+     "solver": "skglm",
+     "tolerance": 1e-06,
+     "wall_seconds": 1.67493
+    },
+    {
+     "family": "block",
+     "instance_label": "block-s107-k20",
+     "iterations": 59,
+     "k": 20,
+     "lambda_ratio": 0.3,
+     "ok": true,
+     "p": 200,
+     "seed": 107,
+     "solver": "lars",
+     "support_recall": 0.612403,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.512997
+    },
+    {
+     "family": "illcond",
+     "instance_label": "illcond-s107-k5",
+     "iterations": 26,
+     "k": 5,
+     "lambda_ratio": 0.5,
+     "ok": true,
+     "p": 100,
+     "seed": 107,
+     "solver": "cg_hist",
+     "support_recall": 0.638076,
+     "tolerance": 1e-06,
+     "wall_seconds": 0.986069
+    },
+    {
+     "family": "illcond",
+     "instance_label": "illcond-s107-k10",
+     "iterations": 31,
+     "k": 10,
+     "lambda_ratio": 0.5,
+     "ok": true,
+     "p": 200,
+     "seed": 107,
+     "solver": "celer",
+     "support_recall": 0.380003,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.811204
+    },
+    {
+     "family": "illcond",
+     "instance_label": "illcond-s107-k20",
+     "iterations": 16,
+     "k": 20,
+     "lambda_ratio": 0.7,
+     "ok": true,
+     "p": 100,
+     "seed": 107,
+     "solver": "skglm",
+     "support_recall": 0.507531,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.76135
+    },
+    {
+     "family": "illcond",
+     "instance_label": "illcond-s107-k5",
+     "iterations": 10,
+     "k": 5,
+     "lambda_ratio": 0.7,
+     "ok": true,
+     "p": 200,
+     "seed": 107,
+     "solver": "lars",
+     "support_recall": 0.348876,
+     "tolerance": 1e-06,
+     "wall_seconds": 0.960008
+    }
+   ],
+   "summary": {
+    "cells": 160,
+    "ok_records": 137
+   }
+  },
+  "small": {
+   "records": [
+    {
+     "family": "sparse",
+     "instance_label": "sparse-s100-k5",
+     "iterations": 46,
+     "k": 5,
+     "lambda_ratio": 0.1,
+     "ok": false,
+     "p": 100,
+     "seed": 100,
+     "solver": "cg_hist",
+     "tolerance": 1e-06,
+     "wall_seconds": 1.026592
+    },
+    {
+     "family": "sparse",
+     "instance_label": "sparse-s100-k10",
+     "iterations": 19,
+     "k": 10,
+     "lambda_ratio": 0.1,
+     "ok": true,
+     "p": 200,
+     "seed": 100,
+     "solver": "celer",
+     "support_recall": 0.906866,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.435479
+    },
+    {
+     "family": "sparse",
+     "instance_label": "sparse-s100-k20",
+     "iterations": 14,
+     "k": 20,
+     "lambda_ratio": 0.3,
+     "ok": true,
+     "p": 100,
+     "seed": 100,
+     "solver": "skglm",
+     "support_recall": 0.579194,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.229882
+    },
+    {
+     "family": "sparse",
+     "instance_label": "sparse-s100-k5",
+     "iterations": 58,
+     "k": 5,
+     "lambda_ratio": 0.3,
+     "ok": true,
+     "p": 200,
+     "seed": 100,
+     "solver": "lars",
+     "support_recall": 0.672283,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.364463
+    },
+    {
+     "family": "correlated",
+     "instance_label": "correlated-s100-k10",
+     "iterations": 72,
+     "k": 10,
+     "lambda_ratio": 0.5,
+     "ok": true,
+     "p": 100,
+     "seed": 100,
+     "solver": "cg_hist",
+     "support_recall": 0.572364,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.236827
+    },
+    {
+     "family": "correlated",
+     "instance_label": "correlated-s100-k20",
+     "iterations": 33,
+     "k": 20,
+     "lambda_ratio": 0.5,
+     "ok": true,
+     "p": 200,
+     "seed": 100,
+     "solver": "celer",
+     "support_recall": 0.54908,
+     "tolerance": 1e-06,
+     "wall_seconds": 2.371658
+    },
+    {
+     "family": "correlated",
+     "instance_label": "correlated-s100-k5",
+     "iterations": 21,
+     "k": 5,
+     "lambda_ratio": 0.7,
+     "ok": true,
+     "p": 100,
+     "seed": 100,
+     "solver": "skglm",
+     "support_recall": 0.425208,
+     "tolerance": 1e-06,
+     "wall_seconds": 2.126075
+    },
+    {
+     "family": "correlated",
+     "instance_label": "correlated-s100-k10",
+     "iterations": 6,
+     "k": 10,
+     "lambda_ratio": 0.7,
+     "ok": false,
+     "p": 200,
+     "seed": 100,
+     "solver": "lars",
+     "support_recall": 0.402845,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.420527
+    },
+    {
+     "family": "toeplitz",
+     "instance_label": "toeplitz-s100-k20",
+     "iterations": 70,
+     "k": 20,
+     "lambda_ratio": 0.1,
+     "ok": true,
+     "p": 100,
+     "seed": 100,
+     "solver": "cg_hist",
+     "support_recall": 0.911125,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.393747
+    },
+    {
+     "family": "toeplitz",
+     "instance_label": "toeplitz-s100-k5",
+     "iterations": 34,
+     "k": 5,
+     "lambda_ratio": 0.1,
+     "ok": true,
+     "p": 200,
+     "seed": 100,
+     "solver": "celer",
+     "support_recall": 0.846198,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.0601
+    },
+    {
+     "family": "toeplitz",
+     "instance_label": "toeplitz-s100-k10",
+     "iterations": 16,
+     "k": 10,
+     "lambda_ratio": 0.3,
+     "ok": true,
+     "p": 100,
+     "seed": 100,
+     "solver": "skglm",
+     "support_recall": 0.785916,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.583157
+    },
+    {
+     "family": "toeplitz",
+     "instance_label": "toeplitz-s100-k20",
+     "iterations": 26,
+     "k": 20,
+     "lambda_ratio": 0.3,
+     "ok": true,
+     "p": 200,
+     "seed": 100,
+     "solver": "lars",
+     "tolerance": 1e-06,
+     "wall_seconds": 1.537462
+    },
+    {
+     "family": "block",
+     "instance_label": "block-s100-k5",
+     "iterations": 56,
+     "k": 5,
+     "lambda_ratio": 0.5,
+     "ok": true,
+     "p": 100,
+     "seed": 100,
+     "solver": "cg_hist",
+     "support_recall": 0.489117,
+     "tolerance": 1e-06,
+     "wall_seconds": 0.703416
+    },
+    {
+     "family": "block",
+     "instance_label": "block-s100-k10",
+     "iterations": 36,
+     "k": 10,
+     "lambda_ratio": 0.5,
+     "ok": true,
+     "p": 200,
+     "seed": 100,
+     "solver": "celer",
+     "support_recall": 0.446512,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.164966
+    },
+    {
+     "family": "block",
+     "instance_label": "block-s100-k20",
+     "iterations": 49,
+     "k": 20,
+     "lambda_ratio": 0.7,
+     "ok": false,
+     "p": 100,
+     "seed": 100,
+     "solver": "skglm",
+     "support_recall": 0.387259,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.372299
+    },
+    {
+     "family": "block",
+     "instance_label": "block-s100-k5",
+     "iterations": 6,
+     "k": 5,
+     "lambda_ratio": 0.7,
+     "ok": true,
+     "p": 200,
+     "seed": 100,
+     "solver": "lars",
+     "support_recall": 0.133038,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.443195
+    },
+    {
+     "family": "illcond",
+     "instance_label": "illcond-s100-k10",
+     "iterations": 17,
+     "k": 10,
+     "lambda_ratio": 0.1,
+     "ok": true,
+     "p": 100,
+     "seed": 100,
+     "solver": "cg_hist",
+     "support_recall": 0.895329,
+     "tolerance": 1e-06,
+     "wall_seconds": 0.913202
+    },
+    {
+     "family": "illcond",
+     "instance_label": "illcond-s100-k20",
+     "iterations": 12,
+     "k": 20,
+     "lambda_ratio": 0.1,
+     "ok": true,
+     "p": 200,
+     "seed": 100,
+     "solver": "celer",
+     "support_recall": 0.81666,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.176348
+    },
+    {
+     "family": "illcond",
+     "instance_label": "illcond-s100-k5",
+     "iterations": 43,
+     "k": 5,
+     "lambda_ratio": 0.3,
+     "ok": true,
+     "p": 100,
+     "seed": 100,
+     "solver": "skglm",
+     "support_recall": 0.81686,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.939109
+    },
+    {
+     "family": "illcond",
+     "instance_label": "illcond-s100-k10",
+     "iterations": 74,
+     "k": 10,
+     "lambda_ratio": 0.3,
+     "ok": true,
+     "p": 200,
+     "seed": 100,
+     "solver": "lars",
+     "support_recall": 0.672982,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.682407
+    },
+    {
+     "family": "sparse",
+     "instance_label": "sparse-s101-k20",
+     "iterations": 30,
+     "k": 20,
+     "lambda_ratio": 0.5,
+     "ok": true,
+     "p": 100,
+     "seed": 101,
+     "solver": "cg_hist",
+     "support_recall": 0.521452,
+     "tolerance": 1e-06,
+     "wall_seconds": 0.897437
+    },
+    {
+     "family": "sparse",
+     "instance_label": "sparse-s101-k5",
+     "iterations": 18,
+     "k": 5,
+     "lambda_ratio": 0.5,
+     "ok": false,
+     "p": 200,
+     "seed": 101,
+     "solver": "celer",
+     "support_recall": 0.370318,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.153492
+    },
+    {
+     "family": "sparse",
+     "instance_label": "sparse-s101-k10",
+     "iterations": 79,
+     "k": 10,
+     "lambda_ratio": 0.7,
+     "ok": true,
+     "p": 100,
+     "seed": 101,
+     "solver": "skglm",
+     "tolerance": 1e-06,
+     "wall_seconds": 3.372756
+    },
+    {
+     "family": "sparse",
+     "instance_label": "sparse-s101-k20",
+     "iterations": 6,
+     "k": 20,
+     "lambda_ratio": 0.7,
+     "ok": true,
+     "p": 200,
+     "seed": 101,
+     "solver": "lars",
+     "support_recall": 0.435362,
+     "tolerance": 1e-06,
+     "wall_seconds": 1.268142
+    }
+   ],
+   "summary": {
+    "cells": 24,
+    "ok_records": 20
+   }
+  }
+ },
+ "engine": "portfolio.analysis@1",
+ "readings": [
+  {
+   "analysis": {
+    "analysable": true,
+    "estimand": "The ratio of cg_hist's median wall_seconds to the pooled median wall_seconds of whichever non-cg_hist baseline solver(s) the committed campaign pairs it against, computed over ok=true solves in the planted-support regime the design selects (k spanning roughly 75 up to 0.4p) across the families sparse, correlated, toeplitz, block and illcond.",
+    "execution_shape": {
+     "capability": "cg.cells@1",
+     "per_execution": {
+      "arms": 2,
+      "instances": 4,
+      "lambda_ratios": 1,
+      "repetitions": 3,
+      "tolerances": 1
+     },
+     "rationale": "Six plan-differing units split 5 families x 2 seeds (10 instance combinations) across three units per baseline for two baselines, each unit pairing cg_hist with one baseline at a shared lambda_ratio and tolerance with 3 repetitions, so the pooled cg_hist-vs-baseline ratio has family, seed and baseline diversity within one execution's 4-instance/2-arm cap and the campaign's 6-unit cap.",
+     "unit_varies": [
+      "plan"
+     ],
+     "units": 6
+    },
+    "failure": {
+     "comparator": ">=",
+     "threshold": 1.0
+    },
+    "observables": [
+     {
+      "description": "One record per solve; restricted to ok=true to hold accuracy matched across cg_hist and baselines.",
+      "fields": [
+       "solver",
+       "wall_seconds",
+       "ok",
+       "family",
+       "seed"
+      ],
+      "include": [
+       {
+        "comparator": "==",
+        "field": "ok",
+        "value": true
+       }
+      ],
+      "incomplete_records": "insufficient",
+      "kind": "records",
+      "name": "solves",
+      "path": "records",
+      "source": "results/ros/cells.json"
+     }
+    ],
+    "on_missing": "INSUFFICIENT",
+    "population": "cg.cells@1 solves with ok=true in the five planted-support families (sparse, correlated, toeplitz, block, illcond), at whatever (n,p,k) instances, shared lambda_ratio and shared tolerance the campaign plan sets within the k~75-to-0.4p regime, comparing cg_hist against the specific baseline solver(s) -- at least two distinct baselines, out of celer/skglm/lars/sklearn/conic_reduced/conic_thesis -- that the plan actually pairs it with; this frozen analysis speaks only to the baselines and families the campaign includes, pooled together, not necessarily all six baselines individually.",
+    "primary_statistic": "ratio_cg_baseline",
+    "reductions": [
+     {
+      "coefficient": "",
+      "field": "wall_seconds",
+      "name": "median_cg",
+      "observable": "solves",
+      "of": [],
+      "op": "median",
+      "other_field": "",
+      "q": null,
+      "response": "",
+      "terms": [],
+      "where": [
+       {
+        "comparator": "==",
+        "field": "solver",
+        "value": "cg_hist"
+       }
+      ]
+     },
+     {
+      "coefficient": "",
+      "field": "wall_seconds",
+      "name": "median_baseline",
+      "observable": "solves",
+      "of": [],
+      "op": "median",
+      "other_field": "",
+      "q": null,
+      "response": "",
+      "terms": [],
+      "where": [
+       {
+        "comparator": "!=",
+        "field": "solver",
+        "value": "cg_hist"
+       }
+      ]
+     },
+     {
+      "coefficient": "",
+      "field": "",
+      "name": "ratio_cg_baseline",
+      "observable": "",
+      "of": [
+       "median_cg",
+       "median_baseline"
+      ],
+      "op": "ratio",
+      "other_field": "",
+      "q": null,
+      "response": "",
+      "terms": [],
+      "where": []
+     }
+    ],
+    "stopping_rule": "fixed_campaign",
+    "success": {
+     "comparator": "<",
+     "threshold": 0.8
+    },
+    "support": [
+     {
+      "min_distinct": {
+       "family": 5,
+       "seed": 2,
+       "solver": 3
+      },
+      "min_records": 100,
+      "observable": "solves"
+     }
+    ],
+    "target_claim": "cg_hist's median wall-clock time is at least 20% below the pooled median wall-clock time of the baseline solver(s) it is run against, within the planted-support regime, across the families and seeds the campaign covers.",
+    "unanalysable_reason": "",
+    "uncertainty": {
+     "level": 0.95,
+     "method": "bootstrap_percentile",
+     "resamples": 1000,
+     "seed": 20260915
+    }
+   },
+   "dataset": "main",
+   "name": "c61e2198_frozen",
+   "reading": {
+    "conclusion": "INSUFFICIENT",
+    "engine": "portfolio.analysis@1",
+    "interval": null,
+    "notes": [],
+    "primary_statistic_value": null,
+    "records": {
+     "solves": {
+      "excluded_by_rule": 23,
+      "included": 137,
+      "incomplete": 0,
+      "total": 160
+     }
+    },
+    "statistics": {},
+    "summary": "the data do not support the preregistered analysis: median_cg computes on 34 record(s) of 'solves' and the contract requires 100; median_cg computes on records where 'solver' takes 1 distinct value(s); the contract requires 3",
+    "support": [
+     {
+      "distinct": {
+       "family": {
+        "observed": 5,
+        "required": 5
+       },
+       "seed": {
+        "observed": 8,
+        "required": 2
+       },
+       "solver": {
+        "observed": 4,
+        "required": 3
+       }
+      },
+      "met": true,
+      "min_records": 100,
+      "observable": "solves",
+      "records": 137
+     }
+    ]
+   }
+  },
+  {
+   "analysis": {
+    "analysable": true,
+    "estimand": "The ratio of cg_hist's median wall_seconds to the pooled median wall_seconds of whichever non-cg_hist baseline solver(s) the committed campaign pairs it against, computed over ok=true solves in the planted-support regime the design selects (k spanning roughly 75 up to 0.4p) across the families sparse, correlated, toeplitz, block and illcond.",
+    "execution_shape": {
+     "capability": "cg.cells@1",
+     "per_execution": {
+      "arms": 2,
+      "instances": 4,
+      "lambda_ratios": 1,
+      "repetitions": 3,
+      "tolerances": 1
+     },
+     "rationale": "Six plan-differing units split 5 families x 2 seeds (10 instance combinations) across three units per baseline for two baselines, each unit pairing cg_hist with one baseline at a shared lambda_ratio and tolerance with 3 repetitions, so the pooled cg_hist-vs-baseline ratio has family, seed and baseline diversity within one execution's 4-instance/2-arm cap and the campaign's 6-unit cap.",
+     "unit_varies": [
+      "plan"
+     ],
+     "units": 6
+    },
+    "failure": {
+     "comparator": ">=",
+     "threshold": 1.0
+    },
+    "observables": [
+     {
+      "description": "One record per solve; restricted to ok=true to hold accuracy matched across cg_hist and baselines.",
+      "fields": [
+       "solver",
+       "wall_seconds",
+       "ok",
+       "family",
+       "seed"
+      ],
+      "include": [
+       {
+        "comparator": "==",
+        "field": "ok",
+        "value": true
+       }
+      ],
+      "incomplete_records": "insufficient",
+      "kind": "records",
+      "name": "solves",
+      "path": "records",
+      "source": "results/ros/cells.json"
+     }
+    ],
+    "on_missing": "INSUFFICIENT",
+    "population": "cg.cells@1 solves with ok=true in the five planted-support families (sparse, correlated, toeplitz, block, illcond), at whatever (n,p,k) instances, shared lambda_ratio and shared tolerance the campaign plan sets within the k~75-to-0.4p regime, comparing cg_hist against the specific baseline solver(s) -- at least two distinct baselines, out of celer/skglm/lars/sklearn/conic_reduced/conic_thesis -- that the plan actually pairs it with; this frozen analysis speaks only to the baselines and families the campaign includes, pooled together, not necessarily all six baselines individually.",
+    "primary_statistic": "ratio_cg_baseline",
+    "reductions": [
+     {
+      "coefficient": "",
+      "field": "wall_seconds",
+      "name": "median_cg",
+      "observable": "solves",
+      "of": [],
+      "op": "median",
+      "other_field": "",
+      "q": null,
+      "response": "",
+      "terms": [],
+      "where": [
+       {
+        "comparator": "==",
+        "field": "solver",
+        "value": "cg_hist"
+       }
+      ]
+     },
+     {
+      "coefficient": "",
+      "field": "wall_seconds",
+      "name": "median_baseline",
+      "observable": "solves",
+      "of": [],
+      "op": "median",
+      "other_field": "",
+      "q": null,
+      "response": "",
+      "terms": [],
+      "where": [
+       {
+        "comparator": "!=",
+        "field": "solver",
+        "value": "cg_hist"
+       }
+      ]
+     },
+     {
+      "coefficient": "",
+      "field": "",
+      "name": "ratio_cg_baseline",
+      "observable": "",
+      "of": [
+       "median_cg",
+       "median_baseline"
+      ],
+      "op": "ratio",
+      "other_field": "",
+      "q": null,
+      "response": "",
+      "terms": [],
+      "where": []
+     }
+    ],
+    "stopping_rule": "fixed_campaign",
+    "success": {
+     "comparator": "<",
+     "threshold": 0.8
+    },
+    "support": [
+     {
+      "min_distinct": {
+       "family": 5,
+       "seed": 2,
+       "solver": 3
+      },
+      "min_records": 100,
+      "observable": "solves"
+     }
+    ],
+    "target_claim": "cg_hist's median wall-clock time is at least 20% below the pooled median wall-clock time of the baseline solver(s) it is run against, within the planted-support regime, across the families and seeds the campaign covers.",
+    "unanalysable_reason": "",
+    "uncertainty": {
+     "level": 0.95,
+     "method": "bootstrap_percentile",
+     "resamples": 1000,
+     "seed": 20260915
+    }
+   },
+   "dataset": "small",
+   "name": "c61e2198_frozen",
+   "reading": {
+    "conclusion": "INSUFFICIENT",
+    "engine": "portfolio.analysis@1",
+    "interval": null,
+    "notes": [],
+    "primary_statistic_value": null,
+    "records": {
+     "solves": {
+      "excluded_by_rule": 4,
+      "included": 20,
+      "incomplete": 0,
+      "total": 24
+     }
+    },
+    "statistics": {},
+    "summary": "the data do not support the preregistered analysis: 'solves' has 20 analysed record(s) and the contract requires 100; median_baseline computes on 15 record(s) of 'solves' and the contract requires 100; median_cg computes on 5 record(s) of 'solves' and the contract requires 100; median_cg computes on records where 'solver' takes 1 distinct value(s); the contract requires 3",
+    "support": [
+     {
+      "distinct": {
+       "family": {
+        "observed": 5,
+        "required": 5
+       },
+       "seed": {
+        "observed": 2,
+        "required": 2
+       },
+       "solver": {
+        "observed": 4,
+        "required": 3
+       }
+      },
+      "met": false,
+      "min_records": 100,
+      "observable": "solves",
+      "records": 20
+     }
+    ]
+   }
+  },
+  {
+   "analysis": {
+    "analysable": true,
+    "estimand": "a v1 reading kept for the engine's backward compatibility",
+    "failure": {
+     "comparator": "<",
+     "threshold": -0.3
+    },
+    "observables": [
+     {
+      "fields": [
+       "solver",
+       "wall_seconds",
+       "iterations"
+      ],
+      "include": [],
+      "incomplete_records": "exclude",
+      "kind": "records",
+      "name": "solves",
+      "path": "records",
+      "source": "results/ros/cells.json"
+     }
+    ],
+    "primary_statistic": "rel",
+    "reductions": [
+     {
+      "field": "wall_seconds",
+      "name": "m",
+      "observable": "solves",
+      "op": "mean"
+     },
+     {
+      "field": "iterations",
+      "name": "md",
+      "observable": "solves",
+      "op": "median"
+     },
+     {
+      "field": "wall_seconds",
+      "name": "sd",
+      "observable": "solves",
+      "op": "std",
+      "where": [
+       {
+        "comparator": "==",
+        "field": "solver",
+        "value": "celer"
+       }
+      ]
+     },
+     {
+      "field": "iterations",
+      "name": "lo",
+      "observable": "solves",
+      "op": "min"
+     },
+     {
+      "field": "iterations",
+      "name": "hi",
+      "observable": "solves",
+      "op": "max"
+     },
+     {
+      "field": "iterations",
+      "name": "total",
+      "observable": "solves",
+      "op": "sum"
+     },
+     {
+      "field": "wall_seconds",
+      "name": "q9",
+      "observable": "solves",
+      "op": "quantile",
+      "q": 0.9
+     },
+     {
+      "name": "spread",
+      "of": [
+       "hi",
+       "lo"
+      ],
+      "op": "difference"
+     },
+     {
+      "name": "rel",
+      "of": [
+       "sd",
+       "m"
+      ],
+      "op": "ratio"
+     }
+    ],
+    "success": {
+     "comparator": ">",
+     "threshold": 0.3
+    },
+    "support": [
+     {
+      "min_distinct": {
+       "iterations": 5
+      },
+      "min_records": 20,
+      "observable": "solves"
+     }
+    ],
+    "uncertainty": {
+     "level": 0.95,
+     "method": "bootstrap_percentile",
+     "resamples": 300,
+     "seed": 5
+    }
+   },
+   "dataset": "main",
+   "name": "field_operations",
+   "reading": {
+    "conclusion": "INCONCLUSIVE",
+    "engine": "portfolio.analysis@1",
+    "interval": [
+     0.28191009318669774,
+     0.5136002243107969
+    ],
+    "notes": [
+     "the interval straddles a prespecified threshold, so neither condition holds across it"
+    ],
+    "primary_statistic_value": 0.41267621596965515,
+    "records": {
+     "solves": {
+      "excluded_by_rule": 0,
+      "included": 160,
+      "incomplete": 0,
+      "total": 160
+     }
+    },
+    "statistics": {
+     "hi": 80.0,
+     "lo": 3.0,
+     "m": 1.56628089375,
+     "md": 43.0,
+     "q9": 2.2389926,
+     "rel": 0.41267621596965515,
+     "sd": 0.6463668723783195,
+     "spread": 77.0,
+     "total": 6707.0
+    },
+    "summary": "rel (ratio of sd and m) = 0.412676 (0.95 bootstrap interval [0.28191, 0.5136], 300 resamples, seed 5); prespecified support > 0.3, refutation < -0.3",
+    "support": [
+     {
+      "distinct": {
+       "iterations": {
+        "observed": 72,
+        "required": 5
+       }
+      },
+      "met": true,
+      "min_records": 20,
+      "observable": "solves",
+      "records": 160
+     }
+    ]
+   }
+  },
+  {
+   "analysis": {
+    "analysable": true,
+    "estimand": "a v1 reading kept for the engine's backward compatibility",
+    "failure": {
+     "comparator": "<",
+     "threshold": -0.3
+    },
+    "observables": [
+     {
+      "fields": [
+       "solver",
+       "wall_seconds",
+       "iterations"
+      ],
+      "include": [],
+      "incomplete_records": "exclude",
+      "kind": "records",
+      "name": "solves",
+      "path": "records",
+      "source": "results/ros/cells.json"
+     }
+    ],
+    "primary_statistic": "rel",
+    "reductions": [
+     {
+      "field": "wall_seconds",
+      "name": "m",
+      "observable": "solves",
+      "op": "mean"
+     },
+     {
+      "field": "iterations",
+      "name": "md",
+      "observable": "solves",
+      "op": "median"
+     },
+     {
+      "field": "wall_seconds",
+      "name": "sd",
+      "observable": "solves",
+      "op": "std",
+      "where": [
+       {
+        "comparator": "==",
+        "field": "solver",
+        "value": "celer"
+       }
+      ]
+     },
+     {
+      "field": "iterations",
+      "name": "lo",
+      "observable": "solves",
+      "op": "min"
+     },
+     {
+      "field": "iterations",
+      "name": "hi",
+      "observable": "solves",
+      "op": "max"
+     },
+     {
+      "field": "iterations",
+      "name": "total",
+      "observable": "solves",
+      "op": "sum"
+     },
+     {
+      "field": "wall_seconds",
+      "name": "q9",
+      "observable": "solves",
+      "op": "quantile",
+      "q": 0.9
+     },
+     {
+      "name": "spread",
+      "of": [
+       "hi",
+       "lo"
+      ],
+      "op": "difference"
+     },
+     {
+      "name": "rel",
+      "of": [
+       "sd",
+       "m"
+      ],
+      "op": "ratio"
+     }
+    ],
+    "success": {
+     "comparator": ">",
+     "threshold": 0.3
+    },
+    "support": [
+     {
+      "min_distinct": {
+       "iterations": 5
+      },
+      "min_records": 20,
+      "observable": "solves"
+     }
+    ],
+    "uncertainty": {
+     "level": 0.95,
+     "method": "bootstrap_percentile",
+     "resamples": 300,
+     "seed": 5
+    }
+   },
+   "dataset": "small",
+   "name": "field_operations",
+   "reading": {
+    "conclusion": "INSUFFICIENT",
+    "engine": "portfolio.analysis@1",
+    "interval": null,
+    "notes": [],
+    "primary_statistic_value": null,
+    "records": {
+     "solves": {
+      "excluded_by_rule": 0,
+      "included": 24,
+      "incomplete": 0,
+      "total": 24
+     }
+    },
+    "statistics": {},
+    "summary": "the data do not support the preregistered analysis: sd computes on 6 record(s) of 'solves' and the contract requires 20",
+    "support": [
+     {
+      "distinct": {
+       "iterations": {
+        "observed": 22,
+        "required": 5
+       }
+      },
+      "met": true,
+      "min_records": 20,
+      "observable": "solves",
+      "records": 24
+     }
+    ]
+   }
+  },
+  {
+   "analysis": {
+    "analysable": true,
+    "estimand": "a v1 reading kept for the engine's backward compatibility",
+    "failure": {
+     "comparator": "<",
+     "threshold": -0.3
+    },
+    "observables": [
+     {
+      "fields": [
+       "lambda_ratio",
+       "support_recall",
+       "iterations",
+       "k",
+       "p"
+      ],
+      "include": [],
+      "incomplete_records": "exclude",
+      "kind": "records",
+      "name": "solves",
+      "path": "records",
+      "source": "results/ros/cells.json"
+     }
+    ],
+    "primary_statistic": "slope",
+    "reductions": [
+     {
+      "field": "lambda_ratio",
+      "name": "corr",
+      "observable": "solves",
+      "op": "correlation",
+      "other_field": "support_recall"
+     },
+     {
+      "coefficient": "lambda_ratio",
+      "name": "slope",
+      "observable": "solves",
+      "op": "ols_coefficient",
+      "response": "support_recall",
+      "terms": [
+       "lambda_ratio",
+       "k",
+       "lambda_ratio:k"
+      ],
+      "where": [
+       {
+        "comparator": ">=",
+        "field": "p",
+        "value": 150
+       }
+      ]
+     }
+    ],
+    "success": {
+     "comparator": ">",
+     "threshold": 0.3
+    },
+    "support": [
+     {
+      "min_distinct": {
+       "k": 2,
+       "lambda_ratio": 3
+      },
+      "min_records": 30,
+      "observable": "solves"
+     }
+    ]
+   },
+   "dataset": "main",
+   "name": "regression_and_correlation",
+   "reading": {
+    "conclusion": "CONTRADICTS",
+    "engine": "portfolio.analysis@1",
+    "interval": null,
+    "notes": [],
+    "primary_statistic_value": -0.9926097582927188,
+    "records": {
+     "solves": {
+      "excluded_by_rule": 0,
+      "included": 145,
+      "incomplete": 15,
+      "total": 160
+     }
+    },
+    "statistics": {
+     "corr": -0.9041505351145044,
+     "slope": -0.9926097582927188
+    },
+    "summary": "slope (coefficient of lambda_ratio in support_recall ~ lambda_ratio + k + lambda_ratio:k over solves where p >= 150) = -0.99261; prespecified support > 0.3, refutation < -0.3",
+    "support": [
+     {
+      "distinct": {
+       "k": {
+        "observed": 3,
+        "required": 2
+       },
+       "lambda_ratio": {
+        "observed": 4,
+        "required": 3
+       }
+      },
+      "met": true,
+      "min_records": 30,
+      "observable": "solves",
+      "records": 145
+     }
+    ]
+   }
+  },
+  {
+   "analysis": {
+    "analysable": true,
+    "estimand": "a v1 reading kept for the engine's backward compatibility",
+    "failure": {
+     "comparator": "<",
+     "threshold": -0.3
+    },
+    "observables": [
+     {
+      "fields": [
+       "lambda_ratio",
+       "support_recall",
+       "iterations",
+       "k",
+       "p"
+      ],
+      "include": [],
+      "incomplete_records": "exclude",
+      "kind": "records",
+      "name": "solves",
+      "path": "records",
+      "source": "results/ros/cells.json"
+     }
+    ],
+    "primary_statistic": "slope",
+    "reductions": [
+     {
+      "field": "lambda_ratio",
+      "name": "corr",
+      "observable": "solves",
+      "op": "correlation",
+      "other_field": "support_recall"
+     },
+     {
+      "coefficient": "lambda_ratio",
+      "name": "slope",
+      "observable": "solves",
+      "op": "ols_coefficient",
+      "response": "support_recall",
+      "terms": [
+       "lambda_ratio",
+       "k",
+       "lambda_ratio:k"
+      ],
+      "where": [
+       {
+        "comparator": ">=",
+        "field": "p",
+        "value": 150
+       }
+      ]
+     }
+    ],
+    "success": {
+     "comparator": ">",
+     "threshold": 0.3
+    },
+    "support": [
+     {
+      "min_distinct": {
+       "k": 2,
+       "lambda_ratio": 3
+      },
+      "min_records": 30,
+      "observable": "solves"
+     }
+    ]
+   },
+   "dataset": "small",
+   "name": "regression_and_correlation",
+   "reading": {
+    "conclusion": "INSUFFICIENT",
+    "engine": "portfolio.analysis@1",
+    "interval": null,
+    "notes": [],
+    "primary_statistic_value": null,
+    "records": {
+     "solves": {
+      "excluded_by_rule": 0,
+      "included": 21,
+      "incomplete": 3,
+      "total": 24
+     }
+    },
+    "statistics": {},
+    "summary": "the data do not support the preregistered analysis: 'solves' has 21 analysed record(s) and the contract requires 30; slope computes on 11 record(s) of 'solves' and the contract requires 30",
+    "support": [
+     {
+      "distinct": {
+       "k": {
+        "observed": 3,
+        "required": 2
+       },
+       "lambda_ratio": {
+        "observed": 4,
+        "required": 3
+       }
+      },
+      "met": false,
+      "min_records": 30,
+      "observable": "solves",
+      "records": 21
+     }
+    ]
+   }
+  },
+  {
+   "analysis": {
+    "analysable": true,
+    "estimand": "a v1 reading kept for the engine's backward compatibility",
+    "failure": {
+     "comparator": "<",
+     "threshold": 0.5
+    },
+    "observables": [
+     {
+      "fields": [
+       "ok",
+       "solver"
+      ],
+      "include": [],
+      "incomplete_records": "insufficient",
+      "kind": "records",
+      "name": "solves",
+      "path": "records",
+      "source": "results/ros/cells.json"
+     }
+    ],
+    "primary_statistic": "share",
+    "reductions": [
+     {
+      "name": "share",
+      "observable": "solves",
+      "op": "fraction",
+      "where": [
+       {
+        "comparator": "==",
+        "field": "ok",
+        "value": true
+       }
+      ]
+     },
+     {
+      "name": "n",
+      "observable": "solves",
+      "op": "count"
+     }
+    ],
+    "success": {
+     "comparator": ">",
+     "threshold": 0.8
+    },
+    "uncertainty": {
+     "level": 0.95,
+     "method": "wilson_score"
+    }
+   },
+   "dataset": "main",
+   "name": "fraction_wilson",
+   "reading": {
+    "conclusion": "INCONCLUSIVE",
+    "engine": "portfolio.analysis@1",
+    "interval": [
+     0.7935312683939587,
+     0.9022633175463438
+    ],
+    "notes": [
+     "the interval straddles a prespecified threshold, so neither condition holds across it"
+    ],
+    "primary_statistic_value": 0.85625,
+    "records": {
+     "solves": {
+      "excluded_by_rule": 0,
+      "included": 160,
+      "incomplete": 0,
+      "total": 160
+     }
+    },
+    "statistics": {
+     "n": 160.0,
+     "share": 0.85625
+    },
+    "summary": "share (fraction of solves where ok == True) = 0.85625 (0.95 Wilson score interval [0.793531, 0.902263]); prespecified support > 0.8, refutation < 0.5",
+    "support": []
+   }
+  },
+  {
+   "analysis": {
+    "analysable": true,
+    "estimand": "a v1 reading kept for the engine's backward compatibility",
+    "failure": {
+     "comparator": "<",
+     "threshold": 0.5
+    },
+    "observables": [
+     {
+      "fields": [
+       "ok",
+       "solver"
+      ],
+      "include": [],
+      "incomplete_records": "insufficient",
+      "kind": "records",
+      "name": "solves",
+      "path": "records",
+      "source": "results/ros/cells.json"
+     }
+    ],
+    "primary_statistic": "share",
+    "reductions": [
+     {
+      "name": "share",
+      "observable": "solves",
+      "op": "fraction",
+      "where": [
+       {
+        "comparator": "==",
+        "field": "ok",
+        "value": true
+       }
+      ]
+     },
+     {
+      "name": "n",
+      "observable": "solves",
+      "op": "count"
+     }
+    ],
+    "success": {
+     "comparator": ">",
+     "threshold": 0.8
+    },
+    "uncertainty": {
+     "level": 0.95,
+     "method": "wilson_score"
+    }
+   },
+   "dataset": "small",
+   "name": "fraction_wilson",
+   "reading": {
+    "conclusion": "INCONCLUSIVE",
+    "engine": "portfolio.analysis@1",
+    "interval": [
+     0.6414692935030095,
+     0.9332132367136705
+    ],
+    "notes": [
+     "the interval straddles a prespecified threshold, so neither condition holds across it"
+    ],
+    "primary_statistic_value": 0.8333333333333334,
+    "records": {
+     "solves": {
+      "excluded_by_rule": 0,
+      "included": 24,
+      "incomplete": 0,
+      "total": 24
+     }
+    },
+    "statistics": {
+     "n": 24.0,
+     "share": 0.8333333333333334
+    },
+    "summary": "share (fraction of solves where ok == True) = 0.833333 (0.95 Wilson score interval [0.641469, 0.933213]); prespecified support > 0.8, refutation < 0.5",
+    "support": []
+   }
+  },
+  {
+   "analysis": {
+    "analysable": true,
+    "estimand": "a v1 reading kept for the engine's backward compatibility",
+    "failure": {
+     "comparator": "<",
+     "threshold": 50
+    },
+    "observables": [
+     {
+      "kind": "scalar",
+      "name": "cells",
+      "path": "summary.cells",
+      "source": "results/ros/cells.json"
+     }
+    ],
+    "primary_statistic": "v",
+    "reductions": [
+     {
+      "name": "v",
+      "observable": "cells",
+      "op": "value"
+     }
+    ],
+    "success": {
+     "comparator": ">=",
+     "threshold": 100
+    }
+   },
+   "dataset": "main",
+   "name": "scalar_value",
+   "reading": {
+    "conclusion": "SUPPORTS",
+    "engine": "portfolio.analysis@1",
+    "interval": null,
+    "notes": [],
+    "primary_statistic_value": 160.0,
+    "records": {},
+    "statistics": {
+     "v": 160.0
+    },
+    "summary": "summary.cells = 160 in results/ros/cells.json; prespecified support >= 100.0, refutation < 50.0",
+    "support": []
+   }
+  },
+  {
+   "analysis": {
+    "analysable": true,
+    "estimand": "a v1 reading kept for the engine's backward compatibility",
+    "failure": {
+     "comparator": "<",
+     "threshold": 50
+    },
+    "observables": [
+     {
+      "kind": "scalar",
+      "name": "cells",
+      "path": "summary.cells",
+      "source": "results/ros/cells.json"
+     }
+    ],
+    "primary_statistic": "v",
+    "reductions": [
+     {
+      "name": "v",
+      "observable": "cells",
+      "op": "value"
+     }
+    ],
+    "success": {
+     "comparator": ">=",
+     "threshold": 100
+    }
+   },
+   "dataset": "small",
+   "name": "scalar_value",
+   "reading": {
+    "conclusion": "CONTRADICTS",
+    "engine": "portfolio.analysis@1",
+    "interval": null,
+    "notes": [],
+    "primary_statistic_value": 24.0,
+    "records": {},
+    "statistics": {
+     "v": 24.0
+    },
+    "summary": "summary.cells = 24 in results/ros/cells.json; prespecified support >= 100.0, refutation < 50.0",
+    "support": []
+   }
+  },
+  {
+   "analysis": {
+    "analysable": true,
+    "estimand": "a v1 reading kept for the engine's backward compatibility",
+    "failure": {
+     "comparator": "<",
+     "threshold": -0.3
+    },
+    "observables": [
+     {
+      "fields": [
+       "support_recall",
+       "lambda_ratio"
+      ],
+      "include": [],
+      "incomplete_records": "insufficient",
+      "kind": "records",
+      "name": "solves",
+      "path": "records",
+      "source": "results/ros/cells.json"
+     }
+    ],
+    "primary_statistic": "m",
+    "reductions": [
+     {
+      "field": "support_recall",
+      "name": "m",
+      "observable": "solves",
+      "op": "mean"
+     }
+    ],
+    "success": {
+     "comparator": ">",
+     "threshold": 0.3
+    }
+   },
+   "dataset": "main",
+   "name": "incomplete_is_insufficient",
+   "reading": {
+    "conclusion": "INSUFFICIENT",
+    "engine": "portfolio.analysis@1",
+    "interval": null,
+    "notes": [],
+    "primary_statistic_value": null,
+    "records": {
+     "solves": {
+      "excluded_by_rule": 0,
+      "included": 145,
+      "incomplete": 15,
+      "total": 160
+     }
+    },
+    "statistics": {},
+    "summary": "15 of 160 records of 'solves' lack a required field or hold a non-number where one is required, and the contract fixed that such records make the analysis insufficient rather than being dropped",
+    "support": []
+   }
+  },
+  {
+   "analysis": {
+    "analysable": true,
+    "estimand": "a v1 reading kept for the engine's backward compatibility",
+    "failure": {
+     "comparator": "<",
+     "threshold": -0.3
+    },
+    "observables": [
+     {
+      "fields": [
+       "support_recall",
+       "lambda_ratio"
+      ],
+      "include": [],
+      "incomplete_records": "insufficient",
+      "kind": "records",
+      "name": "solves",
+      "path": "records",
+      "source": "results/ros/cells.json"
+     }
+    ],
+    "primary_statistic": "m",
+    "reductions": [
+     {
+      "field": "support_recall",
+      "name": "m",
+      "observable": "solves",
+      "op": "mean"
+     }
+    ],
+    "success": {
+     "comparator": ">",
+     "threshold": 0.3
+    }
+   },
+   "dataset": "small",
+   "name": "incomplete_is_insufficient",
+   "reading": {
+    "conclusion": "INSUFFICIENT",
+    "engine": "portfolio.analysis@1",
+    "interval": null,
+    "notes": [],
+    "primary_statistic_value": null,
+    "records": {
+     "solves": {
+      "excluded_by_rule": 0,
+      "included": 21,
+      "incomplete": 3,
+      "total": 24
+     }
+    },
+    "statistics": {},
+    "summary": "3 of 24 records of 'solves' lack a required field or hold a non-number where one is required, and the contract fixed that such records make the analysis insufficient rather than being dropped",
+    "support": []
+   }
+  },
+  {
+   "analysis": {
+    "analysable": true,
+    "estimand": "a v1 reading kept for the engine's backward compatibility",
+    "failure": {
+     "comparator": "<",
+     "threshold": -0.3
+    },
+    "observables": [
+     {
+      "fields": [
+       "family",
+       "iterations",
+       "seed"
+      ],
+      "include": [],
+      "incomplete_records": "insufficient",
+      "kind": "records",
+      "name": "solves",
+      "path": "records",
+      "source": "results/ros/cells.json"
+     }
+    ],
+    "primary_statistic": "m",
+    "reductions": [
+     {
+      "field": "iterations",
+      "name": "m",
+      "observable": "solves",
+      "op": "mean",
+      "where": [
+       {
+        "comparator": "==",
+        "field": "family",
+        "value": "sparse"
+       }
+      ]
+     }
+    ],
+    "success": {
+     "comparator": ">",
+     "threshold": 0.3
+    },
+    "support": [
+     {
+      "min_distinct": {
+       "seed": 3
+      },
+      "min_records": 40,
+      "observable": "solves"
+     }
+    ]
+   },
+   "dataset": "main",
+   "name": "subset_support_unmet",
+   "reading": {
+    "conclusion": "INSUFFICIENT",
+    "engine": "portfolio.analysis@1",
+    "interval": null,
+    "notes": [],
+    "primary_statistic_value": null,
+    "records": {
+     "solves": {
+      "excluded_by_rule": 0,
+      "included": 160,
+      "incomplete": 0,
+      "total": 160
+     }
+    },
+    "statistics": {},
+    "summary": "the data do not support the preregistered analysis: m computes on 32 record(s) of 'solves' and the contract requires 40",
+    "support": [
+     {
+      "distinct": {
+       "seed": {
+        "observed": 8,
+        "required": 3
+       }
+      },
+      "met": true,
+      "min_records": 40,
+      "observable": "solves",
+      "records": 160
+     }
+    ]
+   }
+  },
+  {
+   "analysis": {
+    "analysable": true,
+    "estimand": "a v1 reading kept for the engine's backward compatibility",
+    "failure": {
+     "comparator": "<",
+     "threshold": -0.3
+    },
+    "observables": [
+     {
+      "fields": [
+       "family",
+       "iterations",
+       "seed"
+      ],
+      "include": [],
+      "incomplete_records": "insufficient",
+      "kind": "records",
+      "name": "solves",
+      "path": "records",
+      "source": "results/ros/cells.json"
+     }
+    ],
+    "primary_statistic": "m",
+    "reductions": [
+     {
+      "field": "iterations",
+      "name": "m",
+      "observable": "solves",
+      "op": "mean",
+      "where": [
+       {
+        "comparator": "==",
+        "field": "family",
+        "value": "sparse"
+       }
+      ]
+     }
+    ],
+    "success": {
+     "comparator": ">",
+     "threshold": 0.3
+    },
+    "support": [
+     {
+      "min_distinct": {
+       "seed": 3
+      },
+      "min_records": 40,
+      "observable": "solves"
+     }
+    ]
+   },
+   "dataset": "small",
+   "name": "subset_support_unmet",
+   "reading": {
+    "conclusion": "INSUFFICIENT",
+    "engine": "portfolio.analysis@1",
+    "interval": null,
+    "notes": [],
+    "primary_statistic_value": null,
+    "records": {
+     "solves": {
+      "excluded_by_rule": 0,
+      "included": 24,
+      "incomplete": 0,
+      "total": 24
+     }
+    },
+    "statistics": {},
+    "summary": "the data do not support the preregistered analysis: 'solves' has 24 analysed record(s) and the contract requires 40; 'seed' takes 2 distinct value(s) in the analysed records of 'solves' and the contract requires 3; m computes on 8 record(s) of 'solves' and the contract requires 40; m computes on records where 'seed' takes 2 distinct value(s); the contract requires 3",
+    "support": [
+     {
+      "distinct": {
+       "seed": {
+        "observed": 2,
+        "required": 3
+       }
+      },
+      "met": false,
+      "min_records": 40,
+      "observable": "solves",
+      "records": 24
+     }
+    ]
+   }
+  }
+ ]
+}

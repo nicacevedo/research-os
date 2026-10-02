@@ -1,0 +1,71 @@
+{
+  "analysis": {
+    "analysable": false,
+    "estimand": "Per family: the dispersion (e.g. MAD) across seeds of a continuous per-seed k/p crossover location, obtained by linearly interpolating between the two adjacent measured k/p bins that bracket the sign change of log(ratio); compared against a null built by permuting, independently within each seed, the pairing between that seed's four k/p values and its four log(ratio) values.",
+    "failure": null,
+    "observables": [],
+    "on_missing": "INSUFFICIENT",
+    "population": "Sparse-regression benchmark instances from the declared families (sparse, toeplitz, block, correlated, illcond, historical) run through cg.cells@1 at the parent's fixed baseline (lambda_ratio grid, solver pair, tolerance).",
+    "primary_statistic": "",
+    "reductions": [],
+    "stopping_rule": "fixed_single_execution",
+    "success": null,
+    "support": [],
+    "target_claim": "In each tested family separately, the observed cross-seed dispersion of bracket-interpolated crossover locations falls in the lower 5% tail of its own within-seed-permutation null, evidencing a seed-consistent, k/p-anchored crossover rather than a generic monotonic trend.",
+    "unanalysable_reason": "The idea's primary statistic and its null cannot be built from the closed reduction language. (1) The per-seed crossover estimate requires locating, for each seed, the bracketing pair of k/p bins where log(ratio) changes sign and linearly interpolating within it -- a non-linear, per-seed-grouped operation with no counterpart among value, count, fraction, mean, median, std, min, max, sum, quantile, difference, ratio, correlation, or ols_coefficient, none of which can branch on a sign change or group-then-aggregate per seed before the cross-seed dispersion statistic is even formed. (2) The idea's falsifier is a bespoke permutation test -- independently permuting, within each seed, the pairing between that seed's four k/p values and its four log(ratio) values, recomputing the dispersion statistic over >=10,000 permutations, and reading whether the observed dispersion falls in the lower 5% tail of that empirical null. The only resampling mechanism available (uncertainty) is a percentile bootstrap over whole records (or a Wilson interval for a proportion), used to form a CI around a single statistic for a threshold success/failure check; it cannot permute field pairings within a seed-defined subgroup or construct a tail-probability comparison against a custom null. No combination of the available observables (k, p, and the records needed to build log(ratio)) and reductions identifies either the per-seed crossover location or the permutation null the idea's falsifier depends on, so no honest approximation exists within this schema -- substituting a different crossover estimator (e.g. an ols_coefficient-based linear crossover) or a different null (the built-in bootstrap) would test a different claim than the one proposed.",
+    "uncertainty": null
+  },
+  "analysis_digest": "panalysis-v1:8c6e9012695489a61b6e222039d19773de94cc2cebc6d8c6a0e1994d13c168bb",
+  "contract_id": "PCON-20261002T172532Z-44a4eabf",
+  "execution_shape_check": {
+    "campaign": {
+      "fits": false,
+      "max_units": 0,
+      "min_units": null,
+      "supported": false,
+      "unit_varies": []
+    },
+    "capability": null,
+    "checked_by": "research_os.portfolio.shape.check",
+    "commit": "5b969804fc3474903b6a753d8acadaee150c3cb7",
+    "demands": [],
+    "envelope_digest": "renv-v1:3715791800a66600e19592c9d7bfaf96f7fa5ea2fb7f0f7e29ebe4825dea718a",
+    "problems": [],
+    "schema": "research-os-execution-shape-check-v1",
+    "shape": {
+      "unit_varies": [],
+      "units": null
+    },
+    "single_execution": {
+      "fits": false
+    },
+    "stated_shape": null,
+    "stopping_rule": "fixed_single_execution",
+    "suggestion": "",
+    "unresolved": "the analysis is not analysable",
+    "verdict": "UNRESOLVED"
+  },
+  "hypothesis": {
+    "content_digest": "pidea-content-v1:10107dca07c3afb6e6174dbbb22a92d96e55607a629fa7cbf3a6378aef1e1840",
+    "core_idea": "For each seed in a family, compute a continuous crossover estimate by interpolating between the two adjacent measured k/p bins that bracket the sign change of log(ratio). Compute a cross-seed dispersion statistic (e.g. MAD) of these estimates. Build the null for that family by permuting, independently within each seed, which of its own four log(ratio) values is paired with which of its four k/p values (this preserves each seed's marginal value set and any smooth monotonic trend shared across random pairings, but destroys any seed-specific, k/p-anchored crossover), recompute the interpolated crossover and the dispersion statistic under each permutation, and compare the observed dispersion to this null, separately per family. Run on the parent's baseline family plus at least two additional declared families as a minimum decisive step, reporting each family's result individually rather than collapsing to a single cross-family majority vote, so a family-specific (non-generalizing) effect is not scored identically to no effect at all.",
+    "falsifier": "Run cg.cells@1 campaigns for the parent's baseline family plus at least 2 additional declared families (minimum 3 total; extend to all 5 if budget allows), at the same fixed baseline (lambda_ratio grid, solver pair, tolerance as the parent), with >=8 seeds per family and 4 distinct k/p instances per seed. For each seed, compute the continuous crossover estimate by bracket interpolation of log(ratio) against k/p. For each family, build a null by permuting, independently within each seed, the pairing between that seed's 4 k/p values and its 4 log(ratio) values (>=10,000 permutations), recomputing the cross-seed dispersion statistic (e.g. MAD of per-seed crossover estimates) under each permutation. Report, per family, whether the observed dispersion falls in the lower 5% tail of its own null distribution, and separately report the null's own rate of producing an apparently monotonic log(ratio)-vs-k/p sequence as a diagnostic. The claim of a continuously-estimable, cross-seed-consistent crossover is falsified in a given family if its observed dispersion is not in that lower 5% tail; the claim of family generality is falsified if this tightening is not observed in all tested families, with every family's individual result reported so that a true family-specific effect (tight in a strict subset) is visible rather than being scored identically to a fully absent effect.",
+    "idea_id": "PIDEA-20261002T165447Z-35ef9d24",
+    "mechanism": "If a true active-set-size-driven crossover exists, it anchors the sign change of log(ratio) to a specific k/p location for a given seed and family; interpolating within the bracketing bin pair recovers this location more precisely than the discrete bin label. Permuting the k/p-to-value pairing within each seed destroys this anchoring while preserving each seed's own set of four log(ratio) values (and hence any shared smooth trend across k/p that is not itself the hypothesized crossover), making the null a test of whether the specific k/p anchoring -- not merely a generic monotonic trend -- is what produces cross-seed consistency.",
+    "research_question": "Holding one baseline fixed (same lambda_ratio grid, solver pair, and tolerance as the parent), does a continuous per-seed estimate of the k/p crossover location -- obtained by interpolating the bracketing bin pair where log(ratio) changes sign -- show, in each tested family separately, cross-seed dispersion tighter than a null built by permuting, within each seed, the pairing between that seed's four k/p values and its four log(ratio) values?",
+    "title": "Within-seed k/p-shuffle test for a cross-seed-consistent continuous crossover location, reported per family",
+    "version": 2
+  },
+  "hypothesis_digest": "pidea-content-v1:10107dca07c3afb6e6174dbbb22a92d96e55607a629fa7cbf3a6378aef1e1840",
+  "kind": "PREREGISTERED",
+  "parent_contract_id": null,
+  "project_id": "cg-sparse-regression",
+  "provenance": {
+    "analysis_call_id": "MCALL-20261002T172532Z-2b5867b0",
+    "analysis_prompt": "analysis_designer@4",
+    "analysis_role": "analysis_designer",
+    "model": "claude-sonnet-5",
+    "provider": "claude"
+  },
+  "role": "PRIMARY",
+  "schema": "portfolio-analysis-v1"
+}

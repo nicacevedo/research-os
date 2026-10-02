@@ -1,0 +1,71 @@
+{
+  "analysis": {
+    "analysable": false,
+    "estimand": "Whether the parent ablation's toggle-induced ranking-shift for a fixed solver pair exceeds the 95th percentile of the same ranking-shift statistic's empirical distribution under seed-only resampling of the identical control plan.",
+    "failure": null,
+    "observables": [],
+    "on_missing": "INSUFFICIENT",
+    "population": "The one solver pair, instance family/size/parameters, lambda grid and tolerance set used in the parent ablation's untoggled control cell.",
+    "primary_statistic": "",
+    "reductions": [],
+    "stopping_rule": "fixed_single_execution",
+    "success": null,
+    "support": [],
+    "target_claim": "The parent ablation's reported ranking shift for this solver pair is no larger than ordinary seed-resampling noise, so the toggle is not shown to cause it.",
+    "unanalysable_reason": "The idea's central quantity is a comparison between (a) a noise-floor statistic computed here and (b) the parent ablation's already-computed toggle-induced ranking-shift for the same pair. (b) is not a declared observable: cg.cells@1's solves records carry no field recording a toggle condition, a protocol variant, or any already-computed shift magnitude, and no capability in the catalogue exposes the parent ablation's result as a readable scalar or record set. There is therefore no observable from which the comparison the idea's falsifier depends on -- \"does the toggle-induced shift exceed this threshold\" -- could ever be evaluated; freezing a guessed numeric threshold in its place would not be measuring the parent ablation's result, it would be inventing one. Separately, even the noise-floor half is not expressible: the idea defines its statistic per execution (aggregated over one execution's instance x lambda_ratio x tolerance grid) and wants the distribution of that per-execution scalar across ~30 independently seeded executions. The declared reduction operations (count, fraction, mean, median, std, min, max, sum, quantile, difference, ratio, correlation, ols_coefficient) act once over a single flat set of records -- the campaign's solves concatenated across units -- with no grouping construct and no field identifying which unit/execution a record came from (seed and instance_label vary per instance, not per unit, and campaign unit boundaries are not themselves a readable field). So a distribution of per-execution statistic values, as opposed to one statistic computed over all pooled records, cannot be formed from what cg.cells@1 declares. Both gaps would need to close -- a readable parent-ablation shift value, and a per-execution grouping field -- before this idea's prediction could be measured; neither is present in the observable catalogue.",
+    "uncertainty": null
+  },
+  "analysis_digest": "panalysis-v1:da2eae5d5832f928cb3047e0c749fbe5b0434b79758b3bc4e11856c1f3d3cf6d",
+  "contract_id": "PCON-20261002T191602Z-2b1fcc2b",
+  "execution_shape_check": {
+    "campaign": {
+      "fits": false,
+      "max_units": 0,
+      "min_units": null,
+      "supported": false,
+      "unit_varies": []
+    },
+    "capability": null,
+    "checked_by": "research_os.portfolio.shape.check",
+    "commit": "5b969804fc3474903b6a753d8acadaee150c3cb7",
+    "demands": [],
+    "envelope_digest": "renv-v1:3715791800a66600e19592c9d7bfaf96f7fa5ea2fb7f0f7e29ebe4825dea718a",
+    "problems": [],
+    "schema": "research-os-execution-shape-check-v1",
+    "shape": {
+      "unit_varies": [],
+      "units": null
+    },
+    "single_execution": {
+      "fits": false
+    },
+    "stated_shape": null,
+    "stopping_rule": "fixed_single_execution",
+    "suggestion": "",
+    "unresolved": "the analysis is not analysable",
+    "verdict": "UNRESOLVED"
+  },
+  "hypothesis": {
+    "content_digest": "pidea-content-v1:761599e4c7aacecb39464a36e8f8d88f8e534d0d59a1673ec2df52875fc592bf",
+    "core_idea": "Before attributing a ranking shift between two solvers to a protocol toggle, measure how much the same ranking-shift statistic moves under zero toggle, using repeated fresh instance draws (new RESEARCH_OS_SEED_0 per execution, not bootstrap-reweighting of one fixed small instance set) as the sole noise source, since the capability declares solver execution paths deterministic given plan and seed -- the only seed-driven randomness is in instance generation, not in solver algorithms.",
+    "falsifier": "Run ~30 executions of the identical control plan (same solver pair, family, size, lambda grid, tolerances) differing only in RESEARCH_OS_SEED_0, compute the solver-pair ranking-shift statistic per execution, and derive its empirical 95th-percentile magnitude. If the parent ablation's toggle-induced shift for that same pair exceeds this threshold, sampling noise is rejected as the explanation; if the toggle-induced shift falls at or below this threshold, noise is confirmed as a sufficient alternative explanation for that ablation result.",
+    "idea_id": "PIDEA-20261002T184704Z-d1b13797",
+    "mechanism": "cg.cells@1 caps each execution at 2 distinct solvers ('arms'), so the statistic is scoped to one solver pair at a time (the pair from the parent ablation), computed from each execution's 'solves' records (objective, ok, wall_seconds) aggregated across that execution's instance x lambda_ratio x tolerance grid. A campaign (or several, since a single campaign caps at 6 execution-units) supplies ~30 such executions, each an independent fresh instance draw under an unchanged plan; the resulting ~30 statistic values form the empirical null. This replaces the original bootstrap-of-a-fixed-4-instance-set with genuine resampling of the instance population via the seed offset, and replaces the 'solver seed' assumption (unsupported by the declared determinism) with instance-generation seed as the only verified noise source.",
+    "research_question": "Holding the plan fixed at exactly the parent ablation's untoggled control cell (same two solvers, same instance family/size/parameters, same lambda grid and tolerances) and varying only RESEARCH_OS_SEED_0 across repeated executions, what is the empirical distribution of the solver-pair ranking-shift statistic, and does the toggle-induced shift reported in the parent ablation for that same pair exceed its 95th percentile?",
+    "title": "Seed-resampling noise floor for a single solver-pair ranking-shift statistic",
+    "version": 2
+  },
+  "hypothesis_digest": "pidea-content-v1:761599e4c7aacecb39464a36e8f8d88f8e534d0d59a1673ec2df52875fc592bf",
+  "kind": "PREREGISTERED",
+  "parent_contract_id": null,
+  "project_id": "cg-sparse-regression",
+  "provenance": {
+    "analysis_call_id": "MCALL-20261002T191602Z-182e15a7",
+    "analysis_prompt": "analysis_designer@4",
+    "analysis_role": "analysis_designer",
+    "model": "claude-sonnet-5",
+    "provider": "claude"
+  },
+  "role": "PRIMARY",
+  "schema": "portfolio-analysis-v1"
+}

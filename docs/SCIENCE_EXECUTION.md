@@ -32,7 +32,9 @@ Code: `research_os/capability.py` (generic, kernel-level),
 `research_os/portfolio/sciencechain.py` (objects, verification, outcomes,
 gate records), `research_os/portfolio/campaign.py` (campaign compilation and
 aggregation), `research_os/portfolio/empirical.py` (the route),
-`research_os/portfolio/gates.py` (the gate), `sql/0047_science_chain.sql`
+`research_os/portfolio/gates.py` (the gate), `research_os/portfolio/analysis.py`
+and `research_os/portfolio/expressions.py` (the analysis language, §4a),
+`sql/0047_science_chain.sql`
 and `sql/0048_science_campaigns.sql` (the database's own refusals), `research_os/portfolio/qualification.py` and
 `qualification_v1.yaml` (the v1 qualification contract).
 
@@ -326,6 +328,11 @@ campaign in the stated shape, can hold:
 | `CAPABILITY_LIMITED` | neither one execution nor any allowed campaign can | refused; not asked again under this envelope |
 | `UNRESOLVED` | nothing to check (not analysable, or it reads nothing a capability declares) | frozen, and capability resolution then blocks it exactly as before (§1) |
 
+What a table derived from an observable must hold is a lower bound on what
+the observable must, and joins it here; and a support rule that a selection
+of the primary statistic makes impossible is refused before any check, as
+incoherent (§4a, "The statistic's effective population").
+
 A refusal is a certainty about that shape; a valid verdict means only that
 the envelope does not rule it out -- the design is still compiled and
 checked (§3a), and the data still read against the frozen support. A
@@ -568,8 +575,10 @@ present where declared (a finite number for a scalar, a list of records for
 records). Otherwise the outcome is `INVALID_EVIDENCE` and the decision rule
 is never applied.
 
-Then the frozen analysis is evaluated by `portfolio/analysis.py` (unchanged)
-and mapped, by code, to one of seven states:
+Then the frozen analysis is evaluated by `portfolio/analysis.py` (engine
+`portfolio.analysis@2`, which reads a first-language analysis exactly as
+version 1 did and the second language of §4a as specified there) and mapped,
+by code, to one of seven states:
 
 | state | when |
 |---|---|
@@ -592,6 +601,232 @@ retry finds, never a reading without one.
 
 No model is asked whether a threshold was crossed. Models may interpret,
 critique and propose follow-ups afterwards; they cannot make an outcome.
+
+## 4a. The second analysis language
+
+Cycle 002 of the persistent column-generation research run (Research OS
+1b4ff5a, CG 5b96980) stopped `PAUSED_NO_FRONTIER` with 33.27 USD of authority
+left. Each of its four INVESTIGATING ideas held a contract whose frozen
+analysis said, in prose, that the first analysis language could not express
+it (the analysis author froze `analysable: false`; capability resolution
+then blocked each contract `CAPABILITY_LIMITED`). Between them they asked for:
+grouping by seed, per-record derived fields, the crossing of a field-vs-field
+curve, a permutation null, rank and partial correlations, a logistic fit, an
+equivalence test, and another idea's result as an observable. The second
+language is the smallest closed extension that writes what of that is
+well-posed; it is an extension, not a replacement, and an analysis that uses
+none of it is a first-language analysis in every byte.
+
+**Composable, closed, evaluated by code.** Tables derive records from records;
+reductions read tables as they read observables; arithmetic is one closed
+grammar. Nothing a model writes is executed, and nothing derived is an
+observable: a table can only rearrange and compute with fields its source
+holds, and what an observable holds of a capability is what the capability
+declares.
+
+### Tables
+
+`AnalysisSpec.tables`, at most 8, evaluated in order after the observables'
+records are filtered and before any reduction. Each names a `source` -- a
+records observable or an *earlier* table -- and does, in order:
+
+1. **group** (`by`, one to four fields, and `aggregates`, at most 8). One
+   record per distinct combination of the key fields in the source, holding
+   the keys (each with the value of the group's first record) and one field
+   per aggregate. Keys are typed: `true` and `1` are two groups, `3` and `3.0`
+   one. Groups are in key order, whatever order the records arrived in. An
+   aggregate is a record operation -- `count`, `fraction`, `mean`, `median`,
+   `std`, `min`, `max`, `sum`, `quantile`, `correlation`, `rank_correlation`,
+   `partial_correlation`, `partial_rank_correlation`, `ols_coefficient`,
+   `crossing` -- over that group's records, with its own `where`; it names no
+   observable. A grouped table holds its keys and aggregates and nothing else.
+   `by` without aggregates is allowed: the table's records are then the
+   distinct combinations themselves (and `min_records` on it counts them).
+   Without `by`, one record per source record, holding the source's fields.
+2. **compute** (at most 8): each adds a field, an expression over the
+   record's own fields and the fields computed before it. A field may not be
+   computed from itself or shadow a field it reads.
+3. **include**: conditions, as an observable's.
+
+A record whose aggregate or computed value is undefined, or for which an
+`include` or a selection some reduction or aggregate makes of the table
+cannot be decided, is **incomplete**; `incomplete_records` fixes in advance
+whether that makes the analysis INSUFFICIENT (the default) or excludes the
+record, counted. Every table's counts (`total`, `included`, `incomplete`,
+`excluded_by_rule`) are recorded with the reading.
+
+### Expressions
+
+`research_os/portfolio/expressions.py`, parsed by a hand-written parser and
+never executed:
+
+```text
+expression := term (("+" | "-") term)*
+term       := factor (("*" | "/") factor)*
+factor     := "-" factor | primary
+primary    := NUMBER | NAME | FUNCTION "(" expression ("," expression)* ")" | "(" expression ")"
+FUNCTION   := log | exp | abs (one argument) | min | max (two or more)
+```
+
+A NAME is a field (in a table) or an earlier quantity (in an `expression`
+reduction). Floating point throughout. A zero denominator, the logarithm of a
+number that is not positive, an overflow, any non-finite intermediate, or a
+name that is not a finite number (a boolean, a string, an absent field) makes
+the value **undefined** -- never zero, never clipped. At most 256
+characters, 64 nodes, 16 levels and 8 distinct names. Anything outside the
+grammar is refused when the analysis is validated, before anything is
+frozen; fields an expression reads are capability requirements read as
+numbers.
+
+### Operations added
+
+| op | reads | semantics | undefined when |
+|---|---|---|---|
+| `rank_correlation` | `field`, `other_field` | Pearson of fractional ranks (ties share the mean of the ranks they span) -- Spearman's rho | fewer than 3 records; either field constant |
+| `partial_correlation` | `field`, `other_field`, `terms` (1-6; a field or `a:b`) | each field replaced by its residual from a least-squares fit on an intercept and the terms; Pearson of the residuals | fewer than `terms + 3` records; the terms collinear or constant; a field determined by the terms (residual sum of squares <= 1e-10 of its total) |
+| `partial_rank_correlation` | as above | the same with both fields and every term's values replaced by fractional ranks first (partial Spearman) | as above |
+| `crossing` | `field` (x), `other_field` (y), `crossing` | below | below |
+| `expression` | `expression` over earlier quantities | the expression's value | an operand undefined; the arithmetic undefined |
+| `permutation_p` | `of` (one earlier quantity), `observable` (a records observable or a table), `field`, `permutation` | below | below |
+
+**`crossing`** -- `crossing: {level, pick: first|last|single, direction:
+any|rising|falling}`. The points are the records' `(field, other_field)`,
+sorted by `field`; there must be at least two, with distinct `field` values
+(several records at one abscissa are aggregated first, by a table). With
+`d = other_field - level`, a crossing is a change of strict sign of `d`
+between consecutive points where `d` is not zero; between adjacent points it
+is located by linear interpolation, `x0 + (level - y0)(x1 - x0)/(y1 - y0)`;
+across points exactly on the level, at the middle of the first and last of
+them (a single such point: exactly there). A point on the level with the
+same sign either side is a touch, not a crossing. `direction` keeps rising
+(from below to above) or falling crossings; `pick` takes the first or last
+along `field`, or -- `single` -- requires exactly one. No crossing is
+undefined.
+
+**`permutation_p`** -- `permutation: {by: [<= 4 fields], tail:
+lower|upper|two_sided, resamples: 100..20000, seed}`. The observed value `T`
+is the quantity in `of`, which must read the permuted frame (directly or
+through a table derived from it). Each draw shuffles the values of `field`
+among the frame's records that agree on every `by` field (all records when
+`by` is empty) -- Fisher-Yates, from `random.Random(seed)`, strata in key
+order -- derives every table downstream of the frame again, and recomputes
+`T` and only what `T` depends on. With `B` draws, `lower = (1 + #{T_b <= T} +
+#undefined) / (B + 1)`, `upper` the same with `>=`, `two_sided = min(1,
+2 min(lower, upper))`. A tie (within `1e-12 max(1, |T|)` of `T`) counts
+as at least as extreme, and so does a draw where `T_b` is undefined: both can
+only raise the p-value. If more than a tenth of the draws are undefined, the
+draws are not a null distribution of `T` and the p-value is undefined. A
+p-value takes no `uncertainty` (nested resampling), and a permutation_p's
+quantity may not itself be computed from one.
+
+**Equivalence needs no new operation.** A two-one-sided test of an effect
+against a margin is the existing interval rule on a non-negative magnitude:
+`uncertainty` at level `1 - 2 alpha`, `success: < margin` and `failure: >=
+margin`. SUPPORTS needs the whole interval below the margin, CONTRADICTS the
+whole of it at or above, and the rest is INCONCLUSIVE.
+
+### Bounds, determinism and resampling
+
+| bound | value |
+|---|---|
+| tables / group keys / aggregates / computed fields | 8 / 4 / 8 / 8 |
+| expression | 256 characters, 64 nodes, 16 levels, 8 names |
+| permutations | 100 to 20 000 per `permutation_p` |
+| resampling work | `MAX_RESAMPLING_WORK` = 20 000 000 record operations per resampling |
+
+A permutation null's work is its draws times an upper bound on the records
+each draw recomputes (the permuted frame's records for it and every table
+derived from it, plus what each quantity in the chain reads); a bootstrap
+over tables counts the observables it resamples plus every table it derives
+again. Past the bound the quantity is undefined and the conclusion says so,
+before anything is drawn; it is never thinned to fit. The bootstrap of §4 is
+unchanged for an analysis without tables; with tables it resamples the
+observables' records and derives every table again from each resample (a
+resample in which a table is insufficient gives no value). Every result is a
+function of the frozen analysis and the bytes the run wrote: grouping is in
+key order, sums are `math.fsum`, and the only randomness is a recorded
+seed's.
+
+### Honest by construction
+
+- **Capability requirements.** `AnalysisSpec.raw_reads` resolves every field
+  a table reads -- keys, aggregate fields and selections, expression
+  variables, inclusion rules -- and every field anything reads of a table to
+  the observable it descends from. Those join `requirements_from_analysis`
+  (§1), so capability resolution holds them to the declaration exactly as it
+  holds an observable's own fields: a table cannot make `cg.cells@1` observe
+  a field it does not return, nor read a string as a number. A field a table
+  derives is no requirement of anything.
+- **Checked twice.** `AnalysisSpec.check` refuses an incoherent table, an
+  operation's parameters on another operation, a reference forward, a read of
+  a field a grouped table does not hold, and every incoherent permutation
+  before anything is frozen. The engine checks a second-language analysis
+  again before reading it, so a caller that built one around the validators
+  gets INSUFFICIENT, not a number. A first-language analysis is read as it
+  always was and is not re-checked by later rules.
+
+### The statistic's effective population, before it is frozen
+
+Two consequences of the language's own semantics close the structurally
+INCONCLUSIVE class of cycle 001 (§2a reads support over whole observables;
+the evaluator reads it over every selection the primary statistic is
+computed on):
+
+- **A support rule no data can meet is refused** (`AnalysisSpec.check`). A
+  selection or an inclusion rule `field == value` leaves the field one value;
+  a rule requiring two or more distinct values of it, over that observable,
+  can never be met, and the analysis is refused as incoherent before it is
+  frozen. Cycle 001 spent six contained executions on exactly that
+  (`min_distinct solver: 3` beside a median selected to `solver ==
+  'cg_hist'`). Only that proof is used; nothing that merely looks hard to
+  meet is refused. Diversity across what quantities select is stated on a
+  table grouped by the field.
+- **A table's support reaches the envelope** (`AnalysisSpec.implied_support`,
+  used by `portfolio.shape`). A grouped table holds one record per distinct
+  key combination of its source and an ungrouped one at most one per source
+  record, so a table that must hold N records needs N source records -- and,
+  grouped, N distinct key combinations, which for one key are N distinct
+  values of it -- and a key that must take M values takes M in the source.
+  These lower bounds join the observable's own support in the pre-freeze
+  check; a combination of fields of one bounded input needs that many of its
+  slots. What a table computes implies nothing, so an unknown stays allowed.
+
+### Versions
+
+An analysis that uses a table or any operation above is a second-language
+analysis: hashed `panalysis-v2:`, stored with schema `portfolio-analysis-v2`.
+Every key the second language added is omitted from every dump when absent,
+so every analysis and every design frozen before it rebuilds to its digest
+and bytes (the five analyses the live run froze, and the fourteen readings
+the base engine made of first-language analyses, are fixtures the suite
+re-derives). The engine is `portfolio.analysis@2`. The analysis author is
+`analysis_designer@5`: it is shown the language, and that support is checked
+over every selection; every *unread* contract frozen by `@4` is stale by the
+existing rule and is analysed again when its idea next reaches the evidence
+stage -- which is how the four contracts Cycle 002 blocked can be asked
+again, once a person releases the ideas (`researchctl portfolio resume`);
+nothing here releases them. No migration.
+
+### What the second language does not do
+
+Each is a capability, not an omission to fix in the analysis language:
+
+- **no logistic or other nonlinear fit** -- `7d78decb` named a logistic-fit
+  crossing as an example of a second transition-point scheme; two schemes
+  are expressible without one (interpolation along `lambda_ratio` and along
+  `log(lambda_ratio)`);
+- **no disjunction and no data-dependent threshold in a condition** --
+  `e3906d0e`'s subset (not-ok cells OR lambda_ratio at or above each family's
+  own 75th percentile) has no form; conditions stay conjunctive and literal;
+- **no join, no reshaping to long form, no cluster bootstrap and no
+  Freedman-Lane residual permutation** -- a permutation shuffles one field's
+  observed values;
+- **no execution-unit field** -- a campaign's records are concatenated as the
+  units wrote them and hashed so; a unit is identified only by what its
+  difference renews (with seed-differing units, `seed`);
+- **no other idea's result as an observable** -- `d1b13797` compares against
+  a parent ablation that was never measured; an analysis reads what its own
+  execution produces, and nothing else.
 
 ## 5. Replication
 
@@ -711,6 +946,16 @@ still applies).
   chain, one reading per execution.
 - **SCI-05 the gates read the chain** -- empirical VALIDATED and HUMAN_READY
   require admissible science chains.
+
+The second analysis language of §4a is held by
+`tests/test_analysis_operations_v2.py` (its semantics, refusals, bounds and
+history, against analyses the live run froze and readings the base engine
+made), `tests/test_analysis_operations_v2_cycle002.py` (the four blocked
+Cycle 002 analyses against the committed `cg.cells@1` declaration) and
+`tests/test_analysis_operations_v2_route.py` (the route, a retry, and a
+blocked `@4` contract analysed again), and each enforcement point by a mutant
+in `tests/analysis_operations_mutations.py`, checked to still apply by
+`test_every_analysis_operations_mutant_still_applies`.
 
 The capability envelope and the pre-freeze check of §1a and §2a are held by
 `tests/test_capability_planning.py`, the live-failure regression

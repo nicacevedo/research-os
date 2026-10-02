@@ -1,0 +1,71 @@
+{
+  "analysis": {
+    "analysable": false,
+    "estimand": "A positive partial correlation of per_iteration_cost (wall_seconds/iterations) with excess/p ((columns_generated-k)/p) after controlling for k/p, log(iterations), lambda_ratio and condition, within screened subsets of cg_hist cells per family.",
+    "failure": null,
+    "observables": [],
+    "on_missing": "INSUFFICIENT",
+    "population": "cg_hist solves in families sparse, illcond, toeplitz, block.",
+    "primary_statistic": "",
+    "reductions": [],
+    "stopping_rule": "fixed_single_execution",
+    "success": null,
+    "support": [],
+    "target_claim": "Per-round CG cost is driven by active-set size (columns_generated beyond planted k), not just generic problem-size/iteration-count scaling.",
+    "unanalysable_reason": "The idea's primary statistic and every covariate it needs are per-record arithmetic transforms of two or more raw fields -- per_iteration_cost = wall_seconds/iterations, k/p, excess/p = (columns_generated-k)/p, and log(iterations) -- and the closed reduction language has no operation that builds such a per-record derived field. 'ratio' and 'difference' combine two EARLIER scalar reductions (already-aggregated numbers), not two fields of the same record; 'ols_coefficient' terms and response are restricted to a literal field name or the product of two field names, so neither a ratio (k/p, excess/p, wall_seconds/iterations) nor a log transform (log(iterations)) can appear as a term or response; and 'correlation' is Pearson on two raw fields, not Spearman and not a partial correlation controlling for several covariates simultaneously beyond a single linear OLS term. Consequently none of per_iteration_cost, k/p, excess/p or log(iterations) -- the quantities the whole falsifier is built on -- can be constructed from the fields cg.cells@1 declares (wall_seconds, iterations, columns_generated, k, p, lambda_ratio, condition) under the operations this schema allows, so the estimand cannot be computed regardless of what command or grid the design chooses. This caps every measurement of this idea at INSUFFICIENT; the capability would need to emit per-record derived ratio/log fields, or the analysis language would need a per-record transform/residualization primitive, before this question is analysable.",
+    "uncertainty": null
+  },
+  "analysis_digest": "panalysis-v1:540109499ac36a1039b290b821c2586a4b3a65b5dd14c59c78646620ab4aed74",
+  "contract_id": "PCON-20261002T202122Z-6a40b97a",
+  "execution_shape_check": {
+    "campaign": {
+      "fits": false,
+      "max_units": 0,
+      "min_units": null,
+      "supported": false,
+      "unit_varies": []
+    },
+    "capability": null,
+    "checked_by": "research_os.portfolio.shape.check",
+    "commit": "5b969804fc3474903b6a753d8acadaee150c3cb7",
+    "demands": [],
+    "envelope_digest": "renv-v1:3715791800a66600e19592c9d7bfaf96f7fa5ea2fb7f0f7e29ebe4825dea718a",
+    "problems": [],
+    "schema": "research-os-execution-shape-check-v1",
+    "shape": {
+      "unit_varies": [],
+      "units": null
+    },
+    "single_execution": {
+      "fits": false
+    },
+    "stated_shape": null,
+    "stopping_rule": "fixed_single_execution",
+    "suggestion": "",
+    "unresolved": "the analysis is not analysable",
+    "verdict": "UNRESOLVED"
+  },
+  "hypothesis": {
+    "content_digest": "pidea-content-v1:7b85c3bdc0dbaec738b86fa198c6e44657b1ddb24428d981e92d68bd06e31cfb",
+    "core_idea": "columns_generated/p is near-collinear with k/p under exact support recovery, so it cannot separate an active-set-size mechanism from generic problem-size scaling (the parent idea's failure mode). excess = columns_generated-k is identically zero under exact recovery and only departs from zero in not-ok or high-lambda_ratio cells, giving a regressor not mechanically tied to k/p by construction. Test whether per_iteration_cost still moves with excess/p once k/p, iteration count, lambda_ratio and condition are removed, restricting the test to family-screened subsets with pre-specified, quantile-based (not data-peeked) thresholds so that failing the screen is reported as inconclusive rather than silently testing degenerate data, and reporting a mandatory diagnostic for whether the screened subsample re-entangles excess/p with log(iterations).",
+    "falsifier": "Per family: (1) select cg_hist cells not-ok-but-attempted OR lambda_ratio >= family's own 75th percentile (rule fixed in advance, not chosen post hoc). (2) If within-family IQR(|excess|/p) does not exceed 4/median(p) (pre-registered floor = 2x the 1/p quantization step), report that family inconclusive and exclude it from the verdict. (3) In passing families, fit per_iteration_cost ~ k/p + log(iterations) by OLS, compute the Spearman partial correlation of residuals with excess/p; refit adding lambda_ratio and condition and recompute. (4) Mandatory diagnostic: compute Spearman corr(excess/p, log(iterations)) in the same subsample; if |corr| > 0.8, label that family 'confounded-inconclusive' regardless of sign. The hypothesis is falsified if, among families passing both the IQR screen and the confound diagnostic, none shows a significant (p<0.05) positive partial correlation of per_iteration_cost with excess/p after controlling for k/p, log(iterations), lambda_ratio and condition, or the correlation is significant only before adding lambda_ratio/condition. A surviving positive result is consistent with the mechanism but, since cg.cells@1 has no per-round trajectory field, cannot alone discriminate it from the named rival accounts -- the test is asymmetric: it can kill the hypothesis but a positive result remains a multi-way tie among mechanisms.",
+    "idea_id": "PIDEA-20261002T194703Z-e3906d0e",
+    "mechanism": "If per-round cost is driven by the size of the active column set that must be priced/refreshed each CG round, cells carrying more or fewer columns than the planted k should show elevated or reduced per_iteration_cost even after k/p, iteration count, lambda_ratio and condition are held fixed, because excess carries active-set-bloat information those covariates do not fully absorb. A pure problem-size-scaling account predicts excess/p is residual noise once k/p and difficulty covariates are fixed.",
+    "research_question": "Within cg.cells@1 records for solver cg_hist in families {sparse, illcond, toeplitz, block}, restricted per family to cells that are not-ok-but-attempted OR have lambda_ratio at or above that family's own 75th percentile (among cg_hist cells): after regressing per_iteration_cost = wall_seconds/iterations on k/p and log(iterations), does the residual retain a significant positive partial (Spearman) correlation with excess/p = (columns_generated-k)/p, and does this partial correlation survive adding lambda_ratio and condition as covariates, in at least one family whose within-family IQR(|excess|/p) exceeds 4/median(p) (a pre-registered floor set at twice the quantization step 2/p, since excess is integer-valued)?",
+    "title": "Per-iteration cost in cg_hist and active-set overshoot: does excess/p = (columns_generated-k)/p carry residual signal beyond k/p and iteration count?",
+    "version": 3
+  },
+  "hypothesis_digest": "pidea-content-v1:7b85c3bdc0dbaec738b86fa198c6e44657b1ddb24428d981e92d68bd06e31cfb",
+  "kind": "PREREGISTERED",
+  "parent_contract_id": null,
+  "project_id": "cg-sparse-regression",
+  "provenance": {
+    "analysis_call_id": "MCALL-20261002T202122Z-92f3729d",
+    "analysis_prompt": "analysis_designer@4",
+    "analysis_role": "analysis_designer",
+    "model": "claude-sonnet-5",
+    "provider": "claude"
+  },
+  "role": "PRIMARY",
+  "schema": "portfolio-analysis-v1"
+}

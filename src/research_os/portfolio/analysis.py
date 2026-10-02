@@ -30,6 +30,17 @@ always used, extended:
    there is an interval, to both of its ends: ``SUPPORTS`` only when the whole
    interval satisfies the success predicate and none of it the failure one.
 
+The second analysis language (``docs/SCIENCE_EXECUTION.md`` §4a) adds a step
+between 2 and 3 -- **tables**, records derived from records in order:
+grouped and aggregated, given computed fields, filtered -- and, among the
+reductions, rank and partial correlations, the crossing of a curve, closed
+arithmetic over earlier quantities and a seeded permutation null. A table
+derives; it never observes: every number in it is computed here from the
+records the run wrote. Everything above holds for a table as for an
+observable -- incomplete records, undecidable selections, support over every
+selection -- and an analysis written in the first language is evaluated
+exactly as before.
+
 Nothing here estimates, imputes, or substitutes. ``on_missing`` is
 ``INSUFFICIENT`` in every contract because it has no other value.
 """
@@ -43,15 +54,20 @@ import math
 import random
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
+from research_os.portfolio import expressions
 from research_os.portfolio.contracts import (
-    FIELD_OPERATIONS,
+    PARTIAL_OPERATIONS,
+    SCALAR_OPERATIONS,
     AnalysisSpec,
     Condition,
+    ContractError,
     Observable,
     Reduction,
+    Table,
 )
 from research_os.portfolio.models import EmpiricalConclusion
 
@@ -87,11 +103,26 @@ MIN_BOOTSTRAP_RECORDS = 10
 #: resample to p = 1 every time, and the exact interval would reach ~0.48.
 MIN_DEGENERATE_RECORDS = 30
 
+#: The most record operations one resampling -- a bootstrap over tables, or a
+#: permutation null -- may make in one work item: draws times an upper bound
+#: on the records each draw recomputes. Beyond it the quantity is undefined
+#: and the conclusion says so; it is never thinned to fit.
+MAX_RESAMPLING_WORK = MAX_BOOTSTRAP_DRAWS
+
+#: How close, relative to the observed statistic, a permuted one counts as a
+#: tie. A tie counts as at least as extreme as the observation, so the
+#: p-value can only rise: the same multiset of values summed in another order
+#: is the same statistic, and rounding must not make it a smaller one.
+PERMUTATION_TIE_TOLERANCE = 1e-12
+
 #: The evaluator's own identity, recorded with every reading. The digests
 #: bind the *specification*; this binds the semantics that read it, so a
 #: later change to how an analysis is evaluated is visible beside every
-#: conclusion reached before it.
-ENGINE_VERSION = "portfolio.analysis@1"
+#: conclusion reached before it. Version 2 reads the second analysis
+#: language as well; an analysis in the first is read exactly as version 1
+#: read it (tests/test_analysis_operations_v2.py holds that, against analyses
+#: frozen by version 1).
+ENGINE_VERSION = "portfolio.analysis@2"
 
 
 @dataclass(frozen=True, slots=True)
@@ -334,35 +365,38 @@ def _required_fields(spec: AnalysisSpec) -> dict[str, tuple[set[str], set[str]]]
         present, numeric = required[reduction.observable]
         present.update(reduction.fields_read())
         # A field compared by an inequality anywhere must be a number in
-        # every record -- otherwise the comparison is undefined for it.
-        numeric.update(
-            condition.field
-            for condition in reduction.where
-            if condition.comparator in {"<", "<=", ">", ">="}
-        )
-        if reduction.op in FIELD_OPERATIONS or reduction.op == "correlation":
-            numeric.update(
-                item for item in (reduction.field, reduction.other_field) if item
-            )
-        if reduction.op == "ols_coefficient":
-            numeric.add(reduction.response)
-            for term in reduction.terms:
-                numeric.update(term.split(":"))
+        # every record -- otherwise the comparison is undefined for it --
+        # and so must every field an operation computes with.
+        numeric.update(reduction.numeric_fields_read())
     for rule in spec.support:
         if rule.observable in required:
             required[rule.observable][0].update(rule.min_distinct)
+    # What the tables read of each observable, and everything that reads a
+    # table, resolved to the observable's own fields.
+    for name, (fields, numbers) in spec.raw_reads().items():
+        if name in required:
+            required[name][0].update(fields)
+            required[name][1].update(numbers)
     return required
 
 
 def _selection_conditions(spec: AnalysisSpec, observable: str) -> list[Condition]:
-    """Every `where` condition any reduction applies to this observable."""
+    """Every `where` condition any reduction, or any table's aggregate, applies here."""
 
-    return [
+    found = [
         condition
         for reduction in spec.reductions
         if reduction.observable == observable
         for condition in reduction.where
     ]
+    for table in spec.tables:
+        if table.source == observable:
+            found.extend(
+                condition
+                for aggregate in table.aggregates
+                for condition in aggregate.where
+            )
+    return found
 
 
 def _records(
@@ -542,6 +576,195 @@ def _correlation(rows: Sequence[Mapping[str, Any]], reduction: Reduction) -> flo
     return sxy / math.sqrt(sxx * syy)
 
 
+def _ranks(values: Sequence[float]) -> list[float]:
+    """Fractional ranks from 1: tied values share the mean of the ranks they span."""
+
+    order = sorted(range(len(values)), key=lambda index: values[index])
+    ranks = [0.0] * len(values)
+    start = 0
+    while start < len(order):
+        end = start
+        while end + 1 < len(order) and values[order[end + 1]] == values[order[start]]:
+            end += 1
+        shared = (start + end) / 2.0 + 1.0
+        for position in range(start, end + 1):
+            ranks[order[position]] = shared
+        start = end + 1
+    return ranks
+
+
+def _pearson(xs: Sequence[float], ys: Sequence[float]) -> float | None:
+    """The Pearson correlation, or ``None`` when either variable does not vary."""
+
+    mx, my = _mean(xs), _mean(ys)
+    sxy = math.fsum((x - mx) * (y - my) for x, y in zip(xs, ys, strict=True))
+    sxx = math.fsum((x - mx) ** 2 for x in xs)
+    syy = math.fsum((y - my) ** 2 for y in ys)
+    if sxx <= 0.0 or syy <= 0.0:
+        return None
+    return max(-1.0, min(1.0, sxy / math.sqrt(sxx * syy)))
+
+
+def _rank_correlation(rows: Sequence[Mapping[str, Any]], reduction: Reduction) -> float:
+    if len(rows) < 3:
+        raise _Undefined(
+            f"{reduction.name}: a rank correlation needs at least three records"
+        )
+    xs = _ranks([float(row[reduction.field]) for row in rows])
+    ys = _ranks([float(row[reduction.other_field]) for row in rows])
+    value = _pearson(xs, ys)
+    if value is None:
+        raise _Undefined(f"{reduction.name}: one of the fields does not vary")
+    return value
+
+
+def _term_column(rows: Sequence[Mapping[str, Any]], term: str) -> list[float]:
+    column: list[float] = []
+    for row in rows:
+        product = 1.0
+        for part in term.split(":"):
+            product *= float(row[part])
+        column.append(product)
+    return column
+
+
+def _residuals(
+    values: Sequence[float], columns: Sequence[Sequence[float]], reduction: Reduction
+) -> list[float]:
+    """``values`` less its least-squares fit on an intercept and ``columns``."""
+
+    size = len(columns) + 1
+    design = [
+        [1.0, *(column[index] for column in columns)] for index in range(len(values))
+    ]
+    normal = [
+        [
+            math.fsum(design[k][i] * design[k][j] for k in range(len(design)))
+            for j in range(size)
+        ]
+        for i in range(size)
+    ]
+    moment = [
+        math.fsum(design[k][i] * values[k] for k in range(len(design)))
+        for i in range(size)
+    ]
+    solution = _solve(normal, moment)
+    if solution is None:
+        raise _Undefined(
+            f"{reduction.name}: the terms {list(reduction.terms)} are collinear or "
+            f"constant in the analysed records, so they cannot be removed"
+        )
+    return [
+        values[k] - math.fsum(design[k][i] * solution[i] for i in range(size))
+        for k in range(len(values))
+    ]
+
+
+def _partial(
+    rows: Sequence[Mapping[str, Any]], reduction: Reduction, *, ranked: bool
+) -> float:
+    """The correlation of two fields once the terms are removed from both.
+
+    Each of ``field`` and ``other_field`` is replaced by its residual from a
+    least-squares fit on an intercept and the terms, and the residuals are
+    correlated (Pearson). ``ranked`` replaces every variable -- both fields and
+    each term's values -- by its fractional ranks first: the partial Spearman
+    correlation. A field the terms determine exactly has no residual to
+    correlate, and the quantity is undefined rather than whatever rounding
+    leaves.
+    """
+
+    terms = list(reduction.terms)
+    needed = len(terms) + 3
+    if len(rows) < needed:
+        raise _Undefined(
+            f"{reduction.name}: a partial correlation removing {len(terms)} term(s) "
+            f"needs at least {needed} records and has {len(rows)}"
+        )
+    ys = [float(row[reduction.field]) for row in rows]
+    xs = [float(row[reduction.other_field]) for row in rows]
+    columns = [_term_column(rows, term) for term in terms]
+    if ranked:
+        ys, xs = _ranks(ys), _ranks(xs)
+        columns = [_ranks(column) for column in columns]
+    residuals = []
+    for name, values in ((reduction.field, ys), (reduction.other_field, xs)):
+        left = _residuals(values, columns, reduction)
+        centre = _mean(values)
+        total = math.fsum((item - centre) ** 2 for item in values)
+        if math.fsum(item * item for item in left) <= SINGULAR_TOLERANCE * total:
+            raise _Undefined(
+                f"{reduction.name}: {name} is determined by the terms "
+                f"{terms}, so nothing of it is left to correlate"
+            )
+        residuals.append(left)
+    value = _pearson(residuals[0], residuals[1])
+    if value is None:
+        raise _Undefined(
+            f"{reduction.name}: after removing the terms, a field does not vary"
+        )
+    return value
+
+
+def _crossing(rows: Sequence[Mapping[str, Any]], reduction: Reduction) -> float:
+    """Where ``other_field`` against ``field`` crosses the level. See ``Crossing``.
+
+    The points are sorted by ``field`` and must have distinct values of it.
+    With ``d = other_field - level``, a crossing is a change of strict sign of
+    ``d`` between consecutive points where it is not zero: between adjacent
+    points it is located by linear interpolation; across points exactly on
+    the level, at the middle of them. A point on the level with the same sign
+    either side is a touch, not a crossing.
+    """
+
+    assert reduction.crossing is not None  # AnalysisSpec.check
+    rule = reduction.crossing
+    points = sorted(
+        (float(row[reduction.field]), float(row[reduction.other_field])) for row in rows
+    )
+    if len(points) < 2:
+        raise _Undefined(
+            f"{reduction.name}: a crossing needs a curve of at least two points and "
+            f"has {len(points)}"
+        )
+    for (before, _), (after, _) in pairwise(points):
+        if before == after:
+            raise _Undefined(
+                f"{reduction.name}: two records share {reduction.field} = {before:g}; "
+                f"a crossing is of a curve with one {reduction.other_field} per "
+                f"{reduction.field}, so aggregate them first"
+            )
+    offsets = [y - rule.level for _, y in points]
+    nonzero = [index for index, offset in enumerate(offsets) if offset != 0.0]
+    found: list[tuple[float, str]] = []
+    for low, high in pairwise(nonzero):
+        if (offsets[low] < 0.0) == (offsets[high] < 0.0):
+            continue
+        if high == low + 1:
+            (x0, y0), (x1, y1) = points[low], points[high]
+            location = x0 + (rule.level - y0) * (x1 - x0) / (y1 - y0)
+        else:
+            location = (points[low + 1][0] + points[high - 1][0]) / 2.0
+        found.append((location, "rising" if offsets[low] < 0.0 else "falling"))
+    if rule.direction != "any":
+        found = [item for item in found if item[1] == rule.direction]
+    which = "" if rule.direction == "any" else f" {rule.direction}"
+    if not found:
+        raise _Undefined(
+            f"{reduction.name}: {reduction.other_field} does not cross "
+            f"{rule.level:g}{which} along {reduction.field}"
+        )
+    if rule.pick == "single" and len(found) != 1:
+        raise _Undefined(
+            f"{reduction.name}: {reduction.other_field} crosses {rule.level:g}{which} "
+            f"{len(found)} times, and the contract asked for exactly one"
+        )
+    location = found[-1][0] if rule.pick == "last" else found[0][0]
+    if not math.isfinite(location):
+        raise _Undefined(f"{reduction.name}: the crossing is not a finite number")
+    return location
+
+
 def _reduce(
     reduction: Reduction,
     frames: Mapping[str, Any],
@@ -557,9 +780,29 @@ def _reduce(
         if second == 0.0:
             raise _Undefined(f"{reduction.name}: the denominator is zero")
         return first / second
+    if op == "expression":
+        parsed = expressions.parse(reduction.expression)
+        operands = {name: computed.get(name) for name in parsed.variables}
+        if any(value is None for value in operands.values()):
+            raise _Undefined(f"{reduction.name}: an operand is undefined")
+        value = expressions.evaluate(parsed, operands.get)
+        if value is None:
+            raise _Undefined(
+                f"{reduction.name}: {reduction.expression} is undefined for these "
+                f"values -- a zero denominator, the logarithm of a number that is "
+                f"not positive, or an overflow"
+            )
+        return value
     frame = frames[reduction.observable]
     if op == "value":
         return float(frame)
+    return _over_records(reduction, frame)
+
+
+def _over_records(reduction: Reduction, frame: Sequence[Mapping[str, Any]]) -> float:
+    """One record operation over a frame's records -- or over one group's, in a table."""
+
+    op = reduction.op
     if not frame:
         # A count of nothing is not zero violations. An independent review
         # found "violations == 0" reading SUPPORTS for a run that wrote `[]`,
@@ -579,6 +822,12 @@ def _reduce(
         return _correlation(rows, reduction)
     if op == "ols_coefficient":
         return _ols(rows, reduction)
+    if op == "rank_correlation":
+        return _rank_correlation(rows, reduction)
+    if op in PARTIAL_OPERATIONS:
+        return _partial(rows, reduction, ranked=op == "partial_rank_correlation")
+    if op == "crossing":
+        return _crossing(rows, reduction)
     values = [float(row[reduction.field]) for row in rows]
     if not values:
         raise _Undefined(
@@ -610,13 +859,34 @@ def _reduce(
 
 
 def _compute(
-    spec: AnalysisSpec, frames: Mapping[str, Any]
+    spec: AnalysisSpec,
+    frames: Mapping[str, Any],
+    *,
+    only: set[str] | None = None,
+    nested: bool = False,
 ) -> tuple[dict[str, float | None], list[str]]:
+    """Every reduction in order -- or only those in ``only``, a closed chain.
+
+    ``nested`` is a computation inside a resampling, where a permutation null
+    is not drawn again (``AnalysisSpec.check`` refuses one in the chain of
+    another, and of a bootstrapped statistic).
+    """
+
     computed: dict[str, float | None] = {}
     notes: list[str] = []
     for reduction in spec.reductions:
+        if only is not None and reduction.name not in only:
+            continue
         try:
-            value = _reduce(reduction, frames, computed)
+            if reduction.op == "permutation_p":
+                if nested:
+                    raise _Undefined(
+                        f"{reduction.name}: a permutation null is not drawn inside "
+                        f"another resampling"
+                    )
+                value = _permutation(spec, reduction, frames, computed)
+            else:
+                value = _reduce(reduction, frames, computed)
         except (_Undefined, OverflowError, ZeroDivisionError, ValueError) as exc:
             computed[reduction.name] = None
             notes.append(
@@ -634,27 +904,253 @@ def _chain(spec: AnalysisSpec, name: str) -> set[str]:
 
     by_name = {item.name: item for item in spec.reductions}
     found = {name}
-    for other in by_name[name].of:
+    for other in by_name[name].depends_on():
         found |= _chain(spec, other)
     return found
 
 
 def _dependencies(spec: AnalysisSpec, name: str) -> set[str]:
-    """The records observables the named reduction reads, transitively."""
+    """The records observables the named reduction reads, transitively.
+
+    Through a table, the observable its records descend from: resampling an
+    observable's records and deriving the table again is how a statistic
+    over a table is resampled.
+    """
 
     by_name = {item.name: item for item in spec.reductions}
-    kinds = {item.name: item.kind for item in spec.observables}
     reduction = by_name[name]
-    if reduction.op in {"difference", "ratio"}:
+    if reduction.op in SCALAR_OPERATIONS:
         found: set[str] = set()
-        for other in reduction.of:
+        for other in reduction.depends_on():
             found |= _dependencies(spec, other)
         return found
-    return (
-        {reduction.observable}
-        if kinds.get(reduction.observable) == "records"
-        else set()
+    view = spec.frame_views().get(reduction.observable)
+    return {view.observable} if view is not None else set()
+
+
+# ------------------------------------------------------------------ tables --
+def _key_part(value: Any) -> tuple[int, Any]:
+    """A value as part of a group key: typed, so ``True`` and ``1`` are two groups."""
+
+    if isinstance(value, bool):
+        return (0, int(value))
+    if isinstance(value, int | float):
+        return (1, float(value))
+    if isinstance(value, str):
+        return (2, value)
+    return (3, json.dumps(value, sort_keys=True))
+
+
+def _partition(
+    rows: Sequence[Mapping[str, Any]], fields: Sequence[str]
+) -> list[list[int]]:
+    """The indices of ``rows`` by their values of ``fields``, groups in key order."""
+
+    groups: dict[tuple[tuple[int, Any], ...], list[int]] = {}
+    for index, row in enumerate(rows):
+        if any(name not in row for name in fields):
+            raise _Undefined(
+                f"a record lacks one of the fields {list(fields)} it is grouped by"
+            )
+        key = tuple(_key_part(row[name]) for name in fields)
+        groups.setdefault(key, []).append(index)
+    return [groups[key] for key in sorted(groups)]
+
+
+def _table(
+    spec: AnalysisSpec, table: Table, frames: Mapping[str, Any]
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Derive one table from its source frame. Raises ``_Undefined`` on a hard failure."""
+
+    source = frames[table.source]
+    made: list[dict[str, Any]] = []
+    if table.by:
+        for members in _partition(source, table.by):
+            group = [source[index] for index in members]
+            record: dict[str, Any] = {name: group[0][name] for name in table.by}
+            for aggregate in table.aggregates:
+                try:
+                    value = _over_records(aggregate, group)
+                except (_Undefined, OverflowError, ZeroDivisionError, ValueError):
+                    continue
+                if math.isfinite(value):
+                    record[aggregate.name] = value
+            made.append(record)
+    else:
+        made = [dict(row) for row in source]
+    for item in table.compute:
+        try:
+            parsed = expressions.parse(item.expression)
+        except expressions.ExpressionError as exc:
+            raise _Undefined(f"{item.field}: {exc}") from None
+        for record in made:
+            value = expressions.evaluate(
+                parsed, lambda name, record=record: _number(record.get(name, _MISSING))
+            )
+            if value is not None:
+                record[item.field] = value
+    derived = table.derived_fields()
+    selections = spec.selections(table.name)
+    counts = {
+        "total": len(made),
+        "included": 0,
+        "incomplete": 0,
+        "excluded_by_rule": 0,
+    }
+    kept: list[dict[str, Any]] = []
+    for record in made:
+        if any(name not in record for name in derived):
+            counts["incomplete"] += 1
+            continue
+        verdicts = [
+            _holds(condition, record.get(condition.field, _MISSING))
+            for condition in table.include
+        ]
+        undecidable = any(
+            _holds(condition, record.get(condition.field, _MISSING)) is None
+            for condition in selections
+        )
+        if any(item is None for item in verdicts) or undecidable:
+            counts["incomplete"] += 1
+            continue
+        if not all(verdicts):
+            counts["excluded_by_rule"] += 1
+            continue
+        kept.append(record)
+    counts["included"] = len(kept)
+    return kept, counts
+
+
+def _rebuilt(
+    spec: AnalysisSpec, frames: Mapping[str, Any], tables: Sequence[Table]
+) -> dict[str, Any] | None:
+    """``frames`` with ``tables`` derived again, in order; ``None`` if one is insufficient."""
+
+    rebuilt = dict(frames)
+    for table in tables:
+        try:
+            rows, counts = _table(spec, table, rebuilt)
+        except _Undefined:
+            return None
+        if counts["incomplete"] and table.incomplete_records == "insufficient":
+            return None
+        rebuilt[table.name] = rows
+    return rebuilt
+
+
+def _downstream(spec: AnalysisSpec, frame: str) -> list[Table]:
+    """The tables derived, directly or not, from ``frame``, in their order."""
+
+    reached = {frame}
+    found: list[Table] = []
+    for table in spec.tables:
+        if table.source in reached:
+            reached.add(table.name)
+            found.append(table)
+    return found
+
+
+def _bound(spec: AnalysisSpec, frames: Mapping[str, Any], frame: str) -> int:
+    """The most records ``frame`` can hold when its observables keep their sizes."""
+
+    tables = {item.name: item for item in spec.tables}
+    while frame in tables:
+        frame = tables[frame].source
+    value = frames.get(frame)
+    return len(value) if isinstance(value, list) else 1
+
+
+def _permutation(
+    spec: AnalysisSpec,
+    reduction: Reduction,
+    frames: Mapping[str, Any],
+    computed: Mapping[str, float | None],
+) -> float:
+    """The permutation p-value of an earlier quantity. See ``contracts.Permutation``.
+
+    ``field`` of the frame's records is shuffled among the records of each
+    stratum (Fisher-Yates, from the frozen seed), every table derived from the
+    frame is derived again, the statistic is recomputed, and the draws are
+    counted against the observed value. A tie counts as at least as extreme;
+    so does a draw where the statistic is undefined, and when more than a
+    tenth of the draws are undefined the null is not a distribution of the
+    statistic and the p-value is undefined. ``(1 + extreme) / (1 + draws)``.
+    """
+
+    assert reduction.permutation is not None  # AnalysisSpec.check
+    permutation = reduction.permutation
+    statistic = reduction.of[0]
+    observed = computed.get(statistic)
+    if observed is None:
+        raise _Undefined(
+            f"{reduction.name}: {statistic} is undefined, so there is no observed "
+            f"value to set against its null"
+        )
+    rows = frames.get(reduction.observable)
+    if not isinstance(rows, list) or not rows:
+        raise _Undefined(
+            f"{reduction.name}: {reduction.observable} has no analysed records to "
+            f"shuffle"
+        )
+    downstream = _downstream(spec, reduction.observable)
+    chain = _chain(spec, statistic)
+    by_name = {item.name: item for item in spec.reductions}
+    rederived = {reduction.observable} | {item.name for item in downstream}
+    per_draw = len(rows) * (1 + len(downstream)) + sum(
+        len(rows)
+        if by_name[name].observable in rederived
+        else _bound(spec, frames, by_name[name].observable)
+        for name in chain
+        if by_name[name].observable
     )
+    work = permutation.resamples * per_draw
+    if work > MAX_RESAMPLING_WORK:
+        raise _Undefined(
+            f"{reduction.name}: the preregistered permutation null needs about {work} "
+            f"record operations and this build computes at most "
+            f"{MAX_RESAMPLING_WORK} in one work item"
+        )
+    strata = _partition(rows, permutation.by)
+    values = [row[reduction.field] for row in rows]
+    generator = random.Random(permutation.seed)
+    tolerance = PERMUTATION_TIE_TOLERANCE * max(1.0, abs(observed))
+    at_most = at_least = undefined = 0
+    for _ in range(permutation.resamples):
+        shuffled = list(values)
+        for members in strata:
+            for position in range(len(members) - 1, 0, -1):
+                other = generator.randrange(position + 1)
+                first, second = members[position], members[other]
+                shuffled[first], shuffled[second] = shuffled[second], shuffled[first]
+        sample = dict(frames)
+        sample[reduction.observable] = [
+            {**row, reduction.field: shuffled[index]} for index, row in enumerate(rows)
+        ]
+        rebuilt = _rebuilt(spec, sample, downstream)
+        value = None
+        if rebuilt is not None:
+            statistics, _notes = _compute(spec, rebuilt, only=chain, nested=True)
+            value = statistics.get(statistic)
+        if value is None:
+            undefined += 1
+            continue
+        if value <= observed + tolerance:
+            at_most += 1
+        if value >= observed - tolerance:
+            at_least += 1
+    draws = permutation.resamples
+    if undefined > (1.0 - MIN_FINITE_RESAMPLES) * draws:
+        raise _Undefined(
+            f"{reduction.name}: {statistic} is undefined in {undefined} of {draws} "
+            f"permutations, so they are not a null distribution of it"
+        )
+    lower = (1 + at_most + undefined) / (draws + 1)
+    upper = (1 + at_least + undefined) / (draws + 1)
+    if permutation.tail == "lower":
+        return lower
+    if permutation.tail == "upper":
+        return upper
+    return min(1.0, 2.0 * min(lower, upper))
 
 
 def _bootstrap(
@@ -667,7 +1163,12 @@ def _bootstrap(
         for item in spec.observables
         if item.name in _dependencies(spec, spec.primary_statistic)
     ]
-    draws = uncertainty.resamples * sum(len(frames[name]) for name in resampled)
+    # Every table is derived again from each resample, so its source is
+    # counted too: at most as many records as the observable it descends from.
+    rederived = sum(_bound(spec, frames, item.source) for item in spec.tables)
+    draws = uncertainty.resamples * (
+        sum(len(frames[name]) for name in resampled) + rederived
+    )
     if draws > MAX_BOOTSTRAP_DRAWS:
         return None, (
             f"the preregistered bootstrap needs {draws} record draws and this build "
@@ -682,15 +1183,21 @@ def _bootstrap(
             f"{MIN_BOOTSTRAP_RECORDS} analysed records are required"
         )
     generator = random.Random(uncertainty.seed)
+    chain = _chain(spec, spec.primary_statistic)
     values: list[float] = []
     for _ in range(uncertainty.resamples):
-        sample = dict(frames)
+        sample: dict[str, Any] | None = dict(frames)
+        assert sample is not None
         for name in resampled:
             rows = frames[name]
             sample[name] = [
                 rows[generator.randrange(len(rows))] for _ in range(len(rows))
             ]
-        computed, _notes = _compute(spec, sample)
+        if spec.tables:
+            sample = _rebuilt(spec, sample, spec.tables)
+            if sample is None:
+                continue
+        computed, _notes = _compute(spec, sample, only=chain, nested=True)
         value = computed.get(spec.primary_statistic)
         if value is not None:
             values.append(value)
@@ -782,6 +1289,34 @@ def _described(spec: AnalysisSpec, statistic: float) -> str:
         what = f"{reduction.op} of {reduction.observable}"
     elif reduction.op == "correlation":
         what = f"correlation of {reduction.field} and {reduction.other_field} over {reduction.observable}"
+    elif reduction.op == "rank_correlation":
+        what = (
+            f"Spearman rank correlation of {reduction.field} and "
+            f"{reduction.other_field} over {reduction.observable}"
+        )
+    elif reduction.op in {"partial_correlation", "partial_rank_correlation"}:
+        kind = "Spearman" if reduction.op == "partial_rank_correlation" else "Pearson"
+        what = (
+            f"partial {kind} correlation of {reduction.field} and "
+            f"{reduction.other_field} given {' + '.join(reduction.terms)} over "
+            f"{reduction.observable}"
+        )
+    elif reduction.op == "crossing" and reduction.crossing is not None:
+        what = (
+            f"{reduction.crossing.pick} crossing of {reduction.other_field} through "
+            f"{reduction.crossing.level:g} along {reduction.field} over "
+            f"{reduction.observable}"
+        )
+    elif reduction.op == "expression":
+        what = reduction.expression
+    elif reduction.op == "permutation_p" and reduction.permutation is not None:
+        strata = ", ".join(reduction.permutation.by) or "all records"
+        what = (
+            f"{reduction.permutation.tail} permutation p-value of {reduction.of[0]}, "
+            f"{reduction.field} of {reduction.observable} shuffled within {strata}, "
+            f"{reduction.permutation.resamples} permutations, seed "
+            f"{reduction.permutation.seed}"
+        )
     else:
         what = f"{reduction.op} of {reduction.field} over {reduction.observable}"
     if reduction.where:
@@ -803,6 +1338,19 @@ def evaluate(spec: AnalysisSpec, documents: Mapping[str, Any]) -> AnalysisResult
             "no analysis was fixed for this experiment: "
             + (spec.unanalysable_reason or "no reason recorded")
         )
+    if spec.language() == 2:
+        # Checked when it was frozen, and checked again here: what this module
+        # derives from a table or computes from an expression is only defined
+        # for an analysis the checker accepts, and a caller that built one
+        # some other way does not get a reading of it. (An analysis in the
+        # first language is read as it always was; it was frozen under that
+        # language's checks and is not re-decided by later ones.)
+        try:
+            spec.check()
+        except (ContractError, ValueError) as exc:
+            return _insufficient(
+                f"the frozen analysis is not one this engine can read: {exc}"
+            )
     required = _required_fields(spec)
     frames: dict[str, Any] = {}
     records: dict[str, dict[str, int]] = {}
@@ -849,12 +1397,30 @@ def evaluate(spec: AnalysisSpec, documents: Mapping[str, Any]) -> AnalysisResult
             )
         frames[observable.name] = rows
 
+    # The second language's tables, in order: records derived from records.
+    for table in spec.tables:
+        try:
+            rows, counts = _table(spec, table, frames)
+        except _Undefined as exc:
+            return _insufficient(f"table {table.name!r}: {exc}", records=records)
+        records[table.name] = counts
+        if counts["incomplete"] and table.incomplete_records == "insufficient":
+            return _insufficient(
+                f"{counts['incomplete']} of {counts['total']} records of table "
+                f"{table.name!r} have an aggregate or a computed field that is "
+                f"undefined, or a rule that cannot be decided, and the contract "
+                f"fixed that such records make the analysis insufficient rather "
+                f"than being dropped",
+                records=records,
+            )
+        frames[table.name] = rows
+
     support: list[dict[str, Any]] = []
     unmet: list[str] = []
     kinds = {item.name: item.kind for item in spec.observables}
     for rule in spec.support:
         frame = frames[rule.observable]
-        count = len(frame) if kinds[rule.observable] == "records" else 1
+        count = len(frame) if kinds.get(rule.observable, "records") == "records" else 1
         entry: dict[str, Any] = {
             "observable": rule.observable,
             "min_records": rule.min_records,

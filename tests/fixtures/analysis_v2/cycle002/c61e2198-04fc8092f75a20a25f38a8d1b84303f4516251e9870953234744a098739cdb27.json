@@ -1,0 +1,263 @@
+{
+  "analysis": {
+    "analysable": true,
+    "estimand": "The ratio of cg_hist's median wall_seconds to the pooled median wall_seconds of whichever non-cg_hist baseline solver(s) the committed campaign pairs it against, computed over ok=true solves in the planted-support regime the design selects (k spanning roughly 75 up to 0.4p) across the families sparse, correlated, toeplitz, block and illcond.",
+    "execution_shape": {
+      "capability": "cg.cells@1",
+      "per_execution": {
+        "arms": 2,
+        "instances": 4,
+        "lambda_ratios": 1,
+        "repetitions": 3,
+        "tolerances": 1
+      },
+      "rationale": "Six plan-differing units split 5 families x 2 seeds (10 instance combinations) across three units per baseline for two baselines, each unit pairing cg_hist with one baseline at a shared lambda_ratio and tolerance with 3 repetitions, so the pooled cg_hist-vs-baseline ratio has family, seed and baseline diversity within one execution's 4-instance/2-arm cap and the campaign's 6-unit cap.",
+      "unit_varies": [
+        "plan"
+      ],
+      "units": 6
+    },
+    "failure": {
+      "comparator": ">=",
+      "threshold": 1.0
+    },
+    "observables": [
+      {
+        "description": "One record per solve; restricted to ok=true to hold accuracy matched across cg_hist and baselines.",
+        "fields": [
+          "solver",
+          "wall_seconds",
+          "ok",
+          "family",
+          "seed"
+        ],
+        "include": [
+          {
+            "comparator": "==",
+            "field": "ok",
+            "value": true
+          }
+        ],
+        "incomplete_records": "insufficient",
+        "kind": "records",
+        "name": "solves",
+        "path": "records",
+        "source": "results/ros/cells.json"
+      }
+    ],
+    "on_missing": "INSUFFICIENT",
+    "population": "cg.cells@1 solves with ok=true in the five planted-support families (sparse, correlated, toeplitz, block, illcond), at whatever (n,p,k) instances, shared lambda_ratio and shared tolerance the campaign plan sets within the k~75-to-0.4p regime, comparing cg_hist against the specific baseline solver(s) -- at least two distinct baselines, out of celer/skglm/lars/sklearn/conic_reduced/conic_thesis -- that the plan actually pairs it with; this frozen analysis speaks only to the baselines and families the campaign includes, pooled together, not necessarily all six baselines individually.",
+    "primary_statistic": "ratio_cg_baseline",
+    "reductions": [
+      {
+        "coefficient": "",
+        "field": "wall_seconds",
+        "name": "median_cg",
+        "observable": "solves",
+        "of": [],
+        "op": "median",
+        "other_field": "",
+        "q": null,
+        "response": "",
+        "terms": [],
+        "where": [
+          {
+            "comparator": "==",
+            "field": "solver",
+            "value": "cg_hist"
+          }
+        ]
+      },
+      {
+        "coefficient": "",
+        "field": "wall_seconds",
+        "name": "median_baseline",
+        "observable": "solves",
+        "of": [],
+        "op": "median",
+        "other_field": "",
+        "q": null,
+        "response": "",
+        "terms": [],
+        "where": [
+          {
+            "comparator": "!=",
+            "field": "solver",
+            "value": "cg_hist"
+          }
+        ]
+      },
+      {
+        "coefficient": "",
+        "field": "",
+        "name": "ratio_cg_baseline",
+        "observable": "",
+        "of": [
+          "median_cg",
+          "median_baseline"
+        ],
+        "op": "ratio",
+        "other_field": "",
+        "q": null,
+        "response": "",
+        "terms": [],
+        "where": []
+      }
+    ],
+    "stopping_rule": "fixed_campaign",
+    "success": {
+      "comparator": "<",
+      "threshold": 0.8
+    },
+    "support": [
+      {
+        "min_distinct": {
+          "family": 5,
+          "seed": 2,
+          "solver": 3
+        },
+        "min_records": 100,
+        "observable": "solves"
+      }
+    ],
+    "target_claim": "cg_hist's median wall-clock time is at least 20% below the pooled median wall-clock time of the baseline solver(s) it is run against, within the planted-support regime, across the families and seeds the campaign covers.",
+    "unanalysable_reason": "",
+    "uncertainty": {
+      "level": 0.95,
+      "method": "bootstrap_percentile",
+      "resamples": 1000,
+      "seed": 20260915
+    }
+  },
+  "analysis_digest": "panalysis-v1:80acef440a711b82de454a1d7bb161f5c91066cc1c8ca6fa78ec41ccd9c7428a",
+  "contract_id": "PCON-20261002T045746Z-90c32764",
+  "execution_shape_check": {
+    "campaign": {
+      "fits": true,
+      "max_units": 6,
+      "min_units": 2,
+      "supported": true,
+      "unit_varies": [
+        "seeds",
+        "plan"
+      ]
+    },
+    "capability": "cg.cells@1",
+    "checked_by": "research_os.portfolio.shape.check",
+    "commit": "5b969804fc3474903b6a753d8acadaee150c3cb7",
+    "demands": [
+      {
+        "because": [
+          "solves (ok == True) needs 100"
+        ],
+        "bound": "records",
+        "campaign": 1440,
+        "field": null,
+        "needed": 100,
+        "observable": "solves",
+        "one_execution": 240,
+        "renewed_by": [
+          "seeds",
+          "plan"
+        ]
+      },
+      {
+        "because": [
+          "solves (ok == True) needs 5"
+        ],
+        "bound": "instances",
+        "campaign": 24,
+        "field": "family",
+        "needed": 5,
+        "observable": "solves",
+        "one_execution": 4,
+        "renewed_by": [
+          "plan"
+        ]
+      },
+      {
+        "because": [
+          "solves (ok == True) needs 2"
+        ],
+        "bound": "instances",
+        "campaign": 24,
+        "field": "seed",
+        "needed": 2,
+        "observable": "solves",
+        "one_execution": 4,
+        "renewed_by": [
+          "plan",
+          "seeds"
+        ]
+      },
+      {
+        "because": [
+          "solves (ok == True) needs 3"
+        ],
+        "bound": "arms",
+        "campaign": 12,
+        "field": "solver",
+        "needed": 3,
+        "observable": "solves",
+        "one_execution": 2,
+        "renewed_by": [
+          "plan"
+        ]
+      }
+    ],
+    "envelope_digest": "renv-v1:3715791800a66600e19592c9d7bfaf96f7fa5ea2fb7f0f7e29ebe4825dea718a",
+    "problems": [],
+    "schema": "research-os-execution-shape-check-v1",
+    "shape": {
+      "unit_varies": [
+        "plan"
+      ],
+      "units": 6
+    },
+    "single_execution": {
+      "fits": false
+    },
+    "stated_shape": {
+      "capability": "cg.cells@1",
+      "per_execution": {
+        "arms": 2,
+        "instances": 4,
+        "lambda_ratios": 1,
+        "repetitions": 3,
+        "tolerances": 1
+      },
+      "rationale": "Six plan-differing units split 5 families x 2 seeds (10 instance combinations) across three units per baseline for two baselines, each unit pairing cg_hist with one baseline at a shared lambda_ratio and tolerance with 3 repetitions, so the pooled cg_hist-vs-baseline ratio has family, seed and baseline diversity within one execution's 4-instance/2-arm cap and the campaign's 6-unit cap.",
+      "unit_varies": [
+        "plan"
+      ],
+      "units": 6
+    },
+    "stopping_rule": "fixed_campaign",
+    "suggestion": "",
+    "unresolved": "",
+    "verdict": "VALID_CAMPAIGN"
+  },
+  "hypothesis": {
+    "content_digest": "pidea-content-v1:caceaf97bd2403ee3a688ee67052cee2a823331974c344917bf4bc626ef645af",
+    "core_idea": "Replace the proposal's planned from-scratch generator and harness with the already-declared cg.cells@1 capability, which already provides a seeded, versioned, multi-family instance generator and a multi-solver wall-clock harness. Compose a plan that fixes (n, p, k) pairs so that k runs from ~75 up to 0.4p, spans the five non-historical families, pairs cg_hist against each baseline solver at a shared tolerance and lambda_ratio grid, and replicates the design across at least 4 independent seeds (RESEARCH_OS_SEED_0 offsets, combined as a campaign). Pre-register the effect-size threshold (20% median wall-clock reduction) and the majority-of-triples decision rule before running any cell, so the result cannot be narratively fit after the fact.",
+    "falsifier": "Compose and run a cg.cells@1 campaign of at least 4 units differing only in seed (RESEARCH_OS_SEED_0), each unit's plan covering instances from families sparse, correlated, toeplitz, block, illcond with (n, p, k) chosen so k spans from ~75 to 0.4p, a shared lambda_ratio grid, a shared tolerance, and pairing solver=cg_hist against each of celer, skglm, lars, sklearn, conic_reduced, conic_thesis in turn (2 arms per unit, as the capability allows). Restrict to records with ok=true. For every (family, seed, baseline) triple, compute the median wall_seconds ratio of cg_hist to the baseline over repetitions. The pre-registered claim is falsified if, for any baseline, the ratio is not below 0.8 (i.e. cg_hist is not at least 20% faster) in a majority of its (family, seed) triples, or if the sign of the advantage (ratio above vs. below 1) is inconsistent across seeds within the same family.",
+    "idea_id": "PIDEA-20261002T035551Z-c61e2198",
+    "mechanism": "If cg_hist's column-generation strategy gives it a genuine computational edge in this support-size-to-feature-count regime (e.g. because it generates only the columns the active set needs, avoiding full Gram-matrix work that scales with p), that edge should reproduce as a consistent wall_seconds advantage over every baseline, in the same regime, on freshly generated instances with different seeds and across structurally different families (correlation, block, ill-conditioning) -- because the mechanism is about the solver's asymptotic work, not about the specific random draw or generator quirks of the original 2023 artifact.",
+    "research_question": "Within the planted-support regime spanning k≈75 up to k=0.4p, does cg_hist attain a median wall_seconds at least 20% lower than each of celer, skglm, lars, sklearn, conic_reduced and conic_thesis, at matched accuracy (ok=true, comparable relative_gap), in a majority of (family, seed) combinations across the families sparse, correlated, toeplitz, block and illcond, and does that direction of advantage hold consistently across seeds rather than flipping sign?",
+    "title": "Pre-registered wall-clock comparison of cg_hist against all declared baselines in the k=75-to-0.4p regime, using cg.cells@1",
+    "version": 2
+  },
+  "hypothesis_digest": "pidea-content-v1:caceaf97bd2403ee3a688ee67052cee2a823331974c344917bf4bc626ef645af",
+  "kind": "PREREGISTERED",
+  "parent_contract_id": null,
+  "project_id": "cg-sparse-regression",
+  "provenance": {
+    "analysis_call_id": "MCALL-20261002T045746Z-af99f701",
+    "analysis_prompt": "analysis_designer@4",
+    "analysis_role": "analysis_designer",
+    "model": "claude-sonnet-5",
+    "provider": "claude"
+  },
+  "role": "PRIMARY",
+  "schema": "portfolio-analysis-v1"
+}

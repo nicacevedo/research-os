@@ -61,7 +61,11 @@ from research_os.capability import (
     capability_digest,
 )
 from research_os.errors import ResearchOSError
-from research_os.portfolio.contracts import AnalysisSpec, DesignSpecification
+from research_os.portfolio.contracts import (
+    V2_OPERATIONS,
+    AnalysisSpec,
+    DesignSpecification,
+)
 from research_os.portfolio.models import (
     READ_OUTCOMES,
     EmpiricalConclusion,
@@ -142,10 +146,15 @@ def requirements_from_analysis(spec: AnalysisSpec) -> tuple[ObservableNeed, ...]
     fields, its inclusion rules, a reduction's field, a regression's response
     and terms, a ``where`` -- and which of those it reads as numbers. The
     capability must declare each field, and each numeric one as a number.
+    What a table reads, and what anything reads of a table, is resolved to
+    the observable's own fields (``AnalysisSpec.raw_reads``): a table derives
+    from declared fields, so a field it derives is no requirement of the
+    capability and a field it passes through is one.
     """
 
     if not spec.analysable:
         return ()
+    derived = spec.raw_reads()
     needs: list[ObservableNeed] = []
     for observable in spec.observables:
         fields: list[str] = list(observable.fields)
@@ -177,6 +186,11 @@ def requirements_from_analysis(spec: AnalysisSpec) -> tuple[ObservableNeed, ...]
                 numeric.append(reduction.response)
                 for term in reduction.terms:
                     numeric.extend(term.split(":"))
+            elif reduction.op in V2_OPERATIONS:
+                numeric.extend(reduction.numeric_fields_read())
+        fields_v2, numeric_v2 = derived.get(observable.name, ((), ()))
+        fields.extend(fields_v2)
+        numeric.extend(numeric_v2)
         needs.append(
             ObservableNeed(
                 name=observable.name,
@@ -321,6 +335,14 @@ def design_payload(
                     "include_only_when": [item.rendered() for item in reduction.where],
                 }
             )
+    for table in analysis.tables:
+        exclusion.append(
+            {
+                "table": table.name,
+                "include_only_when": [item.rendered() for item in table.include],
+                "incomplete_records": table.incomplete_records,
+            }
+        )
     return {
         "schema": DESIGN_SCHEMA,
         "project_id": project_id,
@@ -337,6 +359,13 @@ def design_payload(
             "reductions": [
                 item.model_dump(mode="json") for item in analysis.reductions
             ],
+            # Present only when the analysis derives tables, so no design of
+            # an analysis in the first language changes.
+            **(
+                {"tables": [item.model_dump(mode="json") for item in analysis.tables]}
+                if analysis.tables
+                else {}
+            ),
             "primary_statistic": analysis.primary_statistic,
             "support": [item.model_dump(mode="json") for item in analysis.support],
         },

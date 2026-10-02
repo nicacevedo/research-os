@@ -4,6 +4,38 @@ All notable changes to Research OS. Dates are release dates.
 
 ## [Unreleased] — rc/thesis-pilot
 
+### The second analysis language (2026-10-02)
+
+`docs/SCIENCE_EXECUTION.md` §4a is the specification. Cycle 002 of the live
+column-generation run stopped `PAUSED_NO_FRONTIER` with its four
+INVESTIGATING ideas blocked by analyses the first language could not write.
+No migration; no capability, scheduler or portfolio-policy change.
+
+- **Tables** (`AnalysisSpec.tables`): records derived from records, in
+  order -- grouped by up to four keys with per-group aggregates, given
+  computed fields, filtered -- with the incompleteness, selection and
+  support rules observables already had.
+- **Closed arithmetic** (`portfolio/expressions.py`): `+ - * /`, `log`,
+  `exp`, `abs`, `min`, `max`, numbers and names; parsed, never executed;
+  undefined rather than a number wherever arithmetic is.
+- **Operations**: `rank_correlation`, `partial_correlation`,
+  `partial_rank_correlation`, `crossing` (linear interpolation of a curve
+  through a level, with a frozen pick and direction), `expression` over
+  earlier quantities, and `permutation_p` (a seeded, stratified permutation
+  null; undefined draws and ties count as extreme). Equivalence is the
+  existing interval rule on a magnitude.
+- **Honesty**: what a table reads is a capability requirement on the
+  observable it descends from; a second-language analysis is checked again
+  before it is read.
+- **Effective population**: a support rule a selection makes impossible is
+  refused before freezing; a table's support reaches the envelope check.
+- **Versions**: second-language analyses are `panalysis-v2` /
+  `portfolio-analysis-v2`; every first-language analysis and design keeps its
+  bytes and digest; engine `portfolio.analysis@2`; `analysis_designer@5`
+  (every unread `@4` contract is stale).
+- **Tests**: `tests/test_analysis_operations_v2*.py` and the mutation
+  harness `tests/analysis_operations_mutations.py` (27 mutants).
+
 ### v1 closure: empirical science execution (2026-09-27)
 
 `docs/SCIENCE_EXECUTION.md` is the specification; `sql/0047` the migration.

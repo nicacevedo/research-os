@@ -51,10 +51,16 @@ from research_os.runtime.failures import FailureClass
 from research_os.runtime.interfaces import ExecutionSpec
 
 ANALYSIS_DIGEST_VERSION = "panalysis-v1"
+#: An analysis in the second language (tables, or any operation of
+#: ``contracts.V2_OPERATIONS``; docs/SCIENCE_EXECUTION.md §4a) is hashed under
+#: its own version, so no digest of the first language can name one, and an
+#: analysis frozen in the first is never read under the second's semantics.
+ANALYSIS_DIGEST_VERSION_2 = "panalysis-v2"
 DESIGN_DIGEST_VERSION = "pdesign-v1"
 CONTRACT_DIGEST_VERSION = "pcontract-v1"
 
 ANALYSIS_SCHEMA = "portfolio-analysis-v1"
+ANALYSIS_SCHEMA_2 = "portfolio-analysis-v2"
 DESIGN_SCHEMA = "portfolio-design-v1"
 CONTRACT_SCHEMA = "portfolio-scientific-contract-v1"
 
@@ -96,11 +102,19 @@ def analysis_payload(spec: AnalysisSpec) -> dict[str, Any]:
         payload.pop("population", None)
     if payload.get("execution_shape") is None:
         payload.pop("execution_shape", None)
+    # The second language's keys are omitted by the models themselves when
+    # absent (`contracts.Reduction`, `contracts.AnalysisSpec`), for the same
+    # reason; this is the belt to those braces.
+    if not payload.get("tables"):
+        payload.pop("tables", None)
     return payload
 
 
 def analysis_digest(spec: AnalysisSpec) -> str:
-    return _digest(ANALYSIS_DIGEST_VERSION, analysis_payload(spec))
+    version = (
+        ANALYSIS_DIGEST_VERSION_2 if spec.language() == 2 else ANALYSIS_DIGEST_VERSION
+    )
+    return _digest(version, analysis_payload(spec))
 
 
 def hypothesis_record(version: IdeaVersion) -> dict[str, Any]:
@@ -142,7 +156,7 @@ def analysis_document(
     """
 
     document = {
-        "schema": ANALYSIS_SCHEMA,
+        "schema": ANALYSIS_SCHEMA_2 if spec.language() == 2 else ANALYSIS_SCHEMA,
         "contract_id": contract_id,
         "project_id": project_id,
         "role": role,
@@ -573,16 +587,20 @@ def requirements_block(
                     else "is excluded and counted"
                 )
             )
+    for table in spec.tables:
+        lines.extend(_rendered_table(table))
     for reduction in spec.reductions:
         lines.append(f"quantity {reduction.name}: {_rendered_reduction(reduction)}")
     lines.append(f"primary statistic: {spec.primary_statistic}")
+    tables = {item.name for item in spec.tables}
     for rule in spec.support:
         needs = [f"at least {rule.min_records} record(s)"] + [
             f"at least {count} distinct value(s) of {name}"
             for name, count in sorted(rule.min_distinct.items())
         ]
         lines.append(
-            f"the data in {rule.observable} must hold "
+            f"the data in {'table ' if rule.observable in tables else ''}"
+            f"{rule.observable} must hold "
             + " and ".join(needs)
             + " -- otherwise the result is INSUFFICIENT whatever it shows"
         )
@@ -677,6 +695,35 @@ def withhold_thresholds(lines: Sequence[str], spec: AnalysisSpec) -> list[str]:
     ]
 
 
+def _rendered_table(table: Any) -> list[str]:
+    """One table, said precisely: what it is derived from and how."""
+
+    head = (
+        f"table {table.name}: from {table.source}, one record per distinct "
+        f"({', '.join(table.by)})"
+        if table.by
+        else f"table {table.name}: from {table.source}, one record per record"
+    )
+    lines = [head]
+    for aggregate in table.aggregates:
+        lines.append(
+            f"    field {aggregate.name}: {_rendered_reduction(aggregate)} of the group"
+        )
+    for item in table.compute:
+        lines.append(f"    field {item.field} = {item.expression}")
+    for condition in table.include:
+        lines.append(f"    records are kept only when {condition.rendered()}")
+    lines.append(
+        "    a record whose derived value is undefined "
+        + (
+            "makes the whole analysis INSUFFICIENT"
+            if table.incomplete_records == "insufficient"
+            else "is excluded and counted"
+        )
+    )
+    return lines
+
+
 def _rendered_reduction(reduction: Any) -> str:
     """One reduction, said precisely -- without any threshold, which is not here."""
 
@@ -686,25 +733,59 @@ def _rendered_reduction(reduction: Any) -> str:
         else ""
     )
     op = reduction.op
+    over = f" over {reduction.observable}" if reduction.observable else ""
     if op in {"difference", "ratio"}:
         return f"{op} of {reduction.of[0]} and {reduction.of[1]}"
+    if op == "expression":
+        return f"{reduction.expression}, of the quantities above"
+    if op == "permutation_p":
+        permutation = reduction.permutation
+        strata = ", ".join(permutation.by) if permutation.by else "all records"
+        return (
+            f"{permutation.tail}-tail permutation p-value of {reduction.of[0]}: "
+            f"{reduction.field} of {reduction.observable} shuffled within "
+            f"{strata}, {permutation.resamples} permutations from seed "
+            f"{permutation.seed}"
+        )
+    if op == "rank_correlation":
+        return (
+            f"Spearman rank correlation of {reduction.field} and "
+            f"{reduction.other_field}{over}{where}"
+        )
+    if op in {"partial_correlation", "partial_rank_correlation"}:
+        kind = "Spearman" if op == "partial_rank_correlation" else "Pearson"
+        return (
+            f"partial {kind} correlation of {reduction.field} and "
+            f"{reduction.other_field}, removing 1 + {' + '.join(reduction.terms)} "
+            f"from both{over}{where}"
+        )
+    if op == "crossing":
+        rule = reduction.crossing
+        which = "" if rule.direction == "any" else f" {rule.direction}"
+        return (
+            f"{rule.pick}{which} crossing of {reduction.other_field} through "
+            f"{rule.level:g} along {reduction.field}, interpolated linearly"
+            f"{over}{where}"
+        )
     if op == "value":
         return f"the number read from observable {reduction.observable}"
+    of_records = (
+        f" of records of {reduction.observable}" if reduction.observable else ""
+    )
     if op in {"count", "fraction"}:
-        return f"{op} of records of {reduction.observable}{where}"
+        return f"{op}{of_records}{where}"
     if op == "correlation":
         return (
-            f"correlation of {reduction.field} and {reduction.other_field} over "
-            f"{reduction.observable}{where}"
+            f"correlation of {reduction.field} and {reduction.other_field}{over}{where}"
         )
     if op == "ols_coefficient":
         return (
             f"least-squares coefficient of {reduction.coefficient} in "
-            f"{reduction.response} ~ 1 + {' + '.join(reduction.terms)} over "
-            f"{reduction.observable}{where}"
+            f"{reduction.response} ~ 1 + {' + '.join(reduction.terms)}"
+            f"{over}{where}"
         )
     quantile = f" q={reduction.q:g}" if reduction.q is not None else ""
-    return f"{op}{quantile} of {reduction.field} over {reduction.observable}{where}"
+    return f"{op}{quantile} of {reduction.field}{over}{where}"
 
 
 def analysis_lines(spec: AnalysisSpec) -> list[str]:

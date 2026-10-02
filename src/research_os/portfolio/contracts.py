@@ -40,12 +40,22 @@ from __future__ import annotations
 import json
 import math
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializerFunctionWrapHandler,
+    ValidationError,
+    field_validator,
+    model_serializer,
+)
 
 from research_os.errors import ResearchOSError
+from research_os.portfolio import expressions
 from research_os.portfolio.models import (
     Disposition,
     ObjectionTarget,
@@ -942,8 +952,9 @@ FIELD_PATTERN = r"^[A-Za-z_][A-Za-z0-9_\-]*(\.[A-Za-z0-9_\-]+)*$"
 MAX_FIELD_CHARS = 128
 MAX_FIELD_DEPTH = 6
 
-#: Everything a frozen analysis may compute. A closed set, and deliberately
-#: no expression language: see the section comment above.
+#: Everything a frozen analysis may compute. A closed set. The only arithmetic
+#: a model may write is the closed grammar of `research_os.portfolio.
+#: expressions`, which this module parses and never executes.
 ANALYSIS_OPERATIONS: tuple[str, ...] = (
     "value",
     "count",
@@ -959,11 +970,55 @@ ANALYSIS_OPERATIONS: tuple[str, ...] = (
     "ratio",
     "correlation",
     "ols_coefficient",
+    # The second analysis language (docs/SCIENCE_EXECUTION.md §4a).
+    "rank_correlation",
+    "partial_correlation",
+    "partial_rank_correlation",
+    "crossing",
+    "expression",
+    "permutation_p",
 )
 
 #: Operations over one field of a records observable.
 FIELD_OPERATIONS: frozenset[str] = frozenset(
     {"mean", "median", "std", "min", "max", "sum", "quantile"}
+)
+
+#: Operations of the second analysis language. An analysis that uses any of
+#: them, or a table, is a version-2 analysis: hashed as ``panalysis-v2``, so
+#: no analysis frozen in the first language reads as one in the second.
+V2_OPERATIONS: frozenset[str] = frozenset(
+    {
+        "rank_correlation",
+        "partial_correlation",
+        "partial_rank_correlation",
+        "crossing",
+        "expression",
+        "permutation_p",
+    }
+)
+
+#: Operations over the records of a frame (an observable or a table) -- what a
+#: table's aggregate may be, computed once per group.
+RECORD_OPERATIONS: frozenset[str] = FIELD_OPERATIONS | {
+    "count",
+    "fraction",
+    "correlation",
+    "rank_correlation",
+    "partial_correlation",
+    "partial_rank_correlation",
+    "ols_coefficient",
+    "crossing",
+}
+
+#: Operations over earlier quantities only.
+SCALAR_OPERATIONS: frozenset[str] = frozenset(
+    {"difference", "ratio", "expression", "permutation_p"}
+)
+
+#: Correlations of two fields after removing the `terms` from both.
+PARTIAL_OPERATIONS: frozenset[str] = frozenset(
+    {"partial_correlation", "partial_rank_correlation"}
 )
 
 MAX_OBSERVABLES = 8
@@ -973,6 +1028,15 @@ MAX_SUPPORT_RULES = 8
 MAX_OLS_TERMS = 6
 MAX_DESIGN_VARIABLES = 12
 MAX_LEVELS = 64
+#: Derived records: tables per analysis, group keys, aggregates and computed
+#: fields per table.
+MAX_TABLES = 8
+MAX_GROUP_KEYS = 4
+MAX_AGGREGATES = 8
+MAX_COMPUTED = 8
+#: Permutations one ``permutation_p`` may draw.
+MIN_PERMUTATIONS = 100
+MAX_PERMUTATIONS = 20_000
 
 
 def _relative_path(value: str, what: str) -> str:
@@ -1100,6 +1164,60 @@ class Observable(_Contract):
         return stripped
 
 
+class Crossing(_Contract):
+    """Where a curve crosses a level, and which crossing is the quantity.
+
+    The curve is ``other_field`` against ``field`` over the records the
+    quantity reads, one point per record. The points must have distinct
+    ``field`` values -- a crossing is of a function, so several records at one
+    abscissa are aggregated first, by a table -- and there must be two. A
+    crossing is a change of sign of ``other_field - level`` between adjacent
+    points, interpolated linearly; a point exactly on the level between
+    opposite signs is where it crosses. ``pick`` chooses among crossings,
+    ``direction`` which ones count; none is undefined, never zero.
+    """
+
+    level: float = Field(allow_inf_nan=False)
+    #: ``first`` / ``last`` along ``field``, or ``single``: exactly one
+    #: crossing, and undefined when there are more.
+    pick: Literal["first", "last", "single"] = "first"
+    #: ``rising`` (from below the level to above it), ``falling``, or ``any``.
+    direction: Literal["any", "rising", "falling"] = "any"
+
+
+class Permutation(_Contract):
+    """The null a ``permutation_p`` draws, fixed in advance.
+
+    ``by`` names the strata: values are shuffled only among records that
+    agree on every one of these fields (all records together when empty).
+    The seed is written down, so the p-value is a deterministic function of
+    the data and the contract.
+    """
+
+    by: tuple[str, ...] = _shown_list(items=128, count=MAX_GROUP_KEYS, default=())
+    #: ``lower``: P(null <= observed); ``upper``: P(null >= observed);
+    #: ``two_sided``: twice the smaller of the two, at most one.
+    tail: Literal["lower", "upper", "two_sided"]
+    resamples: int = Field(default=10_000, ge=MIN_PERMUTATIONS, le=MAX_PERMUTATIONS)
+    seed: int = Field(default=20260915, ge=0, le=2**31 - 1)
+
+    @field_validator("by")
+    @classmethod
+    def _strata(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(value) > MAX_GROUP_KEYS or len(set(value)) != len(value):
+            raise ValueError(
+                f"a permutation has at most {MAX_GROUP_KEYS} distinct strata"
+            )
+        return tuple(_field_name(item, "a permutation stratum") for item in value)
+
+
+#: The keys of a reduction that only the second analysis language has. A
+#: reduction that holds none of them dumps exactly as it did before they
+#: existed, so every analysis -- and every design -- frozen in the first
+#: language rebuilds to the digest it was frozen under.
+_V2_REDUCTION_KEYS: tuple[str, ...] = ("crossing", "permutation", "expression")
+
+
 class Reduction(_Contract):
     """One named quantity, computed by a member of a closed set of operations.
 
@@ -1125,6 +1243,12 @@ class Reduction(_Contract):
         "ratio",
         "correlation",
         "ols_coefficient",
+        "rank_correlation",
+        "partial_correlation",
+        "partial_rank_correlation",
+        "crossing",
+        "expression",
+        "permutation_p",
     ]
     #: The observable this reads, for every operation but difference/ratio.
     observable: str = Field(default="", pattern=r"^([a-z][a-z0-9_]{0,47})?$")
@@ -1140,10 +1264,37 @@ class Reduction(_Contract):
     of: tuple[str, ...] = _shown_list(items=48, count=2, default=())
     #: For ``ols_coefficient``: the response field, the predictor terms (a
     #: field, or two fields joined by ':' for their product) and which term's
-    #: coefficient is the quantity. An intercept is always included.
+    #: coefficient is the quantity. An intercept is always included. For the
+    #: partial correlations: the terms removed, with an intercept, from both
+    #: ``field`` and ``other_field``.
     response: str = _shown(128, default="")
     terms: tuple[str, ...] = _shown_list(items=260, count=MAX_OLS_TERMS, default=())
     coefficient: str = _shown(260, default="")
+    #: For ``crossing``: the level, and which crossing.
+    crossing: Crossing | None = None
+    #: For ``permutation_p``: the strata, the tail, the draws and the seed.
+    permutation: Permutation | None = None
+    #: For ``expression``: arithmetic over earlier quantities, in the closed
+    #: grammar of :mod:`research_os.portfolio.expressions`.
+    expression: str = _shown(expressions.MAX_EXPRESSION_CHARS, default="")
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_v2_keys(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> dict[str, Any]:
+        dumped = handler(self)
+        for key in _V2_REDUCTION_KEYS:
+            if key in dumped and not dumped[key]:
+                del dumped[key]
+        return dumped
+
+    @field_validator("expression")
+    @classmethod
+    def _expression(cls, value: str) -> str:
+        stripped = value.strip()
+        if stripped:
+            expressions.parse(stripped)
+        return stripped
 
     @field_validator("field", "other_field", "response")
     @classmethod
@@ -1202,7 +1353,257 @@ class Reduction(_Contract):
         for term in self.terms:
             found.extend(term.split(":"))
         found.extend(item.field for item in self.where)
+        if self.permutation is not None:
+            found.extend(self.permutation.by)
         return tuple(dict.fromkeys(item for item in found if item))
+
+    def numeric_fields_read(self) -> tuple[str, ...]:
+        """The fields this reduction reads as numbers, in a stable order."""
+
+        found: list[str] = [
+            item.field
+            for item in self.where
+            if item.comparator in {"<", "<=", ">", ">="}
+        ]
+        if self.op in FIELD_OPERATIONS:
+            # ``other_field`` too, if a field operation names one: the first
+            # language's evaluator read it as a number, and still does.
+            found.extend([self.field, self.other_field])
+        elif self.op in {"correlation", "rank_correlation", "crossing"}:
+            found.extend([self.field, self.other_field])
+        elif self.op in PARTIAL_OPERATIONS:
+            found.extend([self.field, self.other_field])
+            for term in self.terms:
+                found.extend(term.split(":"))
+        elif self.op == "ols_coefficient":
+            found.append(self.response)
+            for term in self.terms:
+                found.extend(term.split(":"))
+        return tuple(dict.fromkeys(item for item in found if item))
+
+    def depends_on(self) -> tuple[str, ...]:
+        """The earlier quantities this one is computed from."""
+
+        if self.op == "expression" and self.expression:
+            return expressions.parse(self.expression).variables
+        return tuple(self.of)
+
+
+class ComputedField(_Contract):
+    """One field a table adds to each of its records: an expression over that record."""
+
+    field: str = Field(pattern=ANALYSIS_NAME_PATTERN)
+    expression: str = _shown(expressions.MAX_EXPRESSION_CHARS)
+
+    @field_validator("expression")
+    @classmethod
+    def _expression(cls, value: str) -> str:
+        stripped = value.strip()
+        expressions.parse(stripped)
+        return stripped
+
+
+class Table(_Contract):
+    """Records derived from records -- an observable's, or an earlier table's.
+
+    Evaluated in order, before any reduction, by ordinary code in
+    :mod:`research_os.portfolio.analysis` (``docs/SCIENCE_EXECUTION.md`` §4a):
+
+    1. with ``by``, one record per distinct combination of those fields in
+       the source, carrying them and one field per ``aggregate`` -- a
+       record operation over that group's records; without, one record per
+       source record, carrying the source's fields;
+    2. ``compute`` adds fields, each an expression over the record's own
+       fields and the fields computed before it;
+    3. ``include`` keeps the records satisfying every condition.
+
+    A record whose aggregate or computed value is undefined, or for which an
+    ``include`` or a selection a reduction makes of this table cannot be
+    decided, is incomplete: ``incomplete_records`` fixes in advance whether
+    that makes the analysis INSUFFICIENT or excludes it, counted. A table
+    derives; it never observes. Every field it reads is one its source
+    holds, and what the source holds of a capability is what the capability
+    declares.
+    """
+
+    name: str = Field(pattern=ANALYSIS_NAME_PATTERN)
+    source: str = Field(pattern=ANALYSIS_NAME_PATTERN)
+    by: tuple[str, ...] = _shown_list(items=128, count=MAX_GROUP_KEYS, default=())
+    aggregates: tuple[Reduction, ...] = ()
+    compute: tuple[ComputedField, ...] = ()
+    include: tuple[Condition, ...] = ()
+    incomplete_records: Literal["insufficient", "exclude"] = "insufficient"
+    description: str = _shown(MAX_STATEMENT_CHARS, default="")
+
+    @field_validator("by")
+    @classmethod
+    def _keys(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(value) > MAX_GROUP_KEYS or len(set(value)) != len(value):
+            raise ValueError(
+                f"a table groups by at most {MAX_GROUP_KEYS} distinct fields"
+            )
+        return tuple(_field_name(item, "a group key") for item in value)
+
+    @field_validator("aggregates")
+    @classmethod
+    def _aggregates(cls, value: tuple[Reduction, ...]) -> tuple[Reduction, ...]:
+        if len(value) > MAX_AGGREGATES:
+            raise ValueError(f"at most {MAX_AGGREGATES} aggregates per table")
+        return value
+
+    @field_validator("compute")
+    @classmethod
+    def _computed(cls, value: tuple[ComputedField, ...]) -> tuple[ComputedField, ...]:
+        if len(value) > MAX_COMPUTED:
+            raise ValueError(f"at most {MAX_COMPUTED} computed fields per table")
+        return value
+
+    @field_validator("include")
+    @classmethod
+    def _include(cls, value: tuple[Condition, ...]) -> tuple[Condition, ...]:
+        if len(value) > MAX_CONDITIONS:
+            raise ValueError(f"at most {MAX_CONDITIONS} inclusion rules")
+        return value
+
+    @field_validator("description")
+    @classmethod
+    def _description(cls, value: str) -> str:
+        stripped = value.strip()
+        if len(stripped) > MAX_STATEMENT_CHARS:
+            raise ValueError(f"at most {MAX_STATEMENT_CHARS} characters")
+        return stripped
+
+    def derived_fields(self) -> tuple[str, ...]:
+        """The fields this table makes: its aggregates and computed fields."""
+
+        return tuple(item.name for item in self.aggregates) + tuple(
+            item.field for item in self.compute
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class FrameView:
+    """What one records frame -- an observable or a table -- holds. Ordinary data.
+
+    ``observable`` is the records observable every record of the frame
+    descends from; ``source`` the frame it is derived from (``None`` for an
+    observable itself); ``keys`` its group keys; ``derived`` what it computes.
+    A grouped table is ``closed``: it holds its keys and what it computes,
+    nothing else. Any other frame holds whatever its source holds, and an
+    observable whatever its records carry -- which capability resolution
+    then holds to what the capability declares.
+    """
+
+    name: str
+    observable: str
+    source: str | None
+    keys: tuple[str, ...]
+    derived: frozenset[str]
+    closed: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ImpliedSupport:
+    """What a table's support rule requires of the observable it descends from.
+
+    A lower bound, by construction: a grouped table holds one record per
+    distinct combination of its keys in its source, an ungrouped one at most
+    one per source record, so a table that must hold N records needs N
+    source records -- and, grouped, N distinct key combinations -- and a key
+    that must take M distinct values takes M in the source. Fields a table
+    computes say nothing about its source and are dropped.
+    """
+
+    observable: str
+    min_records: int
+    min_distinct: Mapping[str, int]
+    combinations: tuple[tuple[tuple[str, ...], int], ...]
+
+
+def _observable_views(observables: Any) -> dict[str, FrameView]:
+    return {
+        item.name: FrameView(
+            name=item.name,
+            observable=item.name,
+            source=None,
+            keys=(),
+            derived=frozenset(),
+            closed=False,
+        )
+        for item in observables
+        if item.kind == "records"
+    }
+
+
+def _table_view(table: Table, views: Mapping[str, FrameView]) -> FrameView:
+    source = views[table.source]
+    return FrameView(
+        name=table.name,
+        observable=source.observable,
+        source=table.source,
+        keys=tuple(table.by),
+        derived=frozenset(table.derived_fields()),
+        closed=bool(table.by),
+    )
+
+
+def _holds_field(views: Mapping[str, FrameView], view: FrameView, name: str) -> bool:
+    current: FrameView | None = view
+    while current is not None:
+        if name in current.derived or name in current.keys:
+            return True
+        if current.closed:
+            return False
+        current = views.get(current.source) if current.source else None
+    return True
+
+
+def _require_field(
+    views: Mapping[str, FrameView], view: FrameView, name: str, *, what: str
+) -> None:
+    if not _holds_field(views, view, name):
+        held = sorted({*view.keys, *view.derived})
+        raise ContractError(
+            f"{what} reads {name!r}, which {view.name!r} does not hold: a grouped "
+            f"table holds its keys and what it computes ({', '.join(held)})"
+        )
+
+
+def _resolve(
+    views: Mapping[str, FrameView], view: FrameView, name: str
+) -> tuple[str, str] | None:
+    """The observable and field a frame's field is read from, or ``None`` if derived."""
+
+    current = view
+    while True:
+        if name in current.derived:
+            return None
+        if current.source is None:
+            return current.observable, name
+        if current.closed and name not in current.keys:
+            return None
+        current = views[current.source]
+
+
+def _descends(views: Mapping[str, FrameView], frame: str, ancestor: str) -> bool:
+    """Whether ``frame`` is ``ancestor`` or derived from it."""
+
+    current = views.get(frame)
+    while current is not None:
+        if current.name == ancestor:
+            return True
+        current = views.get(current.source) if current.source else None
+    return False
+
+
+def _chain(name: str, defined: Mapping[str, Any]) -> set[str]:
+    found = {name}
+    item = defined.get(name)
+    if item is None:
+        return found
+    for other in item.depends_on():
+        found |= _chain(other, defined)
+    return found
 
 
 class Uncertainty(_Contract):
@@ -1344,6 +1745,10 @@ class AnalysisSpec(_Contract):
     #: What a SUPPORTS conclusion would mean about the idea, in words.
     target_claim: str = _shown(MAX_STATEMENT_CHARS, default="")
     observables: tuple[Observable, ...] = ()
+    #: Records derived from records, before any reduction (:class:`Table`).
+    #: Omitted from every dump when empty, so an analysis frozen before tables
+    #: existed keeps its bytes and its digest.
+    tables: tuple[Table, ...] = ()
     reductions: tuple[Reduction, ...] = ()
     primary_statistic: str = Field(default="", pattern=r"^([a-z][a-z0-9_]{0,47})?$")
     uncertainty: Uncertainty | None = None
@@ -1369,6 +1774,22 @@ class AnalysisSpec(_Contract):
     #: conclusion INSUFFICIENT. There is no other value, and in particular no
     #: "estimate it".
     on_missing: Literal["INSUFFICIENT"] = "INSUFFICIENT"
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_tables(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> dict[str, Any]:
+        dumped = handler(self)
+        if "tables" in dumped and not dumped["tables"]:
+            del dumped["tables"]
+        return dumped
+
+    @field_validator("tables")
+    @classmethod
+    def _bounded_tables(cls, value: tuple[Table, ...]) -> tuple[Table, ...]:
+        if len(value) > MAX_TABLES:
+            raise ValueError(f"at most {MAX_TABLES} tables")
+        return value
 
     @field_validator("unanalysable_reason")
     @classmethod
@@ -1424,6 +1845,7 @@ class AnalysisSpec(_Contract):
                 )
             if (
                 self.observables
+                or self.tables
                 or self.reductions
                 or self.success
                 or self.failure
@@ -1453,13 +1875,28 @@ class AnalysisSpec(_Contract):
             )
 
         observables = {item.name: item for item in self.observables}
-        names = list(observables) + [item.name for item in self.reductions]
+        names = (
+            list(observables)
+            + [item.name for item in self.tables]
+            + [item.name for item in self.reductions]
+        )
         if len(set(names)) != len(names):
-            raise ContractError("observable and reduction names must all be distinct")
+            raise ContractError(
+                "observable, table and reduction names must all be distinct"
+                if self.tables
+                else "observable and reduction names must all be distinct"
+            )
+
+        views = _observable_views(self.observables)
+        for table in self.tables:
+            self._check_table(table, observables=observables, views=views)
+            views[table.name] = _table_view(table, views)
 
         defined: dict[str, Reduction] = {}
         for item in self.reductions:
-            self._check_reduction(item, observables=observables, defined=defined)
+            self._check_reduction(
+                item, observables=observables, defined=defined, views=views
+            )
             defined[item.name] = item
 
         if self.primary_statistic not in defined:
@@ -1478,9 +1915,7 @@ class AnalysisSpec(_Contract):
                     "an interval cannot be compared for exact equality; with an "
                     "uncertainty the predicates must be <, <=, > or >="
                 )
-            if not self._depends_on_records(
-                self.primary_statistic, defined, observables
-            ):
+            if not self._depends_on_records(self.primary_statistic, defined, views):
                 raise ContractError(
                     "a bootstrap resamples records, and the primary statistic "
                     "reads none; drop the uncertainty or compute it from records"
@@ -1493,21 +1928,46 @@ class AnalysisSpec(_Contract):
                     "a Wilson score interval is the interval of a proportion; "
                     "the primary statistic must be a fraction to use it"
                 )
+            permuted = sorted(
+                name
+                for name in _chain(self.primary_statistic, defined)
+                if defined[name].op == "permutation_p"
+            )
+            if permuted:
+                raise ContractError(
+                    f"the primary statistic is computed from the permutation "
+                    f"p-value {permuted[0]!r}; a bootstrap of a permutation test is "
+                    f"nested resampling, which this language does not do -- drop "
+                    f"the uncertainty and decide on the p-value"
+                )
         self._check_thresholds_are_not_restated()
         for rule in self.support:
             observable = observables.get(rule.observable)
-            if observable is None:
+            view = views.get(rule.observable)
+            if observable is None and view is None:
                 raise ContractError(
                     f"a support requirement names {rule.observable!r}, which is "
                     f"not an observable of this analysis"
+                    + (" or a table" if self.tables else "")
                 )
-            if observable.kind != "records" and (
-                rule.min_distinct or rule.min_records > 1
+            if (
+                observable is not None
+                and observable.kind != "records"
+                and (rule.min_distinct or rule.min_records > 1)
             ):
                 raise ContractError(
                     f"{rule.observable!r} is a scalar; only a records observable "
                     f"can be required to hold records or distinct values"
                 )
+            if view is not None:
+                for name in rule.min_distinct:
+                    _require_field(
+                        views,
+                        view,
+                        name,
+                        what=f"a support requirement on {rule.observable!r}",
+                    )
+        self._check_support_can_be_met(observables=observables, defined=defined)
         shape = self.execution_shape
         if shape is None:
             return
@@ -1523,6 +1983,90 @@ class AnalysisSpec(_Contract):
                 "campaign of one unit is a single execution"
             )
 
+    def _check_support_can_be_met(
+        self,
+        *,
+        observables: Mapping[str, Observable],
+        defined: Mapping[str, Reduction],
+    ) -> None:
+        """Refuse a support rule that no data can meet -- proved, not estimated.
+
+        The evaluator checks every support rule over the whole observable or
+        table and again over every selection the primary statistic is computed
+        on (``portfolio.analysis``; ``count`` and ``fraction`` are exempt, their
+        selection being what they count). A selection or an inclusion rule
+        ``field == value`` leaves that field one value, so a rule asking for
+        two or more distinct values of it can never hold, whatever is
+        measured: the outcome is INCONCLUSIVE before anything runs. Cycle 001
+        of the live column-generation run spent six executions on exactly
+        that (``min_distinct solver: 3`` beside a median selected to
+        ``solver == 'cg_hist'``), and two qualification runs one each.
+
+        Only that proof is used. A requirement that merely looks hard to meet
+        is not refused here: unknown feasibility is the design's and the
+        data's question.
+        """
+
+        rules: dict[str, list[SupportRequirement]] = {}
+        for rule in self.support:
+            rules.setdefault(rule.observable, []).append(rule)
+        tables = {item.name: item for item in self.tables}
+
+        def pinned(conditions: Sequence[Condition]) -> dict[str, Any]:
+            found: dict[str, Any] = {}
+            for condition in conditions:
+                if condition.comparator == "==":
+                    found.setdefault(condition.field, condition.value)
+            return found
+
+        def refuse(where: str, field: str, value: Any, frame: str, wanted: int) -> None:
+            raise ContractError(
+                f"{where} where {field} == {value!r}, so {field} takes one value "
+                f"there, and the support rule on {frame!r} requires {wanted} "
+                f"distinct values of it. Support is checked over the whole "
+                f"{frame!r} and over every selection the primary statistic is "
+                f"computed on, so no data can meet this rule and the outcome "
+                f"would be INCONCLUSIVE whatever was measured. To require that "
+                f"what the selections span is diverse, state it on a table "
+                f"grouped by {field!r}; or drop the requirement"
+            )
+
+        for frame, frame_rules in sorted(rules.items()):
+            include: Sequence[Condition] = (
+                observables[frame].include
+                if frame in observables
+                else tables[frame].include
+                if frame in tables
+                else ()
+            )
+            fixed = pinned(include)
+            for rule in frame_rules:
+                for field_name, wanted in sorted(rule.min_distinct.items()):
+                    if wanted >= 2 and field_name in fixed:
+                        refuse(
+                            f"{frame!r} keeps only records",
+                            field_name,
+                            fixed[field_name],
+                            frame,
+                            wanted,
+                        )
+        for name in sorted(_chain(self.primary_statistic, defined)):
+            reduction = defined[name]
+            if not reduction.where or reduction.op in {"count", "fraction", "value"}:
+                continue
+            fixed = pinned(reduction.where)
+            for rule in rules.get(reduction.observable, ()):
+                for field_name, wanted in sorted(rule.min_distinct.items()):
+                    if wanted >= 2 and field_name in fixed:
+                        refuse(
+                            f"{name} computes on the records of "
+                            f"{reduction.observable!r}",
+                            field_name,
+                            fixed[field_name],
+                            reduction.observable,
+                            wanted,
+                        )
+
     def _check_thresholds_are_not_restated(self) -> None:
         """Refuse free text that repeats a threshold the designer must not see.
 
@@ -1532,6 +2076,8 @@ class AnalysisSpec(_Contract):
         at least 0.8" hands it the bar the split exists to withhold. So a
         number in any of those equal to a threshold is refused here, before
         anything is frozen. 0 and 1 are exempt: they are everywhere in prose.
+        A table's description and the names it gives its fields are shown
+        too, and are held to the same rule.
         """
 
         assert self.success is not None and self.failure is not None
@@ -1543,6 +2089,10 @@ class AnalysisSpec(_Contract):
         texts = [self.estimand, self.target_claim, self.population]
         texts += [item.description for item in self.observables]
         texts += [item.name.replace("_", " ") for item in self.reductions]
+        for table in self.tables:
+            texts.append(table.description)
+            texts.append(table.name.replace("_", " "))
+            texts += [item.replace("_", " ") for item in table.derived_fields()]
         for text in texts:
             for token in re.findall(r"-?\d+(?:\.\d+)?", text):
                 try:
@@ -1557,13 +2107,124 @@ class AnalysisSpec(_Contract):
                     )
 
     @staticmethod
+    def _check_table(
+        table: Table,
+        *,
+        observables: Mapping[str, Observable],
+        views: Mapping[str, FrameView],
+    ) -> None:
+        name = table.name
+        source = views.get(table.source)
+        if source is None:
+            if table.source in observables:
+                raise ContractError(
+                    f"table {name}: {table.source!r} is a scalar; a table derives "
+                    f"records from records"
+                )
+            raise ContractError(
+                f"table {name}: its source {table.source!r} is not a records "
+                f"observable or an earlier table of this analysis"
+            )
+        if table.aggregates and not table.by:
+            raise ContractError(
+                f"table {name}: aggregates summarise groups; name the fields to "
+                f"group by in 'by', or compute the quantity as a reduction"
+            )
+        if not (table.by or table.compute or table.include):
+            raise ContractError(
+                f"table {name}: it groups, computes and selects nothing, so it is "
+                f"its source again"
+            )
+        made = (
+            list(table.by)
+            + [item.name for item in table.aggregates]
+            + [item.field for item in table.compute]
+        )
+        if len(set(made)) != len(made):
+            raise ContractError(
+                f"table {name}: its keys, aggregates and computed fields must all "
+                f"be distinct"
+            )
+        for key in table.by:
+            _require_field(views, source, key, what=f"table {name}'s key")
+        for aggregate in table.aggregates:
+            if aggregate.op not in RECORD_OPERATIONS:
+                raise ContractError(
+                    f"table {name}: {aggregate.name} is {aggregate.op}, which is not "
+                    f"an operation over a group's records"
+                )
+            if aggregate.observable:
+                raise ContractError(
+                    f"table {name}: {aggregate.name} reads its group; an aggregate "
+                    f"names no observable"
+                )
+            AnalysisSpec._check_reduction(
+                aggregate.model_copy(update={"observable": table.source}),
+                observables=observables,
+                defined={},
+                views=views,
+            )
+        later = {item.field for item in table.compute}
+        held = set(table.by) | {item.name for item in table.aggregates}
+        computed: set[str] = set()
+        read_from_source: set[str] = set()
+        for item in table.compute:
+            for variable in expressions.parse(item.expression).variables:
+                if variable in computed:
+                    continue
+                if variable == item.field:
+                    raise ContractError(
+                        f"table {name}: {item.field} reads itself; a derived field "
+                        f"takes a name of its own, never a field it is computed from"
+                    )
+                if variable in later:
+                    raise ContractError(
+                        f"table {name}: {item.field} reads {variable}, which is "
+                        f"computed after it"
+                    )
+                if table.by:
+                    if variable not in held:
+                        raise ContractError(
+                            f"table {name}: {item.field} reads {variable!r}; a "
+                            f"grouped table's records hold only its keys "
+                            f"({', '.join(table.by)}) and its aggregates"
+                        )
+                    continue
+                _require_field(
+                    views, source, variable, what=f"table {name}'s {item.field}"
+                )
+                read_from_source.add(variable)
+            computed.add(item.field)
+        shadowed = sorted(computed & read_from_source)
+        if shadowed:
+            raise ContractError(
+                f"table {name}: {shadowed[0]!r} is both read from the source and "
+                f"computed; a derived field takes a name of its own"
+            )
+        own = _table_view(table, views)
+        for condition in table.include:
+            _require_field(
+                {**views, name: own}, own, condition.field, what=f"table {name}'s rule"
+            )
+
+    @staticmethod
     def _check_reduction(
         item: Reduction,
         *,
         observables: Mapping[str, Observable],
         defined: Mapping[str, Reduction],
+        views: Mapping[str, FrameView] | None = None,
     ) -> None:
+        views = views if views is not None else _observable_views(observables.values())
         op = item.op
+        if item.crossing is not None and op != "crossing":
+            raise ContractError(f"{item.name}: only a crossing takes 'crossing'")
+        if item.permutation is not None and op != "permutation_p":
+            raise ContractError(
+                f"{item.name}: only a permutation_p takes 'permutation'"
+            )
+        if item.expression and op != "expression":
+            raise ContractError(f"{item.name}: only an expression takes 'expression'")
         if op in {"difference", "ratio"}:
             if len(item.of) != 2:
                 raise ContractError(f"{item.name}: {op} takes exactly two reductions")
@@ -1574,19 +2235,48 @@ class AnalysisSpec(_Contract):
                     f"reductions computed earlier in the list"
                 )
             return
+        if op == "expression":
+            if not item.expression:
+                raise ContractError(f"{item.name}: an expression needs its expression")
+            if (
+                item.of
+                or item.observable
+                or item.field
+                or item.other_field
+                or item.where
+                or item.terms
+                or item.response
+                or item.coefficient
+                or item.q is not None
+            ):
+                raise ContractError(
+                    f"{item.name}: an expression is computed from earlier quantities "
+                    f"named in it, and takes nothing else"
+                )
+            missing = [name for name in item.depends_on() if name not in defined]
+            if missing:
+                raise ContractError(
+                    f"{item.name}: its expression refers to {missing}, which are "
+                    f"not reductions computed earlier in the list"
+                )
+            return
+        if op == "permutation_p":
+            AnalysisSpec._check_permutation(item, defined=defined, views=views)
+            return
         if item.of:
             raise ContractError(f"{item.name}: only difference and ratio take 'of'")
         observable = observables.get(item.observable)
-        if observable is None:
+        view = views.get(item.observable)
+        if observable is None and view is None:
             raise ContractError(
                 f"{item.name}: {op} must read an observable of this analysis, and "
                 f"{item.observable!r} is not one"
             )
         if op == "value":
-            if observable.kind != "scalar":
+            if observable is None or observable.kind != "scalar":
                 raise ContractError(f"{item.name}: value reads a scalar observable")
             return
-        if observable.kind != "records":
+        if view is None:
             raise ContractError(f"{item.name}: {op} reads a records observable")
         if op in FIELD_OPERATIONS and not item.field:
             raise ContractError(f"{item.name}: {op} needs the field it aggregates")
@@ -1613,21 +2303,294 @@ class AnalysisSpec(_Contract):
                 )
             if len(set(item.terms)) != len(item.terms):
                 raise ContractError(f"{item.name}: a term is listed twice")
+        if op in {"rank_correlation", "crossing"} | PARTIAL_OPERATIONS:
+            if not (item.field and item.other_field):
+                raise ContractError(f"{item.name}: {op} needs two fields")
+            if item.field == item.other_field:
+                raise ContractError(
+                    f"{item.name}: {op} of a field with itself is not a quantity"
+                )
+        if op == "crossing":
+            if item.crossing is None:
+                raise ContractError(
+                    f"{item.name}: a crossing needs its level, in 'crossing'"
+                )
+            if item.terms or item.response or item.coefficient:
+                raise ContractError(
+                    f"{item.name}: a crossing is of other_field along field, and "
+                    f"takes no terms"
+                )
+        if op in PARTIAL_OPERATIONS:
+            if not item.terms:
+                raise ContractError(
+                    f"{item.name}: a partial correlation needs the terms it removes"
+                )
+            if len(set(item.terms)) != len(item.terms):
+                raise ContractError(f"{item.name}: a term is listed twice")
+            controlled = {part for term in item.terms for part in term.split(":")}
+            if {item.field, item.other_field} & controlled:
+                raise ContractError(
+                    f"{item.name}: a field cannot be correlated after removing itself"
+                )
+            if item.response or item.coefficient:
+                raise ContractError(
+                    f"{item.name}: a partial correlation takes field, other_field "
+                    f"and terms, not a response or a coefficient"
+                )
+        if op == "rank_correlation" and (
+            item.terms or item.response or item.coefficient
+        ):
+            raise ContractError(
+                f"{item.name}: a rank correlation is of field and other_field, and "
+                f"takes no terms; partial_rank_correlation removes terms"
+            )
+        for name in item.fields_read():
+            _require_field(views, view, name, what=item.name)
+
+    @staticmethod
+    def _check_permutation(
+        item: Reduction,
+        *,
+        defined: Mapping[str, Reduction],
+        views: Mapping[str, FrameView],
+    ) -> None:
+        permutation = item.permutation
+        if permutation is None:
+            raise ContractError(
+                f"{item.name}: a permutation_p needs its null fixed, in 'permutation'"
+            )
+        if len(item.of) != 1:
+            raise ContractError(
+                f"{item.name}: a permutation_p takes exactly one earlier quantity in "
+                f"'of' -- the statistic whose null it draws"
+            )
+        statistic = item.of[0]
+        if statistic not in defined:
+            raise ContractError(
+                f"{item.name}: {statistic!r} is not a reduction computed earlier in "
+                f"the list"
+            )
+        view = views.get(item.observable)
+        if view is None:
+            raise ContractError(
+                f"{item.name}: a permutation shuffles the records of an observable "
+                f"or a table of this analysis, and {item.observable!r} is not one"
+            )
+        if not item.field:
+            raise ContractError(
+                f"{item.name}: a permutation_p needs the field it shuffles"
+            )
+        if (
+            item.where
+            or item.other_field
+            or item.terms
+            or item.response
+            or item.coefficient
+            or item.q is not None
+        ):
+            raise ContractError(
+                f"{item.name}: a permutation_p takes of, observable, field and "
+                f"permutation, and nothing else"
+            )
+        if item.field in permutation.by:
+            raise ContractError(
+                f"{item.name}: shuffling {item.field!r} among records that agree on "
+                f"{item.field!r} changes nothing"
+            )
+        for name in (item.field, *permutation.by):
+            _require_field(views, view, name, what=item.name)
+        chain = _chain(statistic, defined)
+        if not any(
+            _descends(views, defined[name].observable, item.observable)
+            for name in chain
+            if defined[name].observable
+        ):
+            raise ContractError(
+                f"{item.name}: {statistic!r} does not read {item.observable!r}, so "
+                f"shuffling it leaves the statistic as it is -- a null of nothing"
+            )
+        nested = sorted(name for name in chain if defined[name].op == "permutation_p")
+        if nested:
+            raise ContractError(
+                f"{item.name}: {statistic!r} is computed from the permutation p-value "
+                f"{nested[0]!r}; a permutation of a permutation test is not drawn here"
+            )
 
     @staticmethod
     def _depends_on_records(
         name: str,
         defined: Mapping[str, Reduction],
-        observables: Mapping[str, Observable],
+        views: Mapping[str, FrameView],
     ) -> bool:
         item = defined[name]
-        if item.op in {"difference", "ratio"}:
+        if item.op in SCALAR_OPERATIONS:
             return any(
-                AnalysisSpec._depends_on_records(other, defined, observables)
-                for other in item.of
+                AnalysisSpec._depends_on_records(other, defined, views)
+                for other in item.depends_on()
             )
-        observable = observables.get(item.observable)
-        return observable is not None and observable.kind == "records"
+        return item.observable in views
+
+    # -- what the analysis reads, said for the code that checks it ---------
+    def language(self) -> int:
+        """1 for the first analysis language, 2 when anything of the second is used."""
+
+        reductions = [*self.reductions]
+        for table in self.tables:
+            reductions.extend(table.aggregates)
+        if self.tables or any(
+            item.op in V2_OPERATIONS
+            or item.crossing is not None
+            or item.permutation is not None
+            or item.expression
+            for item in reductions
+        ):
+            return 2
+        return 1
+
+    def frame_views(self) -> dict[str, FrameView]:
+        """Every records frame: each records observable, then each table, in order."""
+
+        views = _observable_views(self.observables)
+        for table in self.tables:
+            if table.source in views:
+                views[table.name] = _table_view(table, views)
+        return views
+
+    def chain(self, name: str) -> set[str]:
+        """The reductions the named one depends on, itself included."""
+
+        return _chain(name, {item.name: item for item in self.reductions})
+
+    def selections(self, frame: str) -> list[Condition]:
+        """Every selection made of one frame's records, by a reduction or an aggregate.
+
+        A record for which one of them cannot be decided is incomplete for the
+        whole frame, so every quantity sees the same records.
+        """
+
+        found = [
+            condition
+            for reduction in self.reductions
+            if reduction.observable == frame and reduction.op in RECORD_OPERATIONS
+            for condition in reduction.where
+        ]
+        for table in self.tables:
+            if table.source == frame:
+                found.extend(
+                    condition
+                    for aggregate in table.aggregates
+                    for condition in aggregate.where
+                )
+        return found
+
+    def raw_reads(self) -> dict[str, tuple[tuple[str, ...], tuple[str, ...]]]:
+        """What the tables, and everything reading them, read of each records observable.
+
+        Per observable: every field read, and the subset read as numbers, in
+        a stable order. A field a table derives is not read of anything; a
+        key or a field passed through is the source's field, read of the
+        source. Empty for an analysis without tables, whose reads the first
+        language already states.
+        """
+
+        views = self.frame_views()
+        present: dict[str, dict[str, None]] = {}
+        numeric: dict[str, dict[str, None]] = {}
+
+        def read(frame: str, field_name: str, as_number: bool) -> None:
+            view = views.get(frame)
+            if view is None:
+                return
+            resolved = _resolve(views, view, field_name)
+            if resolved is None:
+                return
+            observable, raw = resolved
+            present.setdefault(observable, {})[raw] = None
+            if as_number:
+                numeric.setdefault(observable, {})[raw] = None
+
+        if not self.tables:
+            return {}
+        inequality = {"<", "<=", ">", ">="}
+        for table in self.tables:
+            for key in table.by:
+                read(table.source, key, False)
+            for aggregate in table.aggregates:
+                numbers = set(aggregate.numeric_fields_read())
+                for field_name in aggregate.fields_read():
+                    read(table.source, field_name, field_name in numbers)
+            for item in table.compute:
+                for variable in expressions.parse(item.expression).variables:
+                    read(table.name, variable, True)
+            for condition in table.include:
+                read(table.name, condition.field, condition.comparator in inequality)
+        tables = {item.name for item in self.tables}
+        for reduction in self.reductions:
+            if reduction.observable not in tables:
+                continue
+            numbers = set(reduction.numeric_fields_read())
+            for field_name in reduction.fields_read():
+                read(reduction.observable, field_name, field_name in numbers)
+        for rule in self.support:
+            if rule.observable in tables:
+                for field_name in rule.min_distinct:
+                    read(rule.observable, field_name, False)
+        return {
+            name: (tuple(fields), tuple(numeric.get(name, {})))
+            for name, fields in present.items()
+        }
+
+    def implied_support(self) -> tuple[ImpliedSupport, ...]:
+        """What each table's support rule requires of its observable. See :class:`ImpliedSupport`."""
+
+        views = self.frame_views()
+        tables = {item.name: item for item in self.tables}
+        found: list[ImpliedSupport] = []
+        for rule in self.support:
+            view = views.get(rule.observable)
+            if view is None or view.source is None:
+                continue
+            records = rule.min_records
+            distinct = dict(rule.min_distinct)
+            combinations: list[tuple[tuple[str, ...], int]] = []
+            while view.source is not None:
+                table = tables[view.name]
+                if table.by:
+                    distinct = {
+                        key: count for key, count in distinct.items() if key in table.by
+                    }
+                    combinations = [
+                        (fields, count)
+                        for fields, count in combinations
+                        if set(fields) <= set(table.by)
+                    ]
+                    if records > 1:
+                        combinations.append((tuple(table.by), records))
+                        if len(table.by) == 1:
+                            # One key: N groups are N distinct values of it.
+                            key = table.by[0]
+                            distinct[key] = max(distinct.get(key, 0), records)
+                else:
+                    distinct = {
+                        key: count
+                        for key, count in distinct.items()
+                        if key not in view.derived
+                    }
+                    combinations = [
+                        (fields, count)
+                        for fields, count in combinations
+                        if not set(fields) & view.derived
+                    ]
+                view = views[view.source]
+            found.append(
+                ImpliedSupport(
+                    observable=view.name,
+                    min_records=records,
+                    min_distinct=distinct,
+                    combinations=tuple(combinations),
+                )
+            )
+        return tuple(found)
 
     def sources(self) -> tuple[str, ...]:
         """Every raw output this analysis reads, in a stable order."""

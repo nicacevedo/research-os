@@ -188,6 +188,45 @@ def _needed(
     return best, because
 
 
+def _support_maps(
+    analysis: AnalysisSpec,
+) -> tuple[
+    dict[str, int],
+    dict[str, dict[str, int]],
+    dict[str, list[tuple[tuple[str, ...], int]]],
+    set[str],
+]:
+    """Per analysed observable: records, distinct values and joint combinations needed.
+
+    From the observable's own support rules, and from every rule stated on a
+    table derived from it (``AnalysisSpec.implied_support``): a table's records
+    are the observable's records grouped, given computed fields or filtered,
+    so what a table must hold is a lower bound on what the observable must --
+    the effective population of a statistic over a table, which this check
+    would otherwise not see. An analysis without tables implies nothing.
+    """
+
+    records: dict[str, int] = {}
+    distinct: dict[str, dict[str, int]] = {}
+    for rule in analysis.support:
+        records[rule.observable] = max(
+            records.get(rule.observable, 0), rule.min_records
+        )
+        wanted = distinct.setdefault(rule.observable, {})
+        for name, count in rule.min_distinct.items():
+            wanted[name] = max(wanted.get(name, 0), count)
+    combinations: dict[str, list[tuple[tuple[str, ...], int]]] = {}
+    for implied in analysis.implied_support():
+        records[implied.observable] = max(
+            records.get(implied.observable, 0), implied.min_records
+        )
+        wanted = distinct.setdefault(implied.observable, {})
+        for name, count in implied.min_distinct.items():
+            wanted[name] = max(wanted.get(name, 0), count)
+        combinations.setdefault(implied.observable, []).extend(implied.combinations)
+    return records, distinct, combinations, set(records)
+
+
 def demands(
     analysis: AnalysisSpec,
     *,
@@ -207,16 +246,7 @@ def demands(
         spec = specs.get(analysis_name)
         if spec is not None and spec.kind == "records":
             by_capability.setdefault(capability_name, []).append(analysis_name)
-    records: dict[str, int] = {}
-    distinct: dict[str, dict[str, int]] = {}
-    for rule in analysis.support:
-        records[rule.observable] = max(
-            records.get(rule.observable, 0), rule.min_records
-        )
-        wanted = distinct.setdefault(rule.observable, {})
-        for name, count in rule.min_distinct.items():
-            wanted[name] = max(wanted.get(name, 0), count)
-    supported = set(records)
+    records, distinct, combinations, supported = _support_maps(analysis)
     found: list[Demand] = []
     for capability_name, names in sorted(by_capability.items()):
         pins = {name: _pins(specs[name]) for name in names}
@@ -272,7 +302,7 @@ def demands(
                     )
             joint, because = _needed(
                 {
-                    name: _slots(name, fields, distinct, pins, supported)
+                    name: _slots(name, fields, distinct, pins, supported, combinations)
                     for name in names
                 },
                 pins,
@@ -308,18 +338,24 @@ def _slots(
     distinct: Mapping[str, Mapping[str, int]],
     pins: Mapping[str, Mapping[str, Any]],
     supported: set[str],
+    combinations: Mapping[str, Sequence[tuple[tuple[str, ...], int]]] | None = None,
 ) -> int:
     """The slots of one bounded input one analysed observable needs, at least.
 
     As many as the most distinct values it needs of any field of the input;
     and at least one when it must hold records and selects one value of a
     field of the input -- two observables of two families each need an
-    instance of their family, whatever else they need.
+    instance of their family, whatever else they need. And as many as the
+    distinct combinations of the input's fields a table grouped by them must
+    hold: one execution holds at most ``max`` combinations of them.
     """
 
     need = max((distinct.get(name, {}).get(item, 0) for item in fields), default=0)
     if name in supported and any(item in pins[name] for item in fields):
         need = max(need, 1)
+    for keys, count in (combinations or {}).get(name, ()):
+        if set(keys) <= set(fields):
+            need = max(need, count)
     return need
 
 
@@ -339,12 +375,7 @@ def _fixed_joint(
     """
 
     specs = {item.name: item for item in analysis.observables}
-    distinct: dict[str, dict[str, int]] = {}
-    for rule in analysis.support:
-        wanted = distinct.setdefault(rule.observable, {})
-        for name, count in rule.min_distinct.items():
-            wanted[name] = max(wanted.get(name, 0), count)
-    supported = {rule.observable for rule in analysis.support}
+    _records, distinct, combinations, supported = _support_maps(analysis)
     out: list[Demand] = []
     for capability_name in sorted({item[1] for item in observables}):
         names = [
@@ -365,7 +396,7 @@ def _fixed_joint(
                 continue
             need, because = _needed(
                 {
-                    name: _slots(name, fixed, distinct, pins, supported)
+                    name: _slots(name, fixed, distinct, pins, supported, combinations)
                     for name in names
                 },
                 pins,

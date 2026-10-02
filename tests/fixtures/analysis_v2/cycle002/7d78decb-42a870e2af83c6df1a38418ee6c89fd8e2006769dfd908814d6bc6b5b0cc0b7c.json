@@ -1,0 +1,70 @@
+{
+  "analysis": {
+    "analysable": false,
+    "estimand": "",
+    "failure": null,
+    "observables": [],
+    "on_missing": "INSUFFICIENT",
+    "primary_statistic": "",
+    "reductions": [],
+    "stopping_rule": "fixed_single_execution",
+    "success": null,
+    "support": [],
+    "target_claim": "",
+    "unanalysable_reason": "The idea's primary object -- a scheme-specific transition-point estimate (the lambda_ratio at which support_recall crosses 0.5, located by linear interpolation in one scheme and by a logistic-fit crossing in the other) -- cannot be computed from any operation the schema offers. The reduction vocabulary (value, count, fraction, mean, median, std, min, max, sum, quantile, difference, ratio, correlation, ols_coefficient) has no crossing/root-finding operation over a field-vs-field curve, no logistic (nonlinear) fit, and no way to combine an ols_coefficient slope and intercept into a derived crossing point (difference/ratio only combine two already-named quantities, and there is no literal-constant quantity to supply the 0.5 target). Without a computable transition-point estimate there is no per-family scheme delta, no family x scheme interaction magnitude, and nothing to feed a permutation-calibrated null. Separately, the proposed inference itself is unavailable: `uncertainty` admits only a single seeded percentile bootstrap over the analysed records, not a null built by permuting scheme labels within family, and `success`/`failure` are single-threshold comparator predicates on one primary statistic, not a TOST equivalence test of an interaction magnitude against +/-Delta_min under a custom permutation null. cg.cells@1's solves records give support_recall, lambda_ratio, family and seed, but nothing in the declared observables or the closed reduction language identifies a threshold-crossing location, a nonlinear fit, or a permutation/equivalence-test statistic, so the idea as stated is not analysable from what this capability can produce.",
+    "uncertainty": null
+  },
+  "analysis_digest": "panalysis-v1:c5857a4f0e988610c92b11eb1dbd516fde196e4572e5f247653814a006fe7eb9",
+  "contract_id": "PCON-20261002T150817Z-3a82c568",
+  "execution_shape_check": {
+    "campaign": {
+      "fits": false,
+      "max_units": 0,
+      "min_units": null,
+      "supported": false,
+      "unit_varies": []
+    },
+    "capability": null,
+    "checked_by": "research_os.portfolio.shape.check",
+    "commit": "5b969804fc3474903b6a753d8acadaee150c3cb7",
+    "demands": [],
+    "envelope_digest": "renv-v1:3715791800a66600e19592c9d7bfaf96f7fa5ea2fb7f0f7e29ebe4825dea718a",
+    "problems": [],
+    "schema": "research-os-execution-shape-check-v1",
+    "shape": {
+      "unit_varies": [],
+      "units": null
+    },
+    "single_execution": {
+      "fits": false
+    },
+    "stated_shape": null,
+    "stopping_rule": "fixed_single_execution",
+    "suggestion": "",
+    "unresolved": "the analysis is not analysable",
+    "verdict": "UNRESOLVED"
+  },
+  "hypothesis": {
+    "content_digest": "pidea-content-v1:32dd73a813f5a7034a98dffaf337bf6c56f989f0e6a3d3c62430e0465eb32b39",
+    "core_idea": "Interpolation scheme is treated strictly as a post-hoc analysis choice applied to the same support_recall(lambda_ratio) curve -- not a new data-collection axis -- so the factorial design needed is just family x lambda_ratio x seed, collected once per family with one fixed solver/tolerance. For each family, run a dense-enough lambda_ratio sweep across multiple independent seeds to get a support_recall curve with bootstrap sampling uncertainty; apply >=2 pre-specified transition-point estimators (e.g. linear interpolation to the 0.5-crossing vs. a logistic-fit crossing) to each bootstrap draw; compute per-family scheme deltas and the resulting two-way interaction magnitude. Calibrate against false positives from estimator nonlinearity by permuting scheme labels within family (same curves, same estimators, relabeled) to build the null distribution the interaction magnitude would show under true additivity, then run a TOST equivalence test of the observed interaction against a pre-registered minimal magnitude Delta_min using that permutation null rather than plain NHST. The covariate regression against continuous family properties (correlation strength, block size, etc.) is explicitly descoped from this falsifier: with only 6 declared families there are at most 6 interaction estimates, too few points for a regression to be informative, so that question is left open rather than claimed answered here.",
+    "falsifier": "Pre-register a minimal interaction magnitude Delta_min in lambda_ratio units (set relative to the achievable grid spacing before data collection). Using cg-cells, collect, for each of the 6 declared families (sparse, toeplitz, block, correlated, illcond, historical), a lambda_ratio sweep under one fixed solver and tolerance across enough independent seeds to bootstrap the support_recall(lambda_ratio) curve. Apply 2 pre-specified transition-point interpolation schemes to each bootstrap draw, compute the per-family scheme deltas and the overall family x scheme interaction magnitude, and build its null distribution by permuting scheme labels within family on the same curves. Run a TOST equivalence test of the observed interaction magnitude against +/-Delta_min using that permutation null. Equivalence within Delta_min settles additivity (uniform scheme offset); exceeding Delta_min with the observed interaction outside the permutation null's central mass settles family-dependence. The covariate-regression half of the original proposal is not settled by this falsifier and is left as a separate, explicitly descoped question.",
+    "idea_id": "PIDEA-20261002T141801Z-7d78decb",
+    "mechanism": "cg-cells records, held fixed on one solver and one tolerance, give support_recall as a function of lambda_ratio for each (family, seed). Running several independent seeds per family and a lambda_ratio grid that brackets the support_recall transition yields, for each family, a bootstrap distribution of transition-point estimates under each of the >=2 pre-specified interpolation schemes. The family x scheme interaction term in a two-way decomposition of these bootstrap transition-point estimates is the object of interest. Because the same nonlinear estimator is applied to both the real data and to within-family scheme-label permutations of it, the permutation null isolates genuine family-dependence of the scheme artifact from nonlinearity that the estimator itself would produce even under pure additivity.",
+    "research_question": "Fixing solver and tolerance, and varying only the post-hoc interpolation scheme used to locate the lambda_ratio at which support_recall crosses a fixed threshold, is the scheme-induced shift in the estimated transition point the same size in every instance family (additive, within a pre-registered margin Delta_min), or does it differ by more than Delta_min in at least one family (a genuine scheme x family interaction)?",
+    "title": "Scheme-by-Family Interaction in Transition-Point Estimates: An Equivalence Test with Permutation Calibration",
+    "version": 2
+  },
+  "hypothesis_digest": "pidea-content-v1:32dd73a813f5a7034a98dffaf337bf6c56f989f0e6a3d3c62430e0465eb32b39",
+  "kind": "PREREGISTERED",
+  "parent_contract_id": null,
+  "project_id": "cg-sparse-regression",
+  "provenance": {
+    "analysis_call_id": "MCALL-20261002T150817Z-e1624b5f",
+    "analysis_prompt": "analysis_designer@4",
+    "analysis_role": "analysis_designer",
+    "model": "claude-sonnet-5",
+    "provider": "claude"
+  },
+  "role": "PRIMARY",
+  "schema": "portfolio-analysis-v1"
+}
