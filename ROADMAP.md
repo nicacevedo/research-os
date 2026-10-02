@@ -377,6 +377,33 @@ the frozen analysis allows; what they differ in is derived from their frozen
 specifications; and the rule is applied by the designer-side check, the
 compiler and the chain verification before every run, reading and readiness.
 
+The persistent column-generation research run on this candidate (not a
+qualification; cycles 001 and 002) stopped itself `PAUSED_NO_FRONTIER` with
+33.27 of 100 USD unspent: every INVESTIGATING idea held a contract whose
+frozen analysis the closed reduction language could not express. The
+analysis-operations sprint addresses that, and nothing else
+(`docs/SCIENCE_EXECUTION.md` §4a; no migration, no capability, scheduler or
+policy change):
+
+- **the second analysis language** -- tables (grouping, computed fields,
+  filters), closed arithmetic, rank and partial correlations, the crossing
+  of a curve and a seeded permutation null; equivalence through the existing
+  interval rule; every table's reads held to the capability declaration;
+- **the statistic's effective population before freezing** -- a support
+  rule no data can meet is refused, and a table's support reaches the
+  envelope check;
+- **versions** -- `panalysis-v2` for the new language, every earlier digest
+  unchanged, `analysis_designer@5`. The four blocked contracts are unread
+  and frozen by `@4`, so they are analysed again when their ideas next reach
+  the evidence stage; releasing the ideas is a person's act. Of the four,
+  one becomes expressible once its malformed permutation-calibrated TOST is
+  read through the interval rule, over the four families with a planted
+  truth (`7d78decb`),
+  one is expressible and honestly capability-limited by the campaign bound
+  (`35ef9d24`), one stays limited and asks for a result that was never
+  measured (`d1b13797`), and one is expressible except its disjunctive,
+  data-dependent selection rule (`e3906d0e`).
+
 **Not qualified:** a third run has not been made. Not merged, not tagged.
 
 ## Two external prerequisites, and the policy on each

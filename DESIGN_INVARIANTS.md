@@ -451,3 +451,31 @@ The property worth stating as new rather than preserved:
 ```text
 one allowed difference  !=  permission for the others
 ```
+
+## Change control record: the second analysis language
+
+Per the change-control section above, a dedicated record. **No invariant
+changed, nothing was added to the permitted-technology list, and there is no
+migration.** `docs/SCIENCE_EXECUTION.md` §4a is the specification.
+
+The limitation, measured by the persistent column-generation run rather than
+reasoned about: Cycle 002 stopped `PAUSED_NO_FRONTIER` with 33.27 USD of
+authority unused because all four INVESTIGATING ideas held contracts whose
+frozen analyses said the closed reduction language could not express them --
+no grouping, no per-record derived field, no crossing, no permutation null,
+no rank or partial correlation. Cycle 001 had also spent six contained
+executions on an analysis whose own support rule no data could meet.
+
+| # | invariant | what changed |
+|---|---|---|
+| 1 | local before LLM | strengthened. More of what a result means is computed by ordinary code: tables, the crossing of a curve, rank and partial correlations and a seeded permutation null are evaluated by `portfolio.analysis`; arithmetic a model writes is parsed by a closed grammar (`portfolio.expressions`) and never executed |
+| 8 | no agent approves its own work | unchanged. Every new quantity is system-computed; a second-language analysis is checked again before it is read, so one built around the validators is not read at all |
+| 10 | claims traceable to evidence | unchanged in kind. A table derives from declared fields only: what it reads is a capability requirement on the observable it descends from, so no table can make a capability observe what it does not return |
+| 11 | experiments traceable | strengthened. A second-language analysis is hashed under its own version (`panalysis-v2`); every first-language analysis and design keeps its bytes and digest, and is read exactly as the base engine read it; the engine version is recorded with every reading |
+| 14 | finite stop conditions | unchanged in kind, extended. Every new list, every expression and every resampling is bounded; a permutation null or a bootstrap past its work bound is INSUFFICIENT before it draws anything. A support rule no data can meet is refused before it is frozen, and a table's support reaches the pre-freeze envelope check, so a structurally INCONCLUSIVE execution is not bought |
+
+The property worth stating as new rather than preserved:
+
+```text
+a table that derives  !=  a capability that observes
+```
